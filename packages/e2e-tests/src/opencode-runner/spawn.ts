@@ -246,10 +246,11 @@ function writeConfigs(
 }
 
 /**
- * Wait until the opencode session API returns a well-formed list. The `/doc`
- * endpoint can respond while OpenCode is still warming its application routes;
- * treating that socket-level response as readiness moves startup latency into the
- * scenario that happens to run next. Polls for up to `timeoutMs`.
+ * Wait until OpenCode can list sessions, the configured mock model, and Magic
+ * Context's tool registry. The `/doc` and `/session` endpoints can respond before
+ * provider config and plugin hooks finish loading; returning at that intermediate
+ * state lets the first prompt fail before it can reach the mock provider. Polls for
+ * up to `timeoutMs`.
  *
  * Implementation note — Bun fetch timeout flake:
  *   Bun's default `fetch()` has a hardcoded ~5 minute timeout that ignores
@@ -273,35 +274,88 @@ export async function waitForReady(
 ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
-    const readinessUrl = new URL("/session", url);
-    readinessUrl.searchParams.set("directory", directory);
-    let lastFetchErr: unknown = null;
-    let fetchAttempts = 0;
+    const sessionUrl = new URL("/session", url);
+    const toolsUrl = new URL("/experimental/tool/ids", url);
+    const providersUrl = new URL("/config/providers", url);
+    for (const readinessUrl of [sessionUrl, toolsUrl, providersUrl]) {
+        readinessUrl.searchParams.set("directory", directory);
+    }
 
+    let lastReadinessError: unknown = null;
+    let sessionAttempts = 0;
+    let dependencyAttempts = 0;
+    const fetchJson = async (readinessUrl: URL, label: string): Promise<unknown> => {
+        const res = await fetch(readinessUrl, {
+            method: "GET",
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        });
+        if (!res.ok) throw new Error(`${label} readiness returned HTTP ${res.status}`);
+        return res.json().catch(() => null);
+    };
+
+    let sessionReady = false;
     while (Date.now() < deadline) {
         try {
-            fetchAttempts++;
-            const res = await fetch(readinessUrl, {
-                method: "GET",
-                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-            });
-            if (res.ok) {
-                const body = await res.json().catch(() => null);
-                if (Array.isArray(body)) return;
-                lastFetchErr = new Error("session readiness response was not an array");
-            } else {
-                lastFetchErr = new Error(`session readiness returned HTTP ${res.status}`);
+            sessionAttempts += 1;
+            const sessions = await fetchJson(sessionUrl, "session API");
+            if (!Array.isArray(sessions)) {
+                throw new Error("session readiness response was not an array");
             }
-        } catch (err) {
-            lastFetchErr = err;
+            sessionReady = true;
+            break;
+        } catch (error) {
+            lastReadinessError = error;
+        }
+        await Bun.sleep(200);
+    }
+
+    // These endpoints can initialize provider and plugin state. Probe them only
+    // after the session route is live so separate readiness requests do not race
+    // OpenCode's application startup against each other.
+    while (sessionReady && Date.now() < deadline) {
+        try {
+            dependencyAttempts += 1;
+            const [toolIds, providerConfig] = await Promise.all([
+                fetchJson(toolsUrl, "plugin tools"),
+                fetchJson(providersUrl, "provider config"),
+            ]);
+            if (!Array.isArray(toolIds) || !toolIds.includes("ctx_search")) {
+                throw new Error("Magic Context tool registry is not ready");
+            }
+
+            const providers =
+                providerConfig && typeof providerConfig === "object"
+                    ? (providerConfig as { providers?: unknown }).providers
+                    : null;
+            const mockProvider = Array.isArray(providers)
+                ? providers.find(
+                      (provider) =>
+                          provider &&
+                          typeof provider === "object" &&
+                          (provider as { id?: unknown }).id === "mock-anthropic",
+                  )
+                : null;
+            const models =
+                mockProvider && typeof mockProvider === "object"
+                    ? (mockProvider as { models?: unknown }).models
+                    : null;
+            if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
+                throw new Error("mock-anthropic/mock-sonnet provider config is not ready");
+            }
+            return;
+        } catch (error) {
+            lastReadinessError = error;
         }
         await Bun.sleep(200);
     }
     throw new Error(
         `opencode serve did not become ready in ${timeoutMs}ms.\n` +
-            `  url=${readinessUrl.toString()}\n` +
-            `  fetchAttempts=${fetchAttempts}\n` +
-            `  fetchLastErr=${String(lastFetchErr)}`,
+            `  sessionUrl=${sessionUrl.toString()}\n` +
+            `  toolsUrl=${toolsUrl.toString()}\n` +
+            `  providersUrl=${providersUrl.toString()}\n` +
+            `  sessionAttempts=${sessionAttempts}\n` +
+            `  dependencyAttempts=${dependencyAttempts}\n` +
+            `  readinessLastErr=${String(lastReadinessError)}`,
     );
 }
 
