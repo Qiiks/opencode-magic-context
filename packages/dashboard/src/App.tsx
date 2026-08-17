@@ -169,8 +169,7 @@ export default function App() {
           </Show>
           <Show when={activeSection() === "config"}>
             <ConfigEditor
-              opencodeModels={modelCatalogs().opencode}
-              piModels={modelCatalogs().pi}
+              modelCatalogs={modelCatalogs()}
               opencodeInstallState={opencodeInstallState()}
             />
           </Show>

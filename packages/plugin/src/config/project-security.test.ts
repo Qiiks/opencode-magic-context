@@ -159,15 +159,32 @@ describe("stripUnsafeProjectConfigFields", () => {
     it("strips historian model selection from project config but keeps safe tuning fields", () => {
         const raw: Record<string, unknown> = {
             historian: {
-                model: "repo-model",
-                fallback_models: ["repo-fallback"],
+                model: "legacy/repo-model",
+                fallback_models: ["legacy/repo-fallback"],
+                opencode: {
+                    model: "opencode/repo-model",
+                    fallback_models: ["opencode/repo-fallback"],
+                    variant: "high",
+                },
+                pi: {
+                    model: "pi/repo-model",
+                    fallback_models: ["pi/repo-fallback"],
+                    thinking_level: "medium",
+                },
                 temperature: 0.2,
             },
         };
 
         const warnings = stripUnsafeProjectConfigFields(raw);
-        expect(raw.historian).toEqual({ temperature: 0.2 });
-        expect(warnings.some((w) => w.includes("historian.model/fallback_models"))).toBe(true);
+        expect(raw.historian).toEqual({
+            opencode: { variant: "high" },
+            pi: { thinking_level: "medium" },
+            temperature: 0.2,
+        });
+        const warning = warnings.join("\n");
+        expect(warning).toContain("historian.model");
+        expect(warning).toContain("historian.opencode.model");
+        expect(warning).toContain("historian.pi.model");
     });
 
     it("strips mural.model from project config but keeps the feature switch", () => {

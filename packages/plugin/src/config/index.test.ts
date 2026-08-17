@@ -342,6 +342,40 @@ describe("loadPluginConfig — secret redaction", () => {
         expect(w).toBeDefined();
     });
 
+    it("prunes only cross-harness qualifier leaves and names their full paths", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                historian: {
+                    two_pass: true,
+                    opencode: {
+                        model: "anthropic/claude-sonnet",
+                        variant: "high",
+                        thinking_level: "minimal",
+                    },
+                    pi: {
+                        model: "github-copilot/gpt-5",
+                        thinking_level: "medium",
+                        variant: "fast",
+                    },
+                },
+            }),
+        );
+
+        expect(result.historian?.two_pass).toBe(true);
+        expect(result.historian?.opencode).toEqual({
+            model: "anthropic/claude-sonnet",
+            variant: "high",
+        });
+        expect(result.historian?.pi).toEqual({
+            model: "github-copilot/gpt-5",
+            thinking_level: "medium",
+        });
+        const warnings = result.configWarnings?.join("\n") ?? "";
+        expect(warnings).toContain("historian.opencode.thinking_level");
+        expect(warnings).toContain("historian.pi.variant");
+        expect(warnings).not.toContain("invalid agent configuration, ignoring");
+    });
+
     it("still shows numeric and boolean invalid values (not secrets by nature)", () => {
         // Numbers/booleans in config fields are never secrets — they're
         // plain validation mistakes — so we surface them fully to help
@@ -740,25 +774,43 @@ describe("loadPluginConfig — user-only settings", () => {
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({
                 historian: {
-                    model: "anthropic/user-historian",
-                    fallback_models: ["anthropic/user-fallback"],
+                    opencode: {
+                        model: "anthropic/user-historian",
+                        fallback_models: ["anthropic/user-fallback"],
+                    },
+                    pi: {
+                        model: "github-copilot/user-historian",
+                        fallback_models: ["github-copilot/user-fallback"],
+                    },
                 },
             }),
             JSON.stringify({
                 historian: {
-                    model: "anthropic/project-historian",
-                    fallback_models: ["anthropic/project-fallback"],
+                    opencode: {
+                        model: "anthropic/project-historian",
+                        fallback_models: ["anthropic/project-fallback"],
+                    },
+                    pi: {
+                        model: "github-copilot/project-historian",
+                        fallback_models: ["github-copilot/project-fallback"],
+                    },
                     temperature: 0.2,
                 },
             }),
         );
 
-        expect(result.historian?.model).toBe("anthropic/user-historian");
-        expect(result.historian?.fallback_models).toEqual(["anthropic/user-fallback"]);
+        expect(result.historian?.opencode).toEqual({
+            model: "anthropic/user-historian",
+            fallback_models: ["anthropic/user-fallback"],
+        });
+        expect(result.historian?.pi).toEqual({
+            model: "github-copilot/user-historian",
+            fallback_models: ["github-copilot/user-fallback"],
+        });
         expect(result.historian?.temperature).toBe(0.2);
-        expect(result.configWarnings?.join("\n")).toContain(
-            "Ignoring historian.model/fallback_models",
-        );
+        const warnings = result.configWarnings?.join("\n") ?? "";
+        expect(warnings).toContain("historian.opencode.model");
+        expect(warnings).toContain("historian.pi.model");
     });
 });
 
@@ -877,21 +929,25 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
             JSON.stringify({ language: "tr" }),
             JSON.stringify({
                 dreamer: {
-                    model: "anthropic/project-dreamer",
-                    tasks: {
-                        verify: {
-                            schedule: "0 3 * * *",
-                            model: "anthropic/project-verify",
-                        },
+                    tasks: { verify: { schedule: "0 3 * * *" } },
+                    opencode: {
+                        model: "anthropic/project-dreamer",
+                        tasks: { verify: { model: "anthropic/project-verify" } },
+                    },
+                    pi: {
+                        model: "github-copilot/project-dreamer",
+                        tasks: { verify: { model: "github-copilot/project-verify" } },
                     },
                 },
             }),
         );
 
         expect(result.language).toBe("tr");
-        expect(result.dreamer?.model).toBe("anthropic/project-dreamer");
+        expect(result.dreamer?.opencode?.model).toBe("anthropic/project-dreamer");
+        expect(result.dreamer?.pi?.model).toBe("github-copilot/project-dreamer");
         expect(result.dreamer?.tasks.verify.schedule).toBe("0 3 * * *");
-        expect(result.dreamer?.tasks.verify.model).toBe("anthropic/project-verify");
+        expect(result.dreamer?.opencode?.tasks?.verify?.model).toBe("anthropic/project-verify");
+        expect(result.dreamer?.pi?.tasks?.verify?.model).toBe("github-copilot/project-verify");
     });
 
     it("project boolean override beats user default", () => {

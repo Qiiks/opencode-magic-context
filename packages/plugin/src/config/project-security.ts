@@ -213,8 +213,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.
- *  - `historian.model` / `historian.fallback_models` — historian model spend is
- *    user-level only; a cloned repo cannot force extra compaction cost.
+ *  - historian model/fallback fields, including both per-harness blocks —
+ *    historian model spend is user-level only; a cloned repo cannot force extra
+ *    compaction cost.
  *  - `mural.model` — mural cue-compressor model selection is user-level only;
  *    a cloned repo cannot choose a model that sends project memory to a provider.
  *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
@@ -365,9 +366,19 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                 removed.push(field);
             }
         }
+        for (const harness of ["opencode", "pi"] as const) {
+            const harnessBlock = historian[harness];
+            if (!isPlainObject(harnessBlock)) continue;
+            for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+                if (field in harnessBlock) {
+                    delete harnessBlock[field];
+                    removed.push(`${harness}.${field}`);
+                }
+            }
+        }
         if (removed.length > 0) {
             warnings.push(
-                `Ignoring historian.${removed.join("/")} from project config ` +
+                `Ignoring ${removed.map((path) => `historian.${path}`).join(", ")} from project config ` +
                     "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
             );
         }

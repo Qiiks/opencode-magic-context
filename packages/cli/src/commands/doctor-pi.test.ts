@@ -696,6 +696,35 @@ describe("Pi doctor", () => {
         expect(output).not.toContain("api_key=secret");
     });
 
+    it("checks Copilot reasoning configuration in the Pi historian block", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local" },
+                historian: {
+                    opencode: {
+                        model: { model: "github-copilot/opencode-only", variant: "high" },
+                    },
+                    pi: { model: "github-copilot/gpt-5.4" },
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            'WARN historian.model "github-copilot/gpt-5.4" is a GitHub Copilot reasoning model',
+        );
+        expect(output).not.toContain('github-copilot/opencode-only" is a GitHub Copilot');
+    });
+
     it("sanitizes thrown embedding probe errors before printing them", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");

@@ -266,6 +266,22 @@ describe("subagent-runner pure helpers", () => {
 		]);
 	});
 
+	it("passes the active entry thinking level through Pi's --thinking flag", () => {
+		const args = buildArgsForTest({
+			...baseOptions,
+			model: "github-copilot/gpt-5",
+			thinkingLevel: "high",
+		});
+
+		expect(args.slice(-5)).toEqual([
+			"--model",
+			"github-copilot/gpt-5",
+			"--thinking",
+			"high",
+			"summarize this session",
+		]);
+	});
+
 	it("keeps extension discovery enabled so provider and AFT extensions can load", () => {
 		const args = buildArgsForTest({
 			...baseOptions,

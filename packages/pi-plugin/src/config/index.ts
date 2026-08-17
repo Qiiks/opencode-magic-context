@@ -253,7 +253,13 @@ function parsePiConfig(
 			const key = String(topKey);
 			errorPaths.add(key);
 			const paths = issuePathsByKey.get(key) ?? [];
-			paths.push([...issue.path]);
+			if (issue.code === "unrecognized_keys") {
+				for (const unrecognizedKey of issue.keys) {
+					paths.push([...issue.path, unrecognizedKey]);
+				}
+			} else {
+				paths.push([...issue.path]);
+			}
 			issuePathsByKey.set(key, paths);
 		}
 	}
@@ -265,14 +271,6 @@ function parsePiConfig(
 		recoveredTopLevelKeys.push(key);
 		const isAgentConfig =
 			key === "historian" || key === "dreamer" || key === "sidekick";
-
-		if (isAgentConfig) {
-			delete patched[key];
-			warnings.push(
-				`"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
-			);
-			continue;
-		}
 
 		// Object-valued key: prune ONLY invalid nested leaves, keep valid siblings
 		// (e.g. don't wipe the whole `memory` block — incl. migrated auto_search /
@@ -302,9 +300,21 @@ function parsePiConfig(
 					prunedLeaves.push(result.removed);
 				}
 			}
-			patched[key] = prunedBlock;
+			if (prunedLeaves.length === issuePaths.length) {
+				patched[key] = prunedBlock;
+				warnings.push(
+					`"${key}": invalid nested field(s) ${prunedLeaves.map((leaf) => `"${key}.${leaf}"`).join(", ")}, using defaults for those.`,
+				);
+				continue;
+			}
+		}
+
+		// Root-level or unreachable agent errors cannot be repaired safely because
+		// guessing a model configuration could select an expensive unintended model.
+		if (isAgentConfig) {
+			delete patched[key];
 			warnings.push(
-				`"${key}": invalid nested field(s) ${prunedLeaves.map((l) => `"${l}"`).join(", ")}, using defaults for those.`,
+				`"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
 			);
 			continue;
 		}

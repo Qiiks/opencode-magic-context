@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   fallbackEntries,
+  modelCatalogForHarness,
   modelEntryWithModel,
   modelEntryWithQualifier,
   modelId,
@@ -8,6 +9,22 @@ import {
 } from "./HarnessModelFields";
 
 describe("harness model entries", () => {
+  it("selects each harness catalog from one generation pair without cross-leakage", () => {
+    const catalogs = {
+      opencode: ["openai/opencode-only", "anthropic/shared"],
+      pi: ["github-copilot/pi-only", "anthropic/shared"],
+    };
+
+    expect(modelCatalogForHarness(catalogs, "opencode")).toEqual([
+      "openai/opencode-only",
+      "anthropic/shared",
+    ]);
+    expect(modelCatalogForHarness(catalogs, "pi")).toEqual([
+      "github-copilot/pi-only",
+      "anthropic/shared",
+    ]);
+  });
+
   it("keeps free-text provider/model values usable", () => {
     expect(modelEntryWithModel(undefined, "opencode", "private/model")).toBe("private/model");
     expect(modelEntryWithModel(undefined, "pi", "local/model")).toBe("local/model");
