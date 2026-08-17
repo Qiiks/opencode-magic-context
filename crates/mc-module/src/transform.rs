@@ -40,8 +40,9 @@ use crate::scheduler::{
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
 };
 use crate::selection::{
-    filter_reasoning_ineligible_decisions, select_reductions_with_outcome, PassClass, SelItem,
-    SelKind, SelMessageRole, SelectionConfig, SelectionContext, SelectionOutcome,
+    filter_reasoning_ineligible_decisions, is_reclaim_hint_excluded_tool, resolve_tool_tier,
+    select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole, SelectionConfig,
+    SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
     effective_tail_hygiene, hygiene_band, measure_tail_hygiene, refresh_tail_hygiene_baseline,
@@ -1708,6 +1709,7 @@ struct ActiveTagForNudge {
     tag_number: i64,
     kind: String,
     token_count: i64,
+    tool_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -9130,6 +9132,10 @@ fn active_tags_for_nudge(
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
                 token_count: row.token_count.max(0),
+                tool_name: match &block.wire.kind {
+                    ck_wire::CkKind::ToolResult { tool_name, .. } => tool_name.clone(),
+                    _ => String::new(),
+                },
             });
         }
     }
@@ -9167,6 +9173,10 @@ fn active_tags_for_channel2(
             tag_number: next_tag,
             kind: kind.as_store_kind().to_string(),
             token_count: mc_tokenizer::estimate_tokens(source) as i64,
+            tool_name: match &block.wire.kind {
+                ck_wire::CkKind::ToolResult { tool_name, .. } => tool_name.clone(),
+                _ => String::new(),
+            },
         });
         next_tag = next_tag.saturating_add(1);
     }
@@ -9550,6 +9560,68 @@ mod nudge_formula_tests {
     }
 
     #[test]
+    fn channel1_hint_skips_control_plane_and_tiny_tags_before_tiered_oldest_survivors() {
+        let tag = |tag_number: i64, tool_name: &str, token_count: i64| ActiveTagForNudge {
+            tag_number,
+            kind: "tool_result".to_string(),
+            token_count,
+            tool_name: tool_name.to_string(),
+        };
+        let hint = oldest_reclaimable_hint(
+            &[
+                tag(1, "work", 900),
+                tag(2, "board", 900),
+                tag(3, "bash", 40),
+                tag(4, "bash", 2_300),
+                tag(5, "bash", 1_800),
+                tag(6, "aft_search", 900),
+                tag(7, "read", 900),
+            ],
+            0,
+        );
+
+        assert_eq!(
+            hint,
+            vec![
+                (4, "bash".to_string()),
+                (5, "bash".to_string()),
+                (6, "aft_search".to_string()),
+                (7, "read".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn channel1_hint_omits_control_plane_only_candidates() {
+        let hint = oldest_reclaimable_hint(
+            &[
+                ActiveTagForNudge {
+                    tag_number: 1,
+                    kind: "tool_result".to_string(),
+                    token_count: 900,
+                    tool_name: "work".to_string(),
+                },
+                ActiveTagForNudge {
+                    tag_number: 2,
+                    kind: "tool_result".to_string(),
+                    token_count: 900,
+                    tool_name: "ctx_memory".to_string(),
+                },
+                ActiveTagForNudge {
+                    tag_number: 3,
+                    kind: "tool_result".to_string(),
+                    token_count: 900,
+                    tool_name: "bash_status".to_string(),
+                },
+            ],
+            0,
+        );
+
+        assert!(hint.is_empty());
+        assert!(format_reclaimable_hint(&hint).is_empty());
+    }
+
+    #[test]
     fn channel2_aggregate_uses_persisted_all_class_walk_and_holds_invalid_baselines() {
         let measured = baseline(60_000, 90_000);
         assert_eq!(
@@ -9688,15 +9760,23 @@ fn oldest_reclaimable_hint(
     protected_tags: usize,
 ) -> Vec<(i64, String)> {
     let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
-    active_tags
+    let mut candidates = active_tags
         .iter()
         .filter(|tag| {
             tag.kind == "tool_result"
+                && tag.token_count >= AGE_RECLAIM_MIN_TOKENS as i64
+                && !is_reclaim_hint_excluded_tool(&tag.tool_name)
                 && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
         })
-        .take(4)
-        .map(|tag| (tag.tag_number, "tool".to_string()))
-        .collect()
+        .map(|tag| (tag.tag_number, tag.tool_name.clone()))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        resolve_tool_tier(&right.1)
+            .cmp(&resolve_tool_tier(&left.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.truncate(4);
+    candidates
 }
 
 fn build_channel1_reminder(

@@ -38,6 +38,18 @@ const TODOWRITE_KEEP: usize = 1;
 const CTX_REDUCE_KEEP: usize = 3;
 /// Zero-value meta tools whose every occurrence is droppable.
 const ZERO_VALUE_META_TOOLS: &[&str] = &["bash_status", "bash_kill"];
+/// Coordination tools that should not be surfaced as ctx_reduce guidance. This
+/// does not change what the agent may explicitly drop or what smart-drop selects.
+pub(crate) const RECLAIM_HINT_EXCLUDED_TOOLS: &[&str] = &[
+    "ask",
+    "bash_kill",
+    "bash_status",
+    "board",
+    "task",
+    "todoread",
+    "todowrite",
+    "work",
+];
 /// `ctx_note` actions that carry no lasting value (droppable when positively read).
 const CTX_NOTE_ZERO_VALUE_ACTIONS: &[&str] = &["read", "dismiss"];
 /// Mirrors the duplicate-safe tool list in the TypeScript twin:
@@ -75,7 +87,7 @@ const TARGET_FRACTION: f64 = 0.30;
 /// Newest `ceil(0.20 × n)` of each of T1/T2 are reserved (never evicted).
 const TIER_RECENCY_RESERVE: f64 = 0.20;
 /// Skip arcs too small to recover meaningful tokens during pressure-triggered reclamation.
-const AGE_RECLAIM_MIN_TOKENS: usize = 250;
+pub(crate) const AGE_RECLAIM_MIN_TOKENS: usize = 250;
 /// Minimum reclaim to justify an emergency cache bust (tokens).
 const EMERGENCY_REARM_MIN_TOKENS: f64 = 2000.0;
 /// Byte→token estimate for the emergency reclaim math (matches the TS nudge).
@@ -268,7 +280,7 @@ impl ToolArc {
 
 /// Normalize a tool name for matching (lowercase, strip an `mcp_` prefix) — mirrors
 /// the TS `normalizeToolName`, defensive for MCP-surfaced names.
-fn normalize_tool_name(name: &str) -> String {
+pub(crate) fn normalize_tool_name(name: &str) -> String {
     let lower = name.to_lowercase();
     lower
         .strip_prefix("mcp_")
@@ -945,9 +957,15 @@ fn select_agent_drops(
     }
 }
 
+/// True when a tool result is coordination state rather than useful reclaim guidance.
+pub(crate) fn is_reclaim_hint_excluded_tool(name: &str) -> bool {
+    let normalized = normalize_tool_name(name);
+    normalized.starts_with("ctx_") || RECLAIM_HINT_EXCLUDED_TOOLS.contains(&normalized.as_str())
+}
+
 /// Tier of a tool for the emergency drop: T1 nav (keep longest), T2 edit·search, T3
 /// misc (drop first). Mirrors the TS `resolveToolTier`.
-fn resolve_tool_tier(name: &str) -> u8 {
+pub(crate) fn resolve_tool_tier(name: &str) -> u8 {
     let n = normalize_tool_name(name);
     if T1_TOOLS.contains(&n.as_str()) {
         1
