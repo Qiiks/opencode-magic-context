@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
+import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -436,7 +437,9 @@ async function checkEmbeddingConfig(
 
     let rawText: string;
     try {
-        rawText = readFileSync(magicContextConfigPath, "utf-8");
+        const raw = loadRawConfigFile({ configPath: magicContextConfigPath, tier: "user" });
+        if (!raw) return checkLocalEmbeddingRuntimeForDoctor();
+        rawText = raw.text;
     } catch {
         log.warn("Could not read magic-context.jsonc for embedding check");
         return { issues: 1 };
@@ -746,9 +749,11 @@ export async function runDoctor(
         pass(`Magic Context config: ${paths.magicContextConfig}`);
         // 3a. Validate JSONC parses (with config-variable substitution)
         try {
-            const raw = readFileSync(paths.magicContextConfig, "utf-8");
+            const raw = loadRawConfigFile({ configPath: paths.magicContextConfig, tier: "user" });
+            if (!raw)
+                throw new Error("Magic Context config disappeared while doctor was reading it");
             const substituted = substituteConfigVariables({
-                text: raw,
+                text: raw.text,
                 configPath: paths.magicContextConfig,
             }).text;
             parse(substituted);
@@ -785,8 +790,10 @@ export async function runDoctor(
     // 3b. Migrate deprecated experimental config keys in magic-context.jsonc
     if (existsSync(paths.magicContextConfig)) {
         try {
-            const mcRaw = readFileSync(paths.magicContextConfig, "utf-8");
-            const mcConfig = parse(mcRaw) as Record<string, unknown>;
+            const raw = loadRawConfigFile({ configPath: paths.magicContextConfig, tier: "user" });
+            if (!raw)
+                throw new Error("Magic Context config disappeared while doctor was reading it");
+            const mcConfig = parse(raw.text) as Record<string, unknown>;
             let mcChanged = false;
 
             // Remove deprecated compaction_markers config — always-on since v0.21.4.
@@ -1236,8 +1243,10 @@ export async function runDoctor(
     // so warn loudly when the combination is wrong.
     if (existsSync(paths.magicContextConfig)) {
         try {
-            const mcRaw = readFileSync(paths.magicContextConfig, "utf-8");
-            const mcConfig = parse(mcRaw) as Record<string, unknown>;
+            const raw = loadRawConfigFile({ configPath: paths.magicContextConfig, tier: "user" });
+            if (!raw)
+                throw new Error("Magic Context config disappeared while doctor was reading it");
+            const mcConfig = parse(raw.text) as Record<string, unknown>;
             const warning = checkUserMemoriesDreamerCompatibility(mcConfig);
             if (warning) {
                 log.warn(warning);

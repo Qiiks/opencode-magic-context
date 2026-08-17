@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 
 import { detectConfigFile, isPrototypePollutionKey, parseJsonc } from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
@@ -20,6 +20,7 @@ import {
     stripUnsafeProjectConfigFields,
 } from "./project-security";
 import { pruneNestedConfigLeaf } from "./prune-config-leaf";
+import { loadRawConfigFile } from "./raw-loader";
 import { type MagicContextConfig, MagicContextConfigSchema } from "./schema/magic-context";
 import { resolveTransformMode } from "./transform-mode";
 import { substituteConfigVariables } from "./variable";
@@ -109,8 +110,12 @@ function loadConfigFileDetailed(
     }
 
     let rawText: string;
+    let rawWarnings: string[];
     try {
-        rawText = readFileSync(configPath, "utf-8");
+        const raw = loadRawConfigFile({ configPath, tier: source });
+        if (!raw) return null;
+        rawText = raw.text;
+        rawWarnings = raw.warnings;
     } catch (error) {
         return {
             config: {},
@@ -138,7 +143,7 @@ function loadConfigFileDetailed(
         );
         return {
             config,
-            warnings: [...substituted.warnings, ...unsafeKeyWarnings].map(
+            warnings: [...rawWarnings, ...substituted.warnings, ...unsafeKeyWarnings].map(
                 (warning) => `${configPath}: ${warning}`,
             ),
             outcome:

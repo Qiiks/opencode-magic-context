@@ -8,6 +8,7 @@ import {
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
+import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
@@ -245,6 +246,26 @@ function readJsonc(path: string): {
     }
 }
 
+function readMagicContextJsonc(
+    path: string,
+    tier: "user" | "project",
+): {
+    value: Record<string, unknown>;
+    error?: string;
+} {
+    try {
+        const raw = loadRawConfigFile({ configPath: path, tier });
+        if (!raw)
+            return { value: {}, error: "config file disappeared while doctor was reading it" };
+        return { value: parseJsonc(raw.text) as Record<string, unknown> };
+    } catch (error) {
+        return {
+            value: {},
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
 function packagesFrom(settings: Record<string, unknown>): unknown[] {
     return Array.isArray(settings.packages) ? settings.packages : [];
 }
@@ -288,13 +309,17 @@ function readConfigForEmbedding(
 ): Record<string, unknown> | null {
     if (!existsSync(path)) return null;
     try {
-        const rawText = readFileSync(path, "utf-8");
+        const raw = loadRawConfigFile({
+            configPath: path,
+            tier: isProjectConfig ? "project" : "user",
+        });
+        if (!raw) return null;
         // SECURITY: project-level config must NOT expand {env:}/{file:} tokens —
         // a malicious repo could otherwise resolve {env:ANTHROPIC_API_KEY} into a
         // field we then send to a repo-chosen endpoint. Mirror the runtime loader
         // (isProjectConfig leaves tokens literal for project config).
         const substituted = substituteConfigVariables({
-            text: rawText,
+            text: raw.text,
             configPath: path,
             isProjectConfig,
         });
@@ -540,7 +565,7 @@ async function runHealthChecks(options: {
             }
             continue;
         }
-        const parsed = readJsonc(path);
+        const parsed = readMagicContextJsonc(path, label);
         if (parsed.error)
             add(results, "fail", `${label} magic-context.jsonc is invalid JSONC: ${parsed.error}`);
         else add(results, "pass", `${label} magic-context.jsonc is valid JSONC: ${path}`);

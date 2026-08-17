@@ -6,7 +6,7 @@ import {
 	resolveLegacyConfigSourcesForHarness,
 } from "@magic-context/core/config/migrate-config-location";
 import "@magic-context/core/config/prune-config-leaf";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { migrateLegacyAgentEnabledInMemory } from "@magic-context/core/config/agent-disable";
 import { migrateDreamerV2 } from "@magic-context/core/config/migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "@magic-context/core/config/migrate-experimental";
@@ -16,6 +16,7 @@ import {
 	stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
 import { pruneNestedConfigLeaf } from "@magic-context/core/config/prune-config-leaf";
+import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import {
 	type MagicContextConfig,
 	MagicContextConfigSchema,
@@ -107,9 +108,10 @@ function loadConfigFile(
 	scope: "user" | "project",
 ): LoadedConfigFile | null {
 	try {
-		const rawText = readFileSync(path, "utf-8");
+		const raw = loadRawConfigFile({ configPath: path, tier: scope });
+		if (!raw) return null;
 		const substituted = substituteConfigVariables({
-			text: rawText,
+			text: raw.text,
 			configPath: path,
 			// Repo-supplied project configs are untrusted: do not expand
 			// {env:}/{file:} secret-bearing tokens (parity with OpenCode).
@@ -128,9 +130,11 @@ function loadConfigFile(
 			path,
 			scope,
 			config,
-			warnings: [...substituted.warnings, ...unsafeKeyWarnings].map(
-				(warning) => `${path}: ${warning}`,
-			),
+			warnings: [
+				...raw.warnings,
+				...substituted.warnings,
+				...unsafeKeyWarnings,
+			].map((warning) => `${path}: ${warning}`),
 			loadOutcome:
 				rejectedKeyPaths.length > 0
 					? "schema-recovery"
