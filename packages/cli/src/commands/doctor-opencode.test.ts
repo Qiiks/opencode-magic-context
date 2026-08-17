@@ -400,7 +400,11 @@ describe("doctor OpenCode plugin cache", () => {
 });
 
 describe("doctor OpenCode pinned plugin schema fence", () => {
-    function configurePinnedPlugin(root: string, specifier: string, surface: "server" | "tui" = "server"): string {
+    function configurePinnedPlugin(
+        root: string,
+        specifier: string,
+        surface: "server" | "tui" = "server",
+    ): string {
         const configDir = join(root, "config");
         mkdirSync(configDir, { recursive: true });
         originalOpenCodeConfigDir ??= process.env.OPENCODE_CONFIG_DIR;
@@ -410,11 +414,7 @@ describe("doctor OpenCode pinned plugin schema fence", () => {
         return configPath;
     }
 
-    function createCachedPluginWithFence(
-        root: string,
-        version: string,
-        fence: number,
-    ): void {
+    function createCachedPluginWithFence(root: string, version: string, fence: number): void {
         const pluginCachePath = createCachedOpenCodePlugin(
             root,
             version,
@@ -428,7 +428,10 @@ describe("doctor OpenCode pinned plugin schema fence", () => {
             "dist",
         );
         mkdirSync(distDir, { recursive: true });
-        writeFileSync(join(distDir, "schema-fence.js"), `const LATEST_SUPPORTED_VERSION = ${fence};\n`);
+        writeFileSync(
+            join(distDir, "schema-fence.js"),
+            `const LATEST_SUPPORTED_VERSION = ${fence};\n`,
+        );
     }
 
     function createNpmTarballWithFence(fence: number): Uint8Array {
@@ -436,7 +439,10 @@ describe("doctor OpenCode pinned plugin schema fence", () => {
         const content = new TextEncoder().encode(`const LATEST_SUPPORTED_VERSION = ${fence};\n`);
         const header = new Uint8Array(512);
         header.set(new TextEncoder().encode(path), 0);
-        header.set(new TextEncoder().encode(`${content.length.toString(8).padStart(11, "0")}\0`), 124);
+        header.set(
+            new TextEncoder().encode(`${content.length.toString(8).padStart(11, "0")}\0`),
+            124,
+        );
         header[156] = "0".charCodeAt(0);
         header.set(new TextEncoder().encode("ustar\0"), 257);
         const paddedContentLength = Math.ceil(content.length / 512) * 512;

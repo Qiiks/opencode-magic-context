@@ -1,9 +1,9 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import {
-    findPluginEntry,
     type ConfigSurface,
+    findPluginEntry,
 } from "@magic-context/core/hooks/auto-update-checker/checker";
 
 import { OPENCODE_PLUGIN_NAME } from "./opencode-plugin-cache";
@@ -72,7 +72,7 @@ function readFenceValue(text: string): number | null {
         const version = Number.parseInt(match[1] ?? "", 10);
         if (Number.isFinite(version)) values.add(version);
     }
-    return values.size === 1 ? [...values][0] ?? null : null;
+    return values.size === 1 ? ([...values][0] ?? null) : null;
 }
 
 function readFenceFromDist(packageDirectory: string): number | null {
@@ -99,7 +99,7 @@ function readFenceFromDist(packageDirectory: string): number | null {
             return null;
         }
     }
-    return fenceValues.size === 1 ? [...fenceValues][0] ?? null : null;
+    return fenceValues.size === 1 ? ([...fenceValues][0] ?? null) : null;
 }
 
 function findInstalledPluginPackage(
@@ -123,7 +123,10 @@ function findInstalledPluginPackage(
         const directory = join(cacheRoot, "node_modules", ...PACKAGE_PATH_SEGMENTS);
         const version = readPackageVersion(join(directory, "package.json"));
         if (!version) continue;
-        if (cacheRoot === directCacheRoot || (EXACT_VERSION_PATTERN.test(requestedVersion) && version === requestedVersion)) {
+        if (
+            cacheRoot === directCacheRoot ||
+            (EXACT_VERSION_PATTERN.test(requestedVersion) && version === requestedVersion)
+        ) {
             return { directory, version };
         }
     }
@@ -165,12 +168,14 @@ function readFenceFromNpmTarball(tarball: Uint8Array): number | null {
         if (contentEnd > archive.length) return null;
 
         if (/^package\/dist\/.+\.(?:[cm]?js|ts)$/.test(path)) {
-            const fence = readFenceValue(new TextDecoder().decode(archive.subarray(contentStart, contentEnd)));
+            const fence = readFenceValue(
+                new TextDecoder().decode(archive.subarray(contentStart, contentEnd)),
+            );
             if (fence !== null) fenceValues.add(fence);
         }
         offset = contentStart + Math.ceil(size / 512) * 512;
     }
-    return fenceValues.size === 1 ? [...fenceValues][0] ?? null : null;
+    return fenceValues.size === 1 ? ([...fenceValues][0] ?? null) : null;
 }
 
 function npmPackageVersionUrl(version: string): string {
