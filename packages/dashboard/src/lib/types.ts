@@ -483,6 +483,12 @@ export interface ConfigFile {
 
 export type OpencodeInstallState = "cli" | "desktop" | "none";
 
+/** Harness-scoped model catalogs returned together by the Tauri backend. */
+export interface ModelCatalogs {
+  opencode: string[];
+  pi: string[];
+}
+
 export interface ProjectConfigEntry {
   project_name: string;
   worktree: string;

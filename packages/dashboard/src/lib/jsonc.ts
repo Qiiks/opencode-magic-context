@@ -68,14 +68,26 @@ export function formatJsonc(value: unknown): string {
 }
 
 /**
- * Patch only dreamer.tasks while preserving comments and unrelated sibling keys.
+ * Patch dreamer schedules and, when requested, one harness's task model block.
  * Throws on malformed input so the caller can refuse the save without clobbering the file.
  */
-export function patchDreamerTasksJsonc(text: string, tasks: Record<string, unknown>): string {
+export function patchDreamerTasksJsonc(
+  text: string,
+  tasks: Record<string, unknown>,
+  harness?: "opencode" | "pi",
+  modelTasks?: Record<string, unknown>,
+): string {
   const root = parseRoot(text);
   const dreamer = isRecord(root.dreamer) ? root.dreamer : {};
   root.dreamer = dreamer;
   dreamer.tasks = tasks;
+  if (harness) {
+    const harnessBlock = isRecord(dreamer[harness]) ? dreamer[harness] : {};
+    if (modelTasks && Object.keys(modelTasks).length > 0) harnessBlock.tasks = modelTasks;
+    else delete harnessBlock.tasks;
+    if (Object.keys(harnessBlock).length > 0) dreamer[harness] = harnessBlock;
+    else delete dreamer[harness];
+  }
   return stringifyJsonc(root);
 }
 

@@ -30,13 +30,3 @@ export function piModelIdToCanonical(modelId: string): string {
 export function canonicalModelIdToPi(modelId: string): string {
   return remapProviderPrefix(modelId, CANONICAL_TO_PI_PROVIDER);
 }
-
-/** Combine both harness discovery lists into canonical IDs for shared-config pickers. */
-export function getEffectiveModelIds(
-  piModels: readonly string[],
-  opencodeModels: readonly string[],
-): string[] {
-  return [...new Set([...piModels.map(piModelIdToCanonical), ...opencodeModels])].sort(
-    (left, right) => left.localeCompare(right),
-  );
-}

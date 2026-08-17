@@ -14,6 +14,7 @@ import type {
   LogEntry,
   Memory,
   MemoryStats,
+  ModelCatalogs,
   MuralManifest,
   Note,
   OpencodeInstallState,
@@ -424,12 +425,8 @@ export async function getOpencodeInstallState(): Promise<OpencodeInstallState> {
   return invoke("get_opencode_install_state");
 }
 
-export async function getAvailableModels(): Promise<string[]> {
-  return invoke("get_available_models");
-}
-
-export async function getAvailablePiModels(): Promise<string[]> {
-  return invoke("get_available_pi_models");
+export async function getModelCatalogs(): Promise<ModelCatalogs> {
+  return invoke("get_model_catalogs");
 }
 
 // ── User Memory API ─────────────────────────────────────────
