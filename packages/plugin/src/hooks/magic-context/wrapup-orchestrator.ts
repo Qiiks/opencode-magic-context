@@ -225,6 +225,7 @@ async function runOneWrapupIteration(args: {
         boundarySnapshot: plan.snapshot,
         currentContextLimit: ctx.contextLimit,
         directory: ctx.directory,
+        model: ctx.historianModel,
         fallbackModels: ctx.fallbackModels,
         fallbackModelId: ctx.fallbackModelId,
         language: ctx.language,

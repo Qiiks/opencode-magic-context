@@ -213,8 +213,9 @@ async function runHistorianWith(args: {
 	outputs?: string[];
 	runner?: SubagentRunner;
 	historianModel?: string;
-	fallbackModels?: readonly string[];
+	fallbackModels?: Parameters<typeof runPiHistorian>[0]["fallbackModels"];
 	fallbackModelId?: string;
+	thinkingLevel?: string;
 	memoryEnabled?: boolean;
 	autoPromote?: boolean;
 	userMemoriesEnabled?: boolean;
@@ -253,6 +254,7 @@ async function runHistorianWith(args: {
 		signal: args.signal,
 		retryBackoffMs: args.retryBackoffMs,
 		twoPass: args.twoPass,
+		thinkingLevel: args.thinkingLevel,
 		memoryEnabled: args.memoryEnabled,
 		autoPromote: args.autoPromote,
 		userMemoriesEnabled: args.userMemoriesEnabled,
@@ -543,6 +545,31 @@ describe("runPiHistorian", () => {
 			]);
 			expect(getCompartments(db, "ses-historian")).toEqual([
 				expect.objectContaining({ title: "Initial Pi slice" }),
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("uses only each Pi fallback's own thinking level", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: ["", "", successXml("Qualified fallback recovered Pi history.")],
+			thinkingLevel: "high",
+			fallbackModels: [
+				{ model: "qualified/model", qualifier: "low" },
+				"bare/model",
+			],
+		});
+		try {
+			const options = (
+				runner.run as unknown as {
+					mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+				}
+			).mock.calls.map(([options]) => options);
+			expect(options.map((option) => option.thinkingLevel)).toEqual([
+				"high",
+				"low",
+				undefined,
 			]);
 		} finally {
 			closeQuietly(db);

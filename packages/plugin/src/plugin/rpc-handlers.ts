@@ -979,24 +979,26 @@ export function registerRpcHandlers(
         const { deriveHistorianChunkTokens, resolveHistorianContextLimit } = await import(
             "../hooks/magic-context/derive-budgets"
         );
-        const { resolveFallbackChain } = await import("../shared/resolve-fallbacks");
+        const { resolveHistorianModel } = await import("../shared/model-resolution");
         const { userMemoryCollectionEnabled } = await import(
             "../features/magic-context/dreamer/task-config"
         );
         const DEFAULT_HISTORIAN_TIMEOUT_MS = 10 * 60 * 1000;
+        const historianModel = resolveHistorianModel(config, "opencode");
         return {
             client: args.client as ManagedRecompContext["client"],
             db,
             liveSessionState,
             directory,
             historianChunkTokens: deriveHistorianChunkTokens(
-                resolveHistorianContextLimit(config.historian?.model),
+                resolveHistorianContextLimit(historianModel.primary?.model),
             ),
             historianTimeoutMs: config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
             memoryEnabled: config.memory?.enabled ?? true,
             autoPromote: config.memory?.auto_promote ?? true,
-            fallbackModels: resolveFallbackChain(config.historian?.fallback_models),
-            runMigration: config.memory?.enabled !== false && !!config.historian?.model,
+            historianModel: historianModel.primary,
+            fallbackModels: historianModel.fallbacks,
+            runMigration: config.memory?.enabled !== false && !!historianModel.primary?.model,
             userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
             historianTwoPass: config.historian?.two_pass === true,
             getNotificationParams,

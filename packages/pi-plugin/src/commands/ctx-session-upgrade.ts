@@ -16,6 +16,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/recomp-orchestrator";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
 import {
@@ -36,7 +37,7 @@ export interface CtxSessionUpgradeRuntimeDeps {
 	runner: SubagentRunner;
 	historianModel: string | undefined;
 	historianChunkTokens: number;
-	historianFallbacks?: readonly string[];
+	historianFallbacks?: readonly ModelInput[];
 	historianTimeoutMs?: number;
 	historianThinkingLevel?: string;
 	language?: string;

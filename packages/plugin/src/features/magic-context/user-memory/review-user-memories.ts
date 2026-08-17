@@ -6,6 +6,7 @@ import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
 import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
@@ -41,9 +42,9 @@ interface ReviewUserMemoriesArgs {
     leaseAcquisition?: LeaseAcquisition;
     promotionThreshold: number;
     /** Per-task model override (Dreamer v2). */
-    model?: string;
+    model?: ModelInput;
     /** Resolved dreamer fallback chain. */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     language?: string;
 }
 

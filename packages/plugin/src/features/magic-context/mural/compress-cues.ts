@@ -11,6 +11,7 @@ import {
 import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
@@ -95,8 +96,8 @@ export interface CompressCuesArgs {
     leaseKey: string;
     deadline: number;
     leaseAcquisition?: LeaseAcquisition;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     onProgress?: (processed: number) => void;
     /** Present only when MODULE owns memories; cue columns must be written through the facade. */
     moduleRoute?: DreamerModuleRoute;

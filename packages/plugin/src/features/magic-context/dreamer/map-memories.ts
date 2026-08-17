@@ -11,6 +11,7 @@ import {
 import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
@@ -76,8 +77,8 @@ export interface MapMemoriesArgs {
     leaseKey: string;
     deadline: number;
     leaseAcquisition?: LeaseAcquisition;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number) => void;
 }

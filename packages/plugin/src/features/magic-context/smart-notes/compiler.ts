@@ -6,6 +6,7 @@ import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { nextOccurrence, parseCron } from "../dreamer/cron";
@@ -30,8 +31,8 @@ interface CompileSmartNoteArgs {
     capabilityFactory: SmartNoteCapabilityFactory;
     signal: AbortSignal;
     deadline: number;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
 }
 
 export interface CompileSmartNoteSuccess {
