@@ -7,6 +7,7 @@ import {
     isFailClosedBlockingError,
 } from "../features/magic-context/fail-closed-block";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
 import { createMessagesTransformHandler } from "./messages-transform";
 
 // Minimal fake message shape — just needs info + parts.
@@ -322,5 +323,63 @@ describe("createMessagesTransformHandler — compaction-off fail-closed inertnes
             thrown = error;
         }
         expect(isFailClosedBlockingError(thrown)).toBe(true);
+    });
+});
+
+describe("createMessagesTransformHandler — issue #327 wire tail", () => {
+    it("keeps a user-ended input user-terminated when a pending blank assistant appears mid-pass", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    await Promise.resolve();
+                    (out.messages as any).push({
+                        info: {
+                            id: "assistant-pending",
+                            role: "assistant",
+                            sessionID: "ses_test",
+                        },
+                        parts: [],
+                    });
+                    finalizeMessageRepresentation(out.messages as any, "anthropic", {
+                        trailingBlankDecisions: new Map([["assistant-pending", "keep"]]),
+                    });
+                },
+            },
+        });
+        const output = makeOutput();
+
+        await handler({}, output);
+
+        expect(output.messages.map((message: any) => message.info.role)).toEqual([
+            "assistant",
+            "user",
+        ]);
+        expect(output.messages.at(-1)?.info.id).toBe("m1");
+        expect(output.messages[0].parts).toEqual([{ type: "text", text: "" }]);
+    });
+});
+
+describe("createMessagesTransformHandler — user-tail removal defense", () => {
+    it("restores the input user after an inner transform removes it behind an assistant", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    out.messages.pop();
+                },
+            },
+        });
+        const output = makeOutput();
+        output.messages.unshift({
+            info: { id: "assistant-before", role: "assistant", sessionID: "ses_test" },
+            parts: [{ type: "text", text: "previous answer" }],
+        });
+
+        await handler({}, output);
+
+        expect(output.messages.map((message: any) => message.info.role)).toEqual([
+            "assistant",
+            "user",
+        ]);
+        expect(output.messages.at(-1)?.info.id).toBe("m1");
     });
 });
