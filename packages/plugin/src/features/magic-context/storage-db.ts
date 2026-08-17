@@ -10,7 +10,7 @@ import {
     statSync,
     unlinkSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
     getLegacyOpenCodeMagicContextStorageDir,
@@ -609,6 +609,46 @@ function logInconclusiveMigrationProbes(
     }
 }
 
+function isDefaultSharedDatabasePath(dbPath: string): boolean {
+    // Test-only storage overrides are isolated by construction and must not
+    // inherit a real user's global Pi-process fence.
+    if (
+        !process.env.XDG_DATA_HOME &&
+        (process.env.MAGIC_CONTEXT_TEST_DATA_DIR || process.env.NODE_ENV === "test")
+    ) {
+        return false;
+    }
+    return resolve(dbPath) === resolve(join(getMagicContextStorageDir(), "context.db"));
+}
+
+function migrationBlockingPiPids(
+    dbPath: string,
+    discovery: RpcServerDiscovery,
+    discoveredPiPids: readonly number[],
+): number[] {
+    if (isDefaultSharedDatabasePath(dbPath)) return [...discoveredPiPids];
+
+    // RPC discovery is rooted inside dbDir, so a matching PID is evidence that
+    // this process is attached to the target data directory rather than merely
+    // running elsewhere on the machine.
+    const sameDataDirPids = new Set(discovery.serverPids);
+    return discoveredPiPids.filter((pid) => sameDataDirPids.has(pid));
+}
+
+export function formatLiveProcessMigrationRefusal(
+    dbPath: string,
+    persistedVersion: number,
+    latestSupportedVersion: number,
+    serverPids: readonly number[],
+    piPids: readonly number[],
+): string {
+    const blockers = [
+        ...serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
+        ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`),
+    ];
+    return `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`;
+}
+
 function enforceMigrationOnOpenGuard(
     db: Database,
     dbPath: string,
@@ -622,7 +662,7 @@ function enforceMigrationOnOpenGuard(
     }
     const discovery = inspectRpcServerDiscovery(dbDir);
     const piDiscovery = inspectLivePiProcesses();
-    const piPids = piDiscovery.processIds;
+    const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
     const serverProcesses =
         discovery.serverProcesses ??
         (discovery.state === "live"
@@ -664,12 +704,14 @@ function enforceMigrationOnOpenGuard(
             `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`,
         );
     } else {
-        const blockers = [
-            ...discovery.serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
-            ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`),
-        ];
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`,
+            formatLiveProcessMigrationRefusal(
+                dbPath,
+                persistedVersion,
+                latestSupportedVersion,
+                discovery.serverPids,
+                piPids,
+            ),
         );
     }
     return false;

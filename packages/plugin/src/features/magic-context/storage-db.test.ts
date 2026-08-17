@@ -32,6 +32,7 @@ import {
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
     formatInconclusiveOpenCodeMigrationWarning,
+    formatLiveProcessMigrationRefusal,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
@@ -530,7 +531,76 @@ describe("storage-db", () => {
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
                 { kind: "Pi", pid: 41001 },
             ]);
+            expect(
+                formatLiveProcessMigrationRefusal(
+                    dbPath,
+                    LATEST_SUPPORTED_VERSION - 1,
+                    LATEST_SUPPORTED_VERSION,
+                    [],
+                    [41001],
+                ),
+            ).toContain("confirmed Pi harness PID 41001");
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when an unrelated Pi harness is live #then opens a fresh explicit-path database", () => {
+            const isolatedRoot = makeTempDir("storage-db-isolated-live-pi-");
+            const dbPath = join(isolatedRoot, "profile", "context.db");
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            expect(openDatabase(dbPath)).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
+        it("#when an unrelated Pi harness is live #then opens a test-data-dir database", () => {
+            const savedXdg = process.env.XDG_DATA_HOME;
+            const savedTestDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+            const isolatedRoot = makeTempDir("storage-db-test-data-dir-live-pi-");
+            const dbPath = join(isolatedRoot, "cortexkit", "magic-context", "context.db");
+            mkdirSync(dirname(dbPath), { recursive: true });
+            closeQuietly(new Database(dbPath));
+            delete process.env.XDG_DATA_HOME;
+            process.env.MAGIC_CONTEXT_TEST_DATA_DIR = isolatedRoot;
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            try {
+                const db = openDatabase();
+                expect(db).not.toBeNull();
+                expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+                expect(getMigrationOnOpenRefusal()).toBeNull();
+            } finally {
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
+                if (savedTestDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+                else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
+            }
+        });
+
+        it("#when an explicit-path database has same-directory live RPC evidence #then refuses migration", () => {
+            const isolatedRoot = makeTempDir("storage-db-isolated-same-dir-rpc-");
+            const dbPath = join(isolatedRoot, "profile", "context.db");
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase(dbPath)).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                persistedVersion: 0,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [process.pid],
+            });
+            expect(readPersistedVersion(dbPath)).toBe(0);
         });
 
         it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {
