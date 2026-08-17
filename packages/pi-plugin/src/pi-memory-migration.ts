@@ -11,6 +11,10 @@ import { getAllActiveMemoriesForMigration } from "@magic-context/core/features/m
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { insertUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import type {
+	ModelInput,
+	ResolvedModelEntry,
+} from "@magic-context/core/shared/model-resolution";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 
 /**
@@ -39,7 +43,7 @@ export interface PiMemoryMigrationDeps {
 	 * starts at `model` (the historian model), preserving prior behavior.
 	 */
 	primaryModel?: string;
-	fallbackModels?: readonly string[];
+	fallbackModels?: readonly ModelInput[];
 	timeoutMs?: number;
 	thinkingLevel?: string;
 	/** Project working directory (resolves project identity). */
@@ -110,15 +114,25 @@ export async function runPiMemoryMigration(
 	// and for a misconfigured historian (e.g. an empty-returning provider) it
 	// would waste an attempt on a model OpenCode never tries. Then the configured
 	// fallbacks. Each de-duplicated.
-	const modelChain: string[] = [];
+	const modelChain: ResolvedModelEntry[] = [];
 	const seenModels = new Set<string>();
-	for (const m of [
-		deps.primaryModel ?? deps.model,
-		...(deps.fallbackModels ?? []),
+	for (const candidate of [
+		{
+			model: deps.primaryModel ?? deps.model,
+			...(deps.primaryModel
+				? {}
+				: deps.thinkingLevel
+					? { qualifier: deps.thinkingLevel }
+					: {}),
+		},
+		...(deps.fallbackModels ?? []).map((fallback) =>
+			typeof fallback === "string" ? { model: fallback } : fallback,
+		),
 	]) {
-		if (m && !seenModels.has(m)) {
-			seenModels.add(m);
-			modelChain.push(m);
+		const key = `${candidate.model}\u0000${candidate.qualifier ?? ""}`;
+		if (candidate.model && !seenModels.has(key)) {
+			seenModels.add(key);
+			modelChain.push(candidate);
 		}
 	}
 
@@ -129,7 +143,7 @@ export async function runPiMemoryMigration(
 		if (i > 0) {
 			sessionLog(
 				deps.sessionId,
-				`memory-migration: escalating to configured fallback model ${model} (${i}/${modelChain.length - 1})`,
+				`memory-migration: escalating to configured fallback model ${model.model} (${i}/${modelChain.length - 1})`,
 			);
 		}
 		const result = await deps.runner.run({
@@ -139,13 +153,13 @@ export async function runPiMemoryMigration(
 				deps.language,
 			),
 			userMessage: prompt,
-			model,
+			model: model.model,
 			// We drive the chain here (validating each), so don't let the runner
 			// re-iterate its own hard-failure-only chain.
 			fallbackModels: undefined,
 			timeoutMs: deps.timeoutMs ?? 5 * 60 * 1000,
 			cwd: deps.directory,
-			thinkingLevel: deps.thinkingLevel,
+			thinkingLevel: model.qualifier,
 			accountingSessionId: deps.sessionId,
 			// Reuse the "recomp" accounting bucket — memory migration is part of the
 			// session-upgrade flow and there is no dedicated subagent tag for it.

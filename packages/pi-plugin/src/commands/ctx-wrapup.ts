@@ -29,6 +29,7 @@ import {
 	resolveWrapupProtectedTailBoundary,
 } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
+import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
 import {
@@ -48,7 +49,7 @@ export interface RegisterCtxWrapupDeps {
 	runner: SubagentRunner;
 	historianModel: string | undefined;
 	historianChunkTokens: number;
-	historianFallbacks?: readonly string[];
+	historianFallbacks?: readonly ModelInput[];
 	historianTimeoutMs?: number;
 	historianThinkingLevel?: string;
 	language?: string;

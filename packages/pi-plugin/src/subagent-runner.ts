@@ -28,6 +28,7 @@ import {
 	resolveModelRefForPi,
 } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import type { ResolvedModelEntry } from "@magic-context/core/shared/model-resolution";
 import type {
 	SubagentProgressEvent,
 	SubagentRunner,
@@ -690,16 +691,36 @@ export class PiSubagentRunner implements SubagentRunner {
 		runMode: PiRunMode,
 		primaryModelRef?: string,
 	): Promise<SubagentRunResult> {
-		const models = [options.model, ...(options.fallbackModels ?? [])].filter(
-			(model): model is string => typeof model === "string" && model.length > 0,
-		);
-		const attempts = models.length > 0 ? models : [undefined];
+		const attempts: Array<ResolvedModelEntry | undefined> = [];
+		const seenAttempts = new Set<string>();
+		const appendAttempt = (candidate: ResolvedModelEntry): void => {
+			if (!candidate.model) return;
+			const key = `${candidate.model}\u0000${candidate.qualifier ?? ""}`;
+			if (seenAttempts.has(key)) return;
+			seenAttempts.add(key);
+			attempts.push(candidate);
+		};
+		if (options.model) {
+			appendAttempt({
+				model: options.model,
+				...(options.thinkingLevel ? { qualifier: options.thinkingLevel } : {}),
+			});
+		}
+		for (const candidate of options.fallbackModels ?? []) {
+			appendAttempt(
+				typeof candidate === "string" ? { model: candidate } : candidate,
+			);
+		}
+		if (attempts.length === 0) attempts.push(undefined);
 		let lastResult: SubagentRunResult | null = null;
 		for (let index = 0; index < attempts.length; index += 1) {
-			const model = attempts[index];
+			const attempt = attempts[index];
 			const attemptOptions = {
 				...options,
-				model,
+				model: attempt?.model,
+				// A fallback's qualifier belongs only to that fallback. A bare
+				// fallback deliberately clears the primary --thinking level.
+				thinkingLevel: attempt?.qualifier,
 				fallbackModels: undefined,
 			};
 			const result = await this.runOnce(

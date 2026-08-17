@@ -4,6 +4,7 @@ import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getModuleNoteEvaluationBridge } from "../context-authority";
@@ -39,8 +40,8 @@ export interface EvaluateSmartNotesArgs {
     leaseKey: string;
     deadline: number;
     leaseAcquisition?: LeaseAcquisition;
-    model?: string;
-    fallbackModels?: readonly string[];
+    model?: ModelInput;
+    fallbackModels?: readonly ModelInput[];
     /** When true, authoring-compiled provider conditions are owned by retina. */
     retinaHandoff?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;

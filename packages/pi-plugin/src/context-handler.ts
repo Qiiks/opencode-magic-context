@@ -166,6 +166,7 @@ import { escalationBands } from "@magic-context/core/shared/escalation-bands";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
+import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
@@ -931,8 +932,8 @@ export interface PiHistorianOptions {
 	runner: SubagentRunner;
 	/** Historian provider/model id (e.g. `anthropic/claude-haiku-4-5`). */
 	model: string;
-	/** Optional ordered fallback chain. */
-	fallbackModels?: readonly string[];
+	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
+	fallbackModels?: readonly ModelInput[];
 	/** Historian context window — used to derive chunk token budget. */
 	historianChunkTokens: number;
 	/** Optional per-call timeout (default 120s). */
