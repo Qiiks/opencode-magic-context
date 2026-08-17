@@ -216,15 +216,13 @@ function runCargo(
 }
 
 /**
- * Build the module (always, incrementally) and the daemon (only when absent).
+ * Build the module and daemon from their current workspaces, incrementally.
  *
- * The module under test is rebuilt every run so the lane always exercises the
- * current workspace source — cargo's incremental check makes that near-free once
- * warm. The daemon is an external dependency: a prebuilt `ck-subc` is reused when
- * present to avoid a redundant cross-workspace compile (and the machine
- * saturation that concurrent workspace builds cause on shared hardware); it is
- * built only if no binary exists yet. Set MC_RUST_E2E_REBUILD_DAEMON=1 to force
- * a daemon rebuild.
+ * `ck-mc` links protocol/client path dependencies from the sibling workspace, so
+ * pairing it with an older prebuilt daemon can exercise two different sibling
+ * revisions. Running Cargo for both workspaces keeps the hermetic pair coherent;
+ * Cargo's incremental check makes unchanged builds cheap, and `buildPromise`
+ * serializes and memoizes the work for this test process.
  */
 export async function buildHermeticBinaries(subconsciousRoot: string): Promise<BuiltBinaries> {
     if (buildPromise) return buildPromise;
@@ -267,17 +265,14 @@ export async function buildHermeticBinaries(subconsciousRoot: string): Promise<B
         }
 
         const ckSubcRelease = join(subconsciousRoot, "target/release/ck-subc");
-        const forceRebuild = process.env.MC_RUST_E2E_REBUILD_DAEMON === "1";
-        if (forceRebuild || !existsSync(ckSubcRelease)) {
-            const daemonBuild = await runCargo(
-                ["build", "--release", "-p", "subc-core", "--bins"],
-                subconsciousRoot,
+        const daemonBuild = await runCargo(
+            ["build", "--release", "-p", "subc-core", "--bins"],
+            subconsciousRoot,
+        );
+        if (!daemonBuild.ok || !existsSync(ckSubcRelease)) {
+            throw new Error(
+                `failed to build ck-subc (cargo build --release -p subc-core --bins in ${subconsciousRoot}):\n${daemonBuild.stderr.slice(-4000)}`,
             );
-            if (!daemonBuild.ok || !existsSync(ckSubcRelease)) {
-                throw new Error(
-                    `failed to build ck-subc (cargo build --release -p subc-core --bins in ${subconsciousRoot}):\n${daemonBuild.stderr.slice(-4000)}`,
-                );
-            }
         }
 
         return { ckMcBin, ckSubcBin: ckSubcRelease };

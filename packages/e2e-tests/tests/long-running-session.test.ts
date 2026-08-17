@@ -558,11 +558,14 @@ describe("long-running OpenCode Magic Context session", () => {
         let reduceTarget: number;
         let reduceNeedle: string;
         if (RUST_MODE) {
-            // 20ac0630 moved tag authority out of context.db. Select a live tag
-            // from the actual provider wire so this remains a non-vacuous drop.
+            // Rust-mode tags are absent from context.db, so this transformed
+            // provider request is the authoritative live-tag view. The first
+            // execute may retire warmup assistants; choose unique older content
+            // that is still present here.
             const wire = JSON.stringify((await mainRequestForMarker(replayNudgeMarker)).body.messages ?? []);
-            const match = wire.match(/§(\d+)§ (phase 1 assistant \d+)/);
+            const match = wire.match(/§(\d+)§ (phase 2 execute cleanup)/);
             expect(match).not.toBeNull();
+            expect([...wire.matchAll(/phase 2 execute cleanup/g)]).toHaveLength(1);
             reduceTarget = Number(match![1]);
             reduceNeedle = match![2]!;
         } else {
