@@ -42,6 +42,33 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
     if (output.messages !== next) output.messages.splice(0, output.messages.length, ...next);
 }
 
+function preserveUserTerminatedTail(
+    messages: MessageWithParts[],
+    inputTail: MessageWithParts | undefined,
+): void {
+    if (inputTail?.info.role !== "user" || messages.at(-1)?.info.role !== "assistant") return;
+
+    let userIndex = messages.lastIndexOf(inputTail);
+    if (userIndex < 0) {
+        const inputId = inputTail.info.id;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            const message = messages[index];
+            if (message.info.role === "user" && message.info.id === inputId) {
+                userIndex = index;
+                break;
+            }
+        }
+    }
+
+    // OpenCode owns the hook array and can append a pending assistant shell while
+    // an asynchronous transform is awaiting storage or permission work. Keep any
+    // concurrently appended or injected messages, but re-anchor the input's user
+    // boundary at the wire tail so an empty shell cannot become assistant prefill.
+    const trailingUser = userIndex >= 0 ? messages[userIndex] : inputTail;
+    if (userIndex >= 0) messages.splice(userIndex, 1);
+    messages.push(trailingUser);
+}
+
 /**
  * Top-level transform wrapper. Catches errors so OpenCode's prompt loop
  * always proceeds — without this guard, a transient DB contention event can
@@ -103,7 +130,7 @@ export function createMessagesTransformHandler(args: {
     internalChildSessions?: Set<string>;
     tryReopenStorage?: () => boolean | Promise<boolean>;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
-    return async (input, output): Promise<MessageWithParts[]> => {
+    const run = async (input: Record<string, never>, output: MessagesTransformOutput) => {
         const sessionId = resolveSessionId(output);
         const agent = resolveAgentNameFromMessages(output.messages);
         const isInternalChild =
@@ -284,6 +311,15 @@ export function createMessagesTransformHandler(args: {
         }
         restoreCompactionOffInput();
         return output.messages;
+    };
+
+    return async (input, output): Promise<MessageWithParts[]> => {
+        const inputTail = output.messages.at(-1);
+        try {
+            return await run(input, output);
+        } finally {
+            preserveUserTerminatedTail(output.messages, inputTail);
+        }
     };
 }
 
