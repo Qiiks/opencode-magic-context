@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { detectOpenCodeInstallations } from "./opencode-detect";
 import {
     describeOpenCodeInstallations,
@@ -27,6 +27,37 @@ afterEach(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+describe("OpenCode installation reports", () => {
+    it("enumerates versions for both installs and marks PATH as active", () => {
+        const pathBin = "/virtual/PATH/opencode";
+        const home = "/virtual/home";
+        const homeBin = join(home, ".opencode", "bin", "opencode");
+        const installations = detectOpenCodeInstallations({
+            exists: () => false,
+            isExecutable: (path) => path === pathBin || path === homeBin,
+            home,
+            platform: "darwin",
+            env: {},
+            onPath: () => pathBin,
+            realpath: (path) => path,
+        });
+        const versionProbes: string[] = [];
+
+        expect(
+            describeOpenCodeInstallations(installations, {
+                getVersion: (path) => {
+                    versionProbes.push(path);
+                    return path === pathBin ? "1.18.0" : path === homeBin ? "1.15.13" : null;
+                },
+            }),
+        ).toEqual([
+            { path: pathBin, source: "PATH", kind: "cli", version: "1.18.0", active: true },
+            { path: homeBin, source: "home-bin", kind: "cli", version: "1.15.13", active: false },
+        ]);
+        expect(versionProbes).toEqual([pathBin, homeBin]);
+    });
+});
+
 function fakeOpencode(body: string): string {
     const dir = mkdtempSync(join(tmpdir(), "mc-oc-bin-"));
     tempDirs.push(dir);
@@ -34,16 +65,6 @@ function fakeOpencode(body: string): string {
     writeFileSync(bin, `#!/bin/sh\n${body}\n`);
     chmodSync(bin, 0o755);
     return bin;
-}
-
-function fakeHomeOpencode(body: string): { home: string; bin: string } {
-    const home = mkdtempSync(join(tmpdir(), "mc-oc-home-"));
-    tempDirs.push(home);
-    const bin = join(home, ".opencode", "bin", "opencode");
-    mkdirSync(dirname(bin), { recursive: true });
-    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
-    chmodSync(bin, 0o755);
-    return { home, bin };
 }
 
 function fakeOpenCodeCommandShim(): string {
@@ -122,30 +143,6 @@ describe.if(isPosix)("opencode helpers with a resolved binary path", () => {
     it("getOpenCodeVersion invokes the given absolute binary", () => {
         const bin = fakeOpencode('if [ "$1" = "--version" ]; then echo "1.2.3"; fi');
         expect(getOpenCodeVersion(bin)).toBe("1.2.3");
-    });
-
-    it("enumerates versions for both installs and marks PATH as active", () => {
-        const pathBin = fakeOpencode('echo "1.18.0"');
-        const homeInstall = fakeHomeOpencode('echo "1.15.13"');
-        const installations = detectOpenCodeInstallations({
-            exists: () => false,
-            isExecutable: (path) => path === pathBin || path === homeInstall.bin,
-            home: homeInstall.home,
-            platform: "darwin",
-            env: {},
-            onPath: () => pathBin,
-            realpath: (path) => path,
-        });
-        expect(describeOpenCodeInstallations(installations)).toEqual([
-            { path: pathBin, source: "PATH", kind: "cli", version: "1.18.0", active: true },
-            {
-                path: homeInstall.bin,
-                source: "home-bin",
-                kind: "cli",
-                version: "1.15.13",
-                active: false,
-            },
-        ]);
     });
 
     it("bounds a hanging version probe", () => {

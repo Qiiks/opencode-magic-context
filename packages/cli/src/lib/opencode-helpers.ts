@@ -76,16 +76,21 @@ export interface OpenCodeInstallationReport extends OpenCodeInstallation {
     active: boolean;
 }
 
+export interface DescribeOpenCodeInstallationsDeps {
+    /** Version probe used for CLI installs; defaults to the real OpenCode command. */
+    getVersion?: (binary: string) => string | null;
+}
+
 /** Probe versions for all detected installs, retaining the detection order. */
 export function describeOpenCodeInstallations(
     installations: OpenCodeInstallation[],
+    deps: DescribeOpenCodeInstallationsDeps = {},
 ): OpenCodeInstallationReport[] {
+    const getVersion = deps.getVersion ?? getOpenCodeVersion;
     return installations.map((installation, index) => ({
         ...installation,
         version:
-            installation.kind === "cli"
-                ? (getOpenCodeVersion(installation.path) ?? "unknown")
-                : "unknown",
+            installation.kind === "cli" ? (getVersion(installation.path) ?? "unknown") : "unknown",
         active: index === 0,
     }));
 }

@@ -62,14 +62,18 @@ export interface DetectDeps {
     realpath?: (path: string) => string;
 }
 
-function defaultDeps(): DetectDeps {
+function defaultDeps(overrides: Partial<DetectDeps> = {}): DetectDeps {
+    // Resolve each default lazily so a fully injected caller never reads the
+    // host environment while constructing a virtual detection filesystem.
+    const env = overrides.env ?? process.env;
     return {
-        exists: existsSync,
-        isExecutable: isExecutableFile,
-        home: process.env.HOME?.trim() || homedir(),
-        platform: process.platform,
-        env: process.env,
-        onPath: findOnPath,
+        exists: overrides.exists ?? existsSync,
+        isExecutable: overrides.isExecutable ?? isExecutableFile,
+        home: overrides.home ?? (env.HOME?.trim() || homedir()),
+        platform: overrides.platform ?? process.platform,
+        env,
+        onPath: overrides.onPath ?? findOnPath,
+        realpath: overrides.realpath,
     };
 }
 
@@ -177,7 +181,7 @@ function desktopAppPaths(d: DetectDeps): string[] {
 
 /** The Desktop "has run" settings markers across all release channels. */
 export function openCodeDesktopSettingsMarkers(deps?: Partial<DetectDeps>): string[] {
-    const d = { ...defaultDeps(), ...deps };
+    const d = defaultDeps(deps);
     return OPENCODE_DESKTOP_APP_IDS.map((appId) =>
         join(desktopUserDataDir(d, appId), OPENCODE_DESKTOP_SETTINGS_FILE),
     );
@@ -193,7 +197,7 @@ export function openCodeDesktopSettingsMarkers(deps?: Partial<DetectDeps>): stri
  * Pass `deps` to test against a virtual filesystem.
  */
 export function detectOpenCodeInstallations(deps?: Partial<DetectDeps>): OpenCodeInstallation[] {
-    const d = { ...defaultDeps(), ...deps };
+    const d = defaultDeps(deps);
     const installations: OpenCodeInstallation[] = [];
     const seenRealpaths = new Set<string>();
 
