@@ -51,13 +51,9 @@
       "type": "string"
     },
     "historian": {
-      "description": "Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)",
+      "description": "Historian metadata plus independent strict OpenCode and Pi execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode or historian.pi.",
       "type": "object",
       "properties": {
-        "model": {
-          "description": "Primary model ID (e.g. 'claude-sonnet-4-6')",
-          "type": "string"
-        },
         "temperature": {
           "description": "Sampling temperature (0-2)",
           "type": "number",
@@ -178,41 +174,165 @@
           "description": "Maximum output tokens",
           "type": "number"
         },
-        "variant": {
-          "description": "OpenCode reasoning variant (e.g. for extended thinking)",
-          "type": "string"
-        },
-        "fallback_models": {
-          "description": "Fallback model IDs if primary is unavailable",
-          "anyOf": [
-            {
-              "type": "string"
+        "opencode": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "Primary OpenCode model entry.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "type": "string",
+                      "description": "OpenCode model ID (for example, provider/model)."
+                    },
+                    "variant": {
+                      "description": "OpenCode reasoning variant for this entry.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
             },
-            {
+            "fallback_models": {
+              "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
               "type": "array",
               "items": {
-                "type": "string"
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "description": "OpenCode model ID (for example, provider/model)."
+                      },
+                      "variant": {
+                        "description": "OpenCode reasoning variant for this entry.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "model"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
               }
+            },
+            "variant": {
+              "description": "Default OpenCode reasoning variant.",
+              "type": "string"
             }
-          ]
+          },
+          "additionalProperties": false,
+          "description": "Strict OpenCode model-resolution block. It accepts no Pi vocabulary."
+        },
+        "pi": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "Primary Pi model entry.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "type": "string",
+                      "description": "Pi model ID (for example, provider/model)."
+                    },
+                    "thinking_level": {
+                      "description": "Pi thinking level for this entry.",
+                      "type": "string",
+                      "enum": [
+                        "off",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "fallback_models": {
+              "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "description": "Pi model ID (for example, provider/model)."
+                      },
+                      "thinking_level": {
+                        "description": "Pi thinking level for this entry.",
+                        "type": "string",
+                        "enum": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "model"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "thinking_level": {
+              "description": "Default Pi thinking level.",
+              "type": "string",
+              "enum": [
+                "off",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "description": "Strict Pi model-resolution block. It accepts no OpenCode vocabulary."
         },
         "two_pass": {
           "default": false,
           "description": "Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)",
           "type": "boolean"
-        },
-        "thinking_level": {
-          "description": "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max",
-          "type": "string",
-          "enum": [
-            "off",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max"
-          ]
         },
         "disallowed_tools": {
           "default": [],
@@ -232,13 +352,9 @@
       }
     },
     "dreamer": {
-      "description": "Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.)",
+      "description": "Dreamer metadata and scheduling plus independent strict OpenCode and Pi execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block.",
       "type": "object",
       "properties": {
-        "model": {
-          "description": "Primary model ID (e.g. 'claude-sonnet-4-6')",
-          "type": "string"
-        },
         "temperature": {
           "description": "Sampling temperature (0-2)",
           "type": "number",
@@ -359,83 +475,384 @@
           "description": "Maximum output tokens",
           "type": "number"
         },
-        "variant": {
-          "description": "OpenCode reasoning variant (e.g. for extended thinking)",
-          "type": "string"
-        },
-        "fallback_models": {
-          "description": "Fallback model IDs if primary is unavailable",
-          "anyOf": [
-            {
-              "type": "string"
+        "opencode": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "Primary OpenCode model entry.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "type": "string",
+                      "description": "OpenCode model ID (for example, provider/model)."
+                    },
+                    "variant": {
+                      "description": "OpenCode reasoning variant for this entry.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
             },
-            {
+            "fallback_models": {
+              "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
               "type": "array",
               "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "description": "OpenCode model ID (for example, provider/model)."
+                      },
+                      "variant": {
+                        "description": "OpenCode reasoning variant for this entry.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "model"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "variant": {
+              "description": "Default OpenCode reasoning variant.",
+              "type": "string"
+            },
+            "tasks": {
+              "description": "OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes.",
+              "type": "object",
+              "propertyNames": {
                 "type": "string"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "description": "OpenCode model entry for this task.",
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "description": "OpenCode model ID (for example, provider/model)."
+                          },
+                          "variant": {
+                            "description": "OpenCode reasoning variant for this entry.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "model"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "fallback_models": {
+                    "description": "Ordered OpenCode fallback entries for this task.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "model": {
+                              "type": "string",
+                              "description": "OpenCode model ID (for example, provider/model)."
+                            },
+                            "variant": {
+                              "description": "OpenCode reasoning variant for this entry.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "model"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "variant": {
+                    "description": "Default OpenCode reasoning variant for this task.",
+                    "type": "string"
+                  },
+                  "timeout_minutes": {
+                    "description": "Minutes allowed for this task before it is aborted.",
+                    "type": "number",
+                    "minimum": 5
+                  }
+                },
+                "additionalProperties": false
               }
             }
-          ]
+          },
+          "additionalProperties": false,
+          "description": "Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary."
+        },
+        "pi": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "Primary Pi model entry.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "type": "string",
+                      "description": "Pi model ID (for example, provider/model)."
+                    },
+                    "thinking_level": {
+                      "description": "Pi thinking level for this entry.",
+                      "type": "string",
+                      "enum": [
+                        "off",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "fallback_models": {
+              "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "description": "Pi model ID (for example, provider/model)."
+                      },
+                      "thinking_level": {
+                        "description": "Pi thinking level for this entry.",
+                        "type": "string",
+                        "enum": [
+                          "off",
+                          "minimal",
+                          "low",
+                          "medium",
+                          "high",
+                          "xhigh",
+                          "max"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "model"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "thinking_level": {
+              "description": "Default Pi thinking level.",
+              "type": "string",
+              "enum": [
+                "off",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            },
+            "tasks": {
+              "description": "Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "description": "Pi model entry for this task.",
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "description": "Pi model ID (for example, provider/model)."
+                          },
+                          "thinking_level": {
+                            "description": "Pi thinking level for this entry.",
+                            "type": "string",
+                            "enum": [
+                              "off",
+                              "minimal",
+                              "low",
+                              "medium",
+                              "high",
+                              "xhigh",
+                              "max"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "model"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "fallback_models": {
+                    "description": "Ordered Pi fallback entries for this task.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "model": {
+                              "type": "string",
+                              "description": "Pi model ID (for example, provider/model)."
+                            },
+                            "thinking_level": {
+                              "description": "Pi thinking level for this entry.",
+                              "type": "string",
+                              "enum": [
+                                "off",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "model"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "thinking_level": {
+                    "description": "Default Pi thinking level for this task.",
+                    "type": "string",
+                    "enum": [
+                      "off",
+                      "minimal",
+                      "low",
+                      "medium",
+                      "high",
+                      "xhigh",
+                      "max"
+                    ]
+                  },
+                  "timeout_minutes": {
+                    "description": "Minutes allowed for this task before it is aborted.",
+                    "type": "number",
+                    "minimum": 5
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false,
+          "description": "Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary."
         },
         "tasks": {
           "default": {
             "map-memories": {
-              "schedule": "0 2 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 2 * * *"
             },
             "verify": {
-              "schedule": "0 3 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 3 * * *"
             },
             "verify-broad": {
-              "schedule": "0 4 * * 0",
-              "timeout_minutes": 20
+              "schedule": "0 4 * * 0"
             },
             "curate": {
-              "schedule": "0 4 * * 0",
-              "timeout_minutes": 20
+              "schedule": "0 4 * * 0"
             },
             "compress-cues": {
-              "schedule": "0 4 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 4 * * *"
             },
             "classify-memories": {
-              "schedule": "0 6 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 6 * * *"
             },
             "retrospective": {
-              "schedule": "0 5 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 5 * * *"
             },
             "maintain-docs": {
-              "schedule": "",
-              "timeout_minutes": 20
+              "schedule": ""
             },
             "evaluate-smart-notes": {
-              "schedule": "0 3 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 3 * * *"
             },
             "review-user-memories": {
               "schedule": "0 3 * * *",
-              "timeout_minutes": 20,
               "promotion_threshold": 3
             },
             "promote-primers": {
               "schedule": "0 3 * * *",
-              "timeout_minutes": 20,
               "promotion_threshold": 2
             },
             "refresh-primers": {
-              "schedule": "0 3 * * *",
-              "timeout_minutes": 20
+              "schedule": "0 3 * * *"
             }
           },
           "type": "object",
           "properties": {
             "map-memories": {
               "default": {
-                "schedule": "0 2 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 2 * * *"
               },
               "type": "object",
               "properties": {
@@ -443,50 +860,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "verify": {
               "default": {
-                "schedule": "0 3 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 3 * * *"
               },
               "type": "object",
               "properties": {
@@ -494,50 +874,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "verify-broad": {
               "default": {
-                "schedule": "0 4 * * 0",
-                "timeout_minutes": 20
+                "schedule": "0 4 * * 0"
               },
               "type": "object",
               "properties": {
@@ -545,50 +888,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "curate": {
               "default": {
-                "schedule": "0 4 * * 0",
-                "timeout_minutes": 20
+                "schedule": "0 4 * * 0"
               },
               "type": "object",
               "properties": {
@@ -596,50 +902,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "compress-cues": {
               "default": {
-                "schedule": "0 4 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 4 * * *"
               },
               "type": "object",
               "properties": {
@@ -647,50 +916,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "classify-memories": {
               "default": {
-                "schedule": "0 6 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 6 * * *"
               },
               "type": "object",
               "properties": {
@@ -698,50 +930,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "retrospective": {
               "default": {
-                "schedule": "0 5 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 5 * * *"
               },
               "type": "object",
               "properties": {
@@ -749,50 +944,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "maintain-docs": {
               "default": {
-                "schedule": "",
-                "timeout_minutes": 20
+                "schedule": ""
               },
               "type": "object",
               "properties": {
@@ -800,50 +958,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "evaluate-smart-notes": {
               "default": {
-                "schedule": "0 3 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 3 * * *"
               },
               "type": "object",
               "properties": {
@@ -851,50 +972,13 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "review-user-memories": {
               "default": {
                 "schedule": "0 3 * * *",
-                "timeout_minutes": 20,
                 "promotion_threshold": 3
               },
               "type": "object",
@@ -904,55 +988,18 @@
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
-                },
                 "promotion_threshold": {
                   "description": "review-user-memories: min candidate observations before promotion is considered (default: 3)",
                   "type": "number",
                   "minimum": 2,
                   "maximum": 20
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "promote-primers": {
               "default": {
                 "schedule": "0 3 * * *",
-                "timeout_minutes": 20,
                 "promotion_threshold": 2
               },
               "type": "object",
@@ -962,55 +1009,18 @@
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
-                },
                 "promotion_threshold": {
                   "description": "promote-primers: min recurring source days before promotion is considered (default: 2)",
                   "type": "number",
                   "minimum": 2,
                   "maximum": 20
                 }
-              }
+              },
+              "additionalProperties": false
             },
             "refresh-primers": {
               "default": {
-                "schedule": "0 3 * * *",
-                "timeout_minutes": 20
+                "schedule": "0 3 * * *"
               },
               "type": "object",
               "properties": {
@@ -1018,66 +1028,17 @@
                   "default": "",
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
-                },
-                "model": {
-                  "description": "Per-task model override (inherits dreamer.model)",
-                  "type": "string"
-                },
-                "fallback_models": {
-                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  ]
-                },
-                "thinking_level": {
-                  "description": "Pi only: per-task thinking level",
-                  "type": "string",
-                  "enum": [
-                    "off",
-                    "minimal",
-                    "low",
-                    "medium",
-                    "high",
-                    "xhigh",
-                    "max"
-                  ]
-                },
-                "timeout_minutes": {
-                  "default": 20,
-                  "description": "Minutes allowed for this task before it is aborted",
-                  "type": "number",
-                  "minimum": 5
                 }
-              }
+              },
+              "additionalProperties": false
             }
           },
-          "description": "Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model."
+          "description": "Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks or dreamer.pi.tasks."
         },
         "inject_docs": {
           "default": true,
           "description": "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
           "type": "boolean"
-        },
-        "thinking_level": {
-          "description": "Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level.",
-          "type": "string",
-          "enum": [
-            "off",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max"
-          ]
         }
       }
     },
@@ -1816,7 +1777,7 @@
           "type": "string"
         },
         "thinking_level": {
-          "description": "Pi only: explicit thinking level for sidekick subagent invocations. See historian.thinking_level.",
+          "description": "Pi only: explicit thinking level for sidekick subagent invocations. See historian.pi.thinking_level.",
           "type": "string",
           "enum": [
             "off",
