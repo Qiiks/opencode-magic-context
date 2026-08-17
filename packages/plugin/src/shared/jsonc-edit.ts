@@ -252,6 +252,72 @@ export function setJsoncValue(text: string, path: JSONPath, value: unknown): str
     return applyEdits(text, modify(text, path, value, {}));
 }
 
+function removeObjectProperty(text: string, object: Node, key: string): string {
+    const properties = object.children ?? [];
+    const index = properties.findIndex((property) => {
+        const propertyKey = property.children?.[0];
+        return propertyKey !== undefined && getNodeValue(propertyKey) === key;
+    });
+    if (index === -1) return text;
+
+    const property = properties[index];
+    if (!property) return text;
+    const closingBrace = object.offset + object.length - 1;
+    const next = properties[index + 1];
+    if (next) {
+        const followingComma = findComma(text, property.offset + property.length, next.offset);
+        if (!followingComma) return text;
+        // Leading and trailing comments remain in their original positions. A
+        // comment previously adjacent to a migrated field therefore survives as
+        // standalone JSONC rather than being discarded with the old key.
+        return (
+            text.slice(0, property.offset) +
+            text.slice(followingComma.offset + followingComma.length)
+        );
+    }
+
+    const previous = properties[index - 1];
+    const trailingComma = findComma(text, property.offset + property.length, closingBrace);
+    if (!previous) {
+        const afterProperty = property.offset + property.length;
+        if (!trailingComma) return text.slice(0, property.offset) + text.slice(afterProperty);
+        return (
+            text.slice(0, property.offset) +
+            text.slice(afterProperty, trailingComma.offset) +
+            text.slice(trailingComma.offset + trailingComma.length)
+        );
+    }
+
+    const precedingComma = findComma(text, previous.offset + previous.length, property.offset);
+    if (!precedingComma) return text;
+    const afterProperty = property.offset + property.length;
+    const withoutProperty =
+        text.slice(0, precedingComma.offset) +
+        text.slice(precedingComma.offset + precedingComma.length, property.offset) +
+        text.slice(afterProperty);
+    if (!trailingComma) return withoutProperty;
+
+    // The trailing comma position is measured in the original string. Removing
+    // only one character before it (the preceding comma) shifts it left by one.
+    const shiftedTrailingComma = trailingComma.offset - 1;
+    return (
+        withoutProperty.slice(0, shiftedTrailingComma) +
+        withoutProperty.slice(shiftedTrailingComma + trailingComma.length)
+    );
+}
+
+/**
+ * Delete an object property without reserializing sibling fields. Comments are
+ * retained as JSONC trivia so key migrations do not erase a user's notes.
+ */
+export function removeJsoncValue(text: string, path: JSONPath): string {
+    const key = path.at(-1);
+    if (typeof key !== "string") return text;
+    const parent = findNode(text, path.slice(0, -1));
+    if (parent?.type !== "object") return text;
+    return removeObjectProperty(text, parent, key);
+}
+
 /**
  * Remove matching array entries while retaining the exact bytes for survivor
  * comments and surrounding JSONC regions.
