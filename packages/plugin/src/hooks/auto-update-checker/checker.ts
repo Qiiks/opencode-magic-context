@@ -77,7 +77,7 @@ export function extractChannel(version: string | null): string {
     return "latest";
 }
 
-type ConfigSurface = "server" | "tui";
+export type ConfigSurface = "server" | "tui";
 
 function getSurfaceConfigPaths(directory: string, surface: ConfigSurface): string[] {
     const name = surface === "server" ? "opencode" : "tui";
@@ -224,8 +224,16 @@ export function getCurrentRuntimePackageJsonPath(
     }
 }
 
-export function findPluginEntry(directory: string): PluginEntryInfo | null {
-    const winner = getWinningConfig(directory, "server");
+/**
+ * Resolve the plugin entry that OpenCode will use for one runtime surface.
+ * Config paths are ordered by OpenCode precedence so diagnostics and the
+ * auto-updater agree about the artifact that actually runs.
+ */
+export function findPluginEntry(
+    directory: string,
+    surface: ConfigSurface = "server",
+): PluginEntryInfo | null {
+    const winner = getWinningConfig(directory, surface);
     if (!winner) return null;
     const entry = winner.entries.find(
         (value) => value === PACKAGE_NAME || value.startsWith(`${PACKAGE_NAME}@`),

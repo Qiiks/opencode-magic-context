@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { gzipSync } from "node:zlib";
 import {
     initializeDatabase,
     runMigrations,
@@ -13,6 +14,7 @@ import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
+import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
 import { runV22BackfillCommands } from "../lib/v22-backfill-commands";
 import {
     checkUserMemoriesDreamerCompatibility,
@@ -158,6 +160,7 @@ const dbs: Database[] = [];
 let originalXdgCacheHome: string | undefined;
 let originalHome: string | undefined;
 let originalNpmUserConfig: string | undefined;
+let originalOpenCodeConfigDir: string | undefined;
 
 function makeTempDir(prefix = "mc-v22-doctor-"): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -223,9 +226,15 @@ afterEach(() => {
     } else {
         process.env.NPM_CONFIG_USERCONFIG = originalNpmUserConfig;
     }
+    if (originalOpenCodeConfigDir === undefined) {
+        delete process.env.OPENCODE_CONFIG_DIR;
+    } else {
+        process.env.OPENCODE_CONFIG_DIR = originalOpenCodeConfigDir;
+    }
     originalXdgCacheHome = undefined;
     originalHome = undefined;
     originalNpmUserConfig = undefined;
+    originalOpenCodeConfigDir = undefined;
     for (const db of dbs.splice(0)) {
         db.close();
     }
@@ -248,7 +257,10 @@ function createCachedOpenCodePlugin(
         "package.json",
     );
     mkdirSync(dirname(installedPackagePath), { recursive: true });
-    writeFileSync(installedPackagePath, `${JSON.stringify({ version })}\n`);
+    writeFileSync(
+        installedPackagePath,
+        `${JSON.stringify({ name: OPENCODE_PLUGIN_NAME, version })}\n`,
+    );
     return pluginCachePath;
 }
 
@@ -384,6 +396,158 @@ describe("doctor OpenCode plugin cache", () => {
         });
         expect(removed).toEqual([latestCachePath]);
         expect(existsSync(latestCachePath)).toBe(false);
+    });
+});
+
+describe("doctor OpenCode pinned plugin schema fence", () => {
+    function configurePinnedPlugin(root: string, specifier: string, surface: "server" | "tui" = "server"): string {
+        const configDir = join(root, "config");
+        mkdirSync(configDir, { recursive: true });
+        originalOpenCodeConfigDir ??= process.env.OPENCODE_CONFIG_DIR;
+        process.env.OPENCODE_CONFIG_DIR = configDir;
+        const configPath = join(configDir, `${surface === "server" ? "opencode" : "tui"}.json`);
+        writeFileSync(configPath, `${JSON.stringify({ plugin: [specifier] })}\n`);
+        return configPath;
+    }
+
+    function createCachedPluginWithFence(
+        root: string,
+        version: string,
+        fence: number,
+    ): void {
+        const pluginCachePath = createCachedOpenCodePlugin(
+            root,
+            version,
+            `${OPENCODE_PLUGIN_NAME}@${version}`,
+        );
+        const distDir = join(
+            pluginCachePath,
+            "node_modules",
+            "@cortexkit",
+            "opencode-magic-context",
+            "dist",
+        );
+        mkdirSync(distDir, { recursive: true });
+        writeFileSync(join(distDir, "schema-fence.js"), `const LATEST_SUPPORTED_VERSION = ${fence};\n`);
+    }
+
+    function createNpmTarballWithFence(fence: number): Uint8Array {
+        const path = "package/dist/schema-fence.js";
+        const content = new TextEncoder().encode(`const LATEST_SUPPORTED_VERSION = ${fence};\n`);
+        const header = new Uint8Array(512);
+        header.set(new TextEncoder().encode(path), 0);
+        header.set(new TextEncoder().encode(`${content.length.toString(8).padStart(11, "0")}\0`), 124);
+        header[156] = "0".charCodeAt(0);
+        header.set(new TextEncoder().encode("ustar\0"), 257);
+        const paddedContentLength = Math.ceil(content.length / 512) * 512;
+        const archive = new Uint8Array(512 + paddedContentLength + 1024);
+        archive.set(header);
+        archive.set(content, 512);
+        return gzipSync(archive);
+    }
+
+    it("fails the v78 database fixture when the running server pin only supports v77", async () => {
+        const root = makeTempDir("mc-pinned-fence-");
+        const configPath = configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.36.1`);
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.36.1`, "tui");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = root;
+        createCachedPluginWithFence(root, "0.36.1", 77);
+
+        const findings = await inspectPinnedOpenCodePluginSchemaFences({
+            directory: root,
+            databaseVersion: 78,
+        });
+
+        expect(findings.map((finding) => finding.surface)).toEqual(["server", "tui"]);
+        expect(findings).toContainEqual(
+            expect.objectContaining({
+                status: "fail",
+                databaseVersion: 78,
+                pinnedVersion: "0.36.1",
+                supportedVersion: 77,
+                configPath,
+            }),
+        );
+    });
+
+    it("passes a current pin whose runtime fence supports the shared database", async () => {
+        const root = makeTempDir("mc-pinned-fence-");
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.37.0`);
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.37.0`, "tui");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = root;
+        createCachedPluginWithFence(root, "0.37.0", 78);
+
+        const findings = await inspectPinnedOpenCodePluginSchemaFences({
+            directory: root,
+            databaseVersion: 78,
+        });
+
+        expect(findings).toContainEqual(
+            expect.objectContaining({
+                status: "pass",
+                databaseVersion: 78,
+                pinnedVersion: "0.37.0",
+                supportedVersion: 78,
+            }),
+        );
+    });
+
+    it("falls back to the npm tarball when the pinned package is not installed", async () => {
+        const root = makeTempDir("mc-pinned-fence-");
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.36.1`);
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.36.1`, "tui");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = root;
+        let requestCount = 0;
+
+        const findings = await inspectPinnedOpenCodePluginSchemaFences(
+            { directory: root, databaseVersion: 78 },
+            {
+                fetch: async () => {
+                    requestCount++;
+                    if (requestCount === 1) {
+                        return Response.json({
+                            version: "0.36.1",
+                            dist: { tarball: "https://registry.npmjs.org/plugin-0.36.1.tgz" },
+                        });
+                    }
+                    return new Response(createNpmTarballWithFence(77));
+                },
+            },
+        );
+
+        expect(requestCount).toBe(2);
+        expect(findings).toContainEqual(
+            expect.objectContaining({
+                status: "fail",
+                source: "npm-tarball",
+                supportedVersion: 77,
+            }),
+        );
+    });
+
+    it("reports an unresolvable pinned fence as UNKNOWN instead of passing", async () => {
+        const root = makeTempDir("mc-pinned-fence-");
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.36.1`);
+        configurePinnedPlugin(root, `${OPENCODE_PLUGIN_NAME}@0.36.1`, "tui");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = root;
+
+        const findings = await inspectPinnedOpenCodePluginSchemaFences(
+            { directory: root, databaseVersion: 78 },
+            { fetch: async () => new Response(null, { status: 503 }) },
+        );
+
+        expect(findings).toContainEqual(
+            expect.objectContaining({
+                status: "unknown",
+                databaseVersion: 78,
+                pinnedVersion: "0.36.1",
+            }),
+        );
+        expect(findings).not.toContainEqual(expect.objectContaining({ status: "pass" }));
     });
 });
 

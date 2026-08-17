@@ -89,6 +89,24 @@ describe("auto-update-checker/checker", () => {
             readSpy.mockRestore();
         });
 
+        test("resolves the winning TUI entry with the same config precedence", async () => {
+            const root = makeProjectFixture();
+            const override = join(root, "override");
+            mkdirSync(override, { recursive: true });
+            writePluginConfig(join(root, "tui.json"), `${PACKAGE_NAME}@0.36.1`);
+            writePluginConfig(join(override, "tui.jsonc"), `${PACKAGE_NAME}@0.37.0`);
+            process.env.OPENCODE_CONFIG_DIR = override;
+
+            const { findPluginEntry } = await freshCheckerImport();
+
+            expect(findPluginEntry(root, "tui")).toEqual({
+                entry: `${PACKAGE_NAME}@0.37.0`,
+                isPinned: true,
+                pinnedVersion: "0.37.0",
+                configPath: join(override, "tui.jsonc"),
+            });
+        });
+
         test("detects pinned tuple entries and ignores other scoped packages", async () => {
             const existsSpy = spyOn(fs, "existsSync").mockImplementation((p: fs.PathLike) =>
                 String(p).includes("opencode.json"),
