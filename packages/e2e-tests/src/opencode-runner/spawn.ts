@@ -246,8 +246,10 @@ function writeConfigs(
 }
 
 /**
- * Wait until the opencode server responds to GET /doc (an endpoint that exists in
- * OpenCode's server). Polls for up to `timeoutMs`.
+ * Wait until the opencode session API returns a well-formed list. The `/doc`
+ * endpoint can respond while OpenCode is still warming its application routes;
+ * treating that socket-level response as readiness moves startup latency into the
+ * scenario that happens to run next. Polls for up to `timeoutMs`.
  *
  * Implementation note — Bun fetch timeout flake:
  *   Bun's default `fetch()` has a hardcoded ~5 minute timeout that ignores
@@ -264,22 +266,31 @@ function writeConfigs(
 // take a few minutes" on first boot per fresh CI XDG_DATA_HOME). Local hardware
 // finishes in <2s. The bump to 300s covers CI cold-start without papering over
 // genuine readiness failures — 5 minutes is still far above any realistic boot.
-async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
+export async function waitForReady(
+    url: string,
+    directory: string,
+    timeoutMs = 300_000,
+): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
+    const readinessUrl = new URL("/session", url);
+    readinessUrl.searchParams.set("directory", directory);
     let lastFetchErr: unknown = null;
     let fetchAttempts = 0;
 
     while (Date.now() < deadline) {
         try {
             fetchAttempts++;
-            const res = await fetch(`${url}/doc`, {
+            const res = await fetch(readinessUrl, {
                 method: "GET",
                 signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
             });
-            if (res.ok || res.status === 404 || res.status === 401) {
-                // Server is responding — any HTTP response means it booted.
-                return;
+            if (res.ok) {
+                const body = await res.json().catch(() => null);
+                if (Array.isArray(body)) return;
+                lastFetchErr = new Error("session readiness response was not an array");
+            } else {
+                lastFetchErr = new Error(`session readiness returned HTTP ${res.status}`);
             }
         } catch (err) {
             lastFetchErr = err;
@@ -288,7 +299,7 @@ async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
     }
     throw new Error(
         `opencode serve did not become ready in ${timeoutMs}ms.\n` +
-            `  url=${url}/doc\n` +
+            `  url=${readinessUrl.toString()}\n` +
             `  fetchAttempts=${fetchAttempts}\n` +
             `  fetchLastErr=${String(lastFetchErr)}`,
     );
@@ -414,7 +425,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
 
     const url = `http://127.0.0.1:${port}`;
     try {
-        await waitForReady(url);
+        await waitForReady(url, env.workdir);
     } catch (err) {
         // Surface captured output on boot failure to help debugging.
         child.kill("SIGTERM");
