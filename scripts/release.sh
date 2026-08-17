@@ -130,14 +130,15 @@ manifest_files() {
 # and was green (the Bun-panic case).
 run_package_tests() {
   local label="$1" dir="$2" output status
-  echo "  [$label] bun test..."
-  # `set -e` would abort the script at this assignment the instant `bun test`
-  # exits non-zero — BEFORE `status=$?` and the panic-tolerance below could
-  # run. Bun sometimes exits non-zero with a post-completion panic AFTER
-  # printing a fully-green summary; the grep checks below are the real gate.
-  # Use `|| status=$?` so errexit doesn't fire and the tolerance is reachable.
+  echo "  [$label] bun run test..."
+  # `set -e` would abort the script at this assignment the instant the package
+  # test command exits non-zero — BEFORE `status=$?` and the panic-tolerance
+  # below could run. Bun sometimes exits non-zero with a post-completion panic
+  # AFTER printing a fully-green summary; the grep checks below are the real
+  # gate. Use `|| status=$?` so errexit doesn't fire and the tolerance is
+  # reachable.
   status=0
-  output=$(bun test --cwd "$dir" 2>&1) || status=$?
+  output=$(bun run --cwd "$dir" test 2>&1) || status=$?
   echo "$output"
   if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
     echo "Error: $label tests failed (fail count > 0)"
