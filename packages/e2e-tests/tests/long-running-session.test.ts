@@ -555,34 +555,19 @@ describe("long-running OpenCode Magic Context session", () => {
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
         // Phase 4: ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
-        let reduceTarget: number;
-        let reduceNeedle: string;
-        if (RUST_MODE) {
-            // Rust-mode tags are absent from context.db, so this transformed
-            // provider request is the authoritative live-tag view. The first
-            // execute may retire warmup assistants; choose unique older content
-            // that is still present here.
-            const wire = JSON.stringify((await mainRequestForMarker(replayNudgeMarker)).body.messages ?? []);
-            const match = wire.match(/§(\d+)§ (phase 2 execute cleanup)/);
-            expect(match).not.toBeNull();
-            expect([...wire.matchAll(/phase 2 execute cleanup/g)]).toHaveLength(1);
-            reduceTarget = Number(match![1]);
-            reduceNeedle = match![2]!;
-        } else {
-            reduceTarget = await h.waitFor(
-                () => {
-                    const row = h
-                        .contextDb()
-                        .prepare(
-                            "SELECT t.tag_number AS tag FROM tags t JOIN source_contents s ON s.session_id = t.session_id AND s.tag_id = t.tag_number WHERE t.session_id = ? AND t.status = 'active' AND s.content LIKE 'phase 1 assistant%' ORDER BY t.tag_number ASC LIMIT 1",
-                        )
-                        .get(sessionId) as { tag: number } | null;
-                    return row?.tag ?? 0;
-                },
-                { label: "assistant tag for ctx_reduce" },
-            );
-            reduceNeedle = "phase 1 assistant 1";
-        }
+        // Select the tag number and its expected text from the same provider
+        // request. Pairing a database tag with hard-coded wire text can target a
+        // different block after an earlier pass retags the assistant message.
+        const reduceWire = JSON.stringify(
+            (await mainRequestForMarker(replayNudgeMarker)).body.messages ?? [],
+        );
+        const reduceMatch = RUST_MODE
+            ? reduceWire.match(/§(\d+)§ (phase 2 execute cleanup)/)
+            : reduceWire.match(/§(\d+)§ (phase 1 assistant \d+)/);
+        expect(reduceMatch).not.toBeNull();
+        const reduceTarget = Number(reduceMatch![1]);
+        const reduceNeedle = reduceMatch![0];
+        expect(reduceWire.split(reduceNeedle).length - 1).toBe(1);
         emitToolOnce(/^ctx_reduce$/, { drop: String(reduceTarget) });
         await send(sessionId, `turn 13: drop old assistant tag ${reduceTarget} with ctx_reduce`, "phase 4 after ctx_reduce");
         await send(sessionId, "turn 14: pressure after ctx_reduce so pending op applies next", "phase 4 pressure", FORCE_CLEANUP_USAGE);

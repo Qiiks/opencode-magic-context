@@ -28,7 +28,7 @@ export interface TestHarnessOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
-    /** Set false only when the test intentionally verifies that Magic Context stays disabled. */
+    /** Set false only when the test intentionally verifies conflict-based self-disable behavior. */
     expectMagicContext?: boolean;
     /**
      * Default response used when the mock queue is empty. Lets tests send extra
@@ -94,19 +94,25 @@ export class TestHarness {
         // Always install a default so unexpected extra requests don't 500.
         mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
 
+        const expectMagicContext = options.expectMagicContext !== false;
         const spawnOpts: SpawnOptions = {
             mockProviderURL: baseURL,
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
-            prepareContextDatabase: options.expectMagicContext !== false,
+            prepareContextDatabase: expectMagicContext,
+            expectedMagicContextState: expectMagicContext ? "enabled" : "conflict-disabled",
         };
-        const opencode = await spawnOpencode(spawnOpts);
-
-        const sdk = await import("@opencode-ai/sdk");
-        const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
-
-        return new TestHarness(mock, opencode, client, options.expectMagicContext !== false);
+        let opencode: SpawnedOpencode | undefined;
+        try {
+            opencode = await spawnOpencode(spawnOpts);
+            const sdk = await import("@opencode-ai/sdk");
+            const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
+            return new TestHarness(mock, opencode, client, expectMagicContext);
+        } catch (error) {
+            await Promise.allSettled([opencode?.kill() ?? Promise.resolve(), mock.stop()]);
+            throw error;
+        }
     }
 
     /** Create a session bound to the isolated workdir. Throws on failure. */
