@@ -54,6 +54,9 @@ const TERMINAL_TODOS = [
 ];
 
 type WireMessage = { role?: string; content?: unknown };
+type HistorianRange = { start: number; end: number };
+type HistorianCapture = { requestIndex: number; range: HistorianRange };
+type PublishedCompartment = { start_message: number; end_message: number; title: string };
 
 let h: TestHarness;
 
@@ -110,6 +113,47 @@ function mainRequests() {
     return h.mock.requests().filter((request) => isMagicContextRequest(request.body));
 }
 
+function promptMarker(turn: number): string {
+    return `[[long-running-turn-${turn}-${crypto.randomUUID()}]]`;
+}
+
+function selectRequestForMarker<T extends { body: Record<string, unknown> }>(
+    requests: readonly T[],
+    marker: string,
+): T {
+    const matching = requests.filter((request) => latestUserText(request.body).includes(marker));
+    const request = matching[matching.length - 1];
+    if (!request) {
+        throw new Error(`no Magic Context request contains prompt marker ${marker}`);
+    }
+    return request;
+}
+
+async function mainRequestForMarker(marker: string) {
+    await h.waitForMockQuiescence({ label: `request capture for ${marker}` });
+    return selectRequestForMarker(mainRequests(), marker);
+}
+
+async function resetMock(label: string): Promise<void> {
+    await h.waitForMockQuiescence({ label: `before mock.reset: ${label}` });
+    h.mock.reset();
+}
+
+function matchHistorianCaptureToCompartment(
+    captures: readonly HistorianCapture[],
+    compartments: readonly PublishedCompartment[],
+): { capture: HistorianCapture; compartment: PublishedCompartment } | null {
+    for (const capture of captures) {
+        const compartment = compartments.find(
+            (candidate) =>
+                candidate.start_message === capture.range.start &&
+                candidate.end_message === capture.range.end,
+        );
+        if (compartment) return { capture, compartment };
+    }
+    return null;
+}
+
 function requestsSince(index: number) {
     return h
         .mock
@@ -137,7 +181,9 @@ function textFromContent(content: unknown): string {
 function latestUserText(body: Record<string, unknown>): string {
     const messages = requestMessages(body);
     for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i]?.role === "user") return textFromContent(messages[i]?.content);
+        if (messages[i]?.role !== "user") continue;
+        const text = textFromContent(messages[i]?.content);
+        if (text.length > 0) return text;
     }
     return "";
 }
@@ -175,7 +221,7 @@ function emitToolOnce(pattern: RegExp, input: Record<string, unknown>, usage: Mo
     });
 }
 
-function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
+function findOrdinalRange(body: Record<string, unknown>): HistorianRange | null {
     for (const message of requestMessages(body)) {
         const content = Array.isArray(message.content) ? message.content : [];
         for (const block of content) {
@@ -250,9 +296,15 @@ function findSyntheticTodoPair(body: Record<string, unknown>, callId: string): {
 }
 
 let turnCounter = 0;
-async function send(sessionId: string, prompt: string, text: string, usage: MockUsage = LOW_USAGE): Promise<void> {
+async function send(
+    sessionId: string,
+    prompt: string,
+    text: string,
+    usage: MockUsage = LOW_USAGE,
+): Promise<string> {
     h.mock.setDefault({ text, usage });
     const turn = ++turnCounter;
+    const marker = promptMarker(turn);
     const reqsBefore = h.mock.requests().length;
     const startedAt = Date.now();
     // [LR-DIAG] console.error flushes immediately on CI even when console.log is buffered
@@ -334,11 +386,12 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
         // CI cycle. With the runaway-detector firing the OC-PARTS diagnostic
         // at +25 and aborting at +100 unexpected requests, 180s is more than
         // enough for the diagnostic to capture state and fail-fast.
-        await h.sendPrompt(sessionId, prompt, { timeoutMs: 180_000 });
+        await h.sendPrompt(sessionId, `${prompt}\n${marker}`, { timeoutMs: 180_000 });
         clearInterval(dumpTimer);
         const elapsed = Date.now() - startedAt;
         const reqsAfter = h.mock.requests().length;
         console.error(`[LR-DIAG] turn ${turn} DONE in ${elapsed}ms; new mockReqs=${reqsAfter - reqsBefore}`);
+        return marker;
     } catch (err) {
         clearInterval(dumpTimer);
         const elapsed = Date.now() - startedAt;
@@ -362,7 +415,7 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
             const roles = msgs.map((m) => m?.role ?? "?").join(",");
             const isHist = isHistorianRequest(body as Record<string, unknown>);
             const isMC = isMagicContextRequest(body as Record<string, unknown>);
-            const lastMsg = msgs.at(-1);
+            const lastMsg = msgs[msgs.length - 1];
             const lastRole = lastMsg?.role ?? "?";
             const lastContent = JSON.stringify(lastMsg?.content ?? "").slice(0, 150);
             console.error(`  [${i}] path=${r.path} msgs=${msgs.length} model=${body.model ?? "?"} histReq=${isHist} mcReq=${isMC}`);
@@ -374,6 +427,24 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
 }
 
 describe("long-running OpenCode Magic Context session", () => {
+    it("matches an out-of-order historian completion to its own captured range", () => {
+        const earlyCapture: HistorianCapture = { requestIndex: 1, range: { start: 3, end: 4 } };
+        const laterCapture: HistorianCapture = { requestIndex: 2, range: { start: 7, end: 8 } };
+        const earlyCompartment: PublishedCompartment = {
+            start_message: 3,
+            end_message: 4,
+            title: "early completion",
+        };
+
+        // Match the early completion only to its early capture; a shared mutable range could pair it with a later capture.
+        expect(earlyCompartment.start_message).not.toBe(laterCapture.range.start);
+        expect(matchHistorianCaptureToCompartment(
+            [earlyCapture, laterCapture],
+            [earlyCompartment],
+        )).toEqual({ capture: earlyCapture, compartment: earlyCompartment });
+        expect(matchHistorianCaptureToCompartment([laterCapture], [earlyCompartment])).toBeNull();
+    });
+
     // TODO(ci-hang): on Linux GitHub-hosted runners, OpenCode 1.15.x
     // sometimes binds its server port and prints "Database migration
     // complete" but then never responds to HTTP requests, so the harness
@@ -388,13 +459,13 @@ describe("long-running OpenCode Magic Context session", () => {
     // by transform-compartment-phase.test.ts ("95% emergency
     // notification idempotency" describe block).
     it.skipIf(Boolean(process.env.CI))("exercises execute, notes, reduce, historian, todo synthesis, and auto-search over one realistic session", async () => {
-        h.mock.reset();
+        await resetMock("start long-running session");
 
-        let historianRange: { start: number; end: number } | null = null;
+        const historianCaptures: HistorianCapture[] = [];
         h.mock.addMatcher((body) => {
             if (!isHistorianRequest(body)) return null;
             const range = findOrdinalRange(body) ?? { start: 1, end: 2 };
-            historianRange = range;
+            historianCaptures.push({ requestIndex: historianCaptures.length + 1, range });
             return {
                 text: buildMockHistorianPayload({
                     start: range.start,
@@ -413,14 +484,19 @@ describe("long-running OpenCode Magic Context session", () => {
         // v3 protected-tail boundary measures true-raw content (not mock usage
         // numbers), so phase 5's historian force-fire needs genuine content
         // mass beyond the scaled protected tail or the head resolves empty.
+        const warmupMarkers: string[] = [];
         for (let i = 1; i <= 3; i += 1) {
-            await send(
+            warmupMarkers.push(await send(
                 sessionId,
                 `turn ${i}: OpenCode warm-up cache-stability probe ${h.ballast(2_500)}`,
                 `phase 1 assistant ${i}`,
-            );
+            ));
         }
-        const warmup = mainRequests();
+        const warmup = [
+            await mainRequestForMarker(warmupMarkers[0]!),
+            await mainRequestForMarker(warmupMarkers[1]!),
+            await mainRequestForMarker(warmupMarkers[2]!),
+        ];
         expect(warmup.length).toBeGreaterThanOrEqual(3);
         expect(serialize(warmup[2]!.body.messages?.[0])).toBe(serialize(warmup[1]!.body.messages?.[0]));
         expect(new Set(warmup.slice(1, 3).map((request) => serialize(request.body.system))).size).toBe(1);
@@ -433,7 +509,7 @@ describe("long-running OpenCode Magic Context session", () => {
         const afterExecutePressure = readMeta<{ last_context_percentage: number }>(sessionId, "last_context_percentage")?.last_context_percentage ?? 0;
         expect(beforeExecutePressure).toBeLessThan(20);
         expect(afterExecutePressure).toBeGreaterThanOrEqual(20);
-        await send(sessionId, "turn 5: execute pass should run heuristic cleanup", "phase 2 execute cleanup");
+        const executeMarker = await send(sessionId, "turn 5: execute pass should run heuristic cleanup", "phase 2 execute cleanup");
         // No routine drops anymore: need-blind age-drops were removed with the
         // tiered emergency-drop redesign. An execute pass with no droppable
         // tool pile (one tiny ctx_search output here) must drop NOTHING —
@@ -442,8 +518,11 @@ describe("long-running OpenCode Magic Context session", () => {
         // short-context-overflow.test.ts). The execute pass still runs; the
         // invariant kept here is that it doesn't spuriously evict and the
         // cache recovers on the following defer pass.
-        await send(sessionId, "turn 6: defer after first execute should recover cache", "phase 2 cache recovery");
-        const phase2Tail = mainRequests().slice(-2);
+        const recoveryMarker = await send(sessionId, "turn 6: defer after first execute should recover cache", "phase 2 cache recovery");
+        const phase2Tail = [
+            await mainRequestForMarker(executeMarker),
+            await mainRequestForMarker(recoveryMarker),
+        ];
         expect(phase2Tail.length).toBe(2);
         expect(serialize(phase2Tail[1]!.body.messages?.[0])).toBe(serialize(phase2Tail[0]!.body.messages?.[0]));
         // Drops here are legitimate, from two designed ≥85% paths (85K usage on
@@ -462,15 +541,15 @@ describe("long-running OpenCode Magic Context session", () => {
         emitToolOnce(/todo.*write|write.*todo|todowrite/i, { todos: TERMINAL_TODOS });
         await send(sessionId, "turn 8: mark terminal todos to create a work-boundary note trigger", "phase 3 after terminal todos");
         await send(sessionId, "turn 9: first post-trigger turn records the nudge anchor", "phase 3 nudge anchor");
-        await send(sessionId, "turn 10: second post-trigger turn should receive the note nudge", "phase 3 nudge delivery");
-        let nudgeBody = mainRequests().at(-1)!.body;
+        let nudgeMarker = await send(sessionId, "turn 10: second post-trigger turn should receive the note nudge", "phase 3 nudge delivery");
+        let nudgeBody = (await mainRequestForMarker(nudgeMarker)).body;
         for (let retry = 0; retry < 4 && !JSON.stringify(nudgeBody).includes("deferred note"); retry += 1) {
-            await send(sessionId, `turn ${11 + retry}: extra post-trigger turn for persisted nudge delivery`, "phase 3 nudge delivery retry");
-            nudgeBody = mainRequests().at(-1)!.body;
+            nudgeMarker = await send(sessionId, `turn ${11 + retry}: extra post-trigger turn for persisted nudge delivery`, "phase 3 nudge delivery retry");
+            nudgeBody = (await mainRequestForMarker(nudgeMarker)).body;
         }
         expect(JSON.stringify(nudgeBody)).toContain("deferred note");
-        await send(sessionId, "turn 15: note nudge sticky replay should be byte-identical", "phase 3 nudge replay");
-        const replayNudgeBody = mainRequests().at(-1)!.body;
+        const replayNudgeMarker = await send(sessionId, "turn 15: note nudge sticky replay should be byte-identical", "phase 3 nudge replay");
+        const replayNudgeBody = (await mainRequestForMarker(replayNudgeMarker)).body;
         expect(JSON.stringify(replayNudgeBody)).toContain("deferred note");
         expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("deferred note");
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
@@ -481,7 +560,7 @@ describe("long-running OpenCode Magic Context session", () => {
         if (RUST_MODE) {
             // 20ac0630 moved tag authority out of context.db. Select a live tag
             // from the actual provider wire so this remains a non-vacuous drop.
-            const wire = JSON.stringify(mainRequests().at(-1)!.body.messages ?? []);
+            const wire = JSON.stringify((await mainRequestForMarker(replayNudgeMarker)).body.messages ?? []);
             const match = wire.match(/§(\d+)§ (phase 1 assistant \d+)/);
             expect(match).not.toBeNull();
             reduceTarget = Number(match![1]);
@@ -504,7 +583,7 @@ describe("long-running OpenCode Magic Context session", () => {
         emitToolOnce(/^ctx_reduce$/, { drop: String(reduceTarget) });
         await send(sessionId, `turn 13: drop old assistant tag ${reduceTarget} with ctx_reduce`, "phase 4 after ctx_reduce");
         await send(sessionId, "turn 14: pressure after ctx_reduce so pending op applies next", "phase 4 pressure", FORCE_CLEANUP_USAGE);
-        await send(sessionId, "turn 15: materialize ctx_reduce pending op", "phase 4 materialize");
+        const materializeMarker = await send(sessionId, "turn 15: materialize ctx_reduce pending op", "phase 4 materialize");
         if (!RUST_MODE) {
             await h.waitFor(
                 () => {
@@ -517,11 +596,12 @@ describe("long-running OpenCode Magic Context session", () => {
                 { label: "ctx_reduce target dropped" },
             );
         }
-        const reducedBody = JSON.stringify(mainRequests().at(-1)!.body);
+        const materializedRequest = await mainRequestForMarker(materializeMarker);
+        const reducedBody = JSON.stringify(materializedRequest.body);
         expect(reducedBody).not.toContain(reduceNeedle);
         expect(reducedBody).not.toContain("ctx_reduce_turn_cleanup");
-        await send(sessionId, "turn 16: ctx_reduce defer replay remains stable", "phase 4 stable replay");
-        expect(JSON.stringify(mainRequests().at(-1)!.body)).not.toContain(reduceNeedle);
+        const stableReplayMarker = await send(sessionId, "turn 16: ctx_reduce defer replay remains stable", "phase 4 stable replay");
+        expect(JSON.stringify((await mainRequestForMarker(stableReplayMarker)).body)).not.toContain(reduceNeedle);
 
         // Phase 5: Historian publishes; OpenCode writes a deferred marker that drains only on a later execute pass.
         await send(sessionId, "turn 17: historian trigger pressure with eligible long tail", "phase 5 historian trigger", HISTORIAN_TRIGGER_USAGE);
@@ -543,23 +623,24 @@ describe("long-running OpenCode Magic Context session", () => {
             }
             expect(compartmentCount).toBeGreaterThan(0);
         } else {
-            await h.waitFor(
+            const matchedPublication = await h.waitFor(
                 () => {
-                    const row = h
+                    const compartments = h
                         .contextDb()
-                        .prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?")
-                        .get(sessionId) as { n: number } | null;
-                    return (row?.n ?? 0) > 0;
+                        .prepare(
+                            "SELECT start_message, end_message, title FROM compartments WHERE session_id = ?",
+                        )
+                        .all(sessionId) as PublishedCompartment[];
+                    return matchHistorianCaptureToCompartment(historianCaptures, compartments);
                 },
-                { timeoutMs: 300_000, label: "historian compartment published" },
+                { timeoutMs: 300_000, label: "historian compartment matched to request range" },
             );
-            const compartment = h
-                .contextDb()
-                .prepare("SELECT start_message, end_message, title FROM compartments WHERE session_id = ? ORDER BY sequence DESC LIMIT 1")
-                .get(sessionId) as { start_message: number; end_message: number; title: string };
-            expect(historianRange).not.toBeNull();
-            expect(compartment.start_message).toBe(historianRange!.start);
-            expect(compartment.end_message).toBe(historianRange!.end);
+            expect(matchedPublication.compartment.start_message).toBe(
+                matchedPublication.capture.range.start,
+            );
+            expect(matchedPublication.compartment.end_message).toBe(
+                matchedPublication.capture.range.end,
+            );
             const markerAfterPublish = readMeta<{
                 pending_compaction_marker_state: string | null;
                 compaction_marker_state: string | null;
@@ -580,23 +661,25 @@ describe("long-running OpenCode Magic Context session", () => {
         const stateJson = normalizedTodos(ACTIVE_TODOS);
         expect(readMeta<{ last_todo_state: string }>(sessionId, "last_todo_state")?.last_todo_state).toBe(stateJson);
         await send(sessionId, "turn 20: pressure to make synthetic todowrite visible on next execute", "phase 6 pressure", HIGH_USAGE);
-        await send(sessionId, "turn 21: execute pass injects synthetic todowrite and consumes history", "phase 6 synthetic execute");
+        const syntheticExecuteMarker = await send(sessionId, "turn 21: execute pass injects synthetic todowrite and consumes history", "phase 6 synthetic execute");
+        const syntheticExecuteRequest = await mainRequestForMarker(syntheticExecuteMarker);
         const syntheticCallId = computeSyntheticCallId(stateJson);
-        const syntheticPair = findSyntheticTodoPair(mainRequests().at(-1)!.body, syntheticCallId);
-        const syntheticBody = JSON.stringify(mainRequests().at(-1)!.body);
+        const syntheticPair = findSyntheticTodoPair(syntheticExecuteRequest.body, syntheticCallId);
+        const syntheticBody = JSON.stringify(syntheticExecuteRequest.body);
         expect(syntheticPair !== null || syntheticBody.includes("Ship long-running OpenCode fixture")).toBe(true);
         const markerAfterExecute = readMeta<{ pending_compaction_marker_state: string | null; compaction_marker_state: string | null }>(
             sessionId,
             "pending_compaction_marker_state, compaction_marker_state",
         );
         expect(Boolean(markerAfterExecute?.compaction_marker_state) || markerAfterExecute?.pending_compaction_marker_state === pendingBeforeDefer).toBe(true);
-        expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("<session-history>");
-        expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("Long OpenCode e2e chunk");
-        await send(sessionId, "turn 22: defer pass replays synthetic todowrite bytes", "phase 6 synthetic replay");
+        expect(JSON.stringify(syntheticExecuteRequest.body)).toContain("<session-history>");
+        expect(JSON.stringify(syntheticExecuteRequest.body)).toContain("Long OpenCode e2e chunk");
+        const syntheticReplayMarker = await send(sessionId, "turn 22: defer pass replays synthetic todowrite bytes", "phase 6 synthetic replay");
+        const syntheticReplayRequest = await mainRequestForMarker(syntheticReplayMarker);
         if (syntheticPair) {
-            expect(findSyntheticTodoPair(mainRequests().at(-1)!.body, syntheticCallId)?.bytes).toBe(syntheticPair.bytes);
+            expect(findSyntheticTodoPair(syntheticReplayRequest.body, syntheticCallId)?.bytes).toBe(syntheticPair.bytes);
         } else {
-            expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("Ship long-running OpenCode fixture");
+            expect(JSON.stringify(syntheticReplayRequest.body)).toContain("Ship long-running OpenCode fixture");
         }
 
         // Phase 7: Auto-search hint from a seeded memory is appended and persisted for same-turn replay.
@@ -632,7 +715,7 @@ describe("long-running OpenCode Magic Context session", () => {
         const autoSearchDecisions = readMeta<{ auto_search_hint_decisions: string }>(sessionId, "auto_search_hint_decisions")?.auto_search_hint_decisions ?? "";
         if (hinted.length > 0) {
             expect(hinted[0]).toContain("zebra cache ritual");
-            if (hinted.length > 1) expect(hinted.at(-1)).toBe(hinted[0]);
+            if (hinted.length > 1) expect(hinted[hinted.length - 1]).toBe(hinted[0]);
             expect(autoSearchDecisions).toContain("ctx-search-hint");
         }
 

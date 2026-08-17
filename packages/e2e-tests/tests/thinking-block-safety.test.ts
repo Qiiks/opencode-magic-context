@@ -118,6 +118,53 @@ function mainRequests(): Array<{ body: Record<string, unknown> }> {
     );
 }
 
+function promptMarker(): string {
+    return `[[thinking-block-${crypto.randomUUID()}]]`;
+}
+
+function latestUserPromptText(body: Record<string, unknown>): string {
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const message = messages[i];
+        if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "user") {
+            continue;
+        }
+        const content = (message as { content?: unknown }).content;
+        if (typeof content === "string" && content.length > 0) return content;
+        if (!Array.isArray(content)) continue;
+        const text = content
+            .map((block) => (block && typeof block === "object" ? (block as { text?: unknown }).text : ""))
+            .filter((value): value is string => typeof value === "string")
+            .join("\n");
+        if (text.length > 0) return text;
+    }
+    return "";
+}
+
+function selectRequestForMarker<T extends { body: Record<string, unknown> }>(
+    requests: readonly T[],
+    marker: string,
+): T {
+    const matching = requests.filter((request) =>
+        latestUserPromptText(request.body).includes(marker),
+    );
+    const request = matching[matching.length - 1];
+    if (!request) {
+        throw new Error(`no Magic Context request contains prompt marker ${marker}`);
+    }
+    return request;
+}
+
+async function mainRequestForMarker(marker: string): Promise<{ body: Record<string, unknown> }> {
+    await h.waitForMockQuiescence({ label: `request capture for ${marker}` });
+    return selectRequestForMarker(mainRequests(), marker);
+}
+
+async function resetMock(label: string): Promise<void> {
+    await h.waitForMockQuiescence({ label: `before mock.reset: ${label}` });
+    h.mock.reset();
+}
+
 function toolName(
     body: Record<string, unknown>,
     pattern: RegExp,
@@ -184,7 +231,7 @@ function tagForText(body: Record<string, unknown>, needle: string): number {
 }
 
 async function ageTagBeyondProtectedWindow(sessionId: string): Promise<void> {
-    h.mock.reset();
+    await resetMock("age tag beyond protected window");
     h.mock.setDefault({
         text: "aging response",
         usage: {
@@ -203,7 +250,7 @@ async function dropAndMaterialize(
     sessionId: string,
     tag: number,
 ): Promise<{ body: Record<string, unknown>; dropEmitted: boolean }> {
-    h.mock.reset();
+    await resetMock("configure ctx_reduce response");
     const wasDropEmitted = emitCtxReduceOnce(tag);
     h.mock.setDefault({
         text: "after reduce",
@@ -216,7 +263,7 @@ async function dropAndMaterialize(
     });
     await h.sendPrompt(sessionId, `mark §${tag}§ spent`);
 
-    h.mock.reset();
+    await resetMock("configure reduced-history materialization");
     h.mock.setDefault({
         text: "after materialization",
         usage: {
@@ -226,8 +273,9 @@ async function dropAndMaterialize(
             cache_read_input_tokens: 1_000,
         },
     });
-    await h.sendPrompt(sessionId, "inspect the reduced history");
-    return { body: mainRequests().at(-1)!.body, dropEmitted: wasDropEmitted() };
+    const inspectMarker = promptMarker();
+    await h.sendPrompt(sessionId, `inspect the reduced history ${inspectMarker}`);
+    return { body: (await mainRequestForMarker(inspectMarker)).body, dropEmitted: wasDropEmitted() };
 }
 
 /** Find all thinking/redacted_thinking blocks across all messages in a captured request. */
@@ -245,9 +293,21 @@ function findThinkingBlocks(req: RequestWithMessages): AnthropicContentBlock[] {
 }
 
 describe("thinking-block safety (Anthropic 400 regression)", () => {
+    it("rejects a delayed request that lacks the intended prompt marker", () => {
+        const intendedMarker = "[[thinking-block-intended]]";
+        const intended = { body: { messages: [{ role: "user", content: intendedMarker }] } };
+        const delayed = { body: { messages: [{ role: "user", content: "[[thinking-block-prior]]" }] } };
+
+        expect([intended, delayed][1]).toBe(delayed);
+        expect(selectRequestForMarker([intended, delayed], intendedMarker)).toBe(intended);
+        expect(() => selectRequestForMarker([delayed], intendedMarker)).toThrow(
+            "no Magic Context request contains prompt marker",
+        );
+    });
+
     describe("Bug A: nudge anchor on a thinking-bearing assistant", () => {
         it("does not inject nudge <instruction> text into an assistant that has a thinking block", async () => {
-                h.mock.reset();
+                await resetMock("start Bug A");
 
                 const signedThinking = "Let me work through this carefully step by step.";
                 const signature = "opaque-provider-signature-bug-a";
@@ -281,9 +341,10 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
 
                 // Third turn — the defer pass now sees the anchored placement
                 // (if any) and MUST NOT mutate the signed assistant's text.
+            const finalPromptMarker = promptMarker();
             await h.sendPrompt(
                 sessionId,
-                "turn 3 — defer pass must not mutate signed msg",
+                `turn 3 — defer pass must not mutate signed msg ${finalPromptMarker}`,
             );
 
                 const mainReqs = h.mock.requests().filter((r) => {
@@ -297,7 +358,7 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 // On the third request, the assistant history contains both
                 // prior turns. Find any assistant message whose content
                 // contains a thinking block with our signature.
-                const lastReq = mainReqs[mainReqs.length - 1]!;
+                const lastReq = await mainRequestForMarker(finalPromptMarker);
                 const assistants = capturedAssistants(asAnthropic(lastReq));
                 expect(assistants.length).toBeGreaterThan(0);
 
@@ -351,7 +412,7 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 ? "keeps provider roles safe when whole-arc history supersedes the dropped shell"
                 : "keeps the user shell as [dropped §N§] so adjacent assistants are not merged",
             async () => {
-                h.mock.reset();
+                await resetMock("start Bug B");
 
                 const signedThinkingA = "First thinking block for turn one.";
                 const signedThinkingB = "Second thinking block for turn two.";
@@ -403,12 +464,13 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 const paste = `Here is a log of the failing session:\n${"ERROR: call_failed at line 42.\n".repeat(
                     60,
                 )}`;
-                await h.sendPrompt(sessionId, paste);
+                const pasteMarker = promptMarker();
+                await h.sendPrompt(sessionId, `${paste}\n${pasteMarker}`);
 
                 // Resolve the public §N§ handle from the exact wire bytes, then drop it
                 // through ctx_reduce. This avoids coupling either mode to its private store.
             const pasteTag = tagForText(
-                mainRequests().at(-1)!.body,
+                (await mainRequestForMarker(pasteMarker)).body,
                 "Here is a log of the failing session:",
             );
                 await ageTagBeyondProtectedWindow(sessionId);
@@ -493,7 +555,7 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 ? "allows whole-arc history to supersede the image without partial stripping"
                 : "keeps a user message with an image part even after its text tag is dropped",
             async () => {
-                h.mock.reset();
+                await resetMock("start Bug C");
                 h.mock.setDefault({
                     content: [{ type: "text", text: "I see the screenshot." }],
                     usage: {
@@ -534,12 +596,16 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 const imageDataUrl =
                     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
+                const imagePromptMarker = promptMarker();
                 await rawClient.session.prompt({
                     path: { id: sessionId },
                     body: {
                         model: { providerID: "mock-anthropic", modelID: "mock-sonnet" },
                         parts: [
-                            { type: "text", text: "see this screenshot for the bug" },
+                            {
+                                type: "text",
+                                text: `see this screenshot for the bug ${imagePromptMarker}`,
+                            },
                             {
                                 type: "file",
                                 mime: "image/png",
@@ -549,11 +615,12 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                         ],
                     },
                 });
+                h.assertMagicContextProcessed(sessionId);
 
                 // Drop only the text block via its public §N§ handle. The image is a
                 // sibling content block and must survive the resulting materialization.
                 const userTextTag = tagForText(
-                    mainRequests().at(-1)!.body,
+                    (await mainRequestForMarker(imagePromptMarker)).body,
                     "see this screenshot for the bug",
                 );
                 await ageTagBeyondProtectedWindow(sessionId);
