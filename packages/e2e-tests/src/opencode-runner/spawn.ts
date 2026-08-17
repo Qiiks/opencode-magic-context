@@ -8,7 +8,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareContextDatabase } from "../prepare-context-db";
@@ -62,6 +62,8 @@ export interface SpawnOptions {
     modelContextLimit?: number;
     /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
     prepareContextDatabase?: boolean;
+    /** Expected Magic Context state after startup; readiness waits for this state. Defaults to enabled. */
+    expectedMagicContextState?: "enabled" | "conflict-disabled";
     /**
      * Reuse a pre-created isolated env instead of allocating a fresh one. The
      * Rust-mode harness creates the env first so a hermetic subc daemon can
@@ -245,12 +247,32 @@ function writeConfigs(
     // tui.json: not needed for headless serve, but harmless to emit nothing for now.
 }
 
+export interface ReadinessOptions {
+    expectedMagicContextState?: "enabled" | "conflict-disabled";
+    pluginLogPath?: string;
+    pluginLogStartOffset?: number;
+}
+
+const CONFLICT_DISABLE_VERDICT = "[magic-context] disabled due to conflicts:";
+
+function hasConflictDisableVerdict(logPath: string, startOffset: number): boolean {
+    try {
+        return readFileSync(logPath)
+            .subarray(startOffset)
+            .toString("utf8")
+            .includes(CONFLICT_DISABLE_VERDICT);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+    }
+}
+
 /**
- * Wait until OpenCode can list sessions, the configured mock model, and Magic
- * Context's tool registry. The `/doc` and `/session` endpoints can respond before
- * provider config and plugin hooks finish loading; returning at that intermediate
- * state lets the first prompt fail before it can reach the mock provider. Polls for
- * up to `timeoutMs`.
+ * Wait until OpenCode can list sessions, Magic Context reaches its expected boot
+ * state, and the configured mock model is available. The `/doc` and `/session`
+ * endpoints can respond before provider config and plugin hooks finish loading;
+ * returning at that intermediate state lets the first prompt race startup. Polls
+ * for up to `timeoutMs`.
  *
  * Implementation note — Bun fetch timeout flake:
  *   Bun's default `fetch()` has a hardcoded ~5 minute timeout that ignores
@@ -271,9 +293,15 @@ export async function waitForReady(
     url: string,
     directory: string,
     timeoutMs = 300_000,
+    options: ReadinessOptions = {},
 ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
+    const expectedMagicContextState = options.expectedMagicContextState ?? "enabled";
+    if (expectedMagicContextState === "conflict-disabled" && !options.pluginLogPath) {
+        throw new Error("conflict-disabled readiness requires a plugin log path");
+    }
+
     const sessionUrl = new URL("/session", url);
     const toolsUrl = new URL("/experimental/tool/ids", url);
     const providersUrl = new URL("/config/providers", url);
@@ -281,9 +309,8 @@ export async function waitForReady(
         readinessUrl.searchParams.set("directory", directory);
     }
 
+    const attempts = { session: 0, magicContext: 0, provider: 0 };
     let lastReadinessError: unknown = null;
-    let sessionAttempts = 0;
-    let dependencyAttempts = 0;
     const fetchJson = async (readinessUrl: URL, label: string): Promise<unknown> => {
         const res = await fetch(readinessUrl, {
             method: "GET",
@@ -292,71 +319,85 @@ export async function waitForReady(
         if (!res.ok) throw new Error(`${label} readiness returned HTTP ${res.status}`);
         return res.json().catch(() => null);
     };
-
-    let sessionReady = false;
-    while (Date.now() < deadline) {
-        try {
-            sessionAttempts += 1;
-            const sessions = await fetchJson(sessionUrl, "session API");
-            if (!Array.isArray(sessions)) {
-                throw new Error("session readiness response was not an array");
+    const waitForStage = async (
+        stage: keyof typeof attempts,
+        probe: () => Promise<void> | void,
+    ): Promise<void> => {
+        while (Date.now() < deadline) {
+            attempts[stage] += 1;
+            try {
+                await probe();
+                return;
+            } catch (error) {
+                lastReadinessError = error;
             }
-            sessionReady = true;
-            break;
-        } catch (error) {
-            lastReadinessError = error;
+            await Bun.sleep(200);
         }
-        await Bun.sleep(200);
-    }
+        throw new Error(
+            `opencode serve did not become ready in ${timeoutMs}ms.\n` +
+                `  expectedMagicContextState=${expectedMagicContextState}\n` +
+                `  failedStage=${stage}\n` +
+                `  sessionUrl=${sessionUrl.toString()}\n` +
+                `  toolsUrl=${toolsUrl.toString()}\n` +
+                `  providersUrl=${providersUrl.toString()}\n` +
+                `  pluginLogPath=${options.pluginLogPath ?? "unused"}\n` +
+                `  attempts=${JSON.stringify(attempts)}\n` +
+                `  readinessLastErr=${String(lastReadinessError)}`,
+        );
+    };
 
-    // These endpoints can initialize provider and plugin state. Probe them only
-    // after the session route is live so separate readiness requests do not race
-    // OpenCode's application startup against each other.
-    while (sessionReady && Date.now() < deadline) {
-        try {
-            dependencyAttempts += 1;
-            const [toolIds, providerConfig] = await Promise.all([
-                fetchJson(toolsUrl, "plugin tools"),
-                fetchJson(providersUrl, "provider config"),
-            ]);
+    await waitForStage("session", async () => {
+        const sessions = await fetchJson(sessionUrl, "session API");
+        if (!Array.isArray(sessions)) {
+            throw new Error("session readiness response was not an array");
+        }
+    });
+
+    // Probe plugin state only after the application route is live. A conflict-disabled
+    // plugin intentionally has no Magic Context tools, so its explicit boot log is the
+    // positive verdict; treating a missing tool as disabled would recreate the race.
+    if (expectedMagicContextState === "conflict-disabled") {
+        await waitForStage("magicContext", () => {
+            if (
+                !hasConflictDisableVerdict(
+                    options.pluginLogPath!,
+                    options.pluginLogStartOffset ?? 0,
+                )
+            ) {
+                throw new Error("Magic Context conflict-disable verdict is not ready");
+            }
+        });
+    } else {
+        await waitForStage("magicContext", async () => {
+            const toolIds = await fetchJson(toolsUrl, "plugin tools");
             if (!Array.isArray(toolIds) || !toolIds.includes("ctx_search")) {
                 throw new Error("Magic Context tool registry is not ready");
             }
-
-            const providers =
-                providerConfig && typeof providerConfig === "object"
-                    ? (providerConfig as { providers?: unknown }).providers
-                    : null;
-            const mockProvider = Array.isArray(providers)
-                ? providers.find(
-                      (provider) =>
-                          provider &&
-                          typeof provider === "object" &&
-                          (provider as { id?: unknown }).id === "mock-anthropic",
-                  )
-                : null;
-            const models =
-                mockProvider && typeof mockProvider === "object"
-                    ? (mockProvider as { models?: unknown }).models
-                    : null;
-            if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
-                throw new Error("mock-anthropic/mock-sonnet provider config is not ready");
-            }
-            return;
-        } catch (error) {
-            lastReadinessError = error;
-        }
-        await Bun.sleep(200);
+        });
     }
-    throw new Error(
-        `opencode serve did not become ready in ${timeoutMs}ms.\n` +
-            `  sessionUrl=${sessionUrl.toString()}\n` +
-            `  toolsUrl=${toolsUrl.toString()}\n` +
-            `  providersUrl=${providersUrl.toString()}\n` +
-            `  sessionAttempts=${sessionAttempts}\n` +
-            `  dependencyAttempts=${dependencyAttempts}\n` +
-            `  readinessLastErr=${String(lastReadinessError)}`,
-    );
+
+    await waitForStage("provider", async () => {
+        const providerConfig = await fetchJson(providersUrl, "provider config");
+        const providers =
+            providerConfig && typeof providerConfig === "object"
+                ? (providerConfig as { providers?: unknown }).providers
+                : null;
+        const mockProvider = Array.isArray(providers)
+            ? providers.find(
+                  (provider) =>
+                      provider &&
+                      typeof provider === "object" &&
+                      (provider as { id?: unknown }).id === "mock-anthropic",
+              )
+            : null;
+        const models =
+            mockProvider && typeof mockProvider === "object"
+                ? (mockProvider as { models?: unknown }).models
+                : null;
+        if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
+            throw new Error("mock-anthropic/mock-sonnet provider config is not ready");
+        }
+    });
 }
 
 interface RustSpawnResources {
@@ -450,6 +491,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
         childEnv[key] = value;
     }
+    const pluginLogPath =
+        childEnv.MAGIC_CONTEXT_LOG_PATH?.trim() ||
+        join(env.dataDir, "cortexkit", "magic-context-e2e.log");
+    childEnv.MAGIC_CONTEXT_LOG_PATH = pluginLogPath;
+    const pluginLogStartOffset = existsSync(pluginLogPath) ? statSync(pluginLogPath).size : 0;
 
     // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
     // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
@@ -479,7 +525,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
 
     const url = `http://127.0.0.1:${port}`;
     try {
-        await waitForReady(url, env.workdir);
+        await waitForReady(url, env.workdir, 300_000, {
+            expectedMagicContextState: resolvedOpts.expectedMagicContextState,
+            pluginLogPath,
+            pluginLogStartOffset,
+        });
     } catch (err) {
         // Surface captured output on boot failure to help debugging.
         child.kill("SIGTERM");
