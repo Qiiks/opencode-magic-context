@@ -10,8 +10,8 @@ import {
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
 } from "./context-authority";
-import { insertMemory, getMemoriesByProject } from "./memory/storage-memory";
-import { MIGRATIONS, runMigrations } from './migrations';
+import { getMemoriesByProject, insertMemory } from "./memory/storage-memory";
+import { MIGRATIONS, runMigrations } from "./migrations";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { initializeDatabase } from "./storage-db";
 import { addNote, getSmartNotes } from "./storage-notes";
@@ -49,7 +49,9 @@ function installMigrationLedgerFromSource(db: DatabaseType): void {
         initializeDatabase(source);
         runMigrations(source);
         const row = source
-            .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            )
             .get() as { sql?: string } | null;
         if (!row?.sql) throw new Error("source migration runner did not create its ledger");
         db.exec(row.sql);
@@ -58,10 +60,7 @@ function installMigrationLedgerFromSource(db: DatabaseType): void {
     }
 }
 
-function applyExactlyOneMigration(
-    db: DatabaseType,
-    migration: (typeof MIGRATIONS)[number],
-): void {
+function applyExactlyOneMigration(db: DatabaseType, migration: (typeof MIGRATIONS)[number]): void {
     db.transaction(() => {
         migration.up(db);
         db.prepare(
@@ -151,9 +150,9 @@ function populateTsOwnedRows(
 }
 
 function assertPrivilegeClosed(db: DatabaseType): void {
-    expect(
-        db.prepare("SELECT enabled FROM context_privilege_state WHERE id = 1").get(),
-    ).toEqual({ enabled: 0 });
+    expect(db.prepare("SELECT enabled FROM context_privilege_state WHERE id = 1").get()).toEqual({
+        enabled: 0,
+    });
 }
 
 function assertDurableAuthorityTriggers(db: DatabaseType): void {
