@@ -589,8 +589,18 @@ async function runHealthChecks(options: {
     // known to apply bad default reasoning_effort values (currently GitHub Copilot).
     // Without an explicit `thinking_level`, Pi leaves the level unset and Copilot
     // injects "minimal" — which it then rejects with a 400 error.
-    const historianModel = loadedConfig.config.historian?.model?.trim() ?? "";
-    const historianThinkingLevel = loadedConfig.config.historian?.thinking_level;
+    // Per-harness config shape: Pi's historian model resolution reads only the
+    // pi harness block, so the Copilot check must look there too. Entries may be
+    // strings or { model, thinking_level } objects.
+    const piHistorian = loadedConfig.config.historian?.pi;
+    const piHistorianEntry = piHistorian?.model;
+    const historianModel = (
+        typeof piHistorianEntry === "string" ? piHistorianEntry : (piHistorianEntry?.model ?? "")
+    ).trim();
+    const historianThinkingLevel =
+        (typeof piHistorianEntry === "object" && piHistorianEntry !== null
+            ? piHistorianEntry.thinking_level
+            : undefined) ?? piHistorian?.thinking_level;
     if (historianModel.startsWith("github-copilot/") && !historianThinkingLevel) {
         add(
             results,
