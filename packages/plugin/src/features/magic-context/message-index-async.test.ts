@@ -372,7 +372,14 @@ describe("message-index-async", () => {
         scheduleClearAndReindex(db, sessionId, readSurviving);
         expect(isSessionReconciled(sessionId)).toBe(false);
 
-        await wait(80);
+        // Wait for the observable outcome rather than a fixed wall-clock budget.
+        // Both the boot-quiet reconciliation and the clear-and-reindex must have
+        // run (reads === 2) and the rebuild must have re-marked the session
+        // reconciled. A fixed `await wait(80)` made the verdict a function of
+        // how fast the runner closed two scheduling hops plus two DB cycles
+        // inside one window, which flips under CI load. Waiting for the state
+        // (with a generous ceiling) makes a slow runner slow rather than red.
+        await waitUntil(() => reads === 2 && isSessionReconciled(sessionId));
 
         expect(reads).toBe(2);
         expect(countMessageRows(db, sessionId, "m-survivor")).toBe(1);
