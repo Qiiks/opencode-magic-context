@@ -41,6 +41,7 @@ describe("MagicContextConfigSchema", () => {
                     overlay: true,
                 },
             });
+            expect(result.historian_timeout_ms).toBeGreaterThanOrEqual(10 * 60_000);
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
             expect(result.sidekick).toBeUndefined();

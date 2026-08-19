@@ -16,7 +16,7 @@ export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
 // escalation derives above the effective threshold and the 95% wall stays fixed.
 export const EXECUTE_THRESHOLD_CAP_MESSAGE =
     "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
-export const DEFAULT_HISTORIAN_TIMEOUT_MS = 300_000;
+export const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 
 export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
@@ -784,7 +784,7 @@ export const MagicContextConfigSchema = z
             .number()
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
-            .describe("Timeout for each historian prompt call in milliseconds (default: 300000)"),
+            .describe("Timeout for each historian prompt call in milliseconds (default: 600000)"),
         commit_cluster_trigger: z
             .object({
                 enabled: z

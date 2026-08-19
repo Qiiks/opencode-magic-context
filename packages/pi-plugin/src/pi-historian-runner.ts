@@ -126,7 +126,7 @@ import {
 } from "./read-session-pi";
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
-const DEFAULT_HISTORIAN_TIMEOUT_MS = 120_000;
+const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
 const MAX_HISTORIAN_RETRIES = 2;
 
 /** Keep historian alert noise to once per minute per session. */

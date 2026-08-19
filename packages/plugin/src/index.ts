@@ -372,6 +372,15 @@ const server: Plugin = async (ctx) => {
                 embeddingConfig: pluginConfig.embedding,
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
+                historianChildSweep: {
+                    timeoutMs: pluginConfig.historian_timeout_ms,
+                    fallbackModelCount: Array.isArray(pluginConfig.historian?.fallback_models)
+                        ? pluginConfig.historian.fallback_models.length
+                        : pluginConfig.historian?.fallback_models
+                          ? 1
+                          : 0,
+                    keepSubagents: pluginConfig.keep_subagents === true,
+                },
                 mural: pluginConfig.mural,
                 retinaHandoff: pluginConfig.smart_notes.retina_handoff,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled

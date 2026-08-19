@@ -325,9 +325,6 @@ async function runHistorianPrompt(args: {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     let invocationRecorded = false;
-    // Keep FAILED historian child sessions for debugging (the model output, the
-    // exact prompt, and the error are all inspectable in the child session). Only
-    // delete on SUCCESS, where the result is already persisted as a compartment.
     let outcomeOk = false;
 
     const recordInvocation = (params: {
@@ -489,23 +486,15 @@ async function runHistorianPrompt(args: {
             error: `Historian failed while processing this session: ${desc.brief}`,
         };
     } finally {
-        // Delete the child session ONLY on success. On failure, keep it so the
-        // failed model output / prompt / error can be inspected for debugging
-        // (the run is already recorded as failed in subagent_invocations +
-        // historian_runs; the live child session is the missing piece). A periodic
-        // sweep can GC old failed child sessions later if needed.
-        if (agentSessionId && outcomeOk && !shouldKeepSubagents()) {
-            await client.session.delete({ path: { id: agentSessionId } }).catch((e: unknown) => {
-                shared.sessionLog(
-                    parentSessionId,
-                    "compartment agent: session cleanup failed",
-                    getErrorMessage(e),
-                );
-            });
-        } else if (agentSessionId && (!outcomeOk || shouldKeepSubagents())) {
+        if (agentSessionId) {
+            const retentionReason = shouldKeepSubagents()
+                ? "keep_subagents"
+                : outcomeOk
+                  ? "prompt completed; cleanup deferred to the age-gated sweep"
+                  : "failed; cleanup deferred to the age-gated sweep";
             shared.sessionLog(
                 parentSessionId,
-                `historian: KEEPING child session ${agentSessionId} (${outcomeOk ? "keep_subagents" : "failed"}) — not deleted`,
+                `historian: KEEPING child session ${agentSessionId} (${retentionReason}) — not deleted inline`,
             );
         }
     }
