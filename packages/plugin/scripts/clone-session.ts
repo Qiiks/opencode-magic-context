@@ -7,6 +7,7 @@ import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
 import { Database } from "../src/shared/sqlite";
 import { closeQuietly } from "../src/shared/sqlite-helpers";
 import { clearSession } from "../src/features/magic-context/storage-meta-session";
+import { SESSION_SCOPED_TABLES } from "../src/features/magic-context/storage-session-tables";
 import {
     copySessionStateForClone,
     type CloneCompartmentRow,
@@ -1322,33 +1323,7 @@ function printPlan(plan: ClonePlan, dryRun: boolean): void {
 }
 
 function deleteContextDestination(db: Database, sessionId: string): void {
-    const clearSessionTables = [
-        "pending_ops",
-        "source_contents",
-        "tool_owner_backfill_state",
-        "tags",
-        "session_meta",
-        "session_projects",
-        "compartment_chunk_embeddings",
-        "compartments",
-        "compression_depth",
-        "session_facts",
-        "compartment_state_lease",
-        "notes",
-        "recomp_compartments",
-        "recomp_facts",
-        "user_memory_candidates",
-        "primer_candidates",
-        "m0_mutation_log",
-        "compartment_events",
-        "subagent_invocations",
-        "historian_runs",
-        "plugin_messages",
-        "transform_decisions",
-        "synapse_batch_ledger",
-        "embedding_measurement_corpus",
-    ];
-    if (clearSessionTables.every((table) => tableExists(db, table))) {
+    if (SESSION_SCOPED_TABLES.every(({ table }) => tableExists(db, table))) {
         clearSession(db, sessionId);
     }
     const tables = sessionScopedTables(db).reverse();
