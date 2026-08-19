@@ -108,6 +108,42 @@ describe("OMP provider boundary", () => {
         expect(resolveModelRefForOmp(ompModelRefToCanonical(selector))).toBe(selector);
     });
 
+    it("translates the OpenCode Zen gateway (opencode) to OMP's opencode-zen spelling", () => {
+        expect(resolveModelRefForOmp("opencode/deepseek-v4-flash-free")).toBe(
+            "opencode-zen/deepseek-v4-flash-free",
+        );
+        expect(ompModelRefToCanonical("opencode-zen/deepseek-v4-flash-free")).toBe(
+            "opencode/deepseek-v4-flash-free",
+        );
+    });
+
+    it("resolves an opencode/ shared ref on OMP via modelRefLookupOrder", () => {
+        expect(modelRefLookupOrder("opencode/deepseek-v4-flash-free")).toEqual([
+            "opencode/deepseek-v4-flash-free",
+            "opencode-zen/deepseek-v4-flash-free",
+        ]);
+        expect(modelRefLookupOrder("opencode-zen/deepseek-v4-flash-free")).toEqual([
+            "opencode/deepseek-v4-flash-free",
+            "opencode-zen/deepseek-v4-flash-free",
+        ]);
+    });
+
+    it("leaves the OpenCode Zen gateway unchanged on plain Pi (Pi uses opencode)", () => {
+        expect(resolveModelRefForPi("opencode/deepseek-v4-flash-free")).toBe(
+            "opencode/deepseek-v4-flash-free",
+        );
+        expect(piModelRefToCanonical("opencode/deepseek-v4-flash-free")).toBe(
+            "opencode/deepseek-v4-flash-free",
+        );
+    });
+
+    it("keeps opencode-go unmapped on both harnesses (distinct gateway)", () => {
+        expect(resolveModelRefForOmp("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+        expect(ompModelRefToCanonical("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+        expect(resolveModelRefForPi("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+        expect(piModelRefToCanonical("opencode-go/kimi-k2.6")).toBe("opencode-go/kimi-k2.6");
+    });
+
     it("passes through provider ids that collide with Object.prototype members", () => {
         for (const ref of [
             "constructor/model",
