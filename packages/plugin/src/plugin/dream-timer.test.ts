@@ -119,6 +119,19 @@ describe("dream-timer message-history maintenance (static)", () => {
     });
 });
 
+describe("dream-timer historian child maintenance (static)", () => {
+    const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
+
+    test("runs the historian sweep before the dreamer-enabled guard", () => {
+        const historianSweep = source.indexOf("sweepOrphanedHistorianChildren(reg)");
+        const dreamerGuard = source.indexOf("if (!dreamingEnabled || !dreamerConfig)");
+
+        expect(historianSweep).toBeGreaterThan(0);
+        expect(dreamerGuard).toBeGreaterThan(historianSweep);
+        expect(source).toContain("reg.historianChildSweep !== undefined");
+    });
+});
+
 describe("dream-timer git commit backlog drain (static)", () => {
     const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
 

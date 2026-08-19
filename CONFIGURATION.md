@@ -167,7 +167,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `execute_threshold_percentage` | `number` (20–90) or `object` | `65` | Context usage that forces queued ops to execute. Capped at 90% of the output-reserved safe window, leaving about 10% for mid-turn input growth. Supports per-model maps. |
 | `execute_threshold_tokens` | `object` (per-model map) | — | **Optional absolute-tokens variant of `execute_threshold_percentage`.** Per-model map (e.g. `{ "default": 150000, "github-copilot/gpt-5.2-codex": 40000 }`). When set for a model, overrides the percentage-based threshold for that model. Clamped to `90% × context_limit` with a warn log. Requires a resolvable context limit — falls through to percentage if unavailable. See below. |
 | `clear_reasoning_age` | `number` | `50` | Clear thinking/reasoning blocks older than N tags. |
-| `historian_timeout_ms` | `number` | `300000` | Timeout per historian call (ms). |
+| `historian_timeout_ms` | `number` | `600000` | Timeout per historian call (ms). |
 | `history_budget_percentage` | `number` (0.05–0.5) | `0.15` | Fraction of usable context (`context_limit × execute_threshold`) reserved for the history block. Triggers compression when exceeded. |
 | `compaction.enabled` | `boolean` | `true` | When `false`, use compaction-off mode: keep Magic Context's knowledge layer and let native compaction (or nothing) own the context window. Boot-resolved; restart after changing it. See below. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |

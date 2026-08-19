@@ -1271,8 +1271,8 @@
       "maximum": 0.5
     },
     "historian_timeout_ms": {
-      "default": 300000,
-      "description": "Timeout for each historian prompt call in milliseconds (default: 300000)",
+      "default": 600000,
+      "description": "Timeout for each historian prompt call in milliseconds (default: 600000)",
       "type": "number",
       "minimum": 60000
     },

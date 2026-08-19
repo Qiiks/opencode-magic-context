@@ -5,6 +5,8 @@ import type { ClassifyModuleClient } from "../features/magic-context/dreamer/cla
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
+    HISTORIAN_CHILD_TITLE_MATCHES,
+    historianOrphanStaleMs,
     PRIVACY_SENSITIVE_CHILD_TASKS,
     PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
     retrospectiveOrphanStaleMs,
@@ -85,6 +87,11 @@ interface ProjectRegistration {
     };
     memoryEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
+    historianChildSweep?: {
+        timeoutMs: number;
+        fallbackModelCount: number;
+        keepSubagents: boolean;
+    };
     mural?: { enabled: boolean; model?: string };
     retinaHandoff?: boolean;
     embeddingConfig?: { provider?: string };
@@ -333,7 +340,8 @@ async function runProjectMaintenance(
     const projectMaintenanceEnabled =
         Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
-        reg.gitCommitIndexing?.enabled === true;
+        reg.gitCommitIndexing?.enabled === true ||
+        reg.historianChildSweep !== undefined;
     if (!projectMaintenanceEnabled) return;
 
     await reg.ensureRegistered(reg.directory, db);
@@ -403,6 +411,8 @@ async function sweepProject(
                 `(memory=${gc.memoryRowsDeleted} commit=${gc.commitRowsDeleted} chunk=${gc.chunkRowsDeleted})`,
         );
     }
+
+    await sweepOrphanedHistorianChildren(reg);
 
     const dreamerConfig = reg.dreamerConfig;
     const dreamingEnabled = Boolean(dreamerConfig && dreamerConfig.disable !== true);
@@ -492,6 +502,30 @@ async function sweepProject(
         }
     } catch (error) {
         log(`[dreamer] timer-triggered task scheduling failed for ${reg.projectIdentity}:`, error);
+    }
+}
+
+async function sweepOrphanedHistorianChildren(reg: ProjectRegistration): Promise<void> {
+    const config = reg.historianChildSweep;
+    if (!config || config.keepSubagents) return;
+
+    const ocDb = openOpenCodeDb();
+    if (!ocDb) return;
+    try {
+        await sweepOrphanedRetrospectiveChildren({
+            opencodeDb: ocDb,
+            client: reg.client,
+            sessionDirectory: reg.directory,
+            staleMs: historianOrphanStaleMs(config.timeoutMs, config.fallbackModelCount),
+            titleMatches: HISTORIAN_CHILD_TITLE_MATCHES,
+        });
+    } catch (error) {
+        log(
+            `[magic-context] historian child orphan sweep failed for ${reg.projectIdentity}:`,
+            error,
+        );
+    } finally {
+        closeQuietly(ocDb);
     }
 }
 
