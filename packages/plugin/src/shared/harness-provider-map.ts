@@ -16,6 +16,12 @@
  * their exported functions remain distinct deliberately. A future OMP catalog
  * rename must not silently change plain-Pi behavior (or vice versa).
  *
+ * The OpenCode Zen gateway is the one place the two harnesses diverge: OpenCode
+ * and plain Pi both name it `opencode`, while OMP exposes the same gateway as
+ * `opencode-zen`. Only the OMP map carries that pair; plain Pi keeps `opencode`
+ * as an identity. `opencode-go` is a distinct gateway (the "go" variant at
+ * opencode.ai/zen/go) and stays unmapped on both harnesses.
+ *
  * The mapping is intentionally not a one-to-one provider identity. Both
  * harnesses also expose plain `openai` and `google` providers for direct API
  * keys, while the canonical prefix does not record whether a subscription or
@@ -43,11 +49,13 @@ const PI_TO_CANONICAL_PROVIDER: Readonly<Record<string, string>> = {
 const CANONICAL_TO_OMP_PROVIDER: Readonly<Record<string, string>> = {
     openai: "openai-codex",
     google: "google-antigravity",
+    opencode: "opencode-zen",
 };
 
 const OMP_TO_CANONICAL_PROVIDER: Readonly<Record<string, string>> = {
     "openai-codex": "openai",
     "google-antigravity": "google",
+    "opencode-zen": "opencode",
 };
 
 /** Remap only the provider prefix (text before the first "/"), preserving the
