@@ -44,6 +44,7 @@ import {
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
+import { SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -326,6 +327,33 @@ describe("storage-db", () => {
                     "compression_depth",
                     "session_meta",
                 ]),
+            );
+        });
+
+        it("keeps the shared session table list in lockstep with the live schema", () => {
+            useTempDataHome("storage-db-session-table-list-");
+            const db = openDatabase();
+            const schemaTables = (
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .all() as Array<{ name: string }>
+            )
+                .map((row) => row.name)
+                .filter((table) => {
+                    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                        name: string;
+                    }>;
+                    return columns.some((column) => column.name === "session_id");
+                })
+                .sort();
+
+            // Every exact session_id column denotes session-owned rows. Durable
+            // provenance that must survive session deletion uses explicit names
+            // such as migration_pending.source_session_id instead.
+            expect(SESSION_SCOPED_TABLES.map((definition) => definition.table).sort()).toEqual(
+                schemaTables,
             );
         });
 
