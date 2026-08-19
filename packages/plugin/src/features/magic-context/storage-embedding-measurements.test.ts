@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { closeDatabase, openDatabase } from "./storage";
 import {
     listEmbeddingMeasurements,
-    MEASUREMENT_CORPUS_SESSION_ROW_CAP,
     normalizedQueryHash,
     recordEmbeddingMeasurement,
 } from "./storage-embedding-measurements";
@@ -60,8 +59,15 @@ describe("embedding measurement corpus", () => {
         dirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         const db = openDatabase();
+        // The cap is injectable so the eviction boundary can be exercised at a
+        // small scale instead of the production 2000-row cap. The invariant
+        // under test — "keeps the newest rows when the cap is exceeded" — is
+        // scale-independent, so a small cap proves it in milliseconds rather
+        // than ~7s of disk-backed inserts (which previously timed out on
+        // slower hardware against bun's default 5s per-test budget).
+        const cap = 25;
         const overflow = 5;
-        const total = MEASUREMENT_CORPUS_SESSION_ROW_CAP + overflow;
+        const total = cap + overflow;
         for (let i = 0; i < total; i++) {
             recordEmbeddingMeasurement(db, {
                 sessionId: "ses-cap",
@@ -84,11 +90,11 @@ describe("embedding measurement corpus", () => {
                 shadowEpoch: 0,
                 corpusHash: `corpus-${i}`,
                 coverage: {},
-            });
+            }, cap);
         }
 
         const rows = listEmbeddingMeasurements(db, "ses-cap");
-        expect(rows).toHaveLength(MEASUREMENT_CORPUS_SESSION_ROW_CAP);
+        expect(rows).toHaveLength(cap);
         // The oldest `overflow` rows were pruned; the newest cap rows survive.
         expect(rows[0].query_text_hash).toBe(normalizedQueryHash(`query ${overflow}`));
         expect(rows[rows.length - 1].query_text_hash).toBe(
