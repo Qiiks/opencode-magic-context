@@ -115,8 +115,8 @@ describe("executeStatus", () => {
         const status = executeStatus(db, SESSION_ID, 20);
 
         expect(status).toContain("- Configured: never");
-        expect(status).toContain("- Remaining: never expires (always-warm lane)");
-        expect(status).toContain("never expires");
+        expect(status).toContain("- Remaining: never (MC never assumes expiry — external cache-keep)");
+        expect(status).toContain("never (MC never assumes expiry");
         expect(status).not.toContain("Infinity");
         db.close();
     });

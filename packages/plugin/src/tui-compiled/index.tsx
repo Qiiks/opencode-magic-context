@@ -671,7 +671,7 @@ const StatusDialog = props => {
           },
           l: "Remaining",
           get v() {
-            return _$memo(() => !!s().cacheExpired)() ? "expired" : _$memo(() => !!s().cacheNeverExpires)() ? "never expires (always-warm lane)" : `${Math.round(s().cacheRemainingMs / 1000)}s`;
+            return _$memo(() => !!s().cacheExpired)() ? "expired" : _$memo(() => !!s().cacheNeverExpires)() ? "never (MC never assumes expiry — external cache-keep)" : `${Math.round(s().cacheRemainingMs / 1000)}s`;
           },
           get fg() {
             return _$memo(() => !!s().cacheExpired)() ? t().warning : t().textMuted;

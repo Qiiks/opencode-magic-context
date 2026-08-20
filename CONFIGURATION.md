@@ -119,7 +119,7 @@ Magic Context uses the runtime's built-in SQLite: `bun:sqlite` under Bun (OpenCo
 
 LLM providers cache conversation prefixes server-side. The cache window depends on your provider and subscription tier — Claude Pro offers 5 minutes, Max offers 1 hour, and pricing for cached vs. uncached tokens differs between API and subscription usage.
 
-Magic Context defers all mutations until the cached prefix expires. The default `cache_ttl` of `"5m"` matches most providers. You can tune it:
+Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The default `"5m"` matches Anthropic's default TTL. You can tune it:
 
 ```jsonc
 {
@@ -140,12 +140,15 @@ Per-model overrides for mixed-model workflows:
 
 Supported formats: `"30s"`, `"5m"`, `"1h"`.
 
-**`"never"` sentinel:** set `cache_ttl` to `"never"` to disable the idle-TTL heuristic entirely. Both consumers —
+**`"never"` sentinel:** set `cache_ttl` to `"never"` to mean Magic Context *never assumes* the cached prefix expires — it disables the idle-TTL heuristic entirely. Both consumers —
 the scheduler (which converts defer passes to execute after TTL expiry) and the HARD-fold trigger (which folds
 m[1] into m[0] on a "free" prefix rebuild) — no longer act on idle time. Use this on lanes kept warm by an
 external keepwarm mechanism (prewarm proxies, dedicated cache-keep tools) where the idle heuristic false-positives
 and causes paid full-prefix cache-writes. After a genuine cold start (e.g. the keepwarm process died), MC
 won't detect the free-fold window on that lane — mutations then apply only at the execute threshold.
+
+`"never"` only changes MC's assumption; it does not extend the provider's cache lifetime. Provider-side extended
+TTL is a separate request-level concern (`cache_control: { ttl: "1h" }` in the request body).
 
 Higher-tier models with longer cache windows benefit from a longer TTL. Setting it too low wastes cache hits. Setting it too high delays reduction on long sessions.
 
