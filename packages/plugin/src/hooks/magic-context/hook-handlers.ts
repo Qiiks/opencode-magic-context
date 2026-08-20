@@ -35,6 +35,7 @@ import {
     decideChannel1,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
+import { annotateEmptyTaskOutput } from "./empty-task-output";
 import {
     getMessageUpdatedAssistantInfo,
     getMessageUpdatedInfo,
@@ -533,6 +534,10 @@ export function createToolExecuteAfterHook(args: {
         // boundary. The queue helper re-checks the read-only mid-turn signal,
         // so this is a no-op until the assistant is actually idle.
         await flushIgnoredMessages(typedInput.sessionID);
+
+        // Surface a completed native task that returned no final text so the
+        // caller can distinguish an empty result from a genuinely-empty tool.
+        annotateEmptyTaskOutput(typedInput.tool, output);
 
         if (typedInput.tool === "ctx_reduce") {
             // Mark the Channel 1 baseline dirty so the next nudge re-measures the
