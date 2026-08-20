@@ -69,28 +69,32 @@ describe("embedding measurement corpus", () => {
         const overflow = 5;
         const total = cap + overflow;
         for (let i = 0; i < total; i++) {
-            recordEmbeddingMeasurement(db, {
-                sessionId: "ses-cap",
-                projectPath: "/repo",
-                // Unique query text per row: dedup is on (query hash, cohort), so
-                // distinct queries simulate the cohort-transition growth.
-                queryText: `query ${i}`,
-                cohortKey: "fp-a:0|fp-b:0",
-                primaryResultIds: [],
-                shadowResultIds: [],
-                primaryLatencyMs: 1,
-                shadowLatencyMs: 1,
-                primaryFailed: false,
-                shadowFailed: false,
-                primaryModelId: "local-id",
-                shadowModelId: "synapse-id",
-                primaryFingerprint: "",
-                shadowFingerprint: "fp-b",
-                primaryEpoch: 0,
-                shadowEpoch: 0,
-                corpusHash: `corpus-${i}`,
-                coverage: {},
-            }, cap);
+            recordEmbeddingMeasurement(
+                db,
+                {
+                    sessionId: "ses-cap",
+                    projectPath: "/repo",
+                    // Unique query text per row: dedup is on (query hash, cohort), so
+                    // distinct queries simulate the cohort-transition growth.
+                    queryText: `query ${i}`,
+                    cohortKey: "fp-a:0|fp-b:0",
+                    primaryResultIds: [],
+                    shadowResultIds: [],
+                    primaryLatencyMs: 1,
+                    shadowLatencyMs: 1,
+                    primaryFailed: false,
+                    shadowFailed: false,
+                    primaryModelId: "local-id",
+                    shadowModelId: "synapse-id",
+                    primaryFingerprint: "",
+                    shadowFingerprint: "fp-b",
+                    primaryEpoch: 0,
+                    shadowEpoch: 0,
+                    corpusHash: `corpus-${i}`,
+                    coverage: {},
+                },
+                cap,
+            );
         }
 
         const rows = listEmbeddingMeasurements(db, "ses-cap");
