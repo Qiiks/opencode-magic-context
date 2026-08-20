@@ -49,6 +49,9 @@ describe("compiled TUI runtime imports", () => {
      *  Built from the shared list so the test cannot cover fewer modules than the
      *  build rewrites. */
     async function loadExportSets(): Promise<Record<string, Set<string>>> {
+        // @opentui/core/testing subclasses a core export during module initialization;
+        // warm core before the parallel imports so Bun cannot expose its TDZ.
+        await import("@opentui/core");
         const entries = await Promise.all(
             TUI_RUNTIME_SPECIFIERS.map(
                 async (specifier) =>

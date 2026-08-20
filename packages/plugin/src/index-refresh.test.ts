@@ -14,6 +14,17 @@ describe("plugin model-limit cache warmup", () => {
     });
 });
 
+describe("historian timer fallback budget", () => {
+    test("counts a string fallback as one normalized model", () => {
+        const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+
+        expect(source).toMatch(
+            /resolveFallbackChain\(\s*pluginConfig\.historian\?\.fallback_models,?\s*\)\.length/,
+        );
+        expect(source).not.toContain("pluginConfig.historian?.fallback_models?.length");
+    });
+});
+
 describe("buildHiddenAgentConfig", () => {
     test("clamps maxSteps overrides above the hard cap", () => {
         const config = buildHiddenAgentConfig("prompt", ["read"], 40, { maxSteps: 100_000 });
