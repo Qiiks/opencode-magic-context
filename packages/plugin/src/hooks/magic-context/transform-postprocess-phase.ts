@@ -74,6 +74,7 @@ import {
     injectM0M1,
     type M0HardSignals,
     type M0M1State,
+    type MaterializeDecision,
     mustMaterialize,
     type PreparedCompartmentInjection,
     renderCompartmentInjection,
@@ -672,6 +673,10 @@ export interface PostTransformPhaseResult {
     /** True only when this pass consumed newly folded historian history. */
     historianFoldMaterializedThisPass: boolean;
     materializeReason: string | null;
+    systemHashPrev: string | null;
+    systemHashNew: string | null;
+    m0ModelKeyPrev: string | null;
+    m0ModelKeyNew: string | null;
     droppedTokens: number;
     emergencyReclaimedTokens: number;
     droppedCount: number;
@@ -902,6 +907,7 @@ export async function runPostTransformPhase(
     const m0CoverageBeforeFold =
         args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
     let m0MaterializeReason: string | null = null;
+    let m0ComparisonDecision: MaterializeDecision | null = null;
     if (foldDueDecision.value && args.m0M1) {
         try {
             // Persist the fold before opening mutation gates. Omitting messages
@@ -928,6 +934,9 @@ export async function runPostTransformPhase(
             );
             m0RematerializedThisPass = foldResult.m0RematerializedThisPass;
             m0MaterializeReason = foldResult.decision.reason;
+            if (foldResult.m0RematerializedThisPass) {
+                m0ComparisonDecision = foldResult.decision;
+            }
             try {
                 rearmChannel2AfterCoverageAdvancingHardFold({
                     db: args.db,
@@ -1534,6 +1543,9 @@ export async function runPostTransformPhase(
                 prependedMessageCount += result.prependedMessageCount;
                 m0RematerializedThisPass ||= result.m0RematerializedThisPass;
                 m0MaterializeReason = result.decision.reason ?? m0MaterializeReason;
+                if (result.m0RematerializedThisPass) {
+                    m0ComparisonDecision = result.decision;
+                }
                 sessionLog(
                     args.sessionId,
                     `transform: injected m[0]/m[1] (rematerialized=${result.m0RematerializedThisPass}, reason=${result.decision.reason ?? "cache_hit"})`,
@@ -2287,6 +2299,18 @@ export async function runPostTransformPhase(
         materialized,
         historianFoldMaterializedThisPass: historyWasConsumedThisPass,
         materializeReason,
+        systemHashPrev: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.systemHashPrev ?? null)
+            : null,
+        systemHashNew: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.systemHashNew ?? null)
+            : null,
+        m0ModelKeyPrev: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.m0ModelKeyPrev ?? null)
+            : null,
+        m0ModelKeyNew: m0RematerializedThisPass
+            ? (m0ComparisonDecision?.m0ModelKeyNew ?? null)
+            : null,
         droppedTokens,
         emergencyReclaimedTokens,
         droppedCount,

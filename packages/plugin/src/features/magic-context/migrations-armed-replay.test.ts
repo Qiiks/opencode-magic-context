@@ -364,6 +364,7 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
         case 76:
         case 77:
         case 78:
+        case 79:
             if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
             populateModuleOwnedRows(db, version, state);
             return;
@@ -382,9 +383,9 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
  *
  * Discriminating mutation record (2026-08-17; both mutants were removed):
  *
- * 1. Appended v79 at the end of MIGRATIONS. Its data mover used getNotes/updateNote
- *    to update the first populated smart note; the temporary v79 populate arm prevented
- *    the exhaustive-helper alarm from masking this property. `bun run typecheck` passed,
+ * 1. Appended a temporary migration at the then-current end of MIGRATIONS. Its data
+ *    mover used getNotes/updateNote to update the first populated smart note; the
+ *    temporary populate arm prevented the exhaustive-helper alarm from masking this property. `bun run typecheck` passed,
  *    and the existing empty-store authority controls stayed green (4 pass, 0 fail):
  *    `bun test src/features/magic-context/migrations-v71.test.ts`.
  *    This fence alone went red with the guarded migration write:

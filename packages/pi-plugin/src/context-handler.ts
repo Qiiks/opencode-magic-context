@@ -2956,6 +2956,18 @@ export function registerPiContextHandler(
 							result.materializeReason,
 							result.materialized,
 						),
+						systemHashPrev: result.materialized
+							? (result.injectionResult?.systemHashPrev ?? null)
+							: null,
+						systemHashNew: result.materialized
+							? (result.injectionResult?.systemHashNew ?? null)
+							: null,
+						m0ModelKeyPrev: result.materialized
+							? (result.injectionResult?.m0ModelKeyPrev ?? null)
+							: null,
+						m0ModelKeyNew: result.materialized
+							? (result.injectionResult?.m0ModelKeyNew ?? null)
+							: null,
 						emergency: result.emergency,
 						droppedTokens: result.droppedTokens,
 						droppedCount: result.droppedCount,
@@ -5415,6 +5427,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						m0Materialized: true,
 						m0Reason:
 							preFoldInjectionResult.m0Reason ?? wireInjectionResult.m0Reason,
+						systemHashPrev: preFoldInjectionResult.systemHashPrev ?? null,
+						systemHashNew: preFoldInjectionResult.systemHashNew ?? null,
+						m0ModelKeyPrev: preFoldInjectionResult.m0ModelKeyPrev ?? null,
+						m0ModelKeyNew: preFoldInjectionResult.m0ModelKeyNew ?? null,
 					}
 				: wireInjectionResult;
 			// Temporal markers are derived before history injection trims raw messages.
