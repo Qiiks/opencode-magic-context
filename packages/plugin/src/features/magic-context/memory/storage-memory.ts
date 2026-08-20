@@ -611,6 +611,14 @@ function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {
 }
 
 export function insertMemory(db: Database, input: MemoryInput): Memory {
+    // The "user" sourceType is reserved for FUTURE dashboard manual entry and
+    // must never be written by agent-originated paths (historian/dreamer/tool).
+    // Guard at the single write choke point so no caller can slip it through.
+    if (input.sourceType === "user") {
+        throw new Error(
+            `sourceType "user" is reserved for future dashboard manual entry and cannot be written by agent paths`,
+        );
+    }
     assertTsMemoryWriteAllowed(db, input.projectPath);
     const now = Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
