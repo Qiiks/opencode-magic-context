@@ -566,14 +566,33 @@ fn read_pi_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<PiSes
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
-    let header = parse_json_line(&lines.next()?.ok()?)?;
-    if header.get("type")?.as_str()? != "session" {
-        return None;
-    }
+    let mut title_slot = None;
+    let header = loop {
+        let line = lines.next()?.ok()?;
+        let Some(entry) = parse_json_line(&line) else {
+            continue;
+        };
+        match entry.get("type").and_then(Value::as_str) {
+            Some("title") => {
+                title_slot = entry
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(normalize_title)
+                    .filter(|title| !title.is_empty());
+            }
+            Some("session") => break entry,
+            _ => {}
+        }
+    };
 
     let mut message_count = 0u32;
     let mut first_message = String::new();
-    let mut session_name = None;
+    let mut session_name = header
+        .get("title")
+        .and_then(Value::as_str)
+        .map(normalize_title)
+        .filter(|title| !title.is_empty())
+        .or(title_slot);
     let mut last_activity_line = None;
     let mut has_usage_event = false;
 
@@ -1193,6 +1212,27 @@ mod tests {
         let detail = read_pi_session_detail(&path).unwrap();
         assert_eq!(detail.messages.len(), 2);
         assert_eq!(detail.messages[1].usage.as_ref().unwrap().total, 20);
+    }
+
+    #[test]
+    fn omp_title_slot_session_is_returned_by_scanner() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_path(
+            &dir,
+            r#"{"type":"title","v":1,"title":"OMP session title","source":"user","updatedAt":"2026-01-01T00:00:00.000Z"}
+{"type":"session","version":3,"id":"omp-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/omp-project"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hello from OMP"}}
+"#,
+        );
+
+        let sessions = scan_pi_session_dir_at(dir.path());
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "omp-1");
+        assert_eq!(
+            sessions[0].session_name.as_deref(),
+            Some("OMP session title")
+        );
     }
 
     #[test]
