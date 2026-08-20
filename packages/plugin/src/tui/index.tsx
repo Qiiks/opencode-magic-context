@@ -356,7 +356,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                             </box>
                             <R t={t()} l="Configured" v={s().cacheTtl} />
                             <R t={t()} l="Last response" v={s().lastResponseTime > 0 ? `${Math.round(elapsed() / 1000)}s ago` : "never"} />
-                            <R t={t()} l="Remaining" v={s().cacheExpired ? "expired" : s().cacheNeverExpires ? "never expires (always-warm lane)" : `${Math.round(s().cacheRemainingMs / 1000)}s`} fg={s().cacheExpired ? t().warning : t().textMuted} />
+                            <R t={t()} l="Remaining" v={s().cacheExpired ? "expired" : s().cacheNeverExpires ? "never (MC never assumes expiry — external cache-keep)" : `${Math.round(s().cacheRemainingMs / 1000)}s`} fg={s().cacheExpired ? t().warning : t().textMuted} />
                             <R t={t()} l="Auto-execute" v={s().cacheExpired ? "yes (expired)" : s().cacheNeverExpires ? `at ≥${formatThresholdPercent(s().executeThreshold)}%` : `at TTL or ≥${formatThresholdPercent(s().executeThreshold)}%`} fg={t().textMuted} />
                             <box marginTop={1}>
                                 <text fg={t().text}><b>Memory</b></text>

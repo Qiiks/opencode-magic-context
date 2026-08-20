@@ -1097,7 +1097,7 @@
     },
     "cache_ttl": {
       "default": "5m",
-      "description": "Cache TTL: string (e.g. \"5m\", \"1h\", \"30s\") or per-model object ({ default: \"5m\", \"model-id\": \"10m\" }). Set to \"never\" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.",
+      "description": "How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. \"5m\", \"1h\", \"30s\") or per-model object ({ default: \"5m\", \"model-id\": \"10m\" }). Set to \"never\" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).",
       "anyOf": [
         {
           "type": "string"

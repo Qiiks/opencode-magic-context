@@ -351,7 +351,7 @@ function renderInner(
 			s.cacheExpired
 				? theme.fg("warning", "expired")
 				: s.cacheRemainingMs === Number.POSITIVE_INFINITY
-					? "never expires (always-warm lane)"
+					? "never (MC never assumes expiry — external cache-keep)"
 					: `${Math.round(s.cacheRemainingMs / 1000)}s remaining`
 		}`,
 	);
