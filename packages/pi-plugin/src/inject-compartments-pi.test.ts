@@ -1682,6 +1682,11 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			expect(mustMaterializePi(switched, db)).toMatchObject({
 				value: true,
 				reason: "model_change",
+				mismatch: {
+					signal: "modelKey",
+					cached: "anthropic/opus",
+					current: "anthropic/sonnet",
+				},
 			});
 		} finally {
 			closeQuietly(db);
@@ -1706,6 +1711,11 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			expect(mustMaterializePi(changed, db)).toMatchObject({
 				value: true,
 				reason: "system_hash",
+				mismatch: {
+					signal: "systemHash",
+					cached: "sys-v1",
+					current: "sys-v2",
+				},
 			});
 		} finally {
 			closeQuietly(db);

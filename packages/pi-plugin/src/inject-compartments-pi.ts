@@ -2616,6 +2616,24 @@ export function injectM0M1Pi(
 		state.sessionId,
 		`injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`,
 	);
+	const comparison = decision.mismatch;
+	const systemHashPrev =
+		comparison?.signal === "systemHash" && typeof comparison.cached === "string"
+			? comparison.cached
+			: null;
+	const systemHashNew =
+		comparison?.signal === "systemHash" &&
+		typeof comparison.current === "string"
+			? comparison.current
+			: null;
+	const m0ModelKeyPrev =
+		comparison?.signal === "modelKey" && typeof comparison.cached === "string"
+			? comparison.cached
+			: null;
+	const m0ModelKeyNew =
+		comparison?.signal === "modelKey" && typeof comparison.current === "string"
+			? comparison.current
+			: null;
 	const memPath = memoryProjectPath(state);
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 	const memoryCount = memPath
@@ -2638,6 +2656,10 @@ export function injectM0M1Pi(
 		skippedVisibleMessages,
 		m0Materialized: materialized,
 		m0Reason: decision.reason,
+		systemHashPrev: materialized ? systemHashPrev : null,
+		systemHashNew: materialized ? systemHashNew : null,
+		m0ModelKeyPrev: materialized ? m0ModelKeyPrev : null,
+		m0ModelKeyNew: materialized ? m0ModelKeyNew : null,
 		m0Bytes: m0.length,
 		m1Bytes: m1.length,
 		contentionExhausted,
@@ -2665,4 +2687,10 @@ export interface PiInjectionResult {
 	factCount: number;
 	memoryCount: number;
 	skippedVisibleMessages: number;
+	/** Exact system-hash operands when that comparison caused materialization. */
+	systemHashPrev?: string | null;
+	systemHashNew?: string | null;
+	/** Exact canonical model-key operands when that comparison caused materialization. */
+	m0ModelKeyPrev?: string | null;
+	m0ModelKeyNew?: string | null;
 }

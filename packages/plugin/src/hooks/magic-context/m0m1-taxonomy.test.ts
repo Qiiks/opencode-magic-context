@@ -76,6 +76,10 @@ interface PassResult {
     m1: string;
     rematerialized: boolean;
     reason: string | null;
+    systemHashPrev: string | null;
+    systemHashNew: string | null;
+    m0ModelKeyPrev: string | null;
+    m0ModelKeyNew: string | null;
 }
 
 function pass(opts: {
@@ -101,6 +105,10 @@ function pass(opts: {
         m1: result.m1Text ?? "",
         rematerialized: result.m0RematerializedThisPass,
         reason: result.decision.reason,
+        systemHashPrev: result.decision.systemHashPrev ?? null,
+        systemHashNew: result.decision.systemHashNew ?? null,
+        m0ModelKeyPrev: result.decision.m0ModelKeyPrev ?? null,
+        m0ModelKeyNew: result.decision.m0ModelKeyNew ?? null,
     };
 }
 
@@ -167,6 +175,10 @@ describe("m[0]/m[1] materialization taxonomy", () => {
             hard: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
         });
         expect(hard.reason).toBe("model_change");
+        expect(hard.m0ModelKeyPrev).toBe("anthropic/opus");
+        expect(hard.m0ModelKeyNew).toBe("anthropic/sonnet");
+        expect(hard.systemHashPrev).toBeNull();
+        expect(hard.systemHashNew).toBeNull();
         expect(hard.rematerialized).toBe(true);
         // B is now folded into the m[0] baseline; m[1] resets to placeholder.
         expect(hard.m0).toContain("Bravo delta");
@@ -185,6 +197,10 @@ describe("m[0]/m[1] materialization taxonomy", () => {
             hard: { ...BASE_HARD, systemHash: "sys-v2" },
         });
         expect(hard.reason).toBe("system_hash");
+        expect(hard.systemHashPrev).toBe("sys-v1");
+        expect(hard.systemHashNew).toBe("sys-v2");
+        expect(hard.m0ModelKeyPrev).toBeNull();
+        expect(hard.m0ModelKeyNew).toBeNull();
         expect(hard.rematerialized).toBe(true);
     });
 

@@ -841,6 +841,12 @@ export interface M0M1RenderOptions {
 export interface MaterializeDecision {
     value: boolean;
     reason: string | null;
+    /** Present only when the system-hash operands triggered this decision. */
+    systemHashPrev?: string;
+    systemHashNew?: string;
+    /** Present only when the canonical model-key operands triggered this decision. */
+    m0ModelKeyPrev?: string;
+    m0ModelKeyNew?: string;
 }
 
 export interface MaterializeM0Result {
@@ -1550,10 +1556,21 @@ export function mustMaterialize(args: {
     const canonicalHardModelKey = piModelRefToCanonical(hard.modelKey);
     const canonicalCachedModelKey = piModelRefToCanonical(args.state.cachedM0ModelKey ?? "");
     if (canonicalHardModelKey !== "" && canonicalHardModelKey !== canonicalCachedModelKey) {
-        return { value: true, reason: "model_change" };
+        return {
+            value: true,
+            reason: "model_change",
+            m0ModelKeyPrev: canonicalCachedModelKey,
+            m0ModelKeyNew: canonicalHardModelKey,
+        };
     }
-    if (hard.systemHash !== "" && hard.systemHash !== (args.state.cachedM0SystemHash ?? "")) {
-        return { value: true, reason: "system_hash" };
+    const cachedSystemHash = args.state.cachedM0SystemHash ?? "";
+    if (hard.systemHash !== "" && hard.systemHash !== cachedSystemHash) {
+        return {
+            value: true,
+            reason: "system_hash",
+            systemHashPrev: cachedSystemHash,
+            systemHashNew: hard.systemHash,
+        };
     }
     // Idle > TTL: the provider evicted the cache while the user was away. Guard
     // for idempotence across a multi-pass "came back" turn: cacheExpired stays

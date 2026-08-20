@@ -93,7 +93,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 78;
+export const LATEST_SUPPORTED_VERSION = 79;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1569,6 +1569,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       decision           TEXT    NOT NULL,
       materialized       INTEGER NOT NULL DEFAULT 0,
       materialize_reason TEXT,
+      system_hash_prev   TEXT,
+      system_hash_new    TEXT,
+      m0_model_key_prev  TEXT,
+      m0_model_key_new   TEXT,
       emergency          INTEGER NOT NULL DEFAULT 0,
       dropped_tokens     INTEGER NOT NULL DEFAULT 0,
       dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -2022,6 +2026,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         decision           TEXT    NOT NULL,
         materialized       INTEGER NOT NULL DEFAULT 0,
         materialize_reason TEXT,
+        system_hash_prev   TEXT,
+        system_hash_new    TEXT,
+        m0_model_key_prev  TEXT,
+        m0_model_key_new   TEXT,
         emergency          INTEGER NOT NULL DEFAULT 0,
         dropped_tokens     INTEGER NOT NULL DEFAULT 0,
         dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -2031,6 +2039,15 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
         ON transform_decisions(session_id, harness);
     `);
+
+    // transform_decisions existed before comparison telemetry was introduced.
+    // Keep the boot-time backfill alongside the fresh CREATE definition so
+    // databases opened by a newer runtime before migration replay still accept
+    // the telemetry writer. NULL means no comparison ran on that pass.
+    ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+    ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+    ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+    ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
 
     // NULL-column healing runs in migration v5 and again in v51 to repair
     // databases where the old v5 healer swallowed a transient write error.

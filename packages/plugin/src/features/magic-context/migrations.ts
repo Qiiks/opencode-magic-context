@@ -2818,6 +2818,21 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 79,
+        description: "record m[0] system-hash and model-key comparison telemetry",
+        up(db: Database): void {
+            // These values are evidence for an already-made materialization
+            // comparison, not current cache state. Keep historical rows NULL:
+            // NULL means the pass made no comparison, while an empty string is a
+            // valid operand from a compared but uninitialized cached marker.
+            if (!tableExists(db, "transform_decisions")) return;
+            ensureColumn(db, "transform_decisions", "system_hash_prev", "TEXT");
+            ensureColumn(db, "transform_decisions", "system_hash_new", "TEXT");
+            ensureColumn(db, "transform_decisions", "m0_model_key_prev", "TEXT");
+            ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
+        },
+    },
 ];
 
 /**
