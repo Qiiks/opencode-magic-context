@@ -64,6 +64,7 @@ import { setKeepSubagents } from "./shared/keep-subagents";
 import { log } from "./shared/logger";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
+import { resolveFallbackChain } from "./shared/resolve-fallbacks";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
@@ -374,11 +375,9 @@ const server: Plugin = async (ctx) => {
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
                 historianChildSweep: {
                     timeoutMs: pluginConfig.historian_timeout_ms,
-                    fallbackModelCount: Array.isArray(pluginConfig.historian?.fallback_models)
-                        ? pluginConfig.historian.fallback_models.length
-                        : pluginConfig.historian?.fallback_models
-                          ? 1
-                          : 0,
+                    fallbackModelCount: resolveFallbackChain(
+                        pluginConfig.historian?.fallback_models,
+                    ).length,
                     keepSubagents: pluginConfig.keep_subagents === true,
                 },
                 mural: pluginConfig.mural,
