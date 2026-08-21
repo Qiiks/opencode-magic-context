@@ -208,6 +208,7 @@ describe("surface-condition compiler", () => {
             {
                 projectPath: home,
                 homeDirectory: home,
+                dataDirectory: join(home, ".local", "share"),
                 now: () => 123,
             },
         );
