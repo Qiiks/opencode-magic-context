@@ -257,6 +257,13 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			"Housekeeping: ~50k of this session's ~128k window",
 		);
 		expect(
+			db
+				.prepare(
+					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+				)
+				.get(SESSION),
+		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":10}' });
+		expect(
 			maybeChannel1ReminderForToolResult({
 				db,
 				sessionId: SESSION,
@@ -277,6 +284,13 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		);
 		expect(sticky?.text).not.toContain("Not a limit");
 		expect(
+			db
+				.prepare(
+					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+				)
+				.get(SESSION),
+		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":12}' });
+		expect(
 			maybeChannel1ReminderForToolResult({
 				db,
 				sessionId: SESSION,
@@ -296,6 +310,13 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		expect(escalation?.text).not.toContain(
 			"Reminder: ctx_reduce housekeeping still pending",
 		);
+		expect(
+			db
+				.prepare(
+					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+				)
+				.get(SESSION),
+		).toEqual({ last_nudge_level: '{"level":"urgent","ordinal":13}' });
 		clearPiChannel1State(SESSION);
 	});
 });

@@ -15,13 +15,13 @@ describe("plugin model-limit cache warmup", () => {
 });
 
 describe("historian timer fallback budget", () => {
-    test("counts a string fallback as one normalized model", () => {
+    test("uses the resolved OpenCode fallback chain length", () => {
         const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
 
         expect(source).toMatch(
-            /resolveFallbackChain\(\s*pluginConfig\.historian\?\.fallback_models,?\s*\)\.length/,
+            /fallbackModelCount:\s*resolveHistorianModel\(\s*pluginConfig,\s*"opencode",?\s*\)\.fallbacks\s*\.length,/,
         );
-        expect(source).not.toContain("pluginConfig.historian?.fallback_models?.length");
+        expect(source).not.toContain("pluginConfig.historian?.fallback_models");
     });
 });
 

@@ -12,8 +12,8 @@ import {
 	acquireWrapupInProgress,
 	addNote,
 	appendNoteNudgeAnchor,
+	getChannel1NudgeState,
 	getHistorianFailureState,
-	getLastNudgeLevel,
 	getLastNudgeUndropped,
 	getNoteNudgeAnchors,
 	getOrCreateSessionMeta,
@@ -24,7 +24,7 @@ import {
 	incrementHistorianFailure,
 	insertTag,
 	queuePendingOp,
-	setLastNudgeLevel,
+	setChannel1NudgeState,
 	setLastNudgeUndropped,
 	setPendingPiCompactionMarkerState,
 	updateCavemanDepth,
@@ -1378,7 +1378,7 @@ describe("registerPiContextHandler", () => {
 		try {
 			const sessionId = "ses-pi-band-reset";
 			setLastNudgeUndropped(db, sessionId, 80_000);
-			setLastNudgeLevel(db, sessionId, "urgent");
+			setChannel1NudgeState(db, sessionId, { level: "urgent", ordinal: 12 });
 
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
@@ -1395,7 +1395,17 @@ describe("registerPiContextHandler", () => {
 			);
 
 			expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
-			expect(getLastNudgeLevel(db, sessionId)).toBe("");
+			expect(getChannel1NudgeState(db, sessionId)).toEqual({
+				level: "",
+				ordinal: 0,
+			});
+			expect(
+				db
+					.prepare(
+						"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
+					)
+					.get(sessionId),
+			).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
 		} finally {
 			closeQuietly(db);
 		}

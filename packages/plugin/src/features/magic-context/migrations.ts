@@ -2846,15 +2846,6 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
         },
     },
-    {
-        version: 81,
-        description: "persist Channel-1 last-fire level and message ordinal for reminder dampening",
-        up(db: Database): void {
-            if (!tableExists(db, "session_meta")) return;
-            ensureColumn(db, "session_meta", "channel1_last_fire_level", "TEXT DEFAULT ''");
-            ensureColumn(db, "session_meta", "channel1_last_fire_ordinal", "INTEGER DEFAULT 0");
-        },
-    },
 ];
 
 /**

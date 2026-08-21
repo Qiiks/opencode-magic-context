@@ -24,14 +24,12 @@ import {
 	casChannel2NudgeClaim,
 	casChannel2NudgeState,
 	claimChannel2NudgeState,
+	getChannel1NudgeState,
 	getChannel2NudgeClaim,
 	getChannel2NudgeState,
-	getChannel1LastFire,
-	getLastNudgeLevel,
 	getLastNudgeUndropped,
 	resetLastNudgeCycle,
-	setChannel1LastFire,
-	setLastNudgeLevel,
+	setChannel1NudgeState,
 	setLastNudgeUndropped,
 } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -40,11 +38,12 @@ import {
 	CHANNEL1_SENTINEL,
 	decideChannel1,
 	evaluateChannel2,
-	shouldUseStickyChannel1Reminder,
 	type Channel1State as SharedChannel1State,
+	shouldUseStickyChannel1Reminder,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+
 import { measurePiToolResultDelta } from "./tail-hygiene-walk-pi";
 
 export type Channel1State = SharedChannel1State;
@@ -142,21 +141,26 @@ export function maybeChannel1ReminderForToolResult(args: {
 	if (deltaTokens === 0) return null;
 	state.turnDeltaT += deltaTokens;
 
+	const nudgeState = getChannel1NudgeState(db, sessionId);
 	const decision = decideChannel1({
 		...state,
 		lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
-		lastNudgeLevel: getLastNudgeLevel(db, sessionId),
+		lastNudgeLevel: nudgeState.level,
 		hasRecentReduce: state.reducedSinceRefresh,
 	});
 
 	setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
-	setLastNudgeLevel(db, sessionId, decision.nextLastNudgeLevel);
-	if (!decision.fire) return null;
+	if (!decision.fire) {
+		setChannel1NudgeState(db, sessionId, {
+			...nudgeState,
+			level: decision.nextLastNudgeLevel,
+		});
+		return null;
+	}
 
-	const lastFire = getChannel1LastFire(db, sessionId);
 	const sticky = shouldUseStickyChannel1Reminder({
-		lastLevel: lastFire.level,
-		lastOrdinal: lastFire.ordinal,
+		lastLevel: nudgeState.level,
+		lastOrdinal: nudgeState.ordinal,
 		level: decision.level,
 		currentOrdinal: state.messageOrdinal,
 	});
@@ -170,7 +174,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 			sticky,
 		),
 	};
-	setChannel1LastFire(db, sessionId, {
+	setChannel1NudgeState(db, sessionId, {
 		level: decision.level,
 		ordinal: state.messageOrdinal,
 	});

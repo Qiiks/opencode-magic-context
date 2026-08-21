@@ -13,12 +13,10 @@ import {
     clearEmergencyDropSample,
     clearEmergencyRecovery,
     clearHistorianFailureState,
-    getChannel1LastFire,
-    getLastNudgeLevel,
+    getChannel1NudgeState,
     getLastNudgeUndropped,
     resetLastNudgeCycle,
-    setChannel1LastFire,
-    setLastNudgeLevel,
+    setChannel1NudgeState,
     setLastNudgeUndropped,
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
@@ -483,27 +481,32 @@ function maybeInjectChannel1Nudge(
 
     if (state.reducedSinceRefresh) return;
 
+    const nudgeState = getChannel1NudgeState(args.db, sessionId);
     const decision = decideChannel1({
         baselineU: state.baselineU,
         baselineT: state.baselineT,
         turnDeltaU: state.turnDeltaU,
         turnDeltaT: state.turnDeltaT,
         lastNudgeUndropped: getLastNudgeUndropped(args.db, sessionId),
-        lastNudgeLevel: getLastNudgeLevel(args.db, sessionId),
+        lastNudgeLevel: nudgeState.level,
         hasRecentReduce: false,
         evaluable: state.evaluable,
         generationInvalidated: state.generationInvalidated,
     });
 
-    // Always persist the cadence + band state so a reduce-driven drop re-arms it.
+    // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);
-    setLastNudgeLevel(args.db, sessionId, decision.nextLastNudgeLevel);
-    if (!decision.fire) return;
+    if (!decision.fire) {
+        setChannel1NudgeState(args.db, sessionId, {
+            ...nudgeState,
+            level: decision.nextLastNudgeLevel,
+        });
+        return;
+    }
 
-    const lastFire = getChannel1LastFire(args.db, sessionId);
     const sticky = shouldUseStickyChannel1Reminder({
-        lastLevel: lastFire.level,
-        lastOrdinal: lastFire.ordinal,
+        lastLevel: nudgeState.level,
+        lastOrdinal: nudgeState.ordinal,
         level: decision.level,
         currentOrdinal: state.messageOrdinal,
     });
@@ -514,7 +517,7 @@ function maybeInjectChannel1Nudge(
         state.oldestReclaimableToolTags,
         sticky,
     );
-    setChannel1LastFire(args.db, sessionId, {
+    setChannel1NudgeState(args.db, sessionId, {
         level: decision.level,
         ordinal: state.messageOrdinal,
     });
