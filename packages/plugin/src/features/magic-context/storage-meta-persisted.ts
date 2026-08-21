@@ -978,9 +978,8 @@ export function clearEmergencyDropSample(db: Database, sessionId: string): void 
 
 // ---- Channel 1 (in-turn tool-output ctx_reduce nudge) cadence + band state ----
 // `last_nudge_undropped` records the `undropped` estimate when Channel 1 last
-// fired; `last_nudge_level` records the highest band already surfaced in the
-// current cycle. Both reset after ctx_reduce so the next accumulation can start
-// a fresh gentle→firm→urgent sequence without repeating the same band.
+// fired. The existing `last_nudge_level` scalar holds the paired level and last
+// fire ordinal as JSON, so no schema change is needed for dampening.
 export type PersistedChannel1NudgeLevel = "" | "gentle" | "firm" | "urgent";
 
 interface PersistedLastNudgeUndroppedRow {
@@ -991,15 +990,12 @@ interface PersistedLastNudgeLevelRow {
     last_nudge_level: string;
 }
 
-export interface PersistedChannel1LastFire {
+export interface PersistedChannel1NudgeState {
     level: PersistedChannel1NudgeLevel;
     ordinal: number;
 }
 
-interface PersistedChannel1LastFireRow {
-    channel1_last_fire_level: string;
-    channel1_last_fire_ordinal: number;
-}
+const EMPTY_CHANNEL1_NUDGE_STATE: PersistedChannel1NudgeState = { level: "", ordinal: 0 };
 
 function isLastNudgeUndroppedRow(row: unknown): row is PersistedLastNudgeUndroppedRow {
     return (
@@ -1017,17 +1013,33 @@ function isLastNudgeLevelRow(row: unknown): row is PersistedLastNudgeLevelRow {
     );
 }
 
-function isChannel1LastFireRow(row: unknown): row is PersistedChannel1LastFireRow {
-    return (
-        typeof row === "object" &&
-        row !== null &&
-        typeof (row as PersistedChannel1LastFireRow).channel1_last_fire_level === "string" &&
-        typeof (row as PersistedChannel1LastFireRow).channel1_last_fire_ordinal === "number"
-    );
+function normalizeLastNudgeLevel(value: unknown): PersistedChannel1NudgeLevel {
+    return value === "gentle" || value === "firm" || value === "urgent" ? value : "";
 }
 
-function normalizeLastNudgeLevel(value: string): PersistedChannel1NudgeLevel {
-    return value === "gentle" || value === "firm" || value === "urgent" ? value : "";
+function parseChannel1NudgeState(raw: string): PersistedChannel1NudgeState {
+    try {
+        const parsed = JSON.parse(raw) as { level?: unknown; ordinal?: unknown };
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+            return {
+                level: normalizeLastNudgeLevel(parsed.level),
+                ordinal:
+                    typeof parsed.ordinal === "number"
+                        ? Math.max(0, Math.round(parsed.ordinal))
+                        : 0,
+            };
+        }
+    } catch {
+        // Legacy rows stored only the cadence level as a scalar.
+    }
+    return { level: normalizeLastNudgeLevel(raw), ordinal: 0 };
+}
+
+function serializeChannel1NudgeState(value: PersistedChannel1NudgeState): string {
+    return JSON.stringify({
+        level: normalizeLastNudgeLevel(value.level),
+        ordinal: Math.max(0, Math.round(value.ordinal)),
+    });
 }
 
 export function getLastNudgeUndropped(db: Database, sessionId: string): number {
@@ -1047,52 +1059,27 @@ export function setLastNudgeUndropped(db: Database, sessionId: string, value: nu
     })();
 }
 
-export function getLastNudgeLevel(db: Database, sessionId: string): PersistedChannel1NudgeLevel {
+export function getChannel1NudgeState(
+    db: Database,
+    sessionId: string,
+): PersistedChannel1NudgeState {
     const result = db
         .prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?")
         .get(sessionId);
-    return isLastNudgeLevelRow(result) ? normalizeLastNudgeLevel(result.last_nudge_level) : "";
+    return isLastNudgeLevelRow(result)
+        ? parseChannel1NudgeState(result.last_nudge_level)
+        : EMPTY_CHANNEL1_NUDGE_STATE;
 }
 
-export function setLastNudgeLevel(
+export function setChannel1NudgeState(
     db: Database,
     sessionId: string,
-    value: PersistedChannel1NudgeLevel,
+    value: PersistedChannel1NudgeState,
 ): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
-            normalizeLastNudgeLevel(value),
-            sessionId,
-        );
-    })();
-}
-
-export function getChannel1LastFire(db: Database, sessionId: string): PersistedChannel1LastFire {
-    const result = db
-        .prepare(
-            "SELECT channel1_last_fire_level, channel1_last_fire_ordinal FROM session_meta WHERE session_id = ?",
-        )
-        .get(sessionId);
-    if (!isChannel1LastFireRow(result)) return { level: "", ordinal: 0 };
-    return {
-        level: normalizeLastNudgeLevel(result.channel1_last_fire_level),
-        ordinal: Math.max(0, Math.round(result.channel1_last_fire_ordinal)),
-    };
-}
-
-export function setChannel1LastFire(
-    db: Database,
-    sessionId: string,
-    value: PersistedChannel1LastFire,
-): void {
-    db.transaction(() => {
-        ensureSessionMetaRow(db, sessionId);
-        db.prepare(
-            "UPDATE session_meta SET channel1_last_fire_level = ?, channel1_last_fire_ordinal = ? WHERE session_id = ?",
-        ).run(
-            normalizeLastNudgeLevel(value.level),
-            Math.max(0, Math.round(value.ordinal)),
+            serializeChannel1NudgeState(value),
             sessionId,
         );
     })();
@@ -1102,8 +1089,8 @@ export function resetLastNudgeCycle(db: Database, sessionId: string): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         db.prepare(
-            "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = '', channel1_last_fire_level = '', channel1_last_fire_ordinal = 0 WHERE session_id = ?",
-        ).run(sessionId);
+            "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = ? WHERE session_id = ?",
+        ).run(serializeChannel1NudgeState(EMPTY_CHANNEL1_NUDGE_STATE), sessionId);
     })();
 }
 
@@ -1126,9 +1113,13 @@ export function resetLastNudgeCycleIfTailShrank(
         ensureSessionMetaRow(db, sessionId);
         const result = db
             .prepare(
-                "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = '', channel1_last_fire_level = '', channel1_last_fire_ordinal = 0 WHERE session_id = ? AND last_nudge_undropped > ?",
+                "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = ? WHERE session_id = ? AND last_nudge_undropped > ?",
             )
-            .run(sessionId, Math.max(0, Math.round(measuredUndropped)));
+            .run(
+                serializeChannel1NudgeState(EMPTY_CHANNEL1_NUDGE_STATE),
+                sessionId,
+                Math.max(0, Math.round(measuredUndropped)),
+            );
         changed = (result.changes ?? 0) > 0;
     })();
     return changed;

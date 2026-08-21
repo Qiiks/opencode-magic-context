@@ -62,10 +62,9 @@ import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { log } from "./shared/logger";
-import { resolveOpenCodeAgentOverrides } from "./shared/model-resolution";
+import { resolveHistorianModel, resolveOpenCodeAgentOverrides } from "./shared/model-resolution";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
-import { resolveFallbackChain } from "./shared/resolve-fallbacks";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
@@ -377,9 +376,8 @@ const server: Plugin = async (ctx) => {
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
                 historianChildSweep: {
                     timeoutMs: pluginConfig.historian_timeout_ms,
-                    fallbackModelCount: resolveFallbackChain(
-                        pluginConfig.historian?.fallback_models,
-                    ).length,
+                    fallbackModelCount: resolveHistorianModel(pluginConfig, "opencode").fallbacks
+                        .length,
                     keepSubagents: pluginConfig.keep_subagents === true,
                 },
                 mural: pluginConfig.mural,
