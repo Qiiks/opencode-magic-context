@@ -64,7 +64,11 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
         );
         expect(primed.inputCount).toBeGreaterThan(1_000);
         expect(primed.servedFrom).toBe("transform");
-        expect(primed.transportPages).toBeGreaterThan(1);
+        // Priming can reuse the caller-owned native tail in one request or page a full
+        // retransmission. This phase establishes module state; the large delta below
+        // separately proves that provider-visible tail content survives either path.
+        expect(primed.transportPages).toBeGreaterThanOrEqual(1);
+        expect(primed.transportPages).toBeLessThanOrEqual(6);
 
         let settled = primed;
         for (let probe = 0; !settled.applied && probe < 3; probe += 1) {
