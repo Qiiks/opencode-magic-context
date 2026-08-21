@@ -1762,6 +1762,7 @@ impl PendingOverlayDecisions {
 
 struct Channel1NudgeInputs<'a, 'ctx> {
     ctx: &'a ProducerContext<'ctx>,
+    usable_window_tokens: i64,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
@@ -5162,6 +5163,7 @@ fn apply_once(
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 ctx,
+                usable_window_tokens: context_limit_tokens.round() as i64,
                 core: &core,
                 projection: &projection,
                 tag_rows: &hygiene_tag_rows,
@@ -5353,6 +5355,7 @@ fn apply_once(
         &req.channel2_nudge_state,
         ctx.now_ms,
         Channel2DirectiveInput {
+            usable_window_tokens: context_limit_tokens.round() as i64,
             core: &core,
             projection: &projection,
             tag_rows: &hygiene_tag_rows,
@@ -9013,6 +9016,15 @@ fn maybe_append_channel1_nudge(
         input.tag_rows,
         input.mutation_exempt_mid,
     );
+    let measured_reclaimable = input
+        .baseline
+        .map_or(0, |baseline| effective_tail_hygiene(baseline).0);
+    let cycle_reset = meta.channel1_reduce_suppressed
+        || measured_reclaimable < meta.channel1_last_nudge_undropped.max(0);
+    if cycle_reset {
+        meta.channel1_last_fire_level.clear();
+        meta.channel1_last_fire_ordinal = 0;
+    }
     let decision = decide_channel1(input.baseline, meta);
     meta.channel1_last_nudge_undropped = decision.next_last_nudge;
     meta.channel1_last_nudge_level = decision.next_last_level;
@@ -9034,7 +9046,29 @@ fn maybe_append_channel1_nudge(
         input.mutation_exempt_mid,
     )?;
     let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags);
-    let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
+    let current_ordinal = input
+        .projection
+        .blocks
+        .iter()
+        .filter(|block| !block.synthetic)
+        .map(|block| block.ordinal)
+        .max()
+        .unwrap_or(0);
+    let sticky = should_use_sticky_channel1_reminder(
+        &meta.channel1_last_fire_level,
+        meta.channel1_last_fire_ordinal,
+        decision.level,
+        current_ordinal,
+    );
+    let reminder = build_channel1_reminder(
+        decision.level,
+        decision.reclaimable_tokens,
+        input.usable_window_tokens,
+        &hint,
+        sticky,
+    );
+    meta.channel1_last_fire_level = decision.level.as_str().to_string();
+    meta.channel1_last_fire_ordinal = current_ordinal;
     Some(Channel1AppendRow {
         block_id,
         reminder_text: reminder,
@@ -9183,7 +9217,9 @@ fn active_tags_for_channel2(
     derived
 }
 
+#[derive(Clone, Copy)]
 struct Channel2DirectiveInput<'a> {
+    usable_window_tokens: i64,
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
@@ -9225,6 +9261,7 @@ fn channel2_directives(
                     channel2_nudge: Some(Channel2NudgeDirective {
                         text: build_channel2_host_reminder(
                             pressure.reclaimable_tokens,
+                            input.usable_window_tokens,
                             &pressure.hint,
                         ),
                     }),
@@ -9358,7 +9395,11 @@ fn claude_code_channel2_directive(
 
     let arming_watermark = meta.channel2_arming_watermark.saturating_add(1);
     let pending = PendingChannel2Directive {
-        text: build_channel2_reminder_text(pressure.reclaimable_tokens, &pressure.hint),
+        text: build_channel2_reminder_text(
+            pressure.reclaimable_tokens,
+            input.usable_window_tokens,
+            &pressure.hint,
+        ),
         directive_id: channel2_directive_id(session_id, arming_watermark),
         armed_at_ms: now_ms,
         arming_watermark,
@@ -9417,16 +9458,25 @@ fn oldest_channel2_hint(
         .collect()
 }
 
-fn build_channel2_reminder_text(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
+fn build_channel2_reminder_text(
+    reclaimable_tokens: i64,
+    usable_window_tokens: i64,
+    hint: &[(i64, String)],
+) -> String {
     let amount = approx_thousands(reclaimable_tokens);
+    let usable_window = approx_thousands(usable_window_tokens);
     let hint_text = format_reclaimable_hint(hint);
     format!(
-        "Routine context housekeeping is near: a large span of this session will be comparted soon, and ~{amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce first so the archived span is the part that matters.{hint_text}"
+        "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~{amount} of ~{usable_window} reclaimable).{hint_text}"
     )
 }
 
-fn build_channel2_host_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
-    let text = build_channel2_reminder_text(reclaimable_tokens, hint);
+fn build_channel2_host_reminder(
+    reclaimable_tokens: i64,
+    usable_window_tokens: i64,
+    hint: &[(i64, String)],
+) -> String {
+    let text = build_channel2_reminder_text(reclaimable_tokens, usable_window_tokens, hint);
     format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
@@ -9622,6 +9672,43 @@ mod nudge_formula_tests {
     }
 
     #[test]
+    fn reminder_wording_uses_the_usable_window_and_keeps_gentle_number_free() {
+        let gentle = build_channel1_reminder(Channel1Level::Gentle, 42_000, 128_000, &[], false);
+        assert!(gentle.contains("Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope."));
+        assert!(!gentle.chars().any(|character| character.is_ascii_digit()));
+
+        let firm = build_channel1_reminder(Channel1Level::Firm, 42_000, 128_000, &[], false);
+        assert!(firm.contains("Housekeeping: ~42k of this session's ~128k window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."));
+        let urgent = build_channel1_reminder(Channel1Level::Urgent, 61_000, 128_000, &[], false);
+        assert!(urgent.contains("Housekeeping backlog: ~61k of this session's ~128k window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."));
+
+        let channel2 = build_channel2_reminder_text(55_000, 128_000, &[]);
+        assert_eq!(channel2, "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~55k of ~128k reclaimable).");
+    }
+
+    #[test]
+    fn same_level_refires_dampen_but_escalations_keep_the_full_body() {
+        assert!(should_use_sticky_channel1_reminder(
+            "firm",
+            10,
+            Channel1Level::Firm,
+            13,
+        ));
+        assert!(!should_use_sticky_channel1_reminder(
+            "firm",
+            10,
+            Channel1Level::Urgent,
+            11,
+        ));
+        let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 128_000, &[], true);
+        assert!(sticky.contains("Reminder: ctx_reduce housekeeping still pending —"));
+        assert!(!sticky.contains("Not a limit"));
+        let escalation =
+            build_channel1_reminder(Channel1Level::Urgent, 80_000, 128_000, &[], false);
+        assert!(escalation.contains("Housekeeping backlog:"));
+    }
+
+    #[test]
     fn channel2_aggregate_uses_persisted_all_class_walk_and_holds_invalid_baselines() {
         let measured = baseline(60_000, 90_000);
         assert_eq!(
@@ -9678,6 +9765,7 @@ mod nudge_formula_tests {
             None,
             10 + CHANNEL2_DIRECTIVE_LEASE_TTL_MS,
             Channel2DirectiveInput {
+                usable_window_tokens: 128_000,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tags,
@@ -9697,6 +9785,7 @@ mod nudge_formula_tests {
             Some(&delivered_id),
             20,
             Channel2DirectiveInput {
+                usable_window_tokens: 128_000,
                 core: &core,
                 projection: &projection,
                 tag_rows: &tags,
@@ -9779,22 +9868,44 @@ fn oldest_reclaimable_hint(
     candidates
 }
 
+const CHANNEL1_STICKY_ORDINAL_GAP: u64 = 3;
+
+fn should_use_sticky_channel1_reminder(
+    last_level: &str,
+    last_ordinal: u64,
+    level: Channel1Level,
+    current_ordinal: u64,
+) -> bool {
+    last_level == level.as_str()
+        && last_ordinal > 0
+        && current_ordinal >= last_ordinal
+        && current_ordinal - last_ordinal <= CHANNEL1_STICKY_ORDINAL_GAP
+}
+
 fn build_channel1_reminder(
     level: Channel1Level,
     reclaimable_tokens: i64,
+    usable_window_tokens: i64,
     hint: &[(i64, String)],
+    sticky: bool,
 ) -> String {
-    let amount = approx_thousands(reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
+    if sticky {
+        return format!(
+            "\n\n<system-reminder>\nReminder: ctx_reduce housekeeping still pending —{hint_text}\n</system-reminder>"
+        );
+    }
+
+    let amount = approx_thousands(reclaimable_tokens);
+    let usable_window = approx_thousands(usable_window_tokens);
     let body = match level {
-        Channel1Level::Gentle => format!(
-            "You have ~{amount} tokens of tool output you have not reduced. When you are done with earlier outputs, dropping them with ctx_reduce keeps context lean."
-        ),
+        Channel1Level::Gentle =>
+            "Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.".to_string(),
         Channel1Level::Firm => format!(
-            "~{amount} tokens of unreduced tool output has built up. At your next natural stopping point, consider dropping what you have already processed with ctx_reduce."
+            "Housekeeping: ~{amount} of this session's ~{usable_window} window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."
         ),
         Channel1Level::Urgent => format!(
-            "~{amount} tokens of unreduced tool output remain, and a large span of this session will be comparted before long. Consider dropping spent outputs with ctx_reduce so the archived span is the part that matters."
+            "Housekeeping backlog: ~{amount} of this session's ~{usable_window} window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."
         ),
     };
     format!("\n\n<system-reminder>\n{body}{hint_text}\n</system-reminder>")
@@ -25201,19 +25312,46 @@ pub(crate) mod tests {
             assert_eq!(tail_bytes(&replay, "result2"), first_result);
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
+            let mut refire_meta = s.load("nudge").unwrap();
+            refire_meta.meta.channel1_last_nudge_undropped = 0;
+            s.commit(
+                "nudge",
+                refire_meta.row_version,
+                &refire_meta.core,
+                &refire_meta.meta,
+            )
+            .unwrap();
+
+            let mut refire_messages = messages;
+            refire_messages.push(assistant_tool_call("call3", 5, "c3"));
+            refire_messages.push(tool_result("result3", 6, "c3", &huge));
+            let mut refire_request = active_cc_req("nudge", "cfg0", refire_messages.clone());
+            refire_request.protected_tags = 0;
+            let refire_request = with_usage(refire_request, 900, 1024);
+            let sticky = run(&s, &refire_request, &spine());
+            let sticky_result = tail_bytes(&sticky, "result3").to_string();
+            assert!(
+                sticky_result.contains("Reminder: ctx_reduce housekeeping still pending —"),
+                "expected sticky refire, got {sticky_result}"
+            );
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+            let sticky_replay = run(&s, &refire_request, &spine());
+            assert_eq!(tail_bytes(&sticky_replay, "result3"), sticky_result);
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+
             let mut loaded = s.load("nudge").unwrap();
             loaded.meta.channel1_reduce_suppressed = true;
             s.commit("nudge", loaded.row_version, &loaded.core, &loaded.meta)
                 .unwrap();
-            let mut extended_messages = messages;
-            extended_messages.push(assistant_tool_call("call3", 5, "c3"));
-            extended_messages.push(tool_result("result3", 6, "c3", &huge));
-            let mut extended_request = active_cc_req("nudge", "cfg0", extended_messages);
-            extended_request.protected_tags = 0;
-            let suppressed = run(&s, &with_usage(extended_request, 900, 1024), &spine());
+            refire_messages.push(assistant_tool_call("call4", 7, "c4"));
+            refire_messages.push(tool_result("result4", 8, "c4", &huge));
+            let mut suppressed_request = active_cc_req("nudge", "cfg0", refire_messages);
+            suppressed_request.protected_tags = 0;
+            let suppressed = run(&s, &with_usage(suppressed_request, 900, 1024), &spine());
             assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
-            assert!(!tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            assert!(tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
+            assert!(!tail_bytes(&suppressed, "result4").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
         });
     }
 

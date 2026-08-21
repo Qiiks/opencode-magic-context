@@ -9,6 +9,7 @@ import {
     channel1RefireTokens,
     decideChannel1,
     evaluateChannel2,
+    shouldUseStickyChannel1Reminder,
 } from "./ctx-reduce-nudge";
 
 describe("decideChannel1 — agent-tail hygiene ratio", () => {
@@ -176,22 +177,60 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
 });
 
 describe("reminder rendering", () => {
-    it("renders the passive reminder and amount", () => {
-        const reminder = buildChannel1Reminder("firm", 42_000, [
+    it("renders the user-approved gentle body without numbers", () => {
+        const reminder = buildChannel1Reminder("gentle", 42_000, 128_000);
+        expect(reminder).toContain(
+            "Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.",
+        );
+        expect(reminder).not.toMatch(/\d/);
+    });
+
+    it("renders firm and urgent denominators plus the unchanged hint line", () => {
+        const firm = buildChannel1Reminder("firm", 42_000, 128_000, [
             { tagNumber: 123, toolName: "read" },
             { tagNumber: 145, toolName: null },
         ]);
-        expect(reminder).toContain("<system-reminder>");
-        expect(reminder).toContain("</system-reminder>");
-        expect(reminder).toContain("~42k");
-        expect(reminder).toContain("oldest reclaimable: §123§ read · §145§ tool.");
+        expect(firm).toContain(
+            "Housekeeping: ~42k of this session's ~128k window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way.",
+        );
+        expect(firm).toContain("oldest reclaimable: §123§ read · §145§ tool.");
+
+        const urgent = buildChannel1Reminder("urgent", 61_000, 128_000);
+        expect(urgent).toContain(
+            "Housekeeping backlog: ~61k of this session's ~128k window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope.",
+        );
     });
 
-    it("renders the Channel-2 carrier", () => {
-        const reminder = buildChannel2Reminder(55_000);
-        expect(reminder).toContain("<system-reminder>");
-        expect(reminder).toContain("~55k");
-        expect(reminder).toContain("ctx_reduce");
+    it("renders the user-approved Channel-2 carrier with its denominator", () => {
+        const reminder = buildChannel2Reminder(55_000, 128_000);
+        expect(reminder).toContain(
+            "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~55k of ~128k reclaimable).",
+        );
+    });
+
+    it("dampens same-level refires within three ordinals but not escalations", () => {
+        expect(
+            shouldUseStickyChannel1Reminder({
+                lastLevel: "firm",
+                lastOrdinal: 10,
+                level: "firm",
+                currentOrdinal: 13,
+            }),
+        ).toBe(true);
+        expect(
+            shouldUseStickyChannel1Reminder({
+                lastLevel: "firm",
+                lastOrdinal: 10,
+                level: "urgent",
+                currentOrdinal: 11,
+            }),
+        ).toBe(false);
+
+        const sticky = buildChannel1Reminder("firm", 70_000, 128_000, undefined, true);
+        expect(sticky).toContain("Reminder: ctx_reduce housekeeping still pending —");
+        expect(sticky).not.toContain("Not a limit");
+        const escalation = buildChannel1Reminder("urgent", 80_000, 128_000, undefined, false);
+        expect(escalation).toContain("Housekeeping backlog:");
     });
 });
 
@@ -201,6 +240,7 @@ describe("evaluateChannel2 — fourth hygiene band", () => {
         baselineT: 100_000,
         turnDeltaU: 0,
         turnDeltaT: 0,
+        usableWindow: 128_000,
         evaluable: true,
         generationInvalidated: false,
     };

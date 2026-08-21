@@ -26,9 +26,11 @@ import {
 	claimChannel2NudgeState,
 	getChannel2NudgeClaim,
 	getChannel2NudgeState,
+	getChannel1LastFire,
 	getLastNudgeLevel,
 	getLastNudgeUndropped,
 	resetLastNudgeCycle,
+	setChannel1LastFire,
 	setLastNudgeLevel,
 	setLastNudgeUndropped,
 } from "@magic-context/core/features/magic-context/storage";
@@ -38,6 +40,7 @@ import {
 	CHANNEL1_SENTINEL,
 	decideChannel1,
 	evaluateChannel2,
+	shouldUseStickyChannel1Reminder,
 	type Channel1State as SharedChannel1State,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
@@ -150,14 +153,28 @@ export function maybeChannel1ReminderForToolResult(args: {
 	setLastNudgeLevel(db, sessionId, decision.nextLastNudgeLevel);
 	if (!decision.fire) return null;
 
-	return {
-		type: "text",
+	const lastFire = getChannel1LastFire(db, sessionId);
+	const sticky = shouldUseStickyChannel1Reminder({
+		lastLevel: lastFire.level,
+		lastOrdinal: lastFire.ordinal,
+		level: decision.level,
+		currentOrdinal: state.messageOrdinal,
+	});
+	const block = {
+		type: "text" as const,
 		text: buildChannel1Reminder(
 			decision.level,
 			decision.undroppedTokens,
+			state.usableWindow,
 			state.oldestReclaimableToolTags,
+			sticky,
 		),
 	};
+	setChannel1LastFire(db, sessionId, {
+		level: decision.level,
+		ordinal: state.messageOrdinal,
+	});
+	return block;
 }
 
 /**
@@ -243,6 +260,7 @@ export function maybeDeliverChannel2Pi(
 			customType: CHANNEL2_NUDGE_CUSTOM_TYPE,
 			content: buildChannel2Reminder(
 				undropped,
+				baseline.usableWindow,
 				baseline.oldestReclaimableToolTags,
 			),
 			display: false,

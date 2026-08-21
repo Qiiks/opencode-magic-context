@@ -2169,6 +2169,7 @@ export function createTransform(deps: TransformDeps) {
             activeAgent,
             batch,
             contextUsage,
+            usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
             fullFeatureMode,
             compactionOff,

@@ -63,6 +63,8 @@ export function healAllNullColumns(db: Database): void {
         ["cache_ttl", ""],
         ["last_nudge_band", ""],
         ["last_nudge_level", ""],
+        ["channel1_last_fire_level", ""],
+        ["channel1_last_fire_ordinal", 0],
         ["channel2_nudge_claim_token", ""],
         ["last_transform_error", ""],
         ["nudge_anchor_message_id", ""],

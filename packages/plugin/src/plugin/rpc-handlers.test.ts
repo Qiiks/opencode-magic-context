@@ -116,6 +116,8 @@ describe("buildSidebarSnapshot — persisted tail hygiene", () => {
                 baselineT: 0,
                 turnDeltaU: 0,
                 turnDeltaT: 0,
+                usableWindow: 128_000,
+                messageOrdinal: 0,
                 baselineGeneration: 0,
                 computedAt: 0,
                 evaluable: true,

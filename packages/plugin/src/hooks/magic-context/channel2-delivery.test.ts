@@ -70,6 +70,7 @@ function channel2Baseline(
     overrides: Partial<{
         turnDeltaU: number;
         turnDeltaT: number;
+        usableWindow: number;
         evaluable: boolean;
         generationInvalidated: boolean;
     }> = {},
@@ -79,6 +80,7 @@ function channel2Baseline(
         baselineT,
         turnDeltaU: 0,
         turnDeltaT: 0,
+        usableWindow: 128_000,
         evaluable: true,
         generationInvalidated: false,
         ...overrides,

@@ -13,6 +13,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import type { Channel1State } from "./ctx-reduce-nudge";
 import { EMPTY_TASK_OUTPUT_SENTINEL } from "./empty-task-output";
 import {
     createChatMessageHook,
@@ -613,6 +614,65 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
             expect(sets.historyRefreshSessions.size).toBe(0);
             expect(sets.systemPromptRefreshSessions.size).toBe(0);
             expect(sets.pendingMaterializationSessions.size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("createToolExecuteAfterHook Channel-1 dampening", () => {
+    test("freezes full and sticky variants while escalations keep the full body", async () => {
+        const db = createTestDb();
+        const sessionId = "ses-channel1-dampening";
+        const state = (
+            baselineU: number,
+            baselineT: number,
+            messageOrdinal: number,
+        ): Channel1State => ({
+            baselineU,
+            baselineT,
+            turnDeltaU: 0,
+            turnDeltaT: 0,
+            usableWindow: 128_000,
+            messageOrdinal,
+            baselineGeneration: 1,
+            computedAt: 1,
+            evaluable: true,
+            generationInvalidated: false,
+            baselineParts: [],
+            contentSignature: `baseline-${messageOrdinal}`,
+            reducedSinceRefresh: false,
+            oldestReclaimableToolTags: [],
+        });
+        const channel1StateBySession = new Map<string, Channel1State>([
+            [sessionId, state(50_000, 120_000, 10)],
+        ]);
+        const hook = createToolExecuteAfterHook({ db, channel1StateBySession });
+
+        try {
+            const first = { output: "first output" };
+            await hook({ tool: "bash", sessionID: sessionId }, first);
+            expect(first.output).toContain("Housekeeping: ~50k of this session's ~128k window");
+            const frozenFirst = first.output;
+            await hook({ tool: "bash", sessionID: sessionId }, first);
+            expect(first.output).toBe(frozenFirst);
+
+            channel1StateBySession.set(sessionId, state(80_000, 180_000, 12));
+            const sticky = { output: "second output" };
+            await hook({ tool: "bash", sessionID: sessionId }, sticky);
+            expect(sticky.output).toContain("Reminder: ctx_reduce housekeeping still pending —");
+            expect(sticky.output).not.toContain("Not a limit");
+            const frozenSticky = sticky.output;
+            await hook({ tool: "bash", sessionID: sessionId }, sticky);
+            expect(sticky.output).toBe(frozenSticky);
+
+            channel1StateBySession.set(sessionId, state(120_000, 180_000, 13));
+            const escalation = { output: "third output" };
+            await hook({ tool: "bash", sessionID: sessionId }, escalation);
+            expect(escalation.output).toContain("Housekeeping backlog: ~120k");
+            expect(escalation.output).not.toContain(
+                "Reminder: ctx_reduce housekeeping still pending",
+            );
         } finally {
             closeQuietly(db);
         }

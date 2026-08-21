@@ -25,6 +25,8 @@ function channel2BaselineFields(baselineU: number, baselineT: number) {
 		baselineT,
 		turnDeltaU: 0,
 		turnDeltaT: 0,
+		usableWindow: 128_000,
+		messageOrdinal: 1,
 		baselineGeneration: 1,
 		computedAt: 1,
 		evaluable: true,
@@ -73,7 +75,9 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		expect(block).not.toBeNull();
 		expect(block?.type).toBe("text");
 		expect(block?.text).toContain("<system-reminder>");
-		expect(block?.text).toContain("ctx_reduce");
+		expect(block?.text).toContain(
+			"Housekeeping backlog: ~90k of this session's ~128k window is spent tool output",
+		);
 		clearPiChannel1State(SESSION);
 	});
 
@@ -228,6 +232,72 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		expect(block).toBeNull();
 		clearPiChannel1State(SESSION);
 	});
+
+	it("freezes full and sticky variants while an escalation keeps the full body", () => {
+		const db = createTestDb();
+		const baseline = (
+			baselineU: number,
+			baselineT: number,
+			messageOrdinal: number,
+		) => ({
+			...channel2BaselineFields(baselineU, baselineT),
+			messageOrdinal,
+			reducedSinceRefresh: false,
+			oldestReclaimableToolTags: [],
+		});
+
+		setPiChannel1Baseline(SESSION, baseline(50_000, 120_000, 10));
+		const first = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "first output" }],
+		});
+		expect(first?.text).toContain(
+			"Housekeeping: ~50k of this session's ~128k window",
+		);
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "first output" }, first],
+			}),
+		).toBeNull();
+
+		setPiChannel1Baseline(SESSION, baseline(80_000, 180_000, 12));
+		const sticky = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "second output" }],
+		});
+		expect(sticky?.text).toContain(
+			"Reminder: ctx_reduce housekeeping still pending —",
+		);
+		expect(sticky?.text).not.toContain("Not a limit");
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "second output" }, sticky],
+			}),
+		).toBeNull();
+
+		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 13));
+		const escalation = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "third output" }],
+		});
+		expect(escalation?.text).toContain("Housekeeping backlog: ~120k");
+		expect(escalation?.text).not.toContain(
+			"Reminder: ctx_reduce housekeeping still pending",
+		);
+		clearPiChannel1State(SESSION);
+	});
 });
 
 describe("maybeDeliverChannel2Pi", () => {
@@ -284,7 +354,9 @@ describe("maybeDeliverChannel2Pi", () => {
 		expect(capturedDisplay).toBe(false);
 		expect(capturedCustomType).toBe("magic-context:ceiling-nudge");
 		expect(capturedContent).toContain("<system-reminder>");
-		expect(capturedContent).toContain("ctx_reduce");
+		expect(capturedContent).toContain(
+			"Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~75k of ~128k reclaimable).",
+		);
 		expect(capturedContent).toContain("oldest reclaimable");
 		expect(getChannel2NudgeState(db, SESSION)).toBe("delivered");
 	});

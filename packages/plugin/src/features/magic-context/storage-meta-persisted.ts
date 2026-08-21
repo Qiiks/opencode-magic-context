@@ -991,6 +991,16 @@ interface PersistedLastNudgeLevelRow {
     last_nudge_level: string;
 }
 
+export interface PersistedChannel1LastFire {
+    level: PersistedChannel1NudgeLevel;
+    ordinal: number;
+}
+
+interface PersistedChannel1LastFireRow {
+    channel1_last_fire_level: string;
+    channel1_last_fire_ordinal: number;
+}
+
 function isLastNudgeUndroppedRow(row: unknown): row is PersistedLastNudgeUndroppedRow {
     return (
         typeof row === "object" &&
@@ -1004,6 +1014,15 @@ function isLastNudgeLevelRow(row: unknown): row is PersistedLastNudgeLevelRow {
         typeof row === "object" &&
         row !== null &&
         typeof (row as PersistedLastNudgeLevelRow).last_nudge_level === "string"
+    );
+}
+
+function isChannel1LastFireRow(row: unknown): row is PersistedChannel1LastFireRow {
+    return (
+        typeof row === "object" &&
+        row !== null &&
+        typeof (row as PersistedChannel1LastFireRow).channel1_last_fire_level === "string" &&
+        typeof (row as PersistedChannel1LastFireRow).channel1_last_fire_ordinal === "number"
     );
 }
 
@@ -1049,11 +1068,41 @@ export function setLastNudgeLevel(
     })();
 }
 
+export function getChannel1LastFire(db: Database, sessionId: string): PersistedChannel1LastFire {
+    const result = db
+        .prepare(
+            "SELECT channel1_last_fire_level, channel1_last_fire_ordinal FROM session_meta WHERE session_id = ?",
+        )
+        .get(sessionId);
+    if (!isChannel1LastFireRow(result)) return { level: "", ordinal: 0 };
+    return {
+        level: normalizeLastNudgeLevel(result.channel1_last_fire_level),
+        ordinal: Math.max(0, Math.round(result.channel1_last_fire_ordinal)),
+    };
+}
+
+export function setChannel1LastFire(
+    db: Database,
+    sessionId: string,
+    value: PersistedChannel1LastFire,
+): void {
+    db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        db.prepare(
+            "UPDATE session_meta SET channel1_last_fire_level = ?, channel1_last_fire_ordinal = ? WHERE session_id = ?",
+        ).run(
+            normalizeLastNudgeLevel(value.level),
+            Math.max(0, Math.round(value.ordinal)),
+            sessionId,
+        );
+    })();
+}
+
 export function resetLastNudgeCycle(db: Database, sessionId: string): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         db.prepare(
-            "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = '' WHERE session_id = ?",
+            "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = '', channel1_last_fire_level = '', channel1_last_fire_ordinal = 0 WHERE session_id = ?",
         ).run(sessionId);
     })();
 }
@@ -1077,7 +1126,7 @@ export function resetLastNudgeCycleIfTailShrank(
         ensureSessionMetaRow(db, sessionId);
         const result = db
             .prepare(
-                "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = '' WHERE session_id = ? AND last_nudge_undropped > ?",
+                "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = '', channel1_last_fire_level = '', channel1_last_fire_ordinal = 0 WHERE session_id = ? AND last_nudge_undropped > ?",
             )
             .run(sessionId, Math.max(0, Math.round(measuredUndropped)));
         changed = (result.changes ?? 0) > 0;

@@ -13,9 +13,11 @@ import {
     clearEmergencyDropSample,
     clearEmergencyRecovery,
     clearHistorianFailureState,
+    getChannel1LastFire,
     getLastNudgeLevel,
     getLastNudgeUndropped,
     resetLastNudgeCycle,
+    setChannel1LastFire,
     setLastNudgeLevel,
     setLastNudgeUndropped,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -33,6 +35,7 @@ import {
     CHANNEL1_SENTINEL,
     type Channel1State,
     decideChannel1,
+    shouldUseStickyChannel1Reminder,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
 import { annotateEmptyTaskOutput } from "./empty-task-output";
@@ -497,11 +500,24 @@ function maybeInjectChannel1Nudge(
     setLastNudgeLevel(args.db, sessionId, decision.nextLastNudgeLevel);
     if (!decision.fire) return;
 
+    const lastFire = getChannel1LastFire(args.db, sessionId);
+    const sticky = shouldUseStickyChannel1Reminder({
+        lastLevel: lastFire.level,
+        lastOrdinal: lastFire.ordinal,
+        level: decision.level,
+        currentOrdinal: state.messageOrdinal,
+    });
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
+        state.usableWindow,
         state.oldestReclaimableToolTags,
+        sticky,
     );
+    setChannel1LastFire(args.db, sessionId, {
+        level: decision.level,
+        ordinal: state.messageOrdinal,
+    });
     sessionLog(
         sessionId,
         `channel1 nudge fired: level=${decision.level} undropped~${Math.round(decision.undroppedTokens / 1000)}k tool=${tool}`,
