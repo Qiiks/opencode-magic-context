@@ -359,7 +359,7 @@ check_rust_e2e_prerequisites() {
   fi
   MC_E2E_CK_MC_BIN=$(bun "$detector" --print)
   if [[ "$MC_E2E_CK_MC_BIN" == "$REPO_ROOT/target/release/ck-mc" ]]; then
-    # The harness rebuilds the current workspace target incrementally.
+    # The harness rebuilds current source in its e2e-owned Cargo target directory.
     unset MC_E2E_CK_MC_BIN
   else
     # A prebuilt PATH binary is accepted only when the workspace target is not

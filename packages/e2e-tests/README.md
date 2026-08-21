@@ -75,11 +75,14 @@ current JSON protocol was introduced in `0.16.0`.
   bun run test:rust-e2e
   ```
 
-  Runtime: ~1-2 minutes locally once the binaries are warm. Every invocation asks
-  Cargo to build both release binaries so `ck-mc` and `ck-subc` reflect the same
-  sibling source revision; unchanged builds reuse Cargo's incremental artifacts.
-  Each scenario keeps its session small (tens of turns, tiny context limits) so
-  the suite stays fast.
+   Runtime: ~1-2 minutes locally once the binaries are warm. Every invocation asks
+   Cargo to build both release binaries so `ck-mc` and `ck-subc` reflect the same
+   sibling source revision. The builds share the durable e2e-only cache at
+   `packages/e2e-tests/.cache/rust-e2e-cargo-target`, rather than either source
+   workspace's `target` directory; unchanged builds reuse Cargo's incremental
+   artifacts without contending with a developer build in either workspace.
+   Each scenario keeps its session small (tens of turns, tiny context limits) so
+   the suite stays fast.
 
 ### Rust-mode lane: how it works
 
@@ -97,6 +100,16 @@ Environment honesty: `RustTestHarness.detectPrereqs()` preflights the stack
 (cargo present, sibling `subconscious` workspace present, supported platform) and
 the suite SKIPs with a printed reason when any is missing — never green-washing,
 never hanging.
+
+### Rust build-lock contention drill
+
+To verify that a live sibling build cannot block the harness, start a deliberately
+slow `cargo build --release -p subc-core --bins` in `../subconscious` in one
+terminal, then run `bun run --cwd packages/e2e-tests test:rust-e2e` in another.
+The e2e lane must build and run successfully while the sibling build is active:
+its Cargo invocations use `packages/e2e-tests/.cache/rust-e2e-cargo-target`, not
+`../subconscious/target`. Stop or wait for the background sibling build after the
+drill; it is only a contention probe.
 
 **Pressure technique (load-bearing apparatus rule):** scenarios reach high fill
 by SHRINKING the context limit against REAL message bytes, never by inflating

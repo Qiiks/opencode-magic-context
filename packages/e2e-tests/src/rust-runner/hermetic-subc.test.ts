@@ -1,9 +1,20 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { join } from "node:path";
 import { __hermeticSubcTest } from "./hermetic-subc";
 
 describe("hermetic Rust process isolation", () => {
+    it("uses an e2e-owned Cargo target directory", () => {
+        expect(__hermeticSubcTest.rustE2eCargoTargetDir).toBe(
+            join(import.meta.dir, "../../.cache/rust-e2e-cargo-target"),
+        );
+        expect(__hermeticSubcTest.rustE2eCargoTargetDir).not.toContain("subconscious/target");
+        expect(__hermeticSubcTest.rustE2eCargoEnv().CARGO_TARGET_DIR).toBe(
+            __hermeticSubcTest.rustE2eCargoTargetDir,
+        );
+    });
+
     it("reaps only stale PID records", () => {
         const nowMs = 10 * __hermeticSubcTest.stalePidAgeMs;
 
