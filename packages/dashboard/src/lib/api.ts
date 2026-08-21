@@ -370,6 +370,10 @@ export async function getDreamRunMemoryChanges(runId: number): Promise<DreamRunM
 
 // ── Log & Cache API ─────────────────────────────────────────
 
+export async function getLogPaths(): Promise<string[]> {
+  return invoke("get_log_paths");
+}
+
 export async function getLogEntries(maxLines?: number): Promise<LogEntry[]> {
   return invoke("get_log_entries", { maxLines: maxLines ?? 500 });
 }

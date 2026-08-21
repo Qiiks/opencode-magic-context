@@ -495,15 +495,23 @@ pub fn get_dream_run_memory_changes(
 // ── Log commands ────────────────────────────────────────────
 
 #[tauri::command(async)]
+pub fn get_log_paths() -> Vec<String> {
+    log_parser::resolve_log_paths()
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
+}
+
+#[tauri::command(async)]
 pub fn get_log_entries(max_lines: Option<usize>) -> Vec<log_parser::LogEntry> {
-    let log_path = log_parser::resolve_log_path();
-    log_parser::read_log_tail(&log_path, max_lines.unwrap_or(500))
+    let log_paths = log_parser::resolve_log_paths();
+    log_parser::read_log_tails(&log_paths, max_lines.unwrap_or(500))
 }
 
 #[tauri::command(async)]
 pub fn get_cache_events(max_lines: Option<usize>) -> Vec<log_parser::CacheEvent> {
-    let log_path = log_parser::resolve_log_path();
-    let entries = log_parser::read_log_tail(&log_path, max_lines.unwrap_or(2000));
+    let log_paths = log_parser::resolve_log_paths();
+    let entries = log_parser::read_log_tails(&log_paths, max_lines.unwrap_or(2000));
     log_parser::extract_cache_events(&entries)
 }
 
@@ -512,8 +520,8 @@ pub fn get_session_cache_stats(
     max_lines: Option<usize>,
     limit: Option<usize>,
 ) -> Vec<log_parser::SessionCacheStats> {
-    let log_path = log_parser::resolve_log_path();
-    let entries = log_parser::read_log_tail(&log_path, max_lines.unwrap_or(5000));
+    let log_paths = log_parser::resolve_log_paths();
+    let entries = log_parser::read_log_tails(&log_paths, max_lines.unwrap_or(5000));
     let events = log_parser::extract_cache_events(&entries);
     log_parser::aggregate_session_cache_stats(&events, limit.unwrap_or(5))
 }
@@ -575,8 +583,7 @@ pub fn get_project_configs(state: State<'_, AppState>) -> Vec<config::ProjectCon
 
 #[tauri::command(async)]
 pub fn save_project_config(project_path: String, content: String) -> Result<(), String> {
-    let path = config::resolve_project_config_path(&project_path);
-    config::write_project_config(&project_path, &path, &content)
+    config::write_project_config(&project_path, &content)
 }
 
 // ── Model commands ──────────────────────────────────────────

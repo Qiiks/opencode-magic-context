@@ -45,17 +45,28 @@ pub fn resolve_log_path_for(harness: Harness) -> PathBuf {
         return PathBuf::from(env_path);
     }
 
-    std::env::temp_dir()
+    resolve_log_path_from_temp_dir(&std::env::temp_dir(), harness)
+}
+
+fn resolve_log_path_from_temp_dir(temp_dir: &std::path::Path, harness: Harness) -> PathBuf {
+    temp_dir
         .join(harness.as_str())
         .join("magic-context")
         .join("magic-context.log")
 }
 
-/// Backwards-compatible default — returns the OpenCode log path. Existing
-/// dashboard call sites that don't yet pass a harness keep working against
-/// OpenCode, which matches the historical single-harness behavior.
-pub fn resolve_log_path() -> PathBuf {
-    resolve_log_path_for(Harness::Opencode)
+/// Return every distinct plugin log the dashboard can read. The dashboard does
+/// not run inside a specific harness, so reading both preserves Pi-only and
+/// OpenCode-only activity instead of silently selecting one of them.
+pub fn resolve_log_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(2);
+    for harness in [Harness::Opencode, Harness::Pi] {
+        let path = resolve_log_path_for(harness);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -449,10 +460,28 @@ pub fn read_log_tail(path: &PathBuf, max_lines: usize) -> Vec<LogEntry> {
         .collect()
 }
 
+/// Read recent entries from every harness log, retaining the newest entries
+/// across the combined stream. Plugin timestamps are ISO-8601 strings, so their
+/// lexical order is chronological.
+pub fn read_log_tails(paths: &[PathBuf], max_lines: usize) -> Vec<LogEntry> {
+    let mut entries: Vec<LogEntry> = paths
+        .iter()
+        .flat_map(|path| read_log_tail(path, max_lines))
+        .collect();
+    entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+
+    let first_to_keep = entries.len().saturating_sub(max_lines);
+    entries.drain(0..first_to_keep);
+    entries
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_log_path_for, Harness};
-    use std::path::PathBuf;
+    use super::{
+        read_log_tails, resolve_log_path_for, resolve_log_path_from_temp_dir, resolve_log_paths,
+        Harness,
+    };
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
     // The env var is process-global; serialize the tests that mutate it.
@@ -483,6 +512,89 @@ mod tests {
                 .join("magic-context")
                 .join("magic-context.log")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_log_paths_preserve_tmpdir_and_harness_subdirectories() {
+        let tmpdir = Path::new("/var/folders/example/T");
+
+        assert_eq!(
+            resolve_log_path_from_temp_dir(tmpdir, Harness::Opencode),
+            tmpdir.join("opencode/magic-context/magic-context.log")
+        );
+        assert_eq!(
+            resolve_log_path_from_temp_dir(tmpdir, Harness::Pi),
+            tmpdir.join("pi/magic-context/magic-context.log")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_log_paths_preserve_temp_and_harness_subdirectories() {
+        let tmpdir = Path::new(r"C:\Users\example\AppData\Local\Temp");
+
+        assert_eq!(
+            resolve_log_path_from_temp_dir(tmpdir, Harness::Opencode),
+            tmpdir.join("opencode/magic-context/magic-context.log")
+        );
+        assert_eq!(
+            resolve_log_path_from_temp_dir(tmpdir, Harness::Pi),
+            tmpdir.join("pi/magic-context/magic-context.log")
+        );
+    }
+
+    #[test]
+    fn resolve_log_paths_reads_both_harnesses_when_no_override_is_set() {
+        let _guard = env_lock();
+        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+
+        assert_eq!(
+            resolve_log_paths(),
+            vec![
+                resolve_log_path_for(Harness::Opencode),
+                resolve_log_path_for(Harness::Pi),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_log_paths_deduplicates_a_shared_log_path_override() {
+        let _guard = env_lock();
+        let custom = std::env::temp_dir()
+            .join("custom")
+            .join("magic-context.log");
+        std::env::set_var(
+            "MAGIC_CONTEXT_LOG_PATH",
+            custom.to_string_lossy().to_string(),
+        );
+
+        assert_eq!(resolve_log_paths(), vec![custom]);
+
+        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+    }
+
+    #[test]
+    fn read_log_tails_combines_harness_logs_in_timestamp_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode = dir.path().join("opencode.log");
+        let pi = dir.path().join("pi.log");
+        std::fs::write(
+            &opencode,
+            "[2026-01-01T00:00:00.000Z] [magic-context][opencode-session] OpenCode entry\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &pi,
+            "[2026-01-01T00:00:01.000Z] [magic-context][pi-session] Pi entry\n",
+        )
+        .unwrap();
+
+        let entries = read_log_tails(&[opencode, pi], 10);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, "opencode-session");
+        assert_eq!(entries[1].session_id, "pi-session");
     }
 
     #[test]
