@@ -20,7 +20,10 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const isolatedDataHome = mkdtempSync(join(tmpdir(), "mc-plugin-test-xdg-"));
+// `bun test --parallel` launches separate worker processes. Include the PID so the
+// storage root remains visibly process-scoped even if a future Bun version changes
+// preload timing or environment inheritance.
+const isolatedDataHome = mkdtempSync(join(tmpdir(), `mc-plugin-test-xdg-pid-${process.pid}-`));
 
 // MAGIC_CONTEXT_TEST_DATA_DIR is the BULLETPROOF guard: resolveDatabasePath()
 // (storage-db.ts) resolves the DB inside it with top priority. Unlike

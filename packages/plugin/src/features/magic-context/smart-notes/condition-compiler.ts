@@ -25,6 +25,8 @@ export interface ConditionCompilerOptions {
     /** Filesystem root used to resolve relative paths and default repository predicates. */
     projectPath: string;
     homeDirectory?: string;
+    /** Optional storage root for path predicates, so isolated callers evaluate fences deterministically. */
+    dataDirectory?: string;
     now?: () => number;
     resolvePath?: (path: string) => Promise<ConditionPathResolution>;
 }
@@ -59,6 +61,7 @@ export async function compileSurfaceCondition(
             const resolved = await resolveAndFenceProviderPath(path, {
                 allowMissing: true,
                 homeDirectory: options.homeDirectory,
+                dataDirectory: options.dataDirectory,
                 cwd: options.projectPath,
             });
             return { path: resolved, exists: existsSync(resolved) };
