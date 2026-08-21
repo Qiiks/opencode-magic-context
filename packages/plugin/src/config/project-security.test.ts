@@ -177,14 +177,16 @@ describe("stripUnsafeProjectConfigFields", () => {
 
         const warnings = stripUnsafeProjectConfigFields(raw);
         expect(raw.historian).toEqual({
-            opencode: { variant: "high" },
-            pi: { thinking_level: "medium" },
+            opencode: {},
+            pi: {},
             temperature: 0.2,
         });
         const warning = warnings.join("\n");
         expect(warning).toContain("historian.model");
         expect(warning).toContain("historian.opencode.model");
+        expect(warning).toContain("historian.opencode.variant");
         expect(warning).toContain("historian.pi.model");
+        expect(warning).toContain("historian.pi.thinking_level");
     });
 
     it("strips mural.model from project config but keeps the feature switch", () => {
@@ -238,7 +240,9 @@ describe("stripUnsafeProjectConfigFields", () => {
         const sidekick = raw.sidekick as Record<string, unknown>;
         expect(sidekick.permission).toBeUndefined();
 
-        expect(warnings.some((w) => w.includes("dreamer.prompt/permission/tools"))).toBe(true);
+        expect(warnings.some((w) => w.includes("dreamer.prompt"))).toBe(true);
+        expect(warnings.some((w) => w.includes("dreamer.permission"))).toBe(true);
+        expect(warnings.some((w) => w.includes("dreamer.tools"))).toBe(true);
         expect(warnings.some((w) => w.includes("historian.prompt"))).toBe(true);
         expect(warnings.some((w) => w.includes("sidekick.permission"))).toBe(true);
     });
