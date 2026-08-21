@@ -2833,6 +2833,19 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "transform_decisions", "m0_model_key_new", "TEXT");
         },
     },
+    {
+        version: 80,
+        description: "record observed m[0] tool-set hash comparisons",
+        up(db: Database): void {
+            // Tool-set changes never trigger a fold, but the decision site can
+            // still compare their cached and live names. Preserve only those
+            // actual operands: NULL means no comparison ran on that pass, while
+            // an empty string remains a real compared cached baseline.
+            if (!tableExists(db, "transform_decisions")) return;
+            ensureColumn(db, "transform_decisions", "m0_tool_set_hash_prev", "TEXT");
+            ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
+        },
+    },
 ];
 
 /**

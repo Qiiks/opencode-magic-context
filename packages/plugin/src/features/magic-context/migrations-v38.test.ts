@@ -47,6 +47,8 @@ describe("migration v38 — transform decisions", () => {
                 "materialize_reason",
                 "system_hash_prev",
                 "system_hash_new",
+                "m0_tool_set_hash_prev",
+                "m0_tool_set_hash_new",
                 "m0_model_key_prev",
                 "m0_model_key_new",
                 "emergency",

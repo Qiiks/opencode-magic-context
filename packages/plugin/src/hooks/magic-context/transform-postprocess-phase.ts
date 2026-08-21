@@ -677,6 +677,8 @@ export interface PostTransformPhaseResult {
     systemHashNew: string | null;
     m0ModelKeyPrev: string | null;
     m0ModelKeyNew: string | null;
+    m0ToolSetHashPrev: string | null;
+    m0ToolSetHashNew: string | null;
     droppedTokens: number;
     emergencyReclaimedTokens: number;
     droppedCount: number;
@@ -907,7 +909,10 @@ export async function runPostTransformPhase(
     const m0CoverageBeforeFold =
         args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
     let m0MaterializeReason: string | null = null;
-    let m0ComparisonDecision: MaterializeDecision | null = null;
+    // The preflight is the decision site that decides whether m[0] must fold.
+    // Keep its observational tool-set operands even when it correctly declines
+    // to materialize, so a separate cache-busting pass can be attributed later.
+    let m0ComparisonDecision: MaterializeDecision | null = foldDueDecision;
     if (foldDueDecision.value && args.m0M1) {
         try {
             // Persist the fold before opening mutation gates. Omitting messages
@@ -2311,6 +2316,8 @@ export async function runPostTransformPhase(
         m0ModelKeyNew: m0RematerializedThisPass
             ? (m0ComparisonDecision?.m0ModelKeyNew ?? null)
             : null,
+        m0ToolSetHashPrev: m0ComparisonDecision?.m0ToolSetHashPrev ?? null,
+        m0ToolSetHashNew: m0ComparisonDecision?.m0ToolSetHashNew ?? null,
         droppedTokens,
         emergencyReclaimedTokens,
         droppedCount,

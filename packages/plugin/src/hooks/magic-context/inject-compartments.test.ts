@@ -3028,4 +3028,48 @@ describe("m[0]/m[1] materialization", () => {
         expect(result.m1Text).toContain("docs-hash-only CAS delta memory");
         expect(renderedText(bust[1])).toContain("docs-hash-only CAS delta memory");
     });
+    it("persists observed tool-set hashes without turning tool changes into a fold trigger", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const baselineSignals = {
+            systemHash: "sys-tool-observation",
+            modelKey: "model-tool-observation",
+            toolSetHash: "tools-v1",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+        const state = readStateFromMeta();
+
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: baselineSignals,
+        });
+
+        expect(state.cachedM0ToolSetHash).toBe("tools-v1");
+        expect(
+            db
+                .prepare("SELECT cached_m0_tool_set_hash FROM session_meta WHERE session_id = ?")
+                .get(SESSION_ID),
+        ).toEqual({ cached_m0_tool_set_hash: "tools-v1" });
+
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+                hardSignals: { ...baselineSignals, toolSetHash: "tools-v2" },
+            }),
+        ).toEqual({
+            value: false,
+            reason: null,
+            m0ToolSetHashPrev: "tools-v1",
+            m0ToolSetHashNew: "tools-v2",
+        });
+    });
 });

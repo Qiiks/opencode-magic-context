@@ -66,6 +66,17 @@ export interface PendingTransformDecision {
      * NULL means this pass made no model-key comparison.
      */
     m0ModelKeyNew: string | null;
+    /**
+     * `transform_decisions.m0_tool_set_hash_prev`: cached tool-set operand from
+     * an observed comparison. NULL means this pass made no tool-set comparison;
+     * an empty string is a real compared cached value.
+     */
+    m0ToolSetHashPrev?: string | null;
+    /**
+     * `transform_decisions.m0_tool_set_hash_new`: live tool-set operand from an
+     * observed comparison. NULL means this pass made no tool-set comparison.
+     */
+    m0ToolSetHashNew?: string | null;
     emergency: boolean;
     droppedTokens: number;
     droppedCount: number;
@@ -421,20 +432,23 @@ function writeTransformDecisionRowOnDatabase(
     configureBusyTimeout: boolean,
 ): void {
     if (configureBusyTimeout) db.exec("PRAGMA busy_timeout=0");
-    // Comparison evidence only describes a materialized baseline. A caller may
-    // still log another cache-affecting decision, but it must not attach stale
-    // operands to a row whose m[0] fold did not land.
+    // Trigger operands only describe a materialized baseline. Tool-set
+    // comparison is different: it is deliberately observational rather than a
+    // fold trigger, so its evidence must survive a non-materialized bust.
     const systemHashPrev = row.materialized ? row.systemHashPrev : null;
     const systemHashNew = row.materialized ? row.systemHashNew : null;
     const m0ModelKeyPrev = row.materialized ? row.m0ModelKeyPrev : null;
     const m0ModelKeyNew = row.materialized ? row.m0ModelKeyNew : null;
+    const m0ToolSetHashPrev = row.m0ToolSetHashPrev ?? null;
+    const m0ToolSetHashNew = row.m0ToolSetHashNew ?? null;
     db.prepare(
         `INSERT OR REPLACE INTO transform_decisions (
                 session_id, harness, message_id, ts_ms, decision, materialized,
                 materialize_reason, system_hash_prev, system_hash_new,
+                m0_tool_set_hash_prev, m0_tool_set_hash_new,
                 m0_model_key_prev, m0_model_key_new, emergency, dropped_tokens,
                 dropped_count, input_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
         row.sessionId,
         row.harness,
@@ -445,6 +459,8 @@ function writeTransformDecisionRowOnDatabase(
         row.materializeReason,
         systemHashPrev,
         systemHashNew,
+        m0ToolSetHashPrev,
+        m0ToolSetHashNew,
         m0ModelKeyPrev,
         m0ModelKeyNew,
         row.emergency ? 1 : 0,

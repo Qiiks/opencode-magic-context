@@ -93,7 +93,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 79;
+export const LATEST_SUPPORTED_VERSION = 80;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1569,10 +1569,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       decision           TEXT    NOT NULL,
       materialized       INTEGER NOT NULL DEFAULT 0,
       materialize_reason TEXT,
-      system_hash_prev   TEXT,
-      system_hash_new    TEXT,
-      m0_model_key_prev  TEXT,
-      m0_model_key_new   TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
       emergency          INTEGER NOT NULL DEFAULT 0,
       dropped_tokens     INTEGER NOT NULL DEFAULT 0,
       dropped_count      INTEGER NOT NULL DEFAULT 0,
@@ -2026,10 +2028,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         decision           TEXT    NOT NULL,
         materialized       INTEGER NOT NULL DEFAULT 0,
         materialize_reason TEXT,
-        system_hash_prev   TEXT,
-        system_hash_new    TEXT,
-        m0_model_key_prev  TEXT,
-        m0_model_key_new   TEXT,
+      system_hash_prev      TEXT,
+      system_hash_new       TEXT,
+      m0_tool_set_hash_prev TEXT,
+      m0_tool_set_hash_new  TEXT,
+      m0_model_key_prev     TEXT,
+      m0_model_key_new      TEXT,
         emergency          INTEGER NOT NULL DEFAULT 0,
         dropped_tokens     INTEGER NOT NULL DEFAULT 0,
         dropped_count      INTEGER NOT NULL DEFAULT 0,

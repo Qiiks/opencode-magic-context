@@ -155,6 +155,29 @@ describe("transform_decisions retention cap", () => {
         });
     });
 
+    it("records observed tool-set operands even when the pass did not materialize m[0]", () => {
+        __test.writeRow(dbPath, {
+            ...baseRow("tool-set-observation", 1),
+            materialized: false,
+            materializeReason: null,
+            m0ToolSetHashPrev: "tools-before",
+            m0ToolSetHashNew: "tools-after",
+        });
+
+        expect(
+            db
+                .prepare(
+                    `SELECT materialized, m0_tool_set_hash_prev, m0_tool_set_hash_new
+                     FROM transform_decisions WHERE message_id = 'tool-set-observation'`,
+                )
+                .get(),
+        ).toEqual({
+            materialized: 0,
+            m0_tool_set_hash_prev: "tools-before",
+            m0_tool_set_hash_new: "tools-after",
+        });
+    });
+
     it("does not prune below the cap", () => {
         for (let i = 0; i < TEST_CAP - 1; i++) {
             __test.writeRow(dbPath, baseRow(`m-${i}`, 1000 + i));
