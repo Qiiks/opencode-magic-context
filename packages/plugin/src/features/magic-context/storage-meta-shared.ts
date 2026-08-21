@@ -499,6 +499,7 @@ export interface PersistCachedM0Payload {
     sessionFactsVersion: number;
     upgradeState: string | null;
     systemHash?: string | null;
+    toolSetHash?: string | null;
     modelKey?: string | null;
     projectIdentity?: string | null;
 }
@@ -527,6 +528,7 @@ export function persistCachedM0(
             cached_m0_session_facts_version = ?,
             cached_m0_upgrade_state = ?,
             cached_m0_system_hash = ?,
+            cached_m0_tool_set_hash = ?,
             cached_m0_model_key = ?,
             cached_m0_project_identity = ?
          WHERE session_id = ?`,
@@ -547,6 +549,7 @@ export function persistCachedM0(
         payload.sessionFactsVersion,
         payload.upgradeState,
         payload.systemHash ?? "",
+        payload.toolSetHash ?? "",
         payload.modelKey ? piModelRefToCanonical(payload.modelKey) : "",
         payload.projectIdentity ?? null,
         sessionId,

@@ -735,12 +735,12 @@ export interface M0SnapshotMarkers {
     sessionFactsVersion: number;
     upgradeState: string | null;
     compartmentRenderEpoch: string | null;
-    // HARD-bust markers: provider-side cache-eviction signals. A change in any
-    // of these means the Anthropic prompt cache was already dead (tools/system
-    // block changed, or model switched), so folding m[1] into m[0] is "free".
-    // Captured from runtime signals at the injectM0M1 call site (NOT a pure DB
-    // read), so readCurrentM0SnapshotMarkers takes them as inputs.
+    // HARD-bust markers are captured from runtime signals at the injectM0M1
+    // call site (NOT a pure DB read), so readCurrentM0SnapshotMarkers takes
+    // them as inputs. The tool-set hash is retained for attribution only: its
+    // process-global scope makes it deliberately ineligible to trigger a fold.
     systemHash: string;
+    toolSetHash: string;
     modelKey: string;
     projectIdentity?: string | null;
     /** Hash of the image identity folded into this m0 baseline. */
@@ -753,10 +753,13 @@ export interface M0SnapshotMarkers {
  * Runtime cache-eviction signals threaded into the materialization decision.
  * These are NOT derived from durable DB state like the content markers — they
  * come from the current flight (system-prompt hash, tool-set fingerprint,
- * provider/model key) plus the TTL idle window.
+ * provider/model key) plus the TTL idle window. Tool-set changes are observed
+ * for attribution only; they never request a materialization.
  */
 export interface M0HardSignals {
     systemHash: string;
+    /** Empty or absent means the provider tool set is not observable this pass. */
+    toolSetHash?: string;
     modelKey: string;
     /** True when the provider cache TTL has elapsed since lastResponseTime. */
     cacheExpired: boolean;
@@ -766,6 +769,7 @@ export interface M0HardSignals {
 
 const EMPTY_HARD_SIGNALS: M0HardSignals = {
     systemHash: "",
+    toolSetHash: "",
     modelKey: "",
     cacheExpired: false,
     lastResponseTime: 0,
@@ -847,6 +851,13 @@ export interface MaterializeDecision {
     /** Present only when the canonical model-key operands triggered this decision. */
     m0ModelKeyPrev?: string;
     m0ModelKeyNew?: string;
+    /**
+     * Present when the decision site compared the cached and live tool-set
+     * fingerprints. These operands are observational: a difference never
+     * triggers materialization.
+     */
+    m0ToolSetHashPrev?: string;
+    m0ToolSetHashNew?: string;
 }
 
 export interface MaterializeM0Result {
@@ -1375,6 +1386,7 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             upgradeState: getUpgradeState(args.db, args.sessionId),
             compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
             systemHash: hard.systemHash,
+            toolSetHash: hard.toolSetHash ?? "",
             modelKey: piModelRefToCanonical(hard.modelKey),
             projectIdentity: args.projectPath ?? null,
             muralEnabled: args.muralEnabled === true,
@@ -1400,6 +1412,7 @@ function refreshVolatileMarkerInputs(
                 : "",
         materializedAt: Date.now(),
         systemHash: hard.systemHash,
+        toolSetHash: hard.toolSetHash ?? "",
         modelKey: hard.modelKey,
         projectIdentity: args.projectPath ?? null,
         muralEnabled: args.muralEnabled === true,
@@ -1483,6 +1496,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         upgradeState: cachedUpgradeIdentity.upgradeState,
         compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
         systemHash: state.cachedM0SystemHash ?? "",
+        toolSetHash: state.cachedM0ToolSetHash ?? "",
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
         muralHash: state.cachedM0MuralHash ?? null,
@@ -1572,6 +1586,19 @@ export function mustMaterialize(args: {
             systemHashNew: hard.systemHash,
         };
     }
+    // Tool-set changes are deliberately not HARD-fold triggers: this signal is
+    // process-global, so folding on it would manufacture unrelated session busts.
+    // Preserve the actual operands from this decision site for a later query.
+    const liveToolSetHash = hard.toolSetHash ?? "";
+    const toolSetHashComparison =
+        liveToolSetHash !== ""
+            ? {
+                  m0ToolSetHashPrev: args.state.cachedM0ToolSetHash ?? "",
+                  m0ToolSetHashNew: liveToolSetHash,
+              }
+            : null;
+    const withToolSetHashComparison = (decision: MaterializeDecision): MaterializeDecision =>
+        toolSetHashComparison ? { ...decision, ...toolSetHashComparison } : decision;
     // Idle > TTL: the provider evicted the cache while the user was away. Guard
     // for idempotence across a multi-pass "came back" turn: cacheExpired stays
     // true on every pass until lastResponseTime updates at end-of-response, so
@@ -1584,7 +1611,7 @@ export function mustMaterialize(args: {
         hard.lastResponseTime > 0 &&
         hard.lastResponseTime > (args.state.cachedM0MaterializedAt ?? 0)
     ) {
-        return { value: true, reason: "ttl_idle" };
+        return withToolSetHashComparison({ value: true, reason: "ttl_idle" });
     }
 
     // ── HARD: genuine m[0] CONTENT change (the rendered baseline bytes differ) ──
@@ -1598,7 +1625,7 @@ export function mustMaterialize(args: {
                 )
                 .run(current.projectIdentity, args.sessionId);
         } else if (cachedProjectIdentity !== current.projectIdentity) {
-            return { value: true, reason: "project_change" };
+            return withToolSetHashComparison({ value: true, reason: "project_change" });
         }
     }
 
@@ -1613,7 +1640,7 @@ export function mustMaterialize(args: {
         (args.state.cachedM0WorkspaceFingerprint ?? null) !== null
     ) {
         if ((args.state.cachedM0WorkspaceFingerprint ?? null) !== current.workspaceFingerprint) {
-            return { value: true, reason: "project_memory_epoch" };
+            return withToolSetHashComparison({ value: true, reason: "project_memory_epoch" });
         }
     } else if (args.state.cachedM0ProjectMemoryEpoch !== current.projectMemoryEpoch) {
         return { value: true, reason: "project_memory_epoch" };
@@ -1641,12 +1668,12 @@ export function mustMaterialize(args: {
     // reads fresh docs whenever a natural HARD fold happens and stores that hash
     // with the bytes it actually rendered.
     if (args.state.cachedM0MaxMutationId !== current.maxMutationId) {
-        return { value: true, reason: "max_mutation_id" };
+        return withToolSetHashComparison({ value: true, reason: "max_mutation_id" });
     }
     if (cachedUpgradeIdentity.upgradeState !== current.upgradeState) {
-        return { value: true, reason: "upgrade_state" };
+        return withToolSetHashComparison({ value: true, reason: "upgrade_state" });
     }
-    return { value: false, reason: null };
+    return withToolSetHashComparison({ value: false, reason: null });
 }
 
 export interface TrimMemoriesResultV2 {
@@ -2054,12 +2081,13 @@ function applyMarkersToState(
         markers.muralEnabled,
         markers.renderBudgetIdentity,
     );
-    // HARD-bust markers must be mirrored into the flat state fields too: the next
-    // pass's mustMaterialize reads state.cachedM0SystemHash/ModelKey
-    // directly (not snapshotMarkers). Omitting them here leaves the flat fields at
-    // their pre-materialize values until a DB reload re-syncs them, which would
-    // re-fire the same HARD trigger on the very next pass (double-fold).
+    // Runtime markers must be mirrored into flat state because the next
+    // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
+    // rather than snapshotMarkers. Omitting them leaves a stale baseline until a
+    // DB reload; for HARD triggers that would re-fire the same fold, while the
+    // tool-set marker would lose its comparison baseline.
     state.cachedM0SystemHash = markers.systemHash;
+    state.cachedM0ToolSetHash = markers.toolSetHash;
     state.cachedM0ModelKey = markers.modelKey;
     state.cachedM0ProjectIdentity = markers.projectIdentity;
     state.cachedM0MuralHash = markers.muralHash ?? null;
@@ -2304,6 +2332,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             // THIS request) — they cannot change mid-materialization-transaction,
             // so carry the captured values and exclude them from the stale check.
             systemHash: snapshotMarkers.systemHash,
+            toolSetHash: snapshotMarkers.toolSetHash,
             modelKey: snapshotMarkers.modelKey,
             projectIdentity: projectPath ?? null,
             muralEnabled: snapshotMarkers.muralEnabled,
@@ -2371,6 +2400,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                 snapshotMarkers.renderBudgetIdentity,
             ),
             systemHash: snapshotMarkers.systemHash,
+            toolSetHash: snapshotMarkers.toolSetHash,
             modelKey: snapshotMarkers.modelKey,
             projectIdentity: snapshotMarkers.projectIdentity,
         });
@@ -2682,6 +2712,7 @@ interface CachedM0M1Row {
     cached_m0_session_facts_version: number | null;
     cached_m0_upgrade_state: string | null;
     cached_m0_system_hash: string | null;
+    cached_m0_tool_set_hash: string | null;
     cached_m0_model_key: string | null;
     cached_m0_project_identity: string | null;
     memory_block_ids: string | null;
@@ -2727,9 +2758,10 @@ function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | nul
                     cached_m0_project_docs_hash,
                     cached_m0_materialized_at,
                     cached_m0_session_facts_version,
-                    cached_m0_upgrade_state,
-                    cached_m0_system_hash,
-                    cached_m0_model_key,
+                     cached_m0_upgrade_state,
+                     cached_m0_system_hash,
+                     cached_m0_tool_set_hash,
+                     cached_m0_model_key,
                     cached_m0_project_identity,
                     memory_block_ids
                FROM session_meta
@@ -2762,6 +2794,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         upgradeState: cachedUpgradeIdentity.upgradeState,
         compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
         systemHash: row.cached_m0_system_hash ?? "",
+        toolSetHash: row.cached_m0_tool_set_hash ?? "",
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
         muralHash: row.cached_m0_mural_hash ?? null,
@@ -2790,6 +2823,7 @@ function cachedRowMatchesState(row: CachedM0M1Row, state: M0M1State): boolean {
         row.cached_m0_session_facts_version === state.cachedM0SessionFactsVersion &&
         (row.cached_m0_upgrade_state ?? null) === (state.cachedM0UpgradeState ?? null) &&
         (row.cached_m0_system_hash ?? "") === (state.cachedM0SystemHash ?? "") &&
+        (row.cached_m0_tool_set_hash ?? "") === (state.cachedM0ToolSetHash ?? "") &&
         piModelRefToCanonical(row.cached_m0_model_key ?? "") ===
             piModelRefToCanonical(state.cachedM0ModelKey ?? "") &&
         (row.cached_m0_project_identity ?? null) === (state.cachedM0ProjectIdentity ?? null)
@@ -2822,6 +2856,7 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         markers.renderBudgetIdentity,
     );
     state.cachedM0SystemHash = markers.systemHash;
+    state.cachedM0ToolSetHash = markers.toolSetHash;
     state.cachedM0ModelKey = markers.modelKey;
     state.cachedM0ProjectIdentity = markers.projectIdentity;
     state.snapshotMarkers = markers;

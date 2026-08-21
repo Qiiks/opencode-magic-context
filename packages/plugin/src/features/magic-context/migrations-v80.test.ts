@@ -28,20 +28,15 @@ function columnNames(db: Database, table: string): string[] {
     );
 }
 
-describe("migration v79: transform decision comparison telemetry", () => {
-    test("fresh databases include comparison telemetry and align the schema fence", () => {
+describe("migration v80: observed tool-set comparison telemetry", () => {
+    test("fresh databases include tool-set operands and align the schema fence", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
             runMigrations(db);
 
             expect(columnNames(db, "transform_decisions")).toEqual(
-                expect.arrayContaining([
-                    "system_hash_prev",
-                    "system_hash_new",
-                    "m0_model_key_prev",
-                    "m0_model_key_new",
-                ]),
+                expect.arrayContaining(["m0_tool_set_hash_prev", "m0_tool_set_hash_new"]),
             );
             expect(LATEST_SUPPORTED_VERSION).toBe(80);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
@@ -62,6 +57,10 @@ describe("migration v79: transform decision comparison telemetry", () => {
                     decision TEXT NOT NULL,
                     materialized INTEGER NOT NULL DEFAULT 0,
                     materialize_reason TEXT,
+                    system_hash_prev TEXT,
+                    system_hash_new TEXT,
+                    m0_model_key_prev TEXT,
+                    m0_model_key_new TEXT,
                     emergency INTEGER NOT NULL DEFAULT 0,
                     dropped_tokens INTEGER NOT NULL DEFAULT 0,
                     dropped_count INTEGER NOT NULL DEFAULT 0,
@@ -70,9 +69,9 @@ describe("migration v79: transform decision comparison telemetry", () => {
                 );
                 INSERT INTO transform_decisions (
                     session_id, harness, message_id, ts_ms, decision, materialized
-                ) VALUES ('ses-legacy', 'opencode', 'msg-legacy', 1, 'execute', 1);
+                ) VALUES ('ses-legacy', 'opencode', 'msg-legacy', 1, 'execute', 0);
             `);
-            seedAppliedVersion(db, 78);
+            seedAppliedVersion(db, 79);
 
             runMigrations(db);
             runMigrations(db);
@@ -80,20 +79,14 @@ describe("migration v79: transform decision comparison telemetry", () => {
             expect(
                 db
                     .prepare(
-                        `SELECT system_hash_prev, system_hash_new,
-                                m0_model_key_prev, m0_model_key_new
+                        `SELECT m0_tool_set_hash_prev, m0_tool_set_hash_new
                          FROM transform_decisions WHERE session_id = 'ses-legacy'`,
                     )
                     .get(),
-            ).toEqual({
-                system_hash_prev: null,
-                system_hash_new: null,
-                m0_model_key_prev: null,
-                m0_model_key_new: null,
-            });
+            ).toEqual({ m0_tool_set_hash_prev: null, m0_tool_set_hash_new: null });
             expect(
                 db
-                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 79")
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 80")
                     .get(),
             ).toEqual({ count: 1 });
         } finally {
@@ -101,14 +94,14 @@ describe("migration v79: transform decision comparison telemetry", () => {
         }
     });
 
-    test("tolerates a sparse pre-v79 database without transform decision telemetry", () => {
+    test("tolerates a sparse pre-v80 database without transform decision telemetry", () => {
         const db = new Database(":memory:");
         try {
-            seedAppliedVersion(db, 78);
+            seedAppliedVersion(db, 79);
             expect(() => runMigrations(db)).not.toThrow();
             expect(
-                db.prepare("SELECT version FROM schema_migrations WHERE version = 79").get(),
-            ).toEqual({ version: 79 });
+                db.prepare("SELECT version FROM schema_migrations WHERE version = 80").get(),
+            ).toEqual({ version: 80 });
         } finally {
             closeQuietly(db);
         }

@@ -589,6 +589,11 @@ export interface TransformDeps {
         sessionId: string,
     ) => import("./send-session-notification").NotificationParams;
     getModelKey?: (sessionId: string) => string | undefined;
+    /**
+     * Observed provider-tool-set fingerprint for the session route. This is
+     * telemetry only: a change is recorded but never asks m[0] to fold.
+     */
+    getToolSetHash?: (sessionId: string) => string;
     getFallbackModelId?: (sessionId: string) => string | undefined;
     projectPath?: string;
     experimentalUserMemories?: boolean;
@@ -2087,15 +2092,16 @@ export function createTransform(deps: TransformDeps) {
             deferredMaterializationSessions.add(sessionId);
         }
 
-        // HARD-bust signals for the m[0]/m[1] materialization decision. These
-        // capture provider-side cache-eviction events (model switch, system-block
-        // change, tools-block change) plus the TTL idle window. A change in any
-        // means the Anthropic prompt cache was already dead, so folding m[1] into
-        // m[0] is "free". systemHash is the PERSISTED last-turn hash (system.transform
-        // runs AFTER this messages.transform), so a system change is detected on the
-        // next pass — the accepted one-pass lag.
+        // HARD-bust signals for the m[0]/m[1] materialization decision capture
+        // provider-side cache eviction, such as a model switch or system-block
+        // change, plus the TTL idle window. The tool-set fingerprint is observed
+        // alongside them but never folds m[0] because its process-global scope
+        // would create false-positive folds across sessions. Because system.transform
+        // runs after messages.transform, systemHash is the persisted last-turn hash,
+        // so system changes are detected on the next pass.
         const hardModel = deps.liveModelBySession?.get(sessionId);
         const hardModelKey = hardModel ? `${hardModel.providerID}/${hardModel.modelID}` : "";
+        const hardToolSetHash = deps.getToolSetHash?.(sessionId) ?? "";
         const hardSystemHash =
             typeof sessionMeta.systemPromptHash === "string" ? sessionMeta.systemPromptHash : "";
         const hardCacheExpired = computeHardCacheExpired(
@@ -2109,6 +2115,7 @@ export function createTransform(deps: TransformDeps) {
         );
         const m0HardSignals = {
             systemHash: hardSystemHash,
+            toolSetHash: hardToolSetHash,
             modelKey: hardModelKey,
             cacheExpired: hardCacheExpired,
             lastResponseTime: sessionMeta.lastResponseTime,
@@ -2383,6 +2390,8 @@ export function createTransform(deps: TransformDeps) {
                 ),
                 systemHashPrev: postTransformResult.systemHashPrev,
                 systemHashNew: postTransformResult.systemHashNew,
+                m0ToolSetHashPrev: postTransformResult.m0ToolSetHashPrev,
+                m0ToolSetHashNew: postTransformResult.m0ToolSetHashNew,
                 m0ModelKeyPrev: postTransformResult.m0ModelKeyPrev,
                 m0ModelKeyNew: postTransformResult.m0ModelKeyNew,
                 emergency: postTransformResult.emergency,
