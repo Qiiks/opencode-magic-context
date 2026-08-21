@@ -1,6 +1,6 @@
 # Configuration Reference
 
-All settings are flat top-level keys in `magic-context.jsonc`. The schema is shared by the OpenCode plugin and the Pi-compatible extension used on both Pi and OMP.
+`magic-context.jsonc` has shared top-level settings plus harness-specific model execution blocks. The schema is shared by the OpenCode plugin and the Pi-compatible extension used on both Pi and OMP.
 
 ### Configuration locations
 
@@ -14,6 +14,20 @@ Magic Context reads config from one shared CortexKit location across OpenCode, P
 Project config always merges on top of user config. The unified setup wizard (`npx @cortexkit/magic-context@latest setup`) writes the user-level file with sensible defaults.
 
 > **Migrating from an earlier version?** Config used to live in per-harness paths (`~/.config/opencode/`, `~/.pi/agent/`, `<project>/.opencode/`, `<project>/.pi/`, or the project root). On first run after upgrading, Magic Context moves your existing config to the CortexKit location automatically and leaves a `<old-name>.MOVED_READPLEASE` breadcrumb (preserving your original settings) at each old path. If two old locations held *different* settings it won't guess — it leaves both in place and warns you to consolidate by hand.
+
+### Per-harness model migration
+
+Historian and dreamer model execution now live in independent `opencode` and `pi` blocks. On the first user-config read that finds the former flat model fields, Magic Context writes one exact-byte recovery copy at `<config>.pre-per-harness.bak` before rewriting the config. **Magic Context retains `<config>.pre-per-harness.bak` indefinitely and never garbage-collects it. You may delete it manually after you no longer need the recovery copy.**
+
+Only model-resolution fields move. The migration inventory is explicit:
+
+| Scope | Retained at its current level | Moved to the matching harness block |
+|---|---|---|
+| `historian` | `temperature`, `top_p`, `prompt`, `tools`, `disable`, `description`, `mode`, `color`, `maxSteps`, `permission`, `maxTokens`, `two_pass`, `disallowed_tools` | `model`, `fallback_models`, `variant`, `thinking_level` |
+| `dreamer` | `temperature`, `top_p`, `prompt`, `tools`, `disable`, `description`, `mode`, `color`, `maxSteps`, `permission`, `maxTokens`, `inject_docs` | `model`, `fallback_models`, `variant`, `thinking_level` |
+| `dreamer.tasks.<task>` | `schedule`, `promotion_threshold` | `model`, `fallback_models`, `variant`, `thinking_level`, `timeout_minutes` |
+
+There is no catch-all migration rule: fields not listed in this table are not moved by the per-harness migration.
 
 ### Cross-harness scoping
 
@@ -431,87 +445,78 @@ If `transform_mode: "rust"` is also configured, compaction-off mode resolves to 
 
 ## `historian`
 
-Configures the background historian agent that compresses session history into compartments.
+Historian retains agent metadata at `historian`, while each harness receives its own strict model-resolution block:
 
 ```jsonc
 {
   "historian": {
-    "model": "github-copilot/gpt-5.4",
-    "fallback_models": [
-      "anthropic/claude-sonnet-4-6",
-      "bailian-coding-plan/kimi-k2.5"
-    ],
-    "two_pass": false
-  }
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | `string` | Primary model. |
-| `fallback_models` | `string` or `string[]` | Models to try if the primary fails or is rate-limited. |
-| `temperature` | `number` (0–2) | Sampling temperature. |
-| `variant` | `string` | **OpenCode only.** Agent variant — selects a thinking/reasoning preset configured in OpenCode itself. Pi uses `thinking_level` instead. |
-| `thinking_level` | `string` | **Pi only.** Explicit reasoning level passed to Pi when spawning the historian subagent (`off`, `low`, `medium`, `high`). Required for GitHub Copilot reasoning models on Pi — without it, Copilot injects `"minimal"` as a default and then rejects it (HTTP 400). The Pi setup wizard prompts for this when you pick a `github-copilot/*` model. |
-| `prompt` | `string` | Custom system prompt override. |
-| `two_pass` | `boolean` | Default `false`. When `true`, runs a second editor pass after each successful historian output. The editor (a separate hidden `historian-editor` agent using the same model resolution as the historian) re-reads the draft and removes low-signal `U:` lines, redundant paraphrases, and cross-compartment duplicates, producing cleaner narrative-first summaries. Falls back to the draft if the editor call or its validation fails, so it can never regress behavior. Adds one extra historian-scale call per compartment publication. Recommended for non-reasoning models and open-weight local models where the single-pass draft is noisier. For models with extended thinking/reasoning enabled in OpenCode (Claude 4+, GPT-5.x reasoning variants), the single-pass output is usually already clean and `two_pass` can stay `false`. |
-
-> **Reasoning-heavy models:** Route `historian.model` to a low- or no-reasoning lane/variant. Reasoning can consume the entire output budget before the model emits compartment text. Set `historian.maxTokens` high enough to leave room for the complete compartment structure.
-
----
-
-## `dreamer`
-
-Configures the dreamer agent — both the model it uses and the maintenance tasks it runs. Dreamer creates ephemeral child sessions inside OpenCode for each task.
-
-Each dreamer task is **independently scheduled** with its own cron expression. There is no single dreamer "run" or time window — a process-wide timer runs whichever tasks are due.
-
-```jsonc
-{
-  "dreamer": {
-    "model": "github-copilot/gpt-5.4",
-    "fallback_models": ["anthropic/claude-sonnet-4-6"],
-    "tasks": {
-      "map-memories": { "schedule": "0 2 * * *" },
-      "verify": { "schedule": "0 3 * * *" },
-      "verify-broad": { "schedule": "0 4 * * 0" },
-      "curate": { "schedule": "0 4 * * 0" },
-      "classify-memories": { "schedule": "0 6 * * *" },
-      "retrospective": { "schedule": "0 5 * * *" },
-      "maintain-docs": { "schedule": "" },
-      "promote-primers": { "schedule": "0 3 * * *", "promotion_threshold": 2 },
-      "refresh-primers": { "schedule": "0 3 * * *" },
-      "evaluate-smart-notes": { "schedule": "0 3 * * *" },
-      "review-user-memories": { "schedule": "0 3 * * *", "promotion_threshold": 3 }
+    "two_pass": false,
+    "opencode": {
+      "model": { "model": "github-copilot/gpt-5.4", "variant": "high" },
+      "fallback_models": ["anthropic/claude-sonnet-4-6"]
+    },
+    "pi": {
+      "model": { "model": "github-copilot/gpt-5.4", "thinking_level": "high" },
+      "fallback_models": ["anthropic/claude-sonnet-4-6"]
     }
   }
 }
 ```
 
-To disable the dreamer entirely, set `dreamer.disable: true`. To disable a single task, set its `schedule` to `""` (it can still be run on demand via `/ctx-dream <task>`).
-
-### Agent fields
+An OpenCode entry is either a model string or `{ "model": "provider/model", "variant": "..." }`. A Pi entry is either a model string or `{ "model": "provider/model", "thinking_level": "..." }`. The two entry objects and their harness blocks are strict: Pi never accepts `variant`, and OpenCode never accepts `thinking_level`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `model` | `string` | Default model for all tasks (each task may override). |
-| `fallback_models` | `string` or `string[]` | Default fallback chain (each task may override). |
-| `temperature` | `number` (0–2) | Sampling temperature. |
-| `variant` | `string` | **OpenCode only.** Agent variant — selects a thinking/reasoning preset. Pi uses `thinking_level` instead. |
-| `thinking_level` | `string` | **Pi only.** Explicit reasoning level (`off`/`low`/`medium`/`high`) passed to Pi for dreamer subagent runs. See `historian.thinking_level`. |
-| `prompt` | `string` | Custom system prompt override. |
-| `disable` | `boolean` | Set `true` to disable the dreamer agent entirely. |
-| `inject_docs` | `boolean` (default `true`) | Inject ARCHITECTURE.md and STRUCTURE.md into the agent system prompt. Cached per-session and refreshed on cache-busting passes. |
+| `historian.opencode.model` | OpenCode entry | Primary OpenCode model. |
+| `historian.opencode.fallback_models` | OpenCode entry[] | Ordered OpenCode fallback entries. New-shape fallbacks must be arrays. |
+| `historian.opencode.variant` | `string` | Default OpenCode reasoning variant. |
+| `historian.pi.model` | Pi entry | Primary Pi model. |
+| `historian.pi.fallback_models` | Pi entry[] | Ordered Pi fallback entries. New-shape fallbacks must be arrays. |
+| `historian.pi.thinking_level` | Pi thinking level | Default Pi reasoning level. |
+| `historian.temperature`, `top_p`, `prompt`, `tools`, `disable`, `description`, `mode`, `color`, `maxSteps`, `permission`, `maxTokens`, `two_pass`, `disallowed_tools` | metadata | Retained at `historian`; these fields never move into a harness block. |
 
-### Per-task fields (`dreamer.tasks.<task>`)
+---
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `schedule` | `string` | per task (below) | 5-field cron expression, or `""` to disable. |
-| `model` | `string` | inherits `dreamer.model` | Per-task model override. |
-| `fallback_models` | `string` or `string[]` | inherits `dreamer.fallback_models` | Per-task fallback chain. |
-| `timeout_minutes` | `number` | `20` | Minutes allowed before the task is aborted. |
-| `promotion_threshold` | `number` (2–20) | `3` (review-user-memories) / `2` (promote-primers) | Min recurrences before promotion. **review-user-memories** and **promote-primers** only. |
+## `dreamer`
+
+Dreamer scheduling and agent metadata remain at `dreamer`, while task execution is isolated under the executing harness. A task schedule decides whether the task is due; the harness block decides how that harness runs it.
+
+```jsonc
+{
+  "dreamer": {
+    "inject_docs": true,
+    "tasks": {
+      "verify": { "schedule": "0 3 * * *" },
+      "review-user-memories": { "schedule": "0 3 * * *", "promotion_threshold": 3 }
+    },
+    "opencode": {
+      "model": { "model": "anthropic/claude-sonnet-4-6", "variant": "high" },
+      "fallback_models": ["openai/gpt-5.4"],
+      "tasks": {
+        "verify": { "timeout_minutes": 30, "variant": "medium" }
+      }
+    },
+    "pi": {
+      "model": { "model": "github-copilot/gpt-5.4", "thinking_level": "high" },
+      "fallback_models": ["openai/gpt-5.4"],
+      "tasks": {
+        "verify": { "timeout_minutes": 30, "thinking_level": "medium" }
+      }
+    }
+  }
+}
+```
+
+| Location | Allowed fields | Description |
+|----------|----------------|-------------|
+| `dreamer.opencode` | `model`, `fallback_models`, `variant`, `tasks` | Strict OpenCode execution block. `fallback_models` is an array of OpenCode entries. |
+| `dreamer.pi` | `model`, `fallback_models`, `thinking_level`, `tasks` | Strict Pi execution block. `fallback_models` is an array of Pi entries. |
+| `dreamer.opencode.tasks.<task>` | `model`, `fallback_models`, `variant`, `timeout_minutes` | Strict OpenCode task execution override. |
+| `dreamer.pi.tasks.<task>` | `model`, `fallback_models`, `thinking_level`, `timeout_minutes` | Strict Pi task execution override. |
+| `dreamer.tasks.<task>` | `schedule`, `promotion_threshold` | Harness-independent task metadata. `schedule: ""` disables the task; there is no separate `enabled` key. |
+| `dreamer.temperature`, `top_p`, `prompt`, `tools`, `disable`, `description`, `mode`, `color`, `maxSteps`, `permission`, `maxTokens`, `inject_docs` | metadata | Retained at `dreamer`; these fields never move into a harness block. |
+
+To disable the dreamer entirely, set `dreamer.disable: true`. To disable a single task, set its top-level `dreamer.tasks.<task>.schedule` to `""`; it can still be run on demand via `/ctx-dream <task>`.
 
 ### The tasks
 

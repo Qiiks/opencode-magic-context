@@ -213,20 +213,24 @@ describe("Pi dreamer wiring", () => {
 	test("shared curate validation retries Pi pseudo-tool-call text with the fallback model", async () => {
 		db = createDb();
 		const attemptedModels: Array<string | undefined> = [];
+		const attemptedThinkingLevels: Array<string | undefined> = [];
 		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
 		__test.setPiSubagentRunnerFactory(
 			() =>
 				({
-					run: mock(async (args: { model?: string }) => {
-						attemptedModels.push(args.model);
-						return {
-							ok: true,
-							assistantText:
-								attemptedModels.length === 1
-									? CURATE_PSEUDO_TOOL_CALL
-									: "curation complete",
-						};
-					}),
+					run: mock(
+						async (args: { model?: string; thinkingLevel?: string }) => {
+							attemptedModels.push(args.model);
+							attemptedThinkingLevels.push(args.thinkingLevel);
+							return {
+								ok: true,
+								assistantText:
+									attemptedModels.length === 1
+										? CURATE_PSEUDO_TOOL_CALL
+										: "curation complete",
+							};
+						},
+					),
 				}) as never,
 		);
 		insertMemory(db, {
@@ -240,15 +244,23 @@ describe("Pi dreamer wiring", () => {
 				database: db,
 				projectDir: process.cwd(),
 				projectIdentity: "git:pi-curate-pseudo-tool-call",
-				config: DreamerConfigSchema.parse({
-					model: "primary/curator",
-					tasks: {
-						curate: {
-							schedule: "0 4 * * *",
-							fallback_models: ["fallback/curator"],
+				// Model resolution is harness-scoped: scheduling remains at
+				// dreamer.tasks, while Pi's attempts live under dreamer.pi.
+				config: {
+					...DreamerConfigSchema.parse({
+						tasks: { curate: { schedule: "0 4 * * *" } },
+					}),
+					pi: {
+						model: { model: "primary/curator", thinking_level: "high" },
+						tasks: {
+							curate: {
+								fallback_models: [
+									{ model: "fallback/curator", thinking_level: "low" },
+								],
+							},
 						},
 					},
-				}),
+				} as never,
 			}),
 		);
 
@@ -258,6 +270,7 @@ describe("Pi dreamer wiring", () => {
 		);
 
 		expect(attemptedModels).toEqual(["primary/curator", "fallback/curator"]);
+		expect(attemptedThinkingLevels).toEqual(["high", "low"]);
 		expect(result.failed).toEqual([]);
 		expect(result.ran).toEqual(["curate"]);
 	});

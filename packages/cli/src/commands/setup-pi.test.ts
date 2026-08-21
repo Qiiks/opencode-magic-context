@@ -9,6 +9,7 @@ import {
     removePiSettingsPackage,
     runSetup,
     type SetupEnvironment,
+    writeMagicContextConfig,
     writePiSettingsPackage,
 } from "./setup-pi";
 
@@ -137,6 +138,53 @@ describe("Pi settings rollback", () => {
 
         expect(() => writePiSettingsPackage(settingsPath)).toThrow(/expected an array/);
         expect(readFileSync(settingsPath, "utf-8")).toBe(original);
+    });
+});
+
+describe("setup-pi per-harness config", () => {
+    it("migrates flat fields through the shared raw loader before writing Pi choices", () => {
+        const path = join(makeTempRoot(), "magic-context.jsonc");
+        writeFileSync(
+            path,
+            JSON.stringify({
+                historian: { model: "legacy/historian", thinking_level: "high" },
+                dreamer: {
+                    model: "legacy/dreamer",
+                    tasks: { curate: { schedule: "0 3 * * *" } },
+                },
+            }),
+        );
+
+        writeMagicContextConfig(path, {
+            historianModel: "new/historian",
+            historianThinkingLevel: "medium",
+            dreamerEnabled: true,
+            dreamerModel: "new/dreamer",
+            sidekickEnabled: false,
+            embedding: { provider: "local", model: "Xenova/all-MiniLM-L6-v2" },
+            modelRefToCanonical: (model) => model,
+        });
+
+        const config = parseJsonc(readFileSync(path, "utf-8")) as {
+            historian?: {
+                model?: string;
+                opencode?: { model?: string };
+                pi?: { model?: string; thinking_level?: string };
+            };
+            dreamer?: {
+                model?: string;
+                opencode?: { model?: string };
+                pi?: { model?: string };
+                tasks?: { curate?: { schedule?: string } };
+            };
+        };
+        expect(config.historian?.pi).toEqual({ model: "new/historian", thinking_level: "medium" });
+        expect(config.historian?.opencode?.model).toBe("legacy/historian");
+        expect(config.historian).not.toHaveProperty("model");
+        expect(config.dreamer?.pi?.model).toBe("new/dreamer");
+        expect(config.dreamer?.opencode?.model).toBe("legacy/dreamer");
+        expect(config.dreamer?.tasks?.curate?.schedule).toBe("0 3 * * *");
+        expect(config.dreamer).not.toHaveProperty("model");
     });
 });
 
@@ -291,18 +339,18 @@ describe("runSetup", () => {
         expect(settings.packages).toContain("npm:@cortexkit/pi-magic-context");
 
         const config = parseJsonc(readFileSync(configPath, "utf-8")) as {
-            historian?: { model?: string; thinking_level?: string };
-            dreamer?: { enabled?: boolean; model?: string; disable?: boolean };
+            historian?: { pi?: { model?: string; thinking_level?: string } };
+            dreamer?: { enabled?: boolean; pi?: { model?: string }; disable?: boolean };
             sidekick?: { enabled?: boolean; disable?: boolean };
             embedding?: { provider?: string; model?: string };
         };
         // No recommendation tree anymore: the picker shows the full model list
         // sorted, and the mock selects the first option — alphabetically
         // "anthropic/claude-haiku-4-5" for BOTH historian and dreamer.
-        expect(config.historian?.model).toBe("anthropic/claude-haiku-4-5");
-        expect(config.historian?.thinking_level).toBeUndefined();
+        expect(config.historian?.pi?.model).toBe("anthropic/claude-haiku-4-5");
+        expect(config.historian?.pi?.thinking_level).toBeUndefined();
         expect(config.dreamer).toEqual({
-            model: "anthropic/claude-haiku-4-5",
+            pi: { model: "anthropic/claude-haiku-4-5" },
         });
         expect(config.dreamer).not.toHaveProperty("enabled");
         expect(config.sidekick?.disable).toBe(true);
@@ -348,10 +396,10 @@ describe("runSetup", () => {
         const config = parseJsonc(
             readFileSync(join(root, ".config", "cortexkit", "magic-context.jsonc"), "utf-8"),
         ) as {
-            dreamer?: { model?: string; disable?: boolean };
+            dreamer?: { pi?: { model?: string }; disable?: boolean };
         };
         expect(config.dreamer?.disable).toBe(true);
-        expect(config.dreamer).not.toHaveProperty("model");
+        expect(config.dreamer?.pi?.model).toBeUndefined();
     });
 
     it("prompts for thinking_level when historian model is github-copilot", async () => {
@@ -382,11 +430,11 @@ describe("runSetup", () => {
         const config = parseJsonc(
             readFileSync(join(root, ".config", "cortexkit", "magic-context.jsonc"), "utf-8"),
         ) as {
-            historian?: { model?: string; thinking_level?: string };
+            historian?: { pi?: { model?: string; thinking_level?: string } };
         };
         // github-copilot model — thinking_level must be set by setup wizard
-        expect(config.historian?.model).toBe("github-copilot/gpt-5.4");
-        expect(config.historian?.thinking_level).toBe("medium");
+        expect(config.historian?.pi?.model).toBe("github-copilot/gpt-5.4");
+        expect(config.historian?.pi?.thinking_level).toBe("medium");
     });
 
     it("exits gracefully without writing files when Pi is missing", async () => {

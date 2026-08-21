@@ -4,6 +4,7 @@ import {
     DEFAULT_HISTORY_BUDGET_PERCENTAGE,
     DEFAULT_LOCAL_EMBEDDING_MODEL,
     type MagicContextConfig,
+    PER_HARNESS_MIGRATION_INVENTORY,
     MagicContextConfigSchema,
 } from "./magic-context";
 
@@ -215,8 +216,10 @@ describe("MagicContextConfigSchema", () => {
             expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
         });
 
-        it("defaults classify-memories and retrospective on daily in dreamer task schema", () => {
-            const result = MagicContextConfigSchema.parse({ dreamer: { model: "x/y" } });
+        it("defaults classify-memories and retrospective on daily in dreamer task metadata", () => {
+            const result = MagicContextConfigSchema.parse({
+                dreamer: { opencode: { model: "x/y" } },
+            });
             expect(result.dreamer?.tasks["classify-memories"].schedule).toBe("0 6 * * *");
             expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
         });
@@ -279,6 +282,145 @@ describe("MagicContextConfigSchema", () => {
             expect(
                 MagicContextConfigSchema.parse({ prompt_surface: promptSurface }).prompt_surface,
             ).toEqual(promptSurface);
+        });
+    });
+
+    describe("per-harness model configuration", () => {
+        it("keeps the migration inventory exhaustive and field-specific", () => {
+            expect(PER_HARNESS_MIGRATION_INVENTORY).toEqual({
+                historian: {
+                    retained: [
+                        "temperature",
+                        "top_p",
+                        "prompt",
+                        "tools",
+                        "disable",
+                        "description",
+                        "mode",
+                        "color",
+                        "maxSteps",
+                        "permission",
+                        "maxTokens",
+                        "two_pass",
+                        "disallowed_tools",
+                    ],
+                    migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+                },
+                dreamer: {
+                    retained: [
+                        "temperature",
+                        "top_p",
+                        "prompt",
+                        "tools",
+                        "disable",
+                        "description",
+                        "mode",
+                        "color",
+                        "maxSteps",
+                        "permission",
+                        "maxTokens",
+                        "inject_docs",
+                    ],
+                    migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+                },
+                task: {
+                    retained: ["schedule", "promotion_threshold"],
+                    migrated_execution: [
+                        "model",
+                        "fallback_models",
+                        "variant",
+                        "thinking_level",
+                        "timeout_minutes",
+                    ],
+                },
+            });
+        });
+
+        it("keeps agent and task metadata separate from strict harness execution blocks", () => {
+            const result = MagicContextConfigSchema.parse({
+                historian: {
+                    disable: false,
+                    two_pass: true,
+                    disallowed_tools: ["read"],
+                    opencode: {
+                        model: { model: "anthropic/claude-sonnet-4-6", variant: "high" },
+                        fallback_models: ["openai/gpt-5.4"],
+                        variant: "medium",
+                    },
+                    pi: {
+                        model: {
+                            model: "github-copilot/gpt-5.4",
+                            thinking_level: "high",
+                        },
+                        fallback_models: ["openai/gpt-5.4"],
+                        thinking_level: "medium",
+                    },
+                },
+                dreamer: {
+                    disable: false,
+                    inject_docs: false,
+                    tasks: {
+                        "review-user-memories": {
+                            schedule: "0 3 * * *",
+                            promotion_threshold: 4,
+                        },
+                    },
+                    opencode: {
+                        model: "anthropic/claude-sonnet-4-6",
+                        fallback_models: [{ model: "openai/gpt-5.4", variant: "low" }],
+                        tasks: {
+                            verify: {
+                                model: "anthropic/claude-haiku-4-5",
+                                fallback_models: ["openai/gpt-5.4"],
+                                variant: "medium",
+                                timeout_minutes: 30,
+                            },
+                        },
+                    },
+                    pi: {
+                        model: "github-copilot/gpt-5.4",
+                        fallback_models: [{ model: "openai/gpt-5.4", thinking_level: "minimal" }],
+                        tasks: {
+                            verify: {
+                                model: "github-copilot/gpt-5.4",
+                                fallback_models: ["openai/gpt-5.4"],
+                                thinking_level: "high",
+                                timeout_minutes: 30,
+                            },
+                        },
+                    },
+                },
+            });
+
+            expect(result.historian?.opencode?.fallback_models).toEqual(["openai/gpt-5.4"]);
+            expect(result.dreamer?.tasks["review-user-memories"]).toEqual({
+                schedule: "0 3 * * *",
+                promotion_threshold: 4,
+            });
+            expect(result.dreamer?.opencode?.tasks?.verify?.timeout_minutes).toBe(30);
+        });
+
+        it("rejects cross-harness vocabulary, non-array fallbacks, and execution fields at metadata depth", () => {
+            const invalidConfigs = [
+                { historian: { opencode: { thinking_level: "high" } } },
+                { historian: { pi: { variant: "high" } } },
+                {
+                    dreamer: {
+                        opencode: { tasks: { verify: { thinking_level: "high" } } },
+                    },
+                },
+                {
+                    dreamer: {
+                        pi: { tasks: { verify: { variant: "high" } } },
+                    },
+                },
+                { historian: { opencode: { fallback_models: "anthropic/claude-sonnet-4-6" } } },
+                { dreamer: { tasks: { verify: { model: "anthropic/claude-sonnet-4-6" } } } },
+            ];
+
+            for (const config of invalidConfigs) {
+                expect(MagicContextConfigSchema.safeParse(config).success).toBe(false);
+            }
         });
     });
 

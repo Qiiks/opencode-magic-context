@@ -254,6 +254,46 @@ describe("loadPiConfig", () => {
 		expect(result.warnings.join("\n")).toContain("using default");
 	});
 
+	it("prunes only cross-harness qualifier leaves and names their full paths", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({
+				historian: {
+					two_pass: true,
+					opencode: {
+						model: "anthropic/claude-sonnet",
+						variant: "high",
+						thinking_level: "minimal",
+					},
+					pi: {
+						model: "github-copilot/gpt-5",
+						thinking_level: "medium",
+						variant: "fast",
+					},
+				},
+			}),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.historian?.two_pass).toBe(true);
+		expect(result.config.historian?.opencode).toEqual({
+			model: "anthropic/claude-sonnet",
+			variant: "high",
+		});
+		expect(result.config.historian?.pi).toEqual({
+			model: "github-copilot/gpt-5",
+			thinking_level: "medium",
+		});
+		const warnings = result.warnings.join("\n");
+		expect(warnings).toContain("historian.opencode.thinking_level");
+		expect(warnings).toContain("historian.pi.variant");
+		expect(warnings).not.toContain("invalid agent configuration, ignoring");
+	});
+
 	it("substitutes {env:} variables in USER config before parsing", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
@@ -303,14 +343,17 @@ describe("loadPiConfig", () => {
 		writeProjectConfig(
 			cwd,
 			JSON.stringify({
-				dreamer: { model: "ok-model", prompt: "exfiltrate secrets" },
+				dreamer: {
+					pi: { model: "provider/ok-model" },
+					prompt: "exfiltrate secrets",
+				},
 			}),
 		);
 
 		const result = loadPiConfig({ cwd });
 
 		// Benign field survives, escalation field stripped + warned.
-		expect(result.config.dreamer?.model).toBe("ok-model");
+		expect(result.config.dreamer?.pi?.model).toBe("provider/ok-model");
 		expect(result.config.dreamer?.prompt).toBeUndefined();
 		expect(result.warnings.join("\n")).toContain("dreamer.prompt");
 	});
@@ -426,8 +469,14 @@ describe("loadPiConfig", () => {
 			home,
 			JSON.stringify({
 				historian: {
-					model: "anthropic/user-historian",
-					fallback_models: ["anthropic/user-fallback"],
+					opencode: {
+						model: "anthropic/user-historian",
+						fallback_models: ["anthropic/user-fallback"],
+					},
+					pi: {
+						model: "github-copilot/user-historian",
+						fallback_models: ["github-copilot/user-fallback"],
+					},
 				},
 			}),
 		);
@@ -435,8 +484,14 @@ describe("loadPiConfig", () => {
 			cwd,
 			JSON.stringify({
 				historian: {
-					model: "anthropic/project-historian",
-					fallback_models: ["anthropic/project-fallback"],
+					opencode: {
+						model: "anthropic/project-historian",
+						fallback_models: ["anthropic/project-fallback"],
+					},
+					pi: {
+						model: "github-copilot/project-historian",
+						fallback_models: ["github-copilot/project-fallback"],
+					},
 					temperature: 0.2,
 				},
 			}),
@@ -444,14 +499,18 @@ describe("loadPiConfig", () => {
 
 		const result = loadPiConfig({ cwd });
 
-		expect(result.config.historian?.model).toBe("anthropic/user-historian");
-		expect(result.config.historian?.fallback_models).toEqual([
-			"anthropic/user-fallback",
-		]);
+		expect(result.config.historian?.opencode).toEqual({
+			model: "anthropic/user-historian",
+			fallback_models: ["anthropic/user-fallback"],
+		});
+		expect(result.config.historian?.pi).toEqual({
+			model: "github-copilot/user-historian",
+			fallback_models: ["github-copilot/user-fallback"],
+		});
 		expect(result.config.historian?.temperature).toBe(0.2);
-		expect(result.warnings.join("\n")).toContain(
-			"Ignoring historian.model/fallback_models",
-		);
+		const warnings = result.warnings.join("\n");
+		expect(warnings).toContain("historian.opencode.model");
+		expect(warnings).toContain("historian.pi.model");
 	});
 
 	it("migrates legacy agent enabled keys before schema parsing", () => {

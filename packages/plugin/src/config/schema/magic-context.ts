@@ -104,6 +104,194 @@ export const PromptSurfaceConfigSchema = z
     );
 export type PromptSurfaceConfig = z.infer<typeof PromptSurfaceConfigSchema>;
 
+/**
+ * The flat model-resolution fields are the only fields that move into harness
+ * blocks. Keeping this inventory next to the schema gives the loader migration
+ * an exhaustive contract instead of a catch-all rule.
+ */
+export const PER_HARNESS_MIGRATION_INVENTORY = {
+    historian: {
+        retained: [
+            "temperature",
+            "top_p",
+            "prompt",
+            "tools",
+            "disable",
+            "description",
+            "mode",
+            "color",
+            "maxSteps",
+            "permission",
+            "maxTokens",
+            "two_pass",
+            "disallowed_tools",
+        ],
+        migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+    },
+    dreamer: {
+        retained: [
+            "temperature",
+            "top_p",
+            "prompt",
+            "tools",
+            "disable",
+            "description",
+            "mode",
+            "color",
+            "maxSteps",
+            "permission",
+            "maxTokens",
+            "inject_docs",
+        ],
+        migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
+    },
+    task: {
+        retained: ["schedule", "promotion_threshold"],
+        migrated_execution: [
+            "model",
+            "fallback_models",
+            "variant",
+            "thinking_level",
+            "timeout_minutes",
+        ],
+    },
+} as const;
+
+/** OpenCode entry objects permit `variant` and reject Pi-only `thinking_level`. */
+const OcEntryObjectSchema = z
+    .object({
+        model: z.string().describe("OpenCode model ID (for example, provider/model)."),
+        variant: z.string().optional().describe("OpenCode reasoning variant for this entry."),
+    })
+    .strict();
+export const OcEntrySchema = z.union([z.string(), OcEntryObjectSchema]);
+export type OcEntry = z.infer<typeof OcEntrySchema>;
+
+/** Pi entry objects permit `thinking_level` and reject OpenCode-only `variant`. */
+const PiEntryObjectSchema = z
+    .object({
+        model: z.string().describe("Pi model ID (for example, provider/model)."),
+        thinking_level: PiThinkingLevelSchema.describe("Pi thinking level for this entry."),
+    })
+    .strict();
+export const PiEntrySchema = z.union([z.string(), PiEntryObjectSchema]);
+export type PiEntry = z.infer<typeof PiEntrySchema>;
+
+/** Strict model-resolution block used by historian.opencode. */
+export const OpenCodeHarnessBlockSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        variant: z.string().optional().describe("Default OpenCode reasoning variant."),
+    })
+    .strict()
+    .describe("Strict OpenCode model-resolution block. It accepts no Pi vocabulary.");
+export type OpenCodeHarnessBlock = z.infer<typeof OpenCodeHarnessBlockSchema>;
+
+/** Strict model-resolution block used by historian.pi. */
+export const PiHarnessBlockSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        thinking_level: PiThinkingLevelSchema.describe("Default Pi thinking level."),
+    })
+    .strict()
+    .describe("Strict Pi model-resolution block. It accepts no OpenCode vocabulary.");
+export type PiHarnessBlock = z.infer<typeof PiHarnessBlockSchema>;
+
+/** Strict OpenCode-only execution override for one dreamer task. */
+export const OpenCodeTaskExecutionSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("OpenCode model entry for this task."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe("Ordered OpenCode fallback entries for this task."),
+        variant: z
+            .string()
+            .optional()
+            .describe("Default OpenCode reasoning variant for this task."),
+        timeout_minutes: z
+            .number()
+            .min(5)
+            .optional()
+            .describe("Minutes allowed for this task before it is aborted."),
+    })
+    .strict();
+export type OpenCodeTaskExecution = z.infer<typeof OpenCodeTaskExecutionSchema>;
+
+/** Strict Pi-only execution override for one dreamer task. */
+export const PiTaskExecutionSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Pi model entry for this task."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe("Ordered Pi fallback entries for this task."),
+        thinking_level: PiThinkingLevelSchema.describe("Default Pi thinking level for this task."),
+        timeout_minutes: z
+            .number()
+            .min(5)
+            .optional()
+            .describe("Minutes allowed for this task before it is aborted."),
+    })
+    .strict();
+export type PiTaskExecution = z.infer<typeof PiTaskExecutionSchema>;
+
+/** Strict OpenCode harness block for dreamer execution and task overrides. */
+export const DreamerOpenCodeHarnessBlockSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        variant: z.string().optional().describe("Default OpenCode reasoning variant."),
+        tasks: z
+            .record(z.string(), OpenCodeTaskExecutionSchema)
+            .optional()
+            .describe(
+                "OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes.",
+            ),
+    })
+    .strict()
+    .describe("Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary.");
+export type DreamerOpenCodeHarnessBlock = z.infer<typeof DreamerOpenCodeHarnessBlockSchema>;
+
+/** Strict Pi harness block for dreamer execution and task overrides. */
+export const DreamerPiHarnessBlockSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe(
+                "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+            ),
+        thinking_level: PiThinkingLevelSchema.describe("Default Pi thinking level."),
+        tasks: z
+            .record(z.string(), PiTaskExecutionSchema)
+            .optional()
+            .describe(
+                "Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
+            ),
+    })
+    .strict()
+    .describe("Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary.");
+export type DreamerPiHarnessBlock = z.infer<typeof DreamerPiHarnessBlockSchema>;
+
 /** A 5-field cron expression, or "" to disable the task. */
 const CronScheduleSchema = z
     .string()
@@ -113,23 +301,15 @@ const CronScheduleSchema = z
     })
     .describe('5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task.');
 
-/** Per-task scheduling + model config. Model/fallback/thinking inherit the
- *  dreamer-level defaults when omitted. Task-specific params (promotion_threshold)
- *  are optional and only meaningful for their owning task. */
-const DreamTaskBaseConfigSchema = z.object({
-    schedule: CronScheduleSchema.default(""),
-    model: z.string().optional().describe("Per-task model override (inherits dreamer.model)"),
-    fallback_models: z
-        .union([z.string(), z.array(z.string())])
-        .optional()
-        .describe("Per-task fallback chain (inherits dreamer.fallback_models)"),
-    thinking_level: PiThinkingLevelSchema.describe("Pi only: per-task thinking level"),
-    timeout_minutes: z
-        .number()
-        .min(5)
-        .default(20)
-        .describe("Minutes allowed for this task before it is aborted"),
-});
+/**
+ * Harness-independent task metadata. These fields stay at dreamer.tasks.<task>
+ * during per-harness migration; model execution fields are deliberately absent.
+ */
+const DreamTaskBaseConfigSchema = z
+    .object({
+        schedule: CronScheduleSchema.default(""),
+    })
+    .strict();
 
 const PromotionThresholdSchema = z
     .number()
@@ -188,11 +368,8 @@ function defaultTaskConfig(task: DreamTaskName): z.input<typeof DreamTaskConfigS
     return base;
 }
 
-// `.default()` in Zod 4 wants the OUTPUT shape; the function form lets us derive
-// it by parsing the (partial) input default so timeout_minutes etc. fill in.
-/** The `tasks` record: one entry per canonical task, each defaulting to its
- *  v1-behavior-preserving schedule. Written explicitly (not via fromEntries) so
- *  the inferred type stays a precise per-key object. */
+/** The harness-independent task metadata record. Schedule remains the only
+ * disable control; runtime gates are not configuration fields. */
 export const DreamTasksSchema = z
     .object({
         "map-memories": DreamTaskBaseConfigSchema.default(() =>
@@ -233,50 +410,59 @@ export const DreamTasksSchema = z
         ),
     })
     .describe(
-        "Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model.",
+        "Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks or dreamer.pi.tasks.",
     );
 
-/** Combined dreamer agent + per-task scheduling configuration (Dreamer v2). */
-export const DreamerConfigSchema = AgentOverrideConfigSchema.merge(
-    z.object({
-        tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
-        inject_docs: z
-            .boolean()
-            .default(true)
-            .describe(
-                "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
-            ),
-        thinking_level: PiThinkingLevelSchema.describe(
-            "Pi only: default thinking level for dreamer subagent invocations. See historian.thinking_level.",
+const AgentMetadataSchema = AgentOverrideConfigSchema.pick({
+    temperature: true,
+    top_p: true,
+    prompt: true,
+    tools: true,
+    disable: true,
+    description: true,
+    mode: true,
+    color: true,
+    maxSteps: true,
+    permission: true,
+    maxTokens: true,
+});
+
+/** Combined dreamer metadata plus two independent strict execution blocks. */
+export const DreamerConfigSchema = AgentMetadataSchema.extend({
+    opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
+    pi: DreamerPiHarnessBlockSchema.optional(),
+    tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
+    inject_docs: z
+        .boolean()
+        .default(true)
+        .describe(
+            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
         ),
-    }),
-);
+});
 export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
 
 export const SidekickConfigSchema = AgentOverrideConfigSchema.extend({
     timeout_ms: z.number().default(30000).describe("Timeout for sidekick calls in milliseconds"),
     system_prompt: z.string().optional().describe("Custom system prompt for sidekick"),
     thinking_level: PiThinkingLevelSchema.describe(
-        "Pi only: explicit thinking level for sidekick subagent invocations. See historian.thinking_level.",
+        "Pi only: explicit thinking level for sidekick subagent invocations. See historian.pi.thinking_level.",
     ),
 }).optional();
 export type SidekickConfig = NonNullable<z.infer<typeof SidekickConfigSchema>>;
 
-/** Historian agent configuration — includes all agent overrides plus two_pass mode.
- *  Two-pass mode runs a second editor pass after the initial historian pass to clean
- *  up low-signal U: lines and cross-compartment duplicates. Recommended for models
- *  without extended thinking; not needed for Claude Sonnet/Opus when reasoning is
- *  enabled via OpenCode variant config. */
-export const HistorianConfigSchema = AgentOverrideConfigSchema.extend({
+/**
+ * Historian metadata remains harness-independent. Only model resolution moves to
+ * the strict opencode and pi blocks; two_pass and disallowed_tools stay here.
+ */
+export const HistorianConfigSchema = AgentMetadataSchema.extend({
+    opencode: OpenCodeHarnessBlockSchema.optional(),
+    pi: PiHarnessBlockSchema.optional(),
     two_pass: z
         .boolean()
         .default(false)
         .describe(
             "Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)",
         ),
-    thinking_level: PiThinkingLevelSchema.describe(
-        "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max",
-    ),
     disallowed_tools: z
         .array(z.enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"]))
         .default([])
@@ -689,10 +875,10 @@ export const MagicContextConfigSchema = z
                     "original language until naturally rewritten.",
             ),
         historian: HistorianConfigSchema.describe(
-            "Historian agent configuration (model, fallback_models, variant, temperature, maxTokens, permission, two_pass, etc.)",
+            "Historian metadata plus independent strict OpenCode and Pi execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode or historian.pi.",
         ),
         dreamer: DreamerConfigSchema.optional().describe(
-            "Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.)",
+            "Dreamer metadata and scheduling plus independent strict OpenCode and Pi execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block.",
         ),
         smart_notes: z
             .object({

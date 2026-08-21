@@ -1,4 +1,7 @@
-import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "./schema/magic-context";
+import {
+    DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+    PER_HARNESS_MIGRATION_INVENTORY,
+} from "./schema/magic-context";
 
 /**
  * Security hardening for PROJECT-level (repo-supplied, untrusted) config.
@@ -15,7 +18,12 @@ import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "./schema/magic-context";
 
 /** Hidden agents that run with elevated/autonomous capability. */
 const HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"] as const;
-const HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"] as const;
+const HARNESS_KEYS = ["opencode", "pi"] as const;
+/** Every historian model-resolution field, including per-harness qualifiers.
+ *  Variant and thinking_level merge onto the user's historian model at resolve
+ *  time, so leaving them would let a cloned repo force extra spend. */
+const HISTORIAN_USER_ONLY_FIELDS =
+    PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution;
 const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"] as const;
 
 /**
@@ -62,6 +70,66 @@ interface TokenThresholdConfig {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stripListedFields(
+    target: Record<string, unknown>,
+    fields: readonly string[],
+    path: string,
+    removed: string[],
+): void {
+    for (const field of fields) {
+        if (field in target) {
+            delete target[field];
+            removed.push(path.length > 0 ? `${path}.${field}` : field);
+        }
+    }
+}
+
+/** Strip prompt, permission, tools, and system_prompt from one agent, harness,
+ *  task, or model-entry object, including each fallback_models entry. A cloned
+ *  repo must not reprogram hidden agents through any of those nestings. */
+function stripEscalationAtExecutableSite(
+    block: Record<string, unknown>,
+    path: string,
+    removed: string[],
+): void {
+    stripListedFields(block, AGENT_ESCALATION_FIELDS, path, removed);
+    if (isPlainObject(block.model)) {
+        stripListedFields(block.model, AGENT_ESCALATION_FIELDS, `${path}.model`, removed);
+    }
+    if (Array.isArray(block.fallback_models)) {
+        for (let index = 0; index < block.fallback_models.length; index++) {
+            const entry = block.fallback_models[index];
+            if (isPlainObject(entry)) {
+                stripListedFields(
+                    entry,
+                    AGENT_ESCALATION_FIELDS,
+                    `${path}.fallback_models.${index}`,
+                    removed,
+                );
+            }
+        }
+    }
+}
+
+/** Remove `mural.model` smuggled under hidden-agent trees. Top-level and
+ *  experimental mural blocks are handled separately so their warnings stay
+ *  specific; this walk covers harness and task nesting the schema does not
+ *  admit but a hostile file can still write. */
+function stripNestedMuralModels(
+    node: Record<string, unknown>,
+    path: string,
+    removed: string[],
+): void {
+    for (const [key, value] of Object.entries(node)) {
+        if (key === "mural" && isPlainObject(value) && "model" in value) {
+            delete value.model;
+            removed.push(`${path}.${key}.model`);
+        } else if (isPlainObject(value)) {
+            stripNestedMuralModels(value, `${path}.${key}`, removed);
+        }
+    }
 }
 
 function isValidPercentageThreshold(value: unknown): value is number {
@@ -213,17 +281,22 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.
- *  - `historian.model` / `historian.fallback_models` — historian model spend is
- *    user-level only; a cloned repo cannot force extra compaction cost.
- *  - `mural.model` — mural cue-compressor model selection is user-level only;
- *    a cloned repo cannot choose a model that sends project memory to a provider.
+ *  - historian model-resolution fields (model, fallback_models, variant,
+ *    thinking_level), including both per-harness blocks — historian model
+ *    spend is user-level only. Qualifiers merge onto the user's historian
+ *    model at resolve time, so a cloned repo cannot force extra thinking or
+ *    variant cost.
+ *  - `mural.model` at the top-level block, the legacy experimental spelling,
+ *    and any nested `mural.model` under hidden agents — a cloned repo cannot
+ *    choose where project memory is sent.
  *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
  *    the user's Pi child processes load.
  *  - `prompt_surface.guidance_override_path` / `tool_descriptions` — a repository
  *    may select a reviewed preset, but must not inject arbitrary guidance or tool
  *    description text into the user's provider-visible prompt.
- *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
- *    re-permission the historian/dreamer/sidekick.
+ *  - hidden-agent `prompt`/`permission`/`tools`/`system_prompt` at the agent
+ *    root, each harness block, each task block, and inside model/fallback
+ *    entry objects — a repo must not reprogram or re-permission hidden agents.
  */
 export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknown>): string[] {
     const warnings: string[] = [];
@@ -356,6 +429,49 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         }
     }
 
+    for (const agentKey of HIDDEN_AGENT_KEYS) {
+        const block = projectRaw[agentKey];
+        if (!isPlainObject(block)) continue;
+        const removed: string[] = [];
+        stripEscalationAtExecutableSite(block, agentKey, removed);
+        for (const harness of HARNESS_KEYS) {
+            const harnessBlock = block[harness];
+            if (!isPlainObject(harnessBlock)) continue;
+            stripEscalationAtExecutableSite(harnessBlock, `${agentKey}.${harness}`, removed);
+            const tasks = harnessBlock.tasks;
+            if (isPlainObject(tasks)) {
+                for (const [taskName, taskBlock] of Object.entries(tasks)) {
+                    if (isPlainObject(taskBlock)) {
+                        stripEscalationAtExecutableSite(
+                            taskBlock,
+                            `${agentKey}.${harness}.tasks.${taskName}`,
+                            removed,
+                        );
+                    }
+                }
+            }
+        }
+        const schedulingTasks = block.tasks;
+        if (isPlainObject(schedulingTasks)) {
+            for (const [taskName, taskBlock] of Object.entries(schedulingTasks)) {
+                if (isPlainObject(taskBlock)) {
+                    stripListedFields(
+                        taskBlock,
+                        AGENT_ESCALATION_FIELDS,
+                        `${agentKey}.tasks.${taskName}`,
+                        removed,
+                    );
+                }
+            }
+        }
+        if (removed.length > 0) {
+            warnings.push(
+                `Ignoring ${removed.join(", ")} from project config ` +
+                    "(security: a repository cannot reprogram or re-permission hidden agents).",
+            );
+        }
+    }
+
     const historian = projectRaw.historian;
     if (isPlainObject(historian)) {
         const removed: string[] = [];
@@ -365,9 +481,19 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                 removed.push(field);
             }
         }
+        for (const harness of HARNESS_KEYS) {
+            const harnessBlock = historian[harness];
+            if (!isPlainObject(harnessBlock)) continue;
+            for (const field of HISTORIAN_USER_ONLY_FIELDS) {
+                if (field in harnessBlock) {
+                    delete harnessBlock[field];
+                    removed.push(`${harness}.${field}`);
+                }
+            }
+        }
         if (removed.length > 0) {
             warnings.push(
-                `Ignoring historian.${removed.join("/")} from project config ` +
+                `Ignoring ${removed.map((path) => `historian.${path}`).join(", ")} from project config ` +
                     "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
             );
         }
@@ -394,22 +520,16 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
+    const nestedMuralRemoved: string[] = [];
     for (const agentKey of HIDDEN_AGENT_KEYS) {
         const block = projectRaw[agentKey];
         if (!isPlainObject(block)) continue;
-        const removed: string[] = [];
-        for (const field of AGENT_ESCALATION_FIELDS) {
-            if (field in block) {
-                delete block[field];
-                removed.push(field);
-            }
-        }
-        if (removed.length > 0) {
-            warnings.push(
-                `Ignoring ${agentKey}.${removed.join("/")} from project config ` +
-                    "(security: a repository cannot reprogram or re-permission hidden agents).",
-            );
-        }
+        stripNestedMuralModels(block, agentKey, nestedMuralRemoved);
+    }
+    if (nestedMuralRemoved.length > 0) {
+        warnings.push(
+            `Ignoring ${nestedMuralRemoved.join(", ")} from project config (security: the mural cue-compressor model is a user-level setting; a repository cannot choose where project memory is sent).`,
+        );
     }
 
     return warnings;

@@ -47,6 +47,24 @@ describe("dashboard JSONC patching", () => {
     expect(promotePrimers.schedule).toBe("0 3 * * *");
   });
 
+  it("patches only the requested harness task entries", () => {
+    const next = patchDreamerTasksJsonc(
+      configWithComments,
+      { verify: { schedule: "0 3 * * *" } },
+      "pi",
+      { verify: { model: { model: "anthropic/claude-sonnet", thinking_level: "high" } } },
+    );
+
+    const dreamer = asRecord(asRecord(parse(next)).dreamer);
+    const pi = asRecord(dreamer.pi);
+    const tasks = asRecord(pi.tasks);
+    expect(asRecord(tasks.verify).model).toEqual({
+      model: "anthropic/claude-sonnet",
+      thinking_level: "high",
+    });
+    expect(dreamer.opencode).toBeUndefined();
+  });
+
   it("#given malformed JSONC #when parsing or patching #then the save path is refused", () => {
     const malformed = `{ "dreamer": { "tasks": `;
     expect(() => parseJsonc(malformed)).toThrow(/Config JSONC parse failed/);

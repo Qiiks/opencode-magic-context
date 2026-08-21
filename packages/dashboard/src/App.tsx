@@ -8,35 +8,25 @@ import ProjectDetail from "./components/Projects/ProjectDetail";
 import ProjectsGrid from "./components/Projects/ProjectsGrid";
 import UserMemories from "./components/UserMemories/UserMemories";
 import WorkspacesPanel from "./components/WorkspacesPanel/WorkspacesPanel";
-import {
-  getAvailableModels,
-  getAvailablePiModels,
-  getDbHealth,
-  getOpencodeInstallState,
-} from "./lib/api";
+import { getDbHealth, getModelCatalogs, getOpencodeInstallState } from "./lib/api";
 import { initServeToken, listen } from "./lib/platform";
-import type { NavSection, OpencodeInstallState, ProjectCard } from "./lib/types";
+import type { ModelCatalogs, NavSection, OpencodeInstallState, ProjectCard } from "./lib/types";
 import { checkForUpdate, installAndRelaunch, runUpdater } from "./lib/updater";
 
-const MODELS_CACHE_KEY = "mc_dashboard_models_cache";
-const PI_MODELS_CACHE_KEY = "magic-context.available-pi-models";
+const MODEL_CATALOGS_CACHE_KEY = "magic-context.model-catalogs";
 const UPDATE_POLL_INTERVAL = 10 * 60 * 1000; // 10 minutes
 
-function loadCachedModels(): string[] {
+function loadCachedModelCatalogs(): ModelCatalogs {
   try {
-    const raw = localStorage.getItem(MODELS_CACHE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    const parsed: unknown = JSON.parse(localStorage.getItem(MODEL_CATALOGS_CACHE_KEY) ?? "{}");
+    if (!parsed || typeof parsed !== "object") return { opencode: [], pi: [] };
+    const catalogs = parsed as Partial<ModelCatalogs>;
+    return {
+      opencode: Array.isArray(catalogs.opencode) ? catalogs.opencode : [],
+      pi: Array.isArray(catalogs.pi) ? catalogs.pi : [],
+    };
   } catch {
-    return [];
-  }
-}
-
-function loadCachedPiModels(): string[] {
-  try {
-    const raw = localStorage.getItem(PI_MODELS_CACHE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
+    return { opencode: [], pi: [] };
   }
 }
 
@@ -52,8 +42,7 @@ export default function App() {
     setActiveSection(section);
   };
   const [health] = createResource(getDbHealth);
-  const [availableModels, setAvailableModels] = createSignal<string[]>(loadCachedModels());
-  const [availablePiModels, setAvailablePiModels] = createSignal<string[]>(loadCachedPiModels());
+  const [modelCatalogs, setModelCatalogs] = createSignal<ModelCatalogs>(loadCachedModelCatalogs());
   const [opencodeInstallState, setOpencodeInstallState] =
     createSignal<OpencodeInstallState>("none");
   const [updateVersion, setUpdateVersion] = createSignal<string | null>(null);
@@ -68,22 +57,11 @@ export default function App() {
         setOpencodeInstallState("none");
       });
 
-    getAvailableModels()
+    getModelCatalogs()
       .then((fresh) => {
-        setAvailableModels(fresh);
+        setModelCatalogs(fresh);
         try {
-          localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(fresh));
-        } catch {}
-      })
-      .catch(() => {
-        /* keep cached */
-      });
-
-    getAvailablePiModels()
-      .then((fresh) => {
-        setAvailablePiModels(fresh);
-        try {
-          localStorage.setItem(PI_MODELS_CACHE_KEY, JSON.stringify(fresh));
+          localStorage.setItem(MODEL_CATALOGS_CACHE_KEY, JSON.stringify(fresh));
         } catch {}
       })
       .catch(() => {
@@ -191,8 +169,7 @@ export default function App() {
           </Show>
           <Show when={activeSection() === "config"}>
             <ConfigEditor
-              models={availableModels()}
-              piModels={availablePiModels()}
+              modelCatalogs={modelCatalogs()}
               opencodeInstallState={opencodeInstallState()}
             />
           </Show>

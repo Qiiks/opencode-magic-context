@@ -1,3 +1,7 @@
+import type {
+	ModelInput,
+	ResolvedModelEntry,
+} from "@magic-context/core/shared/model-resolution";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 
 /**
@@ -13,7 +17,7 @@ export function createPiHistorianClient(args: {
 	runner: SubagentRunner;
 	model: string;
 	systemPrompt: string;
-	fallbackModels?: readonly string[];
+	fallbackModels?: readonly ModelInput[];
 	timeoutMs?: number;
 	thinkingLevel?: string;
 	directory: string;
@@ -45,11 +49,15 @@ export function createPiHistorianClient(args: {
 			agent: "magic-context-historian",
 			systemPrompt: args.systemPrompt,
 			userMessage: promptText,
-			model: modelOverride ?? args.model,
+			model: modelOverride?.model ?? args.model,
 			fallbackModels: modelOverride ? undefined : args.fallbackModels,
 			timeoutMs: args.timeoutMs,
 			cwd: args.directory,
-			thinkingLevel: args.thinkingLevel,
+			// An override is one active attempt. Its missing qualifier deliberately
+			// clears the primary level rather than inheriting it on a bare fallback.
+			thinkingLevel: modelOverride
+				? modelOverride.qualifier
+				: args.thinkingLevel,
 			accountingSessionId: args.accountingSessionId,
 			accountingSubagent: "recomp",
 		});
@@ -92,11 +100,17 @@ function readBody(input: unknown): {
 	noReply?: boolean;
 	parts?: unknown;
 	model?: unknown;
+	variant?: unknown;
 } {
 	if (typeof input !== "object" || input === null) return {};
 	const body = (input as { body?: unknown }).body;
 	return typeof body === "object" && body !== null
-		? (body as { noReply?: boolean; parts?: unknown; model?: unknown })
+		? (body as {
+				noReply?: boolean;
+				parts?: unknown;
+				model?: unknown;
+				variant?: unknown;
+			})
 		: {};
 }
 
@@ -106,7 +120,10 @@ function readBody(input: unknown): {
  * passes `body.model = { providerID, modelID }`. Returns undefined when no
  * usable override is present (fall back to the client's primary model).
  */
-function readBodyModel(body: { model?: unknown }): string | undefined {
+function readBodyModel(body: {
+	model?: unknown;
+	variant?: unknown;
+}): ResolvedModelEntry | undefined {
 	const model = body.model;
 	if (typeof model !== "object" || model === null) return undefined;
 	const { providerID, modelID } = model as {
@@ -119,7 +136,13 @@ function readBodyModel(body: { model?: unknown }): string | undefined {
 		typeof modelID === "string" &&
 		modelID.length > 0
 	) {
-		return `${providerID}/${modelID}`;
+		const qualifier =
+			typeof body.variant === "string" && body.variant.length > 0
+				? body.variant
+				: undefined;
+		return qualifier
+			? { model: `${providerID}/${modelID}`, qualifier }
+			: { model: `${providerID}/${modelID}` };
 	}
 	return undefined;
 }

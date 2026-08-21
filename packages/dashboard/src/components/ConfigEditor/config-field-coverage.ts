@@ -35,18 +35,12 @@ export const RENDERED_PREFIXES: readonly string[] = [
   // Historian
   "history_budget_percentage",
   "historian_timeout_ms",
-  "historian.model",
-  "historian.fallback_models",
+  // The OpenCode and Pi configuration editors each render separate harness-specific blocks.
+  "historian",
   "commit_cluster_trigger",
   // Dreamer (panel renders a curated subset of the agent-override schema)
-  "dreamer.model",
-  "dreamer.fallback_models",
-  "dreamer.disable",
-  "dreamer.inject_docs",
-  // Dreamer v2 per-task editor (DreamerTasksField) renders the whole tasks
-  // subtree: per-task schedule preset/custom, model override, and task-specific
-  // params (promotion_threshold, token_budget, min_reads).
-  "dreamer.tasks",
+  // Dreamer renders shared schedules plus OpenCode and Pi model task blocks.
+  "dreamer",
   // Sidekick (panel renders a curated subset)
   "sidekick.model",
   "sidekick.fallback_models",
@@ -84,10 +78,6 @@ export const RENDERED_PREFIXES: readonly string[] = [
  */
 export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   ...agentOverrideTailOmissions(),
-  "historian.disable":
-    "historian is core to magic-context; disabling it is an advanced raw-JSONC choice, not a form toggle",
-  "historian.two_pass": "advanced historian tuning; raw JSONC",
-  "historian.disallowed_tools": "advanced historian tuning; raw JSONC",
   "sidekick.system_prompt": "free-form prompt override; raw JSONC",
   "system_prompt_injection.skip_signatures":
     "free-form substring array; raw JSONC (no array widget in the form yet)",
@@ -110,8 +100,8 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
  * The shared AgentOverride schema gives historian/dreamer/sidekick a long tail
  * of advanced knobs (sampling, prompt, tool/permission overrides, etc.). The
  * form surfaces only the high-signal ones per agent; the rest are raw-JSONC by
- * design. Generated for all three agents from one list so adding a new
- * agent-override field classifies consistently.
+ * design. Historian and Dreamer are covered by their full harness-editor prefixes;
+ * Sidekick remains raw-JSONC for this advanced tail.
  */
 function agentOverrideTailOmissions(): Record<string, string> {
   const tail = [
@@ -128,7 +118,7 @@ function agentOverrideTailOmissions(): Record<string, string> {
     "variant",
     "thinking_level",
   ];
-  const agents = ["historian", "dreamer", "sidekick"];
+  const agents = ["sidekick"];
   const out: Record<string, string> = {};
   for (const agent of agents) {
     for (const field of tail) {

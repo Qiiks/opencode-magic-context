@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
+import type { ModelHarness } from "../shared/model-resolution";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
@@ -77,6 +78,8 @@ const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
 interface ProjectRegistration {
     directory: string;
     projectIdentity: string;
+    /** The runtime selecting models for this registration. */
+    harness: ModelHarness;
     client: PluginContext["client"];
     dreamerConfig?: DreamerConfig;
     language?: string;
@@ -437,7 +440,12 @@ async function sweepProject(
         // runs due tasks grouped by conflict-domain under keyed leases. The
         // executor runs in THIS registration's own checkout (not a sibling
         // worktree the shared git:<sha> identity might resolve to).
-        const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreamerConfig, reg.language);
+        const runtimeConfigs = buildDreamTaskRuntimeConfigs(
+            dreamerConfig,
+            "opencode",
+            reg.language,
+            reg.mural?.model,
+        );
         const executor = createDreamTaskExecutor({
             client: reg.client,
             sessionDirectory: reg.directory,
@@ -455,7 +463,6 @@ async function sweepProject(
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
-            dreamerModel: dreamerConfig.model,
             mural: reg.mural,
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             retinaHandoff: reg.retinaHandoff,

@@ -29,6 +29,8 @@
  * the runner contract is purely additive on the OpenCode side.
  */
 
+import type { ModelInput } from "./model-resolution";
+
 /**
  * Configuration for one subagent invocation.
  *
@@ -63,7 +65,7 @@ export interface SubagentRunOptions {
     systemPrompt: string;
     userMessage: string;
     model?: string | undefined;
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     timeoutMs?: number | undefined;
     cwd?: string | undefined;
     signal?: AbortSignal | undefined;

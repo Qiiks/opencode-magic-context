@@ -1,4 +1,5 @@
 import { createMemo, createResource, createSignal, Show } from "solid-js";
+
 import { saveProjectConfig } from "../../lib/api";
 import {
   jsoncErrorMessage,
@@ -9,20 +10,28 @@ import {
 import { invoke } from "../../lib/platform";
 import type { ConfigFile, DreamerProject } from "../../lib/types";
 import { configSaveBlocker } from "../ConfigEditor/config-save-guard";
-import DreamerTasksField, { type DreamTaskConfig } from "../ConfigEditor/DreamerTasksField";
+import DreamerTasksField, {
+  type DreamTaskConfig,
+  type DreamTaskModelConfig,
+} from "../ConfigEditor/DreamerTasksField";
+import type { Harness } from "../ConfigEditor/HarnessModelFields";
+
+const hasOwn = (value: object, key: string | symbol) => Reflect.ownKeys(value).includes(key);
 
 /**
  * Per-project dreamer config editor (the project-card gear).
  *
  * Option A storage: the project's own `magic-context.jsonc` file. We read the
- * file (or start empty), edit ONLY its `dreamer.tasks`, and write the whole file
- * back via save_project_config — preserving every other key. A project with a
+ * file (or start empty), edit its shared schedules and selected harness task
+ * entries, and write the whole file back via save_project_config — preserving every
+ * other key. A project with a
  * `dreamer` block overrides the global config (the plugin deep-merges
  * project-over-user); removing the block reverts it to inheriting global.
  */
 export default function DreamerProjectConfigPanel(props: {
   project: DreamerProject;
-  models: string[];
+  opencodeModels: string[];
+  piModels: string[];
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -63,12 +72,29 @@ export default function DreamerProjectConfigPanel(props: {
 
   // Local working copy of tasks (seeded from file; edits accumulate here).
   const [tasks, setTasks] = createSignal<Record<string, DreamTaskConfig> | undefined>(undefined);
+  const [harness, setHarness] = createSignal<Harness>("opencode");
+  const [modelTaskOverrides, setModelTaskOverrides] = createSignal<
+    Partial<Record<Harness, Record<string, DreamTaskModelConfig> | undefined>>
+  >({});
   const effectiveTasks = (): Record<string, DreamTaskConfig> | undefined => {
     const local = tasks();
     if (local) return local;
     const stored = dreamerObj().tasks;
     return stored && typeof stored === "object" && !Array.isArray(stored)
       ? (stored as Record<string, DreamTaskConfig>)
+      : undefined;
+  };
+
+  const effectiveModelTasks = (
+    target: Harness,
+  ): Record<string, DreamTaskModelConfig> | undefined => {
+    const overrides = modelTaskOverrides();
+    if (hasOwn(overrides, target)) return overrides[target];
+    const block = dreamerObj()[target];
+    if (!block || typeof block !== "object" || Array.isArray(block)) return undefined;
+    const taskModels = (block as Record<string, unknown>).tasks;
+    return taskModels && typeof taskModels === "object" && !Array.isArray(taskModels)
+      ? (taskModels as Record<string, DreamTaskModelConfig>)
       : undefined;
   };
 
@@ -89,10 +115,18 @@ export default function DreamerProjectConfigPanel(props: {
     const wt = worktree();
     if (!wt || refuseBlockedSave()) return;
     try {
-      const nextConfig = patchDreamerTasksJsonc(
-        configFile()?.content ?? "",
-        effectiveTasks() ?? {},
-      );
+      let nextConfig = patchDreamerTasksJsonc(configFile()?.content ?? "", effectiveTasks() ?? {});
+      const overrides = modelTaskOverrides();
+      for (const target of ["opencode", "pi"] as const) {
+        if (hasOwn(overrides, target)) {
+          nextConfig = patchDreamerTasksJsonc(
+            nextConfig,
+            effectiveTasks() ?? {},
+            target,
+            overrides[target],
+          );
+        }
+      }
       await saveProjectConfig(wt, nextConfig);
       setSaveStatus("✓ Saved — applies on the next dreamer tick");
       setDirty(false);
@@ -160,13 +194,35 @@ export default function DreamerProjectConfigPanel(props: {
                   </p>
                 )}
               </Show>
+              <div class="tab-pills" style={{ "margin-bottom": "12px" }}>
+                <button
+                  type="button"
+                  class={`tab-pill ${harness() === "opencode" ? "active" : ""}`}
+                  onClick={() => setHarness("opencode")}
+                >
+                  OpenCode
+                </button>
+                <button
+                  type="button"
+                  class={`tab-pill ${harness() === "pi" ? "active" : ""}`}
+                  onClick={() => setHarness("pi")}
+                >
+                  Pi
+                </button>
+              </div>
               <DreamerTasksField
                 value={effectiveTasks()}
-                models={props.models}
+                harness={harness()}
+                modelTasks={effectiveModelTasks(harness())}
                 onChange={(next) => {
                   setTasks(next);
                   setDirty(true);
                 }}
+                onModelTasksChange={(next) => {
+                  setModelTaskOverrides((previous) => ({ ...previous, [harness()]: next }));
+                  setDirty(true);
+                }}
+                models={harness() === "opencode" ? props.opencodeModels : props.piModels}
               />
             </Show>
           </Show>

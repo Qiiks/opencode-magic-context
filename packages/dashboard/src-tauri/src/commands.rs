@@ -935,16 +935,37 @@ pub async fn get_opencode_install_state() -> String {
     }
 }
 
-#[tauri::command]
-pub async fn get_available_models() -> Vec<String> {
-    let candidates = opencode_cli_candidates();
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ModelCatalogs {
+    pub opencode: Vec<String>,
+    pub pi: Vec<String>,
+}
 
-    let parse = |text: &str| -> Vec<String> {
-        text.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
-    };
+fn catalog_model_id(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches(',');
+    let (provider, model) = value.split_once('/')?;
+    if !pi_provider_token_ok(provider)
+        || model.is_empty()
+        || !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// Parse OpenCode's one-model-per-line output into attributable provider/model IDs.
+pub fn parse_opencode_models_output(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(catalog_model_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn discover_opencode_models() -> Vec<String> {
+    let candidates = opencode_cli_candidates();
 
     // Use the plain `opencode models` command, NOT `--pure`. `--pure` skips all
     // external plugins, including the auth/provider plugins that register the
@@ -955,7 +976,7 @@ pub async fn get_available_models() -> Vec<String> {
     // not triggered by a model listing.
     for bin in &candidates {
         if let Some(text) = run_bounded_binary(bin, &["models"]).await {
-            let models = parse(&text);
+            let models = parse_opencode_models_output(&text);
             if !models.is_empty() {
                 return models;
             }
@@ -965,7 +986,7 @@ pub async fn get_available_models() -> Vec<String> {
     if cfg!(target_os = "windows") {
         if let Some(bin) = resolve_via_where("opencode").await {
             if let Some(text) = run_bounded_binary(&bin, &["models"]).await {
-                let models = parse(&text);
+                let models = parse_opencode_models_output(&text);
                 if !models.is_empty() {
                     return models;
                 }
@@ -976,10 +997,16 @@ pub async fn get_available_models() -> Vec<String> {
     // Login-shell fallback for version-manager (mise/nvm/fnm) installs the
     // hardcoded candidates can't enumerate — see run_via_login_shell.
     if let Some(text) = run_via_login_shell("opencode models".to_string()).await {
-        return parse(&text);
+        return parse_opencode_models_output(&text);
     }
 
     Vec::new()
+}
+
+#[tauri::command]
+pub async fn get_model_catalogs() -> ModelCatalogs {
+    let (opencode, pi) = tokio::join!(discover_opencode_models(), discover_pi_models());
+    ModelCatalogs { opencode, pi }
 }
 
 fn strip_ansi_pi_output(text: &str) -> String {
@@ -994,15 +1021,6 @@ fn pi_provider_token_ok(s: &str) -> bool {
     }
     s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-fn pi_model_token_ok(s: &str) -> bool {
-    let s = s.trim_matches(',');
-    if s.is_empty() || !s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
 }
 
 /// Parse `pi --list-models` output into `provider/model` ids.
@@ -1027,8 +1045,8 @@ pub fn parse_pi_models_output(text: &str) -> Vec<String> {
         let cols: Vec<&str> = line.split_whitespace().collect();
         let first = cols.first().copied().unwrap_or("").trim_end_matches(',');
 
-        if first.contains('/') && !first.starts_with("http://") && !first.starts_with("https://") {
-            models.insert(first.to_string());
+        if let Some(model) = catalog_model_id(first) {
+            models.insert(model);
             continue;
         }
 
@@ -1037,8 +1055,8 @@ pub fn parse_pi_models_output(text: &str) -> Vec<String> {
         if provider.eq_ignore_ascii_case("provider") && model.eq_ignore_ascii_case("model") {
             continue;
         }
-        if pi_provider_token_ok(provider) && pi_model_token_ok(model) {
-            models.insert(format!("{provider}/{model}"));
+        if let Some(model) = catalog_model_id(&format!("{provider}/{model}")) {
+            models.insert(model);
         }
     }
     models.into_iter().collect()
@@ -1056,8 +1074,8 @@ pub fn parse_omp_models_output(text: &str) -> Vec<String> {
     let mut models = std::collections::BTreeSet::new();
     for entry in entries {
         if let Some(selector) = entry.get("selector").and_then(serde_json::Value::as_str) {
-            if !selector.is_empty() {
-                models.insert(selector.to_string());
+            if let Some(model) = catalog_model_id(selector) {
+                models.insert(model);
                 continue;
             }
         }
@@ -1065,8 +1083,8 @@ pub fn parse_omp_models_output(text: &str) -> Vec<String> {
             entry.get("provider").and_then(serde_json::Value::as_str),
             entry.get("id").and_then(serde_json::Value::as_str),
         ) {
-            if !provider.is_empty() && !id.is_empty() {
-                models.insert(format!("{provider}/{id}"));
+            if let Some(model) = catalog_model_id(&format!("{provider}/{id}")) {
+                models.insert(model);
             }
         }
     }
@@ -1140,8 +1158,7 @@ async fn include_omp_models(pi_models: Vec<String>) -> Vec<String> {
     merge_pi_and_omp_models(pi_models, get_available_omp_models().await)
 }
 
-#[tauri::command]
-pub async fn get_available_pi_models() -> Vec<String> {
+async fn discover_pi_models() -> Vec<String> {
     // GUI apps on macOS don't inherit shell PATH; try common locations.
     //
     // The first candidate is `~/.pi/bin/pi` because that's the path the
@@ -1425,9 +1442,9 @@ pub fn get_db_health(state: State<'_, AppState>) -> db::DbHealth {
 mod tests {
     use super::{
         merge_pi_and_omp_models, opencode_desktop_detected_for_env, parse_omp_models_output,
-        parse_pi_models_output, pick_first_line, prepare_embedding_probe_options,
-        run_bounded_binary, windows_opencode_candidates, DesktopPlatform, OpencodeDesktopEnv,
-        OPENCODE_DESKTOP_APP_IDS,
+        parse_opencode_models_output, parse_pi_models_output, pick_first_line,
+        prepare_embedding_probe_options, run_bounded_binary, windows_opencode_candidates,
+        DesktopPlatform, ModelCatalogs, OpencodeDesktopEnv, OPENCODE_DESKTOP_APP_IDS,
     };
     use crate::embedding_probe::EmbeddingProbeOutcome;
     use std::path::{Path, PathBuf};
@@ -1629,6 +1646,36 @@ mod tests {
         assert!(list.iter().any(|c| c == "C:\\L\\pnpm\\bin\\opencode.cmd"));
         // No APPDATA -> no npm candidates.
         assert!(list.iter().all(|c| !c.contains("\\npm\\")));
+    }
+
+    #[test]
+    fn model_catalogs_keep_one_generation_pair_harness_scoped() {
+        let value = serde_json::to_value(ModelCatalogs {
+            opencode: vec!["openai/gpt-5".to_string(), "shared/model".to_string()],
+            pi: vec![
+                "anthropic/claude-sonnet".to_string(),
+                "shared/model".to_string(),
+            ],
+        })
+        .expect("catalogs serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "opencode": ["openai/gpt-5", "shared/model"],
+                "pi": ["anthropic/claude-sonnet", "shared/model"],
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_catalog_omits_unattributable_entries() {
+        let output =
+            "openai/gpt-5\nnot-a-model\nhttps://example.test/model\nanthropic/claude-sonnet\n";
+        assert_eq!(
+            parse_opencode_models_output(output),
+            vec!["anthropic/claude-sonnet", "openai/gpt-5"]
+        );
     }
 
     #[test]

@@ -900,11 +900,7 @@ mod tests {
     #[tokio::test]
     async fn route_model_discovery_rejects_shell_like_args() {
         let server = spawn_test_server().await;
-        for cmd in [
-            "get_opencode_install_state",
-            "get_available_models",
-            "get_available_pi_models",
-        ] {
+        for cmd in ["get_opencode_install_state", "get_model_catalogs"] {
             let response =
                 invoke(&server, json!({ "cmd": cmd, "args": { "program": "sh" } })).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);

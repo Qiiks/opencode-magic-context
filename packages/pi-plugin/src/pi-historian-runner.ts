@@ -111,6 +111,10 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import type {
+	ModelInput,
+	ResolvedModelEntry,
+} from "@magic-context/core/shared/model-resolution";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
 	SubagentProgressEvent,
@@ -271,19 +275,29 @@ async function runHistorianSubagentWithTransientRetries(args: {
 
 function buildHistorianFallbackChain(
 	primaryModel: string,
-	fallbackModels?: readonly string[],
+	primaryThinkingLevel: string | undefined,
+	fallbackModels?: readonly ModelInput[],
 	fallbackModelId?: string,
-): Array<{ modelId: string; kind: "configured" | "session" }> {
-	const seen = new Set<string>();
-	if (primaryModel) seen.add(primaryModel);
-	const chain: Array<{ modelId: string; kind: "configured" | "session" }> = [];
+): Array<{ entry: ResolvedModelEntry; kind: "configured" | "session" }> {
+	const seen = new Set<string>([
+		`${primaryModel}\u0000${primaryThinkingLevel ?? ""}`,
+	]);
+	const chain: Array<{
+		entry: ResolvedModelEntry;
+		kind: "configured" | "session";
+	}> = [];
 	for (const candidate of fallbackModels ?? []) {
-		if (!candidate || seen.has(candidate)) continue;
-		seen.add(candidate);
-		chain.push({ modelId: candidate, kind: "configured" });
+		const entry =
+			typeof candidate === "string" ? { model: candidate } : candidate;
+		const key = `${entry.model}\u0000${entry.qualifier ?? ""}`;
+		if (!entry.model || seen.has(key)) continue;
+		seen.add(key);
+		chain.push({ entry, kind: "configured" });
 	}
-	if (fallbackModelId && !seen.has(fallbackModelId)) {
-		chain.push({ modelId: fallbackModelId, kind: "session" });
+	if (fallbackModelId) {
+		const entry = { model: fallbackModelId };
+		const key = `${entry.model}\u0000`;
+		if (!seen.has(key)) chain.push({ entry, kind: "session" });
 	}
 	return chain;
 }
@@ -343,8 +357,8 @@ export interface PiHistorianDeps {
 	runner: SubagentRunner;
 	/** Historian model id (provider/model) — required for PiSubagentRunner. */
 	historianModel: string;
-	/** Optional ordered fallback chain. */
-	fallbackModels?: readonly string[];
+	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
+	fallbackModels?: readonly ModelInput[];
 	/** Live session model used as the final fallback after configured fallbacks. */
 	fallbackModelId?: string;
 	/** Historian context window — used to derive chunk token budget. */
@@ -904,6 +918,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// current model is appended as the final last-resort candidate.
 			const fallbackChain = buildHistorianFallbackChain(
 				historianModel,
+				thinkingLevel,
 				fallbackModels,
 				fallbackModelId,
 			);
@@ -919,7 +934,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					const candidate = fallbackChain[i];
 					sessionLog(
 						sessionId,
-						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.modelId}`,
+						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model}`,
 					);
 					const fbResult = await runHistorianSubagentWithTransientRetries({
 						runner,
@@ -931,11 +946,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							agent: HISTORIAN_AGENT_NAME,
 							systemPrompt: historianSystemPrompt,
 							userMessage: prompt,
-							model: candidate.modelId,
+							model: candidate.entry.model,
 							timeoutMs: historianTimeoutMs,
 							cwd: directory,
 							signal,
-							thinkingLevel,
+							thinkingLevel: candidate.entry.qualifier,
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",

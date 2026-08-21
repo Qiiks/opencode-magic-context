@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
+import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import {
@@ -9,7 +10,9 @@ import {
     removeJsoncArrayEntries,
     setJsoncValue,
 } from "@magic-context/core/shared/jsonc-edit";
-import { stringify as stringifyJsonc } from "comment-json";
+import { sanitizeParsedJson } from "@magic-context/core/shared/jsonc-parser";
+import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+
 import {
     isDevPathPluginEntry,
     isLocalPathPluginEntry,
@@ -21,7 +24,11 @@ import {
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
 import { runDreamerSetup } from "../lib/dreamer-setup";
-import { assertJsoncConfigsParseable, readJsoncConfigForUpdate } from "../lib/jsonc-config";
+import {
+    assertJsoncConfigsParseable,
+    ConfigParseError,
+    readJsoncConfigForUpdate,
+} from "../lib/jsonc-config";
 import { pickModel } from "../lib/model-picker";
 import { detectOpenCode } from "../lib/opencode-detect";
 import { getAvailableModels, getOpenCodeVersion } from "../lib/opencode-helpers";
@@ -61,6 +68,38 @@ function resolveCompactionEnabledForWriter(): boolean {
 function ensureDir(dir: string): void {
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
+    }
+}
+
+function configObject(value: unknown): Record<string, unknown> {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? { ...(value as Record<string, unknown>) }
+        : {};
+}
+
+/**
+ * Read the shared config through the same raw-tier loader as runtime and doctor.
+ * That loader performs any required per-harness migration before setup merges its
+ * choices, so setup cannot reintroduce flat model fields into an existing config.
+ */
+function readMagicContextConfigForSetup(configPath: string): Record<string, unknown> {
+    const raw = loadRawConfigFile({ configPath, tier: "user" });
+    if (!raw) return {};
+
+    try {
+        const rejectedKeyPaths: string[] = [];
+        const parsed = sanitizeParsedJson(parseJsonc(raw.text), {
+            onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
+        });
+        if (rejectedKeyPaths.length > 0) {
+            throw new Error(`unsafe prototype-pollution key at ${rejectedKeyPaths.join(", ")}`);
+        }
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("expected a JSON object at the document root");
+        }
+        return parsed as Record<string, unknown>;
+    } catch (error) {
+        throw new ConfigParseError(configPath, raw.text, error);
     }
 }
 
@@ -245,7 +284,7 @@ export function writeMagicContextConfig(
     },
 ): void {
     // A malformed existing file must abort rather than become an empty config.
-    const config = readJsoncConfigForUpdate(configPath);
+    const config = readMagicContextConfigForSetup(configPath);
 
     // Always set $schema for editor autocomplete/validation
     if (!config.$schema) {
@@ -254,21 +293,25 @@ export function writeMagicContextConfig(
     }
 
     if (options.historianModel) {
-        const historian = (config.historian as Record<string, unknown>) ?? {};
-        historian.model = options.historianModel;
+        const historian = configObject(config.historian);
+        const opencode = configObject(historian.opencode);
+        opencode.model = options.historianModel;
+        historian.opencode = opencode;
         config.historian = historian;
     }
 
-    const dreamer = (config.dreamer as Record<string, unknown>) ?? {};
+    const dreamer = configObject(config.dreamer);
+    const opencode = configObject(dreamer.opencode);
     delete dreamer.enabled;
     if (options.dreamerEnabled) {
         delete dreamer.disable;
         if (options.dreamerModel) {
-            dreamer.model = options.dreamerModel;
+            opencode.model = options.dreamerModel;
+            dreamer.opencode = opencode;
         }
-        // Dreamer v2 per-task schedules. Only written when the user declined the
-        // recommended defaults — otherwise we leave `tasks` unset so the schema
-        // defaults apply (and the config stays small).
+        // Dreamer schedules are harness-independent and remain at dreamer.tasks.
+        // Only write explicit wizard overrides so an existing harness's schedule
+        // remains intact when this setup run accepts schema defaults.
         if (options.dreamerTasks) {
             dreamer.tasks = options.dreamerTasks;
         }
@@ -277,7 +320,7 @@ export function writeMagicContextConfig(
     }
     config.dreamer = dreamer;
 
-    const sidekick = (config.sidekick as Record<string, unknown>) ?? {};
+    const sidekick = configObject(config.sidekick);
     delete sidekick.enabled;
     if (options.sidekickEnabled) {
         delete sidekick.disable;

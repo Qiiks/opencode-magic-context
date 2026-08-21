@@ -42,6 +42,7 @@ export interface PiDreamerOptions {
 	 */
 	memoryEnabled: boolean;
 	retinaHandoff?: boolean;
+	mural?: { enabled: boolean; model?: string };
 	language?: string;
 	gitCommitIndexing: {
 		enabled: boolean;
@@ -147,11 +148,13 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	void startDreamScheduleTimerFn({
 		directory: opts.projectDir,
 		projectIdentity: opts.projectIdentity,
+		harness: "pi",
 		client,
 		dreamerConfig: opts.config,
 		language: opts.language,
 		gitCommitIndexing: opts.gitCommitIndexing,
 		retinaHandoff: opts.retinaHandoff,
+		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
 		// SCHEDULED Pi retrospective must read Pi JSONL sessions, not opencode.db.
 		// Supply the Pi provider factory (db arg ignored — Pi reads JSONL by cwd),
@@ -182,7 +185,12 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		runManualDream({
 			db: opts.db,
 			projectIdentity: opts.projectIdentity,
-			tasks: buildDreamTaskRuntimeConfigs(opts.config, opts.language),
+			tasks: buildDreamTaskRuntimeConfigs(
+				opts.config,
+				"pi",
+				opts.language,
+				opts.mural?.model,
+			),
 			executor: createDreamTaskExecutor({
 				client: client as never,
 				sessionDirectory: opts.projectDir,
@@ -195,6 +203,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				language: opts.language,
 				retinaHandoff: opts.retinaHandoff,
+				mural: opts.mural,
 			}),
 			task,
 		});
@@ -261,7 +270,6 @@ export async function awaitInFlightDreamers(): Promise<void> {
 
 function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 	const runner = piSubagentRunnerFactory();
-	const model = opts.config.model;
 
 	const session = {
 		create: async (args: SessionCreateArgs) => {
@@ -291,7 +299,7 @@ function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 			// we use body.model as the current attempt's model and pass
 			// fallbackModels: undefined; passing the dreamer-level chain here would
 			// double-iterate and override a task's own (possibly empty) chain.
-			const perTaskModel = extractBodyModel(args) ?? model;
+			const perTaskModel = extractBodyModel(args);
 			const requestedAgent = extractBodyAgent(args) ?? "magic-context-dreamer";
 			const runPromise = runner.run({
 				agent: requestedAgent,
@@ -305,7 +313,10 @@ function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 				timeoutMs: 30 * 60 * 1000,
 				cwd: dreamSession.directory,
 				signal: args.signal ?? undefined,
-				thinkingLevel: opts.config.thinking_level,
+				// modelBodyField writes the active entry qualifier as OpenCode's
+				// `variant`; the Pi facade translates that same wire field into
+				// `--thinking` without letting a primary level leak to fallbacks.
+				thinkingLevel: extractBodyVariant(args),
 			});
 			inFlightDreams.add(runPromise);
 			try {
@@ -421,6 +432,15 @@ function extractBodyModel(args: { body?: unknown }): string | undefined {
 		return `${providerID}/${modelID}`;
 	}
 	return undefined;
+}
+
+function extractBodyVariant(args: { body?: unknown }): string | undefined {
+	const body = args.body;
+	if (typeof body !== "object" || body === null) return undefined;
+	const variant = (body as { variant?: unknown }).variant;
+	return typeof variant === "string" && variant.length > 0
+		? variant
+		: undefined;
 }
 
 function extractBodyAgent(args: { body?: unknown }): string | undefined {

@@ -692,13 +692,9 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             parse_args::<NoArgs>(args)?;
             json(commands::get_opencode_install_state().await)
         }
-        "get_available_models" => {
+        "get_model_catalogs" => {
             parse_args::<NoArgs>(args)?;
-            json(commands::get_available_models().await)
-        }
-        "get_available_pi_models" => {
-            parse_args::<NoArgs>(args)?;
-            json(commands::get_available_pi_models().await)
+            json(commands::get_model_catalogs().await)
         }
         "test_embedding_endpoint" => {
             let a: TestEmbeddingEndpointArgs = parse_args(args)?;
@@ -771,10 +767,7 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
 pub fn uses_subprocess_or_network_probe(cmd: &str) -> bool {
     matches!(
         cmd,
-        "get_opencode_install_state"
-            | "get_available_models"
-            | "get_available_pi_models"
-            | "test_embedding_endpoint"
+        "get_opencode_install_state" | "get_model_catalogs" | "test_embedding_endpoint"
     )
 }
 
@@ -863,7 +856,7 @@ mod tests {
     async fn dispatch_rejects_extra_args_for_model_commands() {
         let err = dispatch(
             &state_without_db(),
-            "get_available_models",
+            "get_model_catalogs",
             serde_json::json!({ "program": "sh" }),
         )
         .await

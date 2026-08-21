@@ -20,7 +20,9 @@ import {
 } from "../../shared/data-path";
 import { describeError, getErrorMessage } from "../../shared/error-message";
 import { shouldKeepSubagents } from "../../shared/keep-subagents";
+import type { ModelInput, ResolvedModelEntry } from "../../shared/model-resolution";
 import { isRecord } from "../../shared/record-type-guard";
+import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
 import { buildHistorianEditorPrompt } from "./compartment-prompt";
@@ -47,11 +49,6 @@ function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);
 }
 const MAX_HISTORIAN_RETRIES = 2;
-
-interface HistorianModelOverride {
-    providerID: string;
-    modelID: string;
-}
 
 const HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 
@@ -108,6 +105,8 @@ export async function runValidatedHistorianPass(args: {
     sequenceOffset: number;
     dumpLabelBase: string;
     timeoutMs?: number;
+    /** Active OpenCode historian entry, including its outbound request variant. */
+    model?: ModelInput;
     fallbackModelId?: string;
     /**
      * Resolved historian fallback chain ("provider/modelID" entries). When the
@@ -115,7 +114,7 @@ export async function runValidatedHistorianPass(args: {
      * each fallback is tried in order. Independent of `fallbackModelId` (which
      * is a last-ditch single-model retry against the active session model).
      */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     callbacks?: HistorianProgressCallbacks;
     /** When true, run a second editor pass after successful historian output
      *  to clean low-signal U: lines and cross-compartment duplicates. If editor
@@ -128,6 +127,7 @@ export async function runValidatedHistorianPass(args: {
     const firstRun = await runHistorianPrompt({
         ...args,
         dumpLabel: `${args.dumpLabelBase}-initial`,
+        modelOverride: args.model,
         agentId: args.agentId,
     });
     if (!firstRun.ok || !firstRun.result) {
@@ -171,6 +171,7 @@ export async function runValidatedHistorianPass(args: {
         ...args,
         prompt: repairPrompt,
         dumpLabel: `${args.dumpLabelBase}-repair`,
+        modelOverride: args.model,
         agentId: args.agentId,
     });
     if (!repairRun.ok || !repairRun.result) {
@@ -247,6 +248,7 @@ async function runEditorPassOrFallback(args: {
     draftValidation: ValidatedHistorianPassResult;
     draftDumpPath?: string;
     draftInvocationId?: number | null;
+    model?: ModelInput;
 }): Promise<ValidatedHistorianPassResult> {
     shared.sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
     const editorRun = await runHistorianPrompt({
@@ -259,6 +261,7 @@ async function runEditorPassOrFallback(args: {
         dumpLabel: `${args.dumpLabelBase}-editor`,
         agentId: HISTORIAN_EDITOR_AGENT,
         parentInvocationId: args.draftInvocationId ?? null,
+        modelOverride: args.model,
     });
 
     if (!editorRun.ok || !editorRun.result) {
@@ -299,12 +302,12 @@ async function runHistorianPrompt(args: {
     prompt: string;
     timeoutMs?: number;
     dumpLabel?: string;
-    modelOverride?: HistorianModelOverride;
+    modelOverride?: ModelInput;
     /** Agent identifier to route the request to. Defaults to HISTORIAN_AGENT.
      *  Use HISTORIAN_EDITOR_AGENT for the second pass in two-pass mode. */
     agentId?: string;
     /** Resolved historian fallback chain (forwarded to the prompt helper). */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     subagentKind?: SubagentKind;
     parentInvocationId?: number | null;
 }): Promise<HistorianRunResult> {
@@ -354,7 +357,7 @@ async function runHistorianPrompt(args: {
     try {
         shared.sessionLog(
             parentSessionId,
-            `historian: creating child session (agent=${agentId}, model=${modelOverride ? `${modelOverride.providerID}/${modelOverride.modelID}` : `agent:${agentId}`})`,
+            `historian: creating child session (agent=${toModelEntry(modelOverride)?.model ?? `agent:${agentId}`})`,
         );
         const createResponse = await createChildSessionWithFence({
             client,
@@ -393,7 +396,7 @@ async function runHistorianPrompt(args: {
                             // OpenCode uses the override model but still loads the agent's
                             // registered system prompt.
                             agent: agentId,
-                            ...(modelOverride ? { model: modelOverride } : {}),
+                            ...modelBodyField(modelOverride),
                             // synthetic: true keeps this big internal prompt out of the
                             // OpenCode TUI subagent pane (would otherwise render as a huge
                             // unreadable visible message — see issue #50). The historian
@@ -516,6 +519,8 @@ async function runFallbackHistorianPass(args: {
     sequenceOffset: number;
     dumpLabelBase: string;
     timeoutMs?: number;
+    /** Active primary entry, used to avoid re-running the exact same attempt. */
+    model?: ModelInput;
     /**
      * Configured historian fallback chain (e.g. `anthropic/claude-sonnet-4-6`),
      * tried IN ORDER before the session-model last resort. Each candidate's
@@ -524,7 +529,7 @@ async function runFallbackHistorianPass(args: {
      * instead of emitting compartments) escalates to the next candidate rather
      * than failing the whole pass.
      */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     /**
      * The live session provider/model, used as the absolute last resort AFTER
      * the configured chain is exhausted.
@@ -544,10 +549,22 @@ async function runFallbackHistorianPass(args: {
     // empty-but-successful response never throws and so never triggers the
     // throw-based chain inside the prompt call.
     const seen = new Set<string>();
-    const chain: string[] = [];
-    for (const candidate of [...(args.fallbackModels ?? []), args.fallbackModelId ?? ""]) {
-        if (!candidate || seen.has(candidate)) continue;
-        seen.add(candidate);
+    const chain: ResolvedModelEntry[] = [];
+    const primary = toModelEntry(args.model);
+    for (const candidateInput of [
+        ...(args.fallbackModels ?? []),
+        ...(args.fallbackModelId ? [{ model: args.fallbackModelId }] : []),
+    ]) {
+        const candidate = toModelEntry(candidateInput);
+        if (!candidate) continue;
+        const key = `${candidate.model}\u0000${candidate.qualifier ?? ""}`;
+        if (!candidate.model || seen.has(key)) continue;
+        // Do not repeat the primary attempt, but keep the same model when its
+        // fallback intentionally selects a different variant.
+        if (primary?.model === candidate.model && primary.qualifier === candidate.qualifier) {
+            continue;
+        }
+        seen.add(key);
         chain.push(candidate);
     }
     if (chain.length === 0) {
@@ -556,9 +573,9 @@ async function runFallbackHistorianPass(args: {
 
     let lastError = args.error;
     for (let i = 0; i < chain.length; i += 1) {
-        const modelId = chain[i];
-        const modelOverride = parseModelOverride(modelId);
-        if (!modelOverride) continue;
+        const modelOverride = chain[i];
+        const modelId = modelOverride.model;
+        if (!parseModelOverride(modelId)) continue;
 
         const isSessionModelLastResort = modelId === args.fallbackModelId && i === chain.length - 1;
         shared.sessionLog(
@@ -605,7 +622,7 @@ async function runFallbackHistorianPass(args: {
     return { ok: false, error: lastError };
 }
 
-function parseModelOverride(modelId: string): HistorianModelOverride | null {
+function parseModelOverride(modelId: string): { providerID: string; modelID: string } | null {
     const [providerID, ...modelParts] = modelId.split("/");
     const modelID = modelParts.join("/");
     if (!providerID || modelID.length === 0) {

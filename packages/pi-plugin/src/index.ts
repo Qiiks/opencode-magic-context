@@ -94,6 +94,7 @@ import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
+import { resolveHistorianModel } from "@magic-context/core/shared/model-resolution";
 import {
 	createPromptSurfaceGuidanceEpochCache,
 	createPromptSurfaceRuntime,
@@ -649,8 +650,9 @@ export function resolveHistorianFromConfig(
 	// field. Fall back to undefined-safe access so plugin load never crashes.
 	const historian = config.historian as HistorianConfig | undefined;
 	if (historian?.disable === true) return undefined;
-	const model = historian?.model?.trim();
-	if (!model || model.length === 0) return undefined;
+	const resolved = resolveHistorianModel(config, "pi");
+	const model = resolved.primary?.model;
+	if (!model) return undefined;
 
 	// The historian chunk budget is anchored to the HISTORIAN model because
 	// it bounds one summarizer call. The trigger budget is intentionally NOT
@@ -661,7 +663,7 @@ export function resolveHistorianFromConfig(
 		historianContextLimit,
 	);
 
-	const fallbackModels = resolveFallbackChain(historian?.fallback_models);
+	const fallbackModels = resolved.fallbacks;
 
 	return {
 		runner: new PiSubagentRunner(),
@@ -679,7 +681,7 @@ export function resolveHistorianFromConfig(
 		// Pi only: explicit thinking level for historian subagent invocations.
 		// When set, passed as --thinking <level> to Pi subprocess.
 		// Required for providers like GitHub Copilot that apply bad defaults.
-		thinkingLevel: historian?.thinking_level,
+		thinkingLevel: resolved.primary?.qualifier,
 		executeThresholdPercentage: config.execute_threshold_percentage,
 		executeThresholdTokens: config.execute_threshold_tokens,
 		commitClusterTrigger: config.commit_cluster_trigger,
@@ -1474,6 +1476,7 @@ async function startPiMagicContextRuntime(
 			embeddingConfig: bootProjectDeps.config.embedding,
 			memoryEnabled: bootProjectDeps.config.memory.enabled,
 			retinaHandoff: bootProjectDeps.config.smart_notes.retina_handoff,
+			mural: bootProjectDeps.config.mural,
 			language: bootProjectDeps.config.language,
 			gitCommitIndexing: bootProjectDeps.config.memory.git_commit_indexing,
 			onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,

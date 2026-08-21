@@ -118,7 +118,6 @@ export interface DreamTaskExecutorDeps {
     /** Resolved project transform mode; an explicit TS mode always stays on TS. */
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
-    dreamerModel?: string;
     mural?: { enabled: boolean; model?: string };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
@@ -391,8 +390,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
-                // Model ladder mirrors classify: task override → mural
-                // model (the cue COMPRESSOR model) → dreamer model → session model.
+                // `config.model` is already resolved by task-config using the
+                // executing harness's task-specific, mural/project-level,
+                // then default model settings.
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
@@ -403,7 +403,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseKey,
                     deadline,
                     leaseAcquisition,
-                    model: config.model ?? deps.mural.model ?? deps.dreamerModel,
+                    model: config.model,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
                     onProgress: (processed) => reportProgress(processed),

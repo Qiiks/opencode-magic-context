@@ -51,6 +51,7 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
+import type { ModelInput } from "../../shared/model-resolution";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
@@ -568,8 +569,10 @@ export interface TransformDeps {
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historianTimeoutMs?: number;
+    /** Active OpenCode historian entry, including its outbound request variant. */
+    historianModel?: ModelInput;
     /** Resolved fallback chain for historian-family calls. */
-    fallbackModels?: readonly string[];
+    fallbackModels?: readonly ModelInput[];
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
     /**
@@ -1461,6 +1464,7 @@ export function createTransform(deps: TransformDeps) {
                 currentContextLimit: boundaryContextLimit,
                 historyBudgetTokens,
                 historianTimeoutMs: deps.historianTimeoutMs,
+                model: deps.historianModel,
                 fallbackModels: deps.fallbackModels,
                 directory: compartmentDirectory,
                 fallbackModelId,
@@ -2042,6 +2046,7 @@ export function createTransform(deps: TransformDeps) {
             historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
             historyBudgetTokens,
             historianTimeoutMs: deps.historianTimeoutMs,
+            historianModel: deps.historianModel,
             fallbackModels: deps.fallbackModels,
             compartmentDirectory,
             messages,
