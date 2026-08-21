@@ -7,7 +7,7 @@ import {
   onMount,
   Show,
 } from "solid-js";
-import { getLogEntries, truncate } from "../../lib/api";
+import { getLogEntries, getLogPaths, truncate } from "../../lib/api";
 import { formatLogTimestamp } from "../../lib/log-format";
 import FilterSelect from "../shared/FilterSelect";
 
@@ -22,6 +22,7 @@ export default function LogViewer() {
     () => maxLines(),
     (lines) => getLogEntries(lines),
   );
+  const [logPaths] = createResource(getLogPaths);
 
   // Auto-refresh every 3 seconds when not paused
   let refreshInterval: ReturnType<typeof setInterval>;
@@ -169,7 +170,11 @@ export default function LogViewer() {
               <div class="empty-state">
                 <span class="empty-state-icon">📋</span>
                 <span>No log entries found</span>
-                <span style={{ "font-size": "11px" }}>Log file: /tmp/magic-context.log</span>
+                <Show when={logPaths()?.length}>
+                  <span style={{ "font-size": "11px" }}>
+                    Log files: {(logPaths() ?? []).join(" · ")}
+                  </span>
+                </Show>
               </div>
             }
           >

@@ -84,6 +84,7 @@ fn main() {
             commands::get_dream_runs,
             commands::get_dream_run_memory_changes,
             // Logs & Cache
+            commands::get_log_paths,
             commands::get_log_entries,
             commands::get_cache_events,
             commands::get_session_cache_stats,
