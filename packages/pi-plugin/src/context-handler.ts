@@ -3162,6 +3162,8 @@ export function registerPiContextHandler(
 					);
 					const channelState = {
 						...baseline,
+						usableWindow: usageContextLimit ?? 0,
+						messageOrdinal: sessionMetaForCh1.counter,
 						reducedSinceRefresh: false,
 						oldestReclaimableToolTags,
 					};

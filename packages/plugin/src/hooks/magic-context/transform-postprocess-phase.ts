@@ -570,6 +570,8 @@ interface RunPostTransformPhaseArgs {
     activeAgent?: string;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
+    /** Usable tokens available for soft scheduling thresholds and usage-ratio calculation. */
+    usableWindow: number;
     schedulerDecision: "execute" | "defer";
     fullFeatureMode: boolean;
     /**
@@ -2222,8 +2224,11 @@ export async function runPostTransformPhase(
                     previous,
                 });
                 const structuralSignature = tailHygieneStructuralSignature(args.messages);
+                const messageOrdinal = Math.max(0, ...args.messageTagNumbers.values());
                 args.channel1StateBySession.set(args.sessionId, {
                     ...baseline,
+                    usableWindow: args.usableWindow,
+                    messageOrdinal,
                     reducedSinceRefresh:
                         baseline.baselineGeneration !== previous?.baselineGeneration
                             ? false

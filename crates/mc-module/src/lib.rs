@@ -20346,7 +20346,9 @@ mod tests {
         let first_text = first["host_directives"]["channel2_nudge"]["text"]
             .as_str()
             .expect("due OpenCode pass must carry channel2 text");
-        assert!(first_text.contains("Routine context housekeeping is near"));
+        assert!(first_text.contains("Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses."));
+        assert!(first_text.contains("(~"));
+        assert!(first_text.contains("of ~100k reclaimable)"));
         assert!(first.get("channel2_directive").is_none());
 
         let mut terminal_request = opencode_request;
@@ -20383,7 +20385,8 @@ mod tests {
             .as_object()
             .expect("due Claude Code pass must carry the gateway directive");
         let cc_text = cc_directive["text"].as_str().unwrap();
-        assert!(cc_text.contains("Routine context housekeeping is near"));
+        assert!(cc_text.contains("Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses."));
+        assert!(cc_text.contains("of ~100k reclaimable)"));
         assert!(!cc_text.contains("<system-reminder>"));
         assert_eq!(cc_directive["directive_id"].as_str().unwrap().len(), 64);
         assert!(cc_directive["armed_at_ms"].as_i64().unwrap() > 0);

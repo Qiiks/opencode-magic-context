@@ -93,7 +93,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 80;
+export const LATEST_SUPPORTED_VERSION = 81;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1407,6 +1407,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_nudge_band TEXT DEFAULT '',
       last_nudge_undropped INTEGER DEFAULT 0,
       last_nudge_level TEXT DEFAULT '',
+      channel1_last_fire_level TEXT DEFAULT '',
+      channel1_last_fire_ordinal INTEGER DEFAULT 0,
       channel2_nudge_state TEXT DEFAULT '',
       channel2_nudge_claimed_at INTEGER DEFAULT 0,
       channel2_nudge_claim_token TEXT DEFAULT '',
@@ -1684,6 +1686,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "last_nudge_band", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "last_nudge_undropped", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "last_nudge_level", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "channel1_last_fire_level", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "channel1_last_fire_ordinal", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "channel2_nudge_state", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "channel2_nudge_claimed_at", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "channel2_nudge_claim_token", "TEXT DEFAULT ''");

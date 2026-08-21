@@ -417,7 +417,7 @@ describe("tail hygiene baseline and defer-window deltas", () => {
         });
         const mutated = structuredClone(original) as MessageLike;
         const toolPart = mutated.parts[0] as { state: { output: string } };
-        toolPart.state.output += buildChannel1Reminder("gentle", 25_000);
+        toolPart.state.output += buildChannel1Reminder("gentle", 25_000, 128_000);
         const defer = refreshTailHygieneBaseline({
             messages: [mutated],
             tags,

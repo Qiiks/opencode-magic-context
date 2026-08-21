@@ -64,7 +64,7 @@ export interface Channel2DeliveryDeps {
      */
     client?: unknown;
     /** Persisted reclaimable/total tail tokens, typed deltas, and generation validity. */
-    baseline?: Channel2PredicateBaseline;
+    baseline?: Channel2PredicateBaseline & { usableWindow?: number };
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
     /** Module-owned directives are already predicate-validated; preserve their text verbatim. */
     directiveText?: string;
@@ -200,7 +200,12 @@ export async function maybeDeliverChannel2(
         // Module directives carry their own validated wording; host-triggered
         // reminders use the measured reclaimable tail after the predicate above.
         const reminder =
-            deps.directiveText ?? buildChannel2Reminder(effectiveU, deps.oldestReclaimableToolTags);
+            deps.directiveText ??
+            buildChannel2Reminder(
+                effectiveU,
+                deps.baseline?.usableWindow ?? 0,
+                deps.oldestReclaimableToolTags,
+            );
 
         const body: Record<string, unknown> = {
             noReply: false,
