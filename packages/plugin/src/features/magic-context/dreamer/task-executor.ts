@@ -459,9 +459,27 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
-                    `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
+                    `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
                 );
                 if (!result.complete) {
+                    if (result.stopReason === "timeout-circuit-breaker") {
+                        // A repeated timeout is a model-capacity starvation signal, not
+                        // a normal deadline remainder. Keep its failed status loud so
+                        // /ctx-dream and dreamer history expose why it stopped.
+                        const error = `map-memories starvation: timeout circuit breaker stopped the run with ${result.remaining} remain`;
+                        recordRun("failed", error);
+                        return { status: "failed", transient: true, error };
+                    }
+                    const processed = result.mapped + result.independent;
+                    if (processed > 0) {
+                        // Mappings are persisted one completed host batch at a time.
+                        // Like a resumable verify-broad cycle, bank real progress as a
+                        // completed scheduled run so lastRunAt advances, while the
+                        // remaining gate set drives the next scheduled run.
+                        const progress = `map-memories: mapped ${result.mapped}, independent ${result.independent}, completed ${result.batches} batch(es), ${result.remaining} remain`;
+                        recordRun("completed", null, { progress });
+                        return { status: "completed" };
+                    }
                     const error = incompleteMessage(result.remaining);
                     recordRun("failed", error);
                     return { status: "failed", transient: true, error };

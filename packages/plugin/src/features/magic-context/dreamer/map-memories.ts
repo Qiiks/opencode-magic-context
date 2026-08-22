@@ -61,6 +61,20 @@ import {
 // and peak context well under a 128K window. A 200+ pool → ~3 batches.
 const MAP_BATCH_SIZE = 80;
 
+/**
+ * Minimum wall-clock budget for one 80-memory agentic mapping batch. The mapper's
+ * harness history needed about 41 turns for a 100-memory batch, but does not record
+ * reliable wall time; mirror compress-cues' proven four-minute floor rather than
+ * starting a batch with a deadline that cannot finish. Large backfills then bank
+ * each committed batch and resume their remainder on a later run.
+ */
+export const MAP_BATCH_FLOOR_MS = 240_000;
+
+/** Stop after two timeout-class failures: repeated timeouts mean this model cannot
+ * finish the current mapping batch within its fair slice, so more attempts only
+ * burn the deadline and quota without making the resumable backlog smaller. */
+const CONSECUTIVE_TIMEOUT_LIMIT = 2;
+
 /** Cap on already-mapped file-independent rows re-queued per run. A silent
  *  parse miss used to persist `independent=true` for memories that name real
  *  files; those rows never enter verify. Heal at most one extra batch so new
@@ -86,9 +100,41 @@ export interface MapMemoriesArgs {
 export interface MapMemoriesResult {
     mapped: number;
     independent: number;
+    /** Batches whose mappings were durably committed, not merely attempted. */
     batches: number;
     remaining: number;
     complete: boolean;
+    /** Why a resumable run stopped before draining the selected input. */
+    stopReason?: "deadline" | "timeout-circuit-breaker";
+}
+
+type MapBatchFailureClass = "timeout" | "other";
+
+interface MapBatchOutcome {
+    mapped: number;
+    independent: number;
+    /** Failed batches make no writes. The run loop needs the timeout class to
+     * distinguish a model-too-slow starvation streak from ordinary retries. */
+    failure?: {
+        class: MapBatchFailureClass;
+        elapsedMs: number;
+    };
+}
+
+/** Evenly split the remaining deadline, but never starve an agentic mapping batch
+ * below its floor. The caller first verifies that the remaining budget can fit the
+ * floor, so the returned slice always fits the current deadline. */
+export function computeMapBatchSliceMs(remainingMs: number, batchesRemaining: number): number {
+    return Math.min(
+        remainingMs,
+        Math.max(MAP_BATCH_FLOOR_MS, Math.floor(remainingMs / batchesRemaining)),
+    );
+}
+
+/** The shared prompt helper uses this exact error shape for a deadline expiry.
+ * Validation and provider failures remain ordinary per-batch retries. */
+function isTimeoutClassError(error: unknown): boolean {
+    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
 }
 
 /** Re-queue predicate: a file-independent mapping (sentinel, no real files)
@@ -174,23 +220,57 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
     );
 
     try {
+        let consecutiveTimeouts = 0;
+        let timeoutStreakElapsedMs: number[] = [];
         for (let i = 0; i < batches.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
-            if (remainingMs <= 0) break;
-            // Fair per-batch slice so one heavy batch can't starve the rest.
-            const batchesRemaining = batches.length - i;
-            const sliceMs = Math.max(1, Math.floor(remainingMs / batchesRemaining));
+            if (remainingMs <= 0) {
+                result.stopReason = "deadline";
+                break;
+            }
+            // Do not start a batch that cannot receive a fair agentic slice. Its
+            // mappings are host-committed, so stopping here preserves prior batches
+            // and lets a later run continue with this untouched remainder.
+            if (remainingMs < MAP_BATCH_FLOOR_MS) {
+                result.stopReason = "deadline";
+                log(
+                    `[dreamer] map-memories: stopping before batch ${i + 1}/${batches.length} — remaining budget ${remainingMs}ms is below the ${MAP_BATCH_FLOOR_MS}ms batch floor; banking ${result.mapped + result.independent} mapping(s)`,
+                );
+                break;
+            }
+            const sliceMs = computeMapBatchSliceMs(remainingMs, batches.length - i);
+            const batch = batches[i];
+            if (!batch) break;
+            const outcome = await mapOneBatch(args, batch, sliceMs, abortController.signal);
+            const committed = outcome.mapped + outcome.independent;
+            result.mapped += outcome.mapped;
+            result.independent += outcome.independent;
+            result.remaining -= committed;
+            if (committed > 0) {
+                result.batches += 1;
+                args.onProgress?.(result.mapped + result.independent);
+            }
 
-            const counts = await mapOneBatch(args, batches[i], sliceMs, abortController.signal);
-            result.mapped += counts.mapped;
-            result.independent += counts.independent;
-            result.remaining -= counts.mapped + counts.independent;
-            result.batches += 1;
-            args.onProgress?.(result.mapped + result.independent);
+            if (outcome.failure?.class === "timeout") {
+                consecutiveTimeouts += 1;
+                timeoutStreakElapsedMs.push(outcome.failure.elapsedMs);
+                if (consecutiveTimeouts >= CONSECUTIVE_TIMEOUT_LIMIT) {
+                    result.stopReason = "timeout-circuit-breaker";
+                    log(
+                        `[dreamer] map-memories starvation: circuit breaker tripped after ${consecutiveTimeouts} consecutive batch timeouts (model too slow for its time slice); per-batch elapsed [${timeoutStreakElapsedMs.join("ms, ")}ms] vs ${sliceMs}ms slice; stopping with ${result.remaining} mapping(s) remaining`,
+                    );
+                    break;
+                }
+            } else {
+                // A success or non-timeout failure should not poison the next
+                // timeout streak; those preserve the existing retry-next-run path.
+                consecutiveTimeouts = 0;
+                timeoutStreakElapsedMs = [];
+            }
         }
         result.complete = result.remaining === 0;
         log(
-            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`,
+            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
         );
         return result;
     } finally {
@@ -209,7 +289,7 @@ async function mapOneBatch(
     batch: MapMemoryInput[],
     sliceMs: number,
     signal: AbortSignal,
-): Promise<{ mapped: number; independent: number }> {
+): Promise<MapBatchOutcome> {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
@@ -282,7 +362,14 @@ async function mapOneBatch(
         // Swallow per-batch failures: the batch's memories stay unmapped and are
         // retried next run. Only an abort/lease-loss should stop the whole task.
         if (signal.aborted) throw error;
-        return { mapped: 0, independent: 0 };
+        return {
+            mapped: 0,
+            independent: 0,
+            failure: {
+                class: isTimeoutClassError(error) ? "timeout" : "other",
+                elapsedMs: Date.now() - startedAt,
+            },
+        };
     } finally {
         // Delete on success AND failure (the failed child still holds the
         // memory-pool snapshot from the prompt). keep_subagents still honored —
