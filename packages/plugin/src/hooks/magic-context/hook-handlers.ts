@@ -508,7 +508,7 @@ function maybeInjectChannel1Nudge(
         lastLevel: nudgeState.level,
         lastOrdinal: nudgeState.ordinal,
         level: decision.level,
-        currentOrdinal: state.messageOrdinal,
+        currentRealUserTurnCount: state.realUserTurnCount,
     });
     out.output += buildChannel1Reminder(
         decision.level,
@@ -519,7 +519,7 @@ function maybeInjectChannel1Nudge(
     );
     setChannel1NudgeState(args.db, sessionId, {
         level: decision.level,
-        ordinal: state.messageOrdinal,
+        ordinal: state.realUserTurnCount,
     });
     sessionLog(
         sessionId,

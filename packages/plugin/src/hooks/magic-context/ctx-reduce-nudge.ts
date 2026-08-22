@@ -19,7 +19,8 @@ export interface Channel1State {
     turnDeltaU: number;
     turnDeltaT: number;
     usableWindow: number;
-    messageOrdinal: number;
+    /** Monotonic count of real (not Magic Context-injected) user turns in this pass. */
+    realUserTurnCount: number;
     baselineGeneration: number;
     computedAt: number;
     evaluable: boolean;
@@ -217,17 +218,21 @@ export function buildChannel2Reminder(
     );
 }
 
-export const CHANNEL1_STICKY_ORDINAL_GAP = 3;
+export const CHANNEL1_STICKY_REAL_USER_TURN_GAP = 3;
 
 export function shouldUseStickyChannel1Reminder(input: {
     lastLevel: Channel1Level | "";
     lastOrdinal: number;
     level: Channel1Level;
-    currentOrdinal: number;
+    currentRealUserTurnCount: number;
 }): boolean {
     if (input.lastLevel !== input.level || input.lastOrdinal <= 0) return false;
-    const gap = input.currentOrdinal - input.lastOrdinal;
-    return gap >= 0 && gap <= CHANNEL1_STICKY_ORDINAL_GAP;
+    // Older persisted blobs wrote a raw message ordinal. That value is larger
+    // than the real-user counter whenever synthetic rows intervened, so expire
+    // the incomparable state once and overwrite it on this fire.
+    if (input.lastOrdinal > input.currentRealUserTurnCount) return false;
+    const gap = input.currentRealUserTurnCount - input.lastOrdinal;
+    return gap >= 0 && gap < CHANNEL1_STICKY_REAL_USER_TURN_GAP;
 }
 
 export function buildChannel1Reminder(

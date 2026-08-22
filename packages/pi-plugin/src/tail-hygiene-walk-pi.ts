@@ -172,6 +172,21 @@ function isSyntheticMessage(
 	return role === "system" || role === "custom" || role === "compactionSummary";
 }
 
+/**
+ * Counts only JSONL `user` entries that the rendered-entry classifier keeps
+ * as user-authored. `isSyntheticMessage` excludes m0/m1 through
+ * `syntheticLeadingCount` and Channel-2's hidden `custom` entries.
+ */
+export function countRealPiUserMessages(input: PiTailHygieneWalkInput): number {
+	let count = 0;
+	for (let index = 0; index < input.messages.length; index += 1) {
+		const message = input.messages[index];
+		if (!isRecord(message) || message.role !== "user") continue;
+		if (!isSyntheticMessage(message, index, input)) count += 1;
+	}
+	return count;
+}
+
 function imageContentAndTokens(part: Record<string, unknown>): {
 	content: string;
 	tokens: number;

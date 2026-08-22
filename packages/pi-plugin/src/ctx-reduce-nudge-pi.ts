@@ -162,7 +162,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 		lastLevel: nudgeState.level,
 		lastOrdinal: nudgeState.ordinal,
 		level: decision.level,
-		currentOrdinal: state.messageOrdinal,
+		currentRealUserTurnCount: state.realUserTurnCount,
 	});
 	const block = {
 		type: "text" as const,
@@ -176,7 +176,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 	};
 	setChannel1NudgeState(db, sessionId, {
 		level: decision.level,
-		ordinal: state.messageOrdinal,
+		ordinal: state.realUserTurnCount,
 	});
 	return block;
 }

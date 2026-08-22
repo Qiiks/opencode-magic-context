@@ -100,6 +100,7 @@ import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./sup
 import { byteSize, prependTag } from "./tag-content-primitives";
 import {
     assertTailHygieneContentUnchanged,
+    countRealUserMessages,
     refreshTailHygieneBaseline,
     sameTailHygieneStructuralSignature,
     type TailHygieneStructuralSignature,
@@ -2224,11 +2225,10 @@ export async function runPostTransformPhase(
                     previous,
                 });
                 const structuralSignature = tailHygieneStructuralSignature(args.messages);
-                const messageOrdinal = Math.max(0, ...args.messageTagNumbers.values());
                 args.channel1StateBySession.set(args.sessionId, {
                     ...baseline,
                     usableWindow: args.usableWindow,
-                    messageOrdinal,
+                    realUserTurnCount: countRealUserMessages(args.messages),
                     reducedSinceRefresh:
                         baseline.baselineGeneration !== previous?.baselineGeneration
                             ? false

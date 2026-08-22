@@ -129,7 +129,7 @@ describe("Pi status dialog", () => {
 				turnDeltaU: 0,
 				turnDeltaT: 0,
 				usableWindow: 128_000,
-				messageOrdinal: 4,
+				realUserTurnCount: 4,
 				baselineGeneration: 4,
 				computedAt: 123,
 				evaluable: true,

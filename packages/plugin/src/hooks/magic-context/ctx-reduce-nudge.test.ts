@@ -208,21 +208,38 @@ describe("reminder rendering", () => {
         );
     });
 
-    it("dampens same-level refires within three ordinals but not escalations", () => {
+    it("dampens same-level refires before three real user turns but not escalations", () => {
         expect(
             shouldUseStickyChannel1Reminder({
                 lastLevel: "firm",
                 lastOrdinal: 10,
                 level: "firm",
-                currentOrdinal: 13,
+                currentRealUserTurnCount: 12,
             }),
         ).toBe(true);
         expect(
             shouldUseStickyChannel1Reminder({
                 lastLevel: "firm",
                 lastOrdinal: 10,
+                level: "firm",
+                currentRealUserTurnCount: 13,
+            }),
+        ).toBe(false);
+        expect(
+            shouldUseStickyChannel1Reminder({
+                lastLevel: "firm",
+                lastOrdinal: 10,
                 level: "urgent",
-                currentOrdinal: 11,
+                currentRealUserTurnCount: 11,
+            }),
+        ).toBe(false);
+
+        expect(
+            shouldUseStickyChannel1Reminder({
+                lastLevel: "firm",
+                lastOrdinal: 160_750,
+                level: "firm",
+                currentRealUserTurnCount: 12,
             }),
         ).toBe(false);
 

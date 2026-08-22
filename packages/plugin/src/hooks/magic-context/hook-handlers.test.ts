@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
+
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
@@ -20,6 +21,8 @@ import {
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
+import type { MessageLike } from "./tag-messages";
+import { countRealUserMessages } from "./tail-hygiene-walk";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -621,31 +624,47 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
 });
 
 describe("createToolExecuteAfterHook Channel-1 dampening", () => {
-    test("freezes full and sticky variants while escalations keep the full body", async () => {
+    test("uses real user turns for sticky refires, expiration, and escalation", async () => {
         const db = createTestDb();
         const sessionId = "ses-channel1-dampening";
         const state = (
             baselineU: number,
             baselineT: number,
-            messageOrdinal: number,
+            realUserTurnCount: number,
         ): Channel1State => ({
             baselineU,
             baselineT,
             turnDeltaU: 0,
             turnDeltaT: 0,
             usableWindow: 128_000,
-            messageOrdinal,
+            realUserTurnCount,
             baselineGeneration: 1,
             computedAt: 1,
             evaluable: true,
             generationInvalidated: false,
             baselineParts: [],
-            contentSignature: `baseline-${messageOrdinal}`,
+            contentSignature: `baseline-${realUserTurnCount}`,
             reducedSinceRefresh: false,
             oldestReclaimableToolTags: [],
         });
+        const realTurn = {
+            info: { id: "real-user", role: "user" },
+            parts: [{ type: "text", text: "continue working" }],
+        } as unknown as MessageLike;
+        const sameTurnWithSyntheticRows = [
+            realTurn,
+            {
+                info: { id: "reminder", role: "user", summary: true },
+                parts: [{ type: "text", text: "<system-reminder>stale board</system-reminder>" }],
+            },
+            {
+                info: { role: "user" },
+                parts: [{ type: "text", text: "channel two", synthetic: true }],
+            },
+        ] as unknown as MessageLike[];
+        const firstTurnCount = countRealUserMessages([realTurn]);
         const channel1StateBySession = new Map<string, Channel1State>([
-            [sessionId, state(50_000, 120_000, 10)],
+            [sessionId, state(50_000, 120_000, firstTurnCount)],
         ]);
         const hook = createToolExecuteAfterHook({ db, channel1StateBySession });
 
@@ -657,7 +676,10 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             await hook({ tool: "bash", sessionID: sessionId }, first);
             expect(first.output).toBe(frozenFirst);
 
-            channel1StateBySession.set(sessionId, state(80_000, 180_000, 12));
+            // Live repro: two injected user rows arrive before a same-turn refire.
+            const sameTurnCount = countRealUserMessages(sameTurnWithSyntheticRows);
+            expect(sameTurnCount).toBe(firstTurnCount);
+            channel1StateBySession.set(sessionId, state(80_000, 180_000, sameTurnCount));
             const sticky = { output: "second output" };
             await hook({ tool: "bash", sessionID: sessionId }, sticky);
             expect(sticky.output).toContain("Reminder: ctx_reduce housekeeping still pending —");
@@ -666,13 +688,69 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             await hook({ tool: "bash", sessionID: sessionId }, sticky);
             expect(sticky.output).toBe(frozenSticky);
 
-            channel1StateBySession.set(sessionId, state(120_000, 180_000, 13));
-            const escalation = { output: "third output" };
+            const threeLater = Array.from({ length: 4 }, (_, index) => ({
+                info: { id: `real-user-${index}`, role: "user" },
+                parts: [{ type: "text", text: "continue" }],
+            })) as unknown as MessageLike[];
+            channel1StateBySession.set(
+                sessionId,
+                state(110_000, 240_000, countRealUserMessages(threeLater)),
+            );
+            const expired = { output: "third output" };
+            await hook({ tool: "bash", sessionID: sessionId }, expired);
+            expect(expired.output).toContain("Housekeeping: ~110k of this session's ~128k window");
+            expect(expired.output).not.toContain("Reminder: ctx_reduce housekeeping still pending");
+
+            channel1StateBySession.set(sessionId, state(120_000, 180_000, 4));
+            const escalation = { output: "fourth output" };
             await hook({ tool: "bash", sessionID: sessionId }, escalation);
             expect(escalation.output).toContain("Housekeeping backlog: ~120k");
             expect(escalation.output).not.toContain(
                 "Reminder: ctx_reduce housekeeping still pending",
             );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("expires a legacy raw ordinal before writing the real-user counter", async () => {
+        const db = createTestDb();
+        const sessionId = "ses-channel1-legacy-ordinal";
+        const state: Channel1State = {
+            baselineU: 80_000,
+            baselineT: 180_000,
+            turnDeltaU: 0,
+            turnDeltaT: 0,
+            usableWindow: 128_000,
+            realUserTurnCount: 1,
+            baselineGeneration: 1,
+            computedAt: 1,
+            evaluable: true,
+            generationInvalidated: false,
+            baselineParts: [],
+            contentSignature: "legacy",
+            reducedSinceRefresh: false,
+            oldestReclaimableToolTags: [],
+        };
+        getOrCreateSessionMeta(db, sessionId);
+        db.prepare(
+            "UPDATE session_meta SET last_nudge_undropped = ?, last_nudge_level = ? WHERE session_id = ?",
+        ).run(50_000, '{"level":"firm","ordinal":160750}', sessionId);
+        const hook = createToolExecuteAfterHook({
+            db,
+            channel1StateBySession: new Map([[sessionId, state]]),
+        });
+
+        try {
+            const output = { output: "legacy output" };
+            await hook({ tool: "bash", sessionID: sessionId }, output);
+            expect(output.output).toContain("Housekeeping: ~80k of this session's ~128k window");
+            expect(output.output).not.toContain("Reminder: ctx_reduce housekeeping still pending");
+            expect(
+                db
+                    .prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?")
+                    .get(sessionId),
+            ).toEqual({ last_nudge_level: '{"level":"firm","ordinal":1}' });
         } finally {
             closeQuietly(db);
         }

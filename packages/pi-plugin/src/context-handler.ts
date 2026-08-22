@@ -235,6 +235,7 @@ import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
 import {
 	assertPiTailHygieneContentUnchanged,
+	countRealPiUserMessages,
 	effectivePiTailHygiene,
 	refreshPiTailHygieneBaseline,
 } from "./tail-hygiene-walk-pi";
@@ -3163,7 +3164,13 @@ export function registerPiContextHandler(
 					const channelState = {
 						...baseline,
 						usableWindow: usageContextLimit ?? 0,
-						messageOrdinal: sessionMetaForCh1.counter,
+						realUserTurnCount: countRealPiUserMessages({
+							messages: outputMessages,
+							tags,
+							protectedTags,
+							stableId,
+							syntheticLeadingCount: result.syntheticLeadingCount,
+						}),
 						reducedSinceRefresh: false,
 						oldestReclaimableToolTags,
 					};
