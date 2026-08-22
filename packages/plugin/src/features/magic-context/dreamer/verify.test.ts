@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -42,6 +43,34 @@ function tempProject(): string {
     mkdirSync(path.join(dir, "src"), { recursive: true });
     writeFileSync(path.join(dir, "src", "old.ts"), "export const oldValue = 1;", "utf8");
     writeFileSync(path.join(dir, "src", "new.ts"), "export const newValue = 2;", "utf8");
+    return dir;
+}
+
+function gitProject(): string {
+    const dir = tempProject();
+    execFileSync("git", ["init", "--quiet"], { cwd: dir });
+    execFileSync("git", ["add", "."], { cwd: dir });
+    execFileSync(
+        "git",
+        [
+            "-c",
+            "user.name=Magic Context Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial source",
+        ],
+        {
+            cwd: dir,
+            env: {
+                ...process.env,
+                GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+                GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+            },
+        },
+    );
     return dir;
 }
 
@@ -96,14 +125,21 @@ function tokenizedAssistantMessages(
     ];
 }
 
-type ScriptedVerifyResponse = { kind: "manifest" } | { kind: "provider-failure"; text: string };
+type ScriptedVerifyResponse =
+    | { kind: "manifest" }
+    | { kind: "provider-failure"; text: string }
+    | { kind: "text"; text: string; tokens?: { output: number; reasoning: number } };
 
-function scriptedVerifyClient(responseFor: (promptCall: number) => ScriptedVerifyResponse): {
+function scriptedVerifyClient(
+    responseFor: (promptCall: number, ids: number[]) => ScriptedVerifyResponse,
+): {
     client: unknown;
     promptCalls: () => number;
+    promptIds: () => number[][];
 } {
     let promptCalls = 0;
     let childCount = 0;
+    const promptedIds: number[][] = [];
     const messages = new Map<string, unknown[]>();
     return {
         client: {
@@ -118,20 +154,21 @@ function scriptedVerifyClient(responseFor: (promptCall: number) => ScriptedVerif
                     const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
                         Number(match[1]),
                     );
-                    const response = responseFor(promptCalls);
+                    promptedIds.push(ids);
+                    const response = responseFor(promptCalls, ids);
                     const text =
                         response.kind === "manifest"
                             ? `<verify>${ids.map((id) => `<verified id="${id}"/>`).join("")}</verify>`
                             : response.text;
+                    const tokens =
+                        response.kind === "manifest"
+                            ? { output: Math.max(40, ids.length * 4), reasoning: 100 }
+                            : response.kind === "provider-failure"
+                              ? { output: 8, reasoning: 0 }
+                              : (response.tokens ?? { output: 40, reasoning: 100 });
                     messages.set(
                         args.path?.id ?? "",
-                        tokenizedAssistantMessages(
-                            text,
-                            promptCalls,
-                            response.kind === "manifest"
-                                ? { output: Math.max(40, ids.length * 4), reasoning: 100 }
-                                : { output: 8, reasoning: 0 },
-                        ),
+                        tokenizedAssistantMessages(text, promptCalls, tokens),
                     );
                     return {};
                 },
@@ -142,6 +179,7 @@ function scriptedVerifyClient(responseFor: (promptCall: number) => ScriptedVerif
             },
         },
         promptCalls: () => promptCalls,
+        promptIds: () => promptedIds,
     };
 }
 
@@ -173,7 +211,7 @@ function addMappedMemories(db: Database, projectIdentity: string, count: number)
             content: `Mapped fact ${index}.`,
             sourceSessionId: "ses",
         });
-        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
     }
 }
 
@@ -214,6 +252,138 @@ describe("runVerify disposition", () => {
             expect(result.verified).toBe(1);
             expect(result.remaining).toBe(0);
             expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("commits a closed subset and re-selects only its silent id on the next verify run", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-partial-resume";
+            const dir = gitProject();
+            const first = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "First verified fact.",
+                sourceSessionId: "ses",
+            });
+            const silent = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Silent verified fact.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryVerifications(db, first.id, ["src/old.ts"], 1_000);
+            recordMemoryVerifications(db, silent.id, ["src/old.ts"], 1_000);
+
+            const args = verifyArgs(db, dir, projectIdentity);
+            const partial = scriptedVerifyClient((_call, ids) => {
+                expect([...ids].sort((a, b) => a - b)).toEqual(
+                    [first.id, silent.id].sort((a, b) => a - b),
+                );
+                return {
+                    kind: "text",
+                    text: `<verify><verified id="${first.id}" files="src/old.ts"/></verify>`,
+                };
+            });
+            args.client = partial.client as never;
+
+            const firstRun = await runVerify(args);
+
+            expect(firstRun).toMatchObject({ verified: 1, remaining: 1, complete: false });
+            const afterFirst = getMemoryVerifications(db, [first.id, silent.id]);
+            expect(afterFirst.get(first.id)?.verifiedAt).toBeGreaterThan(1_000);
+            expect(afterFirst.get(silent.id)?.verifiedAt).toBe(1_000);
+
+            const resumed = scriptedVerifyClient((_call, ids) => {
+                expect(ids).toEqual([silent.id]);
+                return {
+                    kind: "text",
+                    text: `<verify><verified id="${silent.id}" files="src/old.ts"/></verify>`,
+                };
+            });
+            args.client = resumed.client as never;
+
+            const secondRun = await runVerify(args);
+
+            expect(resumed.promptIds()).toEqual([[silent.id]]);
+            expect(secondRun).toMatchObject({
+                inScope: 1,
+                verified: 1,
+                remaining: 0,
+                complete: true,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("commits a closed subset and re-selects only its silent id in verify-broad", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-broad-partial-resume";
+            const dir = tempProject();
+            const first = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "First broad fact.",
+                sourceSessionId: "ses",
+            });
+            const silent = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Silent broad fact.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryVerifications(db, first.id, ["src/old.ts"], 1_000);
+            recordMemoryVerifications(db, silent.id, ["src/old.ts"], 1_000);
+            seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
+
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            const partial = scriptedVerifyClient((_call, ids) => {
+                expect([...ids].sort((a, b) => a - b)).toEqual(
+                    [first.id, silent.id].sort((a, b) => a - b),
+                );
+                return {
+                    kind: "text",
+                    text: `<verify><verified id="${first.id}" files="src/old.ts"/></verify>`,
+                };
+            });
+            args.client = partial.client as never;
+
+            const firstRun = await runVerify(args);
+
+            expect(firstRun).toMatchObject({
+                mode: "broad",
+                verified: 1,
+                remaining: 1,
+                complete: false,
+            });
+            expect(getMemoryVerifications(db, [silent.id]).get(silent.id)?.verifiedAt).toBe(1_000);
+
+            const resumed = scriptedVerifyClient((_call, ids) => {
+                expect(ids).toEqual([silent.id]);
+                return {
+                    kind: "text",
+                    text: `<verify><verified id="${silent.id}" files="src/old.ts"/></verify>`,
+                };
+            });
+            args.client = resumed.client as never;
+
+            const secondRun = await runVerify(args);
+
+            expect(resumed.promptIds()).toEqual([[silent.id]]);
+            expect(secondRun).toMatchObject({
+                mode: "broad",
+                inScope: 1,
+                verified: 1,
+                complete: true,
+            });
+            expect(
+                getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
+            ).toBeNull();
         } finally {
             closeQuietly(db);
         }
@@ -288,6 +458,44 @@ describe("runVerify disposition", () => {
             expect(
                 getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
             ).toBeGreaterThan(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("classifies a closed partial outage fragment before it can apply", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-partial-provider-outage";
+            const dir = tempProject();
+            const first = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "First outage fact.",
+                sourceSessionId: "ses",
+            });
+            const silent = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Silent outage fact.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryVerifications(db, first.id, ["src/old.ts"], 1_000);
+            recordMemoryVerifications(db, silent.id, ["src/old.ts"], 1_000);
+            const scripted = scriptedVerifyClient(() => ({
+                kind: "provider-failure",
+                text: `<verify><verified id="${first.id}" files="src/old.ts"/></verify>`,
+            }));
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = scripted.client as never;
+
+            await expect(runVerify(args)).rejects.toBeInstanceOf(DreamerProviderOutputFailureError);
+
+            expect(scripted.promptCalls()).toBe(1);
+            expect(getMemoryById(db, first.id)?.status).toBe("active");
+            expect(getMemoryVerifications(db, [first.id]).get(first.id)?.verifiedAt).toBe(1_000);
+            expect(getMemoryVerifications(db, [silent.id]).get(silent.id)?.verifiedAt).toBe(1_000);
         } finally {
             closeQuietly(db);
         }
@@ -388,6 +596,147 @@ describe("runVerify disposition", () => {
 });
 
 describe("applyVerifyManifest", () => {
+    test("treats an absent batch id as silence rather than verify or archive", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-silence";
+            const dir = tempProject();
+            const archived = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Archived fact.",
+                sourceSessionId: "ses",
+            });
+            const silent = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Silent fact.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryVerifications(db, archived.id, ["src/old.ts"], 1_000);
+            recordMemoryVerifications(db, silent.id, ["src/old.ts"], 1_000);
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                [archived, silent].map((memory) => ({
+                    id: memory.id,
+                    category: memory.category,
+                    content: memory.content,
+                    mappedFiles: ["src/old.ts"],
+                })),
+                `<verify><archive id="${archived.id}" reason="positive contradiction"/></verify>`,
+            );
+
+            expect(result).toEqual({ verified: 0, updated: 0, archived: 1 });
+            expect(getMemoryById(db, archived.id)?.status).toBe("archived");
+            expect(getMemoryById(db, silent.id)?.status).toBe("active");
+            const silentState = getMemoryVerifications(db, [silent.id]).get(silent.id);
+            expect(silentState?.files).toEqual(["src/old.ts"]);
+            expect(silentState?.verifiedAt).toBe(1_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("drops unknown ids and commits the valid verification remainder", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-unknown";
+            const dir = tempProject();
+            const verified = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Verified fact.",
+                sourceSessionId: "ses",
+            });
+            const silent = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Silent fact.",
+                sourceSessionId: "ses",
+            });
+            const unknown = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Wrong batch fact.",
+                sourceSessionId: "ses",
+            });
+            for (const memory of [verified, silent, unknown]) {
+                recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
+            }
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                [verified, silent].map((memory) => ({
+                    id: memory.id,
+                    category: memory.category,
+                    content: memory.content,
+                    mappedFiles: ["src/old.ts"],
+                })),
+                `<verify><verified id="${verified.id}" files="src/old.ts"/><archive id="${unknown.id}" reason="wrong batch"/></verify>`,
+            );
+
+            expect(result).toEqual({ verified: 1, updated: 0, archived: 0 });
+            expect(
+                getMemoryVerifications(db, [verified.id]).get(verified.id)?.verifiedAt,
+            ).toBeGreaterThan(1_000);
+            expect(getMemoryVerifications(db, [silent.id]).get(silent.id)?.verifiedAt).toBe(1_000);
+            expect(getMemoryById(db, unknown.id)?.status).toBe("active");
+            expect(getMemoryVerifications(db, [unknown.id]).get(unknown.id)?.verifiedAt).toBe(
+                1_000,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects a mostly-wrong manifest before any verification or archive writes", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-mostly-wrong";
+            const dir = tempProject();
+            const batch = ["First", "Second", "Third"].map((content) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content,
+                    sourceSessionId: "ses",
+                }),
+            );
+            const unknown = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Wrong batch fact.",
+                sourceSessionId: "ses",
+            });
+            for (const memory of [...batch, unknown]) {
+                recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
+            }
+
+            await expect(
+                applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    batch.map((memory) => ({
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        mappedFiles: ["src/old.ts"],
+                    })),
+                    `<verify><archive id="${batch[0]?.id}" reason="stale"/><verified id="${unknown.id}" files="src/old.ts"/></verify>`,
+                ),
+            ).rejects.toThrow(/mostly-wrong manifest/);
+
+            for (const memory of [...batch, unknown]) {
+                expect(getMemoryById(db, memory.id)?.status).toBe("active");
+                expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.verifiedAt).toBe(
+                    1_000,
+                );
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("content rewrites clear stale file mappings and embedding cache", async () => {
         const db = freshDb();
         try {
@@ -453,6 +802,43 @@ describe("applyVerifyManifest", () => {
                     `<verify><verified id="${memory.id}" files="src/old.ts"/><archive id="${memory.id}" reason="stale"/></verify>`,
                 ),
             ).rejects.toThrow(/duplicate id/);
+
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+            const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
+            expect(state?.files).toEqual(["src/old.ts"]);
+            expect(state?.verifiedAt).toBe(1_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects a missing root before any DB write", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-missing-root";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Old value lives in src/old.ts.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
+
+            await expect(
+                applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<archive id="${memory.id}" reason="stale"/>`,
+                ),
+            ).rejects.toThrow(/root <archive> unrecognized/);
 
             expect(getMemoryById(db, memory.id)?.status).toBe("active");
             const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
