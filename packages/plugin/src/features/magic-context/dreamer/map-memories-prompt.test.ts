@@ -105,15 +105,10 @@ describe("parseMapMemoriesManifest", () => {
         expect(out).toEqual([{ id: 5, files: ["a.ts", "b.ts"], independent: false }]);
     });
 
-    it("rejects truncated, duplicate, and invalid entries", () => {
+    it("rejects truncated and invalid entries", () => {
         expect(() => parseMapMemoriesManifest(`<mappings><memory id="5" files="a.ts"/>`)).toThrow(
             /closing root/,
         );
-        expect(() =>
-            parseMapMemoriesManifest(
-                `<mappings><memory id="5" files="a.ts"/><memory id="5" independent="true"/></mappings>`,
-            ),
-        ).toThrow(/duplicate id/);
         expect(() =>
             parseMapMemoriesManifest(`<mappings><memory id="x" files="a.ts"/></mappings>`),
         ).toThrow(/numeric id/);
@@ -166,19 +161,34 @@ describe("validateMapMemoriesManifest", () => {
         );
     });
 
-    it("rejects missing and extra ids at retry time", () => {
-        expect(() =>
+    it("accepts a closed subset and unknown ids for apply-time filtering", () => {
+        expect(
             validateMapMemoriesManifest(
                 `<mappings><memory id="1" files="a.ts"/></mappings>`,
                 new Set([1, 2]),
             ),
-        ).toThrow(/missing id 2/);
-        expect(() =>
+        ).toHaveLength(1);
+        expect(
             validateMapMemoriesManifest(
                 `<mappings><memory id="1" files="a.ts"/><memory id="9" independent="true"/></mappings>`,
                 new Set([1]),
             ),
-        ).toThrow(/unknown id 9/);
+        ).toHaveLength(2);
+    });
+
+    it("still rejects an unclosed root before a partial prefix can apply", () => {
+        expect(() =>
+            validateMapMemoriesManifest(`<mappings><memory id="1" files="a.ts"/>`, new Set([1, 2])),
+        ).toThrow(/closing root/);
+    });
+
+    it("rejects duplicate ids that belong to the requested batch", () => {
+        expect(() =>
+            validateMapMemoriesManifest(
+                `<mappings><memory id="1" files="a.ts"/><memory id="1" independent="true"/></mappings>`,
+                new Set([1]),
+            ),
+        ).toThrow(/duplicate id/);
     });
 
     it("accepts exact coverage", () => {

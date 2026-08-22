@@ -606,7 +606,9 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
                 progress?: string;
                 backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
             };
-            expect(summary.progress).toContain("completed 1 batch(es), 1 remain");
+            expect(summary.progress).toContain(
+                "committed 80 mapping(s) (mapped 0, independent 80); 1 remain",
+            );
             expect(summary.backlog).toEqual({
                 pendingAtStart: 81,
                 totalAtStart: 81,

@@ -2,7 +2,6 @@ import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 
 import {
-    assertManifestCoversExactly,
     assertNoDuplicateManifestIds,
     assertParsedManifestNonEmpty,
     describeUnrecognizedManifestShape,
@@ -181,24 +180,21 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
     if (out.length === 0 && body.trim().length > 0) {
         throw new Error(describeUnrecognizedManifestShape(text, "mappings", "memory"));
     }
-    assertNoDuplicateManifestIds(
-        out.map((entry) => entry.id),
-        "mappings",
-    );
     return out;
 }
 
-/** Retry-time contract: non-empty parse + exact id coverage. Apply still
- *  re-asserts coverage as the final belt. */
+/** Retry responses must contain a non-empty manifest with syntactically valid
+ *  entries and a closing root element, so the response is complete rather than
+ *  truncated. The mapper commits valid expected ids and retries only omissions.
+ *  Duplicate expected ids are rejected; duplicate unknown ids are ignored. */
 export function validateMapMemoriesManifest(
     text: string,
     expectedIds: ReadonlySet<number>,
 ): ParsedMemoryMapping[] {
     const parsed = parseMapMemoriesManifest(text);
     assertParsedManifestNonEmpty(parsed.length, expectedIds.size, text, "mappings", "memory");
-    assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
-        expectedIds,
+    assertNoDuplicateManifestIds(
+        parsed.filter((entry) => expectedIds.has(entry.id)).map((entry) => entry.id),
         "mappings",
     );
     return parsed;
