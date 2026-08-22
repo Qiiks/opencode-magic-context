@@ -141,6 +141,8 @@ export function maybeChannel1ReminderForToolResult(args: {
 	if (deltaTokens === 0) return null;
 	state.turnDeltaT += deltaTokens;
 
+	if (state.agentDropsAppliedThisPass) return null;
+
 	const nudgeState = getChannel1NudgeState(db, sessionId);
 	const decision = decideChannel1({
 		...state,
@@ -152,8 +154,8 @@ export function maybeChannel1ReminderForToolResult(args: {
 	setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
 	if (!decision.fire) {
 		setChannel1NudgeState(db, sessionId, {
-			...nudgeState,
 			level: decision.nextLastNudgeLevel,
+			ordinal: decision.nextLastNudgeLevel === "" ? 0 : nudgeState.ordinal,
 		});
 		return null;
 	}

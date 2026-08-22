@@ -498,6 +498,17 @@ pub(crate) fn measure_tail_hygiene(
     )
 }
 
+pub(crate) fn queued_tag_numbers(
+    tag_rows: &[McTagRow],
+    pending_drop_target_ids: &HashSet<String>,
+) -> HashSet<i64> {
+    tag_rows
+        .iter()
+        .filter(|row| pending_drop_target_ids.contains(&row.block_id))
+        .map(|row| row.tag_number)
+        .collect()
+}
+
 pub(crate) fn measure_tail_hygiene_with_pending_drops(
     projection: &FlatProjection,
     core: &CoreState,
@@ -509,6 +520,7 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
 ) -> TailHygieneMeasurement {
     let (tags_by_block, tags_by_arc) = tag_numbers_by_block_and_arc(projection, tag_rows);
     let protected_numbers = protected_tag_numbers(tag_rows, protected_tags);
+    let queued_numbers = queued_tag_numbers(tag_rows, pending_drop_target_ids);
     let protected_arc_ids = projection
         .blocks
         .iter()
@@ -563,7 +575,7 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
             protected_block_ids,
             &protected_arc_ids,
         );
-        let queued_for_drop = pending_drop_target_ids.contains(&block.id);
+        let queued_for_drop = tag_number.is_some_and(|number| queued_numbers.contains(&number));
         let measured = match &block.wire.kind {
             mc_store::CkKind::Text { text }
                 if block.role == "user" || block.role == "assistant" =>
@@ -938,6 +950,62 @@ mod tests {
     }
 
     #[test]
+    fn queued_tool_tag_excludes_the_full_call_and_result_arc_from_u() {
+        let messages = vec![
+            message(
+                "owner",
+                1,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "queued-call".to_string(),
+                    name: "read".to_string(),
+                    input: json!({ "payload": "large queued input".repeat(200) }),
+                    provider_executed: false,
+                }],
+            ),
+            message(
+                "result",
+                2,
+                "user",
+                vec![CkKind::ToolResult {
+                    id: "queued-call".to_string(),
+                    tool_name: "read".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: "large queued output ".repeat(2_000),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let mut tool_tag = tag(7, "result#0");
+        tool_tag.kind = "tool".to_string();
+        let tags = vec![tool_tag];
+        let initial = measure_tail_hygiene(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+        );
+        let queued = measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+            &HashSet::from(["result#0".to_string()]),
+        );
+
+        assert!(initial.u > 0);
+        assert_eq!(initial.u - queued.u, initial.u);
+        assert_eq!(queued.u, 0);
+        assert_eq!(queued.t, initial.t);
+    }
+
+    #[test]
     fn non_append_mutation_invalidates_until_a_bust() {
         let messages = vec![text("m", 1, "original")];
         let tags = vec![tag(1, "m#0")];
@@ -992,6 +1060,8 @@ mod tests {
         protected_tags: usize,
         messages: Vec<HygieneFixtureMessage>,
         tags: Vec<HygieneFixtureTag>,
+        #[serde(default)]
+        pending_drop_tag_numbers: Vec<i64>,
         expected: HygieneExpected,
     }
 
@@ -1057,6 +1127,8 @@ mod tests {
         protected_tags: usize,
         messages: &'a [HygieneFixtureMessage],
         tags: &'a [HygieneFixtureTag],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pending_drop_tag_numbers: Option<&'a [i64]>,
     }
 
     fn hygiene_fixture_canonical(cases: &[HygieneGoldenCase]) -> String {
@@ -1067,6 +1139,8 @@ mod tests {
                 protected_tags: case.protected_tags,
                 messages: &case.messages,
                 tags: &case.tags,
+                pending_drop_tag_numbers: (!case.pending_drop_tag_numbers.is_empty())
+                    .then_some(case.pending_drop_tag_numbers.as_slice()),
             })
             .collect::<Vec<_>>();
         format!(
@@ -1175,13 +1249,24 @@ mod tests {
                 .collect::<Vec<_>>();
             let tags = case.tags.iter().map(fixture_tag).collect::<Vec<_>>();
             let projection = project_messages(&messages).expect("project parity fixture");
-            let measured = measure_tail_hygiene(
+            let pending_numbers = case
+                .pending_drop_tag_numbers
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let pending_targets = tags
+                .iter()
+                .filter(|tag| pending_numbers.contains(&tag.tag_number))
+                .map(|tag| tag.block_id.clone())
+                .collect::<HashSet<_>>();
+            let measured = measure_tail_hygiene_with_pending_drops(
                 &projection,
                 &CoreState::default(),
                 None,
                 &tags,
                 case.protected_tags,
                 &HashSet::new(),
+                &pending_targets,
             );
             for (label, rust, ts) in [
                 ("U", measured.u, case.expected.u),
@@ -1192,6 +1277,25 @@ mod tests {
                     (rust - ts).abs() <= tolerance,
                     "{} {label} drifted outside tokenizer tolerance: Rust={rust}, TS={ts}, tolerance={tolerance}",
                     case.id
+                );
+            }
+            if case.id == "queued-tool-arc-full-mass" {
+                let unqueued = measure_tail_hygiene(
+                    &projection,
+                    &CoreState::default(),
+                    None,
+                    &tags,
+                    case.protected_tags,
+                    &HashSet::new(),
+                );
+                assert_eq!(
+                    unqueued.u - measured.u,
+                    unqueued.u,
+                    "queueing the tool tag must remove the full attributed call/result mass",
+                );
+                assert_eq!(
+                    measured.u, case.expected.u,
+                    "Rust and TS queued U must agree"
                 );
             }
             if case.id == "reasoning-excluded-both-terms" {

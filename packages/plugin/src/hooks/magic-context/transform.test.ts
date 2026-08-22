@@ -1091,6 +1091,10 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-ops-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
         const scheduler: Scheduler = { shouldExecute };
+        const channel1StateBySession = new Map<
+            string,
+            import("./ctx-reduce-nudge").Channel1State
+        >();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -1106,6 +1110,7 @@ describe("createTransform", () => {
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTags: 0,
+            channel1StateBySession,
         });
 
         const firstPass: TestMessage[] = [
@@ -1160,6 +1165,7 @@ describe("createTransform", () => {
         expect(getTagById(db, "ses-1", 1)?.status).toBe("dropped");
         expect(getTagById(db, "ses-1", 2)?.status).toBe("dropped");
         expect(getTagById(db, "ses-1", 2)?.dropMode).toBe("full");
+        expect(channel1StateBySession.get("ses-1")?.agentDropsAppliedThisPass).toBe(true);
         expect(clearPendingOps(db, "ses-1")).toBeUndefined();
     });
 

@@ -187,7 +187,12 @@ export const OpenCodeHarnessBlockSchema = z
             .describe(
                 "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
             ),
-        variant: z.string().optional().describe("Default OpenCode reasoning variant."),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
     })
     .strict()
     .describe("Strict OpenCode model-resolution block. It accepts no Pi vocabulary.");
@@ -203,7 +208,9 @@ export const PiHarnessBlockSchema = z
             .describe(
                 "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
             ),
-        thinking_level: PiThinkingLevelSchema.describe("Default Pi thinking level."),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
     })
     .strict()
     .describe("Strict Pi model-resolution block. It accepts no OpenCode vocabulary.");
@@ -220,7 +227,9 @@ export const OpenCodeTaskExecutionSchema = z
         variant: z
             .string()
             .optional()
-            .describe("Default OpenCode reasoning variant for this task."),
+            .describe(
+                "OpenCode reasoning variant for this task's primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
         timeout_minutes: z
             .number()
             .min(5)
@@ -238,7 +247,9 @@ export const PiTaskExecutionSchema = z
             .array(PiEntrySchema)
             .optional()
             .describe("Ordered Pi fallback entries for this task."),
-        thinking_level: PiThinkingLevelSchema.describe("Default Pi thinking level for this task."),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
         timeout_minutes: z
             .number()
             .min(5)
@@ -258,7 +269,12 @@ export const DreamerOpenCodeHarnessBlockSchema = z
             .describe(
                 "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
             ),
-        variant: z.string().optional().describe("Default OpenCode reasoning variant."),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
         tasks: z
             .record(z.string(), OpenCodeTaskExecutionSchema)
             .optional()
@@ -280,7 +296,9 @@ export const DreamerPiHarnessBlockSchema = z
             .describe(
                 "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
             ),
-        thinking_level: PiThinkingLevelSchema.describe("Default Pi thinking level."),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+        ),
         tasks: z
             .record(z.string(), PiTaskExecutionSchema)
             .optional()

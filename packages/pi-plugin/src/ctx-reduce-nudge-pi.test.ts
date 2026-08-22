@@ -201,6 +201,70 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		clearPiChannel1State(SESSION);
 	});
 
+	it("gives an applying drop pass one fire-free baseline before resuming", () => {
+		const db = createTestDb();
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
+			reducedSinceRefresh: false,
+			agentDropsAppliedThisPass: true,
+			oldestReclaimableToolTags: [],
+		});
+		const applyingPass = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "output on applying pass" }],
+		});
+		expect(applyingPass).toBeNull();
+
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
+			reducedSinceRefresh: false,
+			agentDropsAppliedThisPass: false,
+			oldestReclaimableToolTags: [],
+		});
+		const nextPass = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "output on next pass" }],
+		});
+		expect(nextPass?.text).toContain("Housekeeping backlog: ~90k");
+		clearPiChannel1State(SESSION);
+	});
+
+	it("clears both the persisted level and ordinal when a collapse resets the cycle", () => {
+		const db = createTestDb();
+		seedBaseline(90_000);
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "first output" }],
+			}),
+		).not.toBeNull();
+		expect(getChannel1NudgeState(db, SESSION)).toEqual({
+			level: "urgent",
+			ordinal: 1,
+		});
+
+		seedBaseline(10_000);
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "post-collapse output" }],
+			}),
+		).toBeNull();
+		expect(getChannel1NudgeState(db, SESSION)).toEqual({
+			level: "",
+			ordinal: 0,
+		});
+		clearPiChannel1State(SESSION);
+	});
+
 	it("suppresses on a ctx_reduce tool result and marks reduced", () => {
 		const db = createTestDb();
 		seedBaseline(90_000);

@@ -1660,7 +1660,9 @@ describe("registerPiContextHandler", () => {
 			expect(pendingOpsReads).toBe(1);
 			const queuedHygiene = getPiChannel1Baseline(sessionId);
 			expect(queuedHygiene?.baselineU).toBe(baselineHygiene?.baselineU);
-			expect(queuedHygiene?.turnDeltaU).toBeLessThan(baselineHygiene?.turnDeltaU ?? 0);
+			expect(queuedHygiene?.turnDeltaU).toBeLessThan(
+				baselineHygiene?.turnDeltaU ?? 0,
+			);
 			expect(getPendingOps(db, sessionId)).toHaveLength(1);
 		} finally {
 			clearContextHandlerSession(sessionId);
@@ -1719,6 +1721,22 @@ describe("registerPiContextHandler", () => {
 
 			expect(textOf(result.messages[1] as never)).toBe("[dropped §2§]");
 			expect(getPendingOps(db, "ses-context")).toEqual([]);
+			expect(
+				getPiChannel1Baseline("ses-context")?.agentDropsAppliedThisPass,
+			).toBe(true);
+
+			await handler(
+				{
+					messages: [
+						userMessage("keep user", 1),
+						assistantMessage("drop assistant", 2),
+					] as never[],
+				},
+				overThresholdCtx as never,
+			);
+			expect(
+				getPiChannel1Baseline("ses-context")?.agentDropsAppliedThisPass,
+			).toBe(false);
 		} finally {
 			closeQuietly(db);
 		}

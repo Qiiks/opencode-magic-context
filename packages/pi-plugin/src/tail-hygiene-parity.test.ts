@@ -49,6 +49,7 @@ type Fixture = {
 	protected_tags: number;
 	messages: FixtureMessage[];
 	tags: FixtureTag[];
+	pending_drop_tag_numbers?: number[];
 	expected: { u: number; t: number; band: string };
 };
 type Golden = {
@@ -279,15 +280,20 @@ describe("nudge hygiene three-leg differential corpus", () => {
 		expect(golden.cases.length).toBeGreaterThanOrEqual(12);
 
 		for (const fixture of golden.cases) {
+			const pendingDropTagNumbers = new Set(
+				fixture.pending_drop_tag_numbers ?? [],
+			);
 			const core = measureTailHygiene({
 				messages: toCoreMessages(fixture),
 				tags: toTags(fixture),
 				protectedTags: fixture.protected_tags,
+				pendingDropTagNumbers,
 			});
 			const pi = measurePiTailHygiene({
 				messages: toPiMessages(fixture),
 				tags: toTags(fixture, true),
 				protectedTags: fixture.protected_tags,
+				pendingDropTagNumbers,
 				stableId: (message) =>
 					typeof (message as { _mid?: unknown })._mid === "string"
 						? (message as { _mid: string })._mid
@@ -295,6 +301,10 @@ describe("nudge hygiene three-leg differential corpus", () => {
 			});
 			assertLeg(fixture.id, "TypeScript", core, fixture.expected);
 			assertLeg(fixture.id, "Pi", pi, fixture.expected);
+			if (fixture.id === "queued-tool-arc-full-mass") {
+				expect(core.u).toBe(fixture.expected.u);
+				expect(pi.u).toBe(fixture.expected.u);
+			}
 		}
 	});
 

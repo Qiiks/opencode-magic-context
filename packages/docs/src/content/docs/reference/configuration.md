@@ -97,11 +97,11 @@ The background agent that condenses old conversation into compact history.
 | `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
 | `historian.opencode.model` | string \\| object | — | Primary OpenCode model entry. |
 | `historian.opencode.fallback_models` | string \\| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
-| `historian.opencode.variant` | string | — | Default OpenCode reasoning variant. |
+| `historian.opencode.variant` | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `historian.pi` | object | — | Strict Pi model-resolution block. It accepts no OpenCode vocabulary. |
 | `historian.pi.model` | string \\| object | — | Primary Pi model entry. |
 | `historian.pi.fallback_models` | string \\| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
-| `historian.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Default Pi thinking level. |
+| `historian.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.two_pass` | boolean | `false` | Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false) |
 | `historian.disallowed_tools` | `"*"` \\| `"read"` \\| `"aft_outline"` \\| `"aft_zoom"` \\| `"aft_search"`[] | `[]` | OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: []) |
 | `historian_timeout_ms` | number (60000–) | `600000` | Timeout for each historian prompt call in milliseconds (default: 600000) |
@@ -166,12 +166,12 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 | `dreamer.opencode` | object | — | Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary. |
 | `dreamer.opencode.model` | string \\| object | — | Primary OpenCode model entry. |
 | `dreamer.opencode.fallback_models` | string \\| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
-| `dreamer.opencode.variant` | string | — | Default OpenCode reasoning variant. |
+| `dreamer.opencode.variant` | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `dreamer.opencode.tasks` | map<string, object> | — | OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes. |
 | `dreamer.pi` | object | — | Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary. |
 | `dreamer.pi.model` | string \\| object | — | Primary Pi model entry. |
 | `dreamer.pi.fallback_models` | string \\| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
-| `dreamer.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Default Pi thinking level. |
+| `dreamer.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `dreamer.pi.tasks` | map<string, object> | — | Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes. |
 | `dreamer.tasks` | object | — | Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks or dreamer.pi.tasks. |
 | `dreamer.tasks.map-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
