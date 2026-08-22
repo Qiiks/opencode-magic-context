@@ -23,12 +23,13 @@ import {
 } from "../memory";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
-import { assertManifestCoversExactly } from "./manifest-parser";
+import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import {
     buildMapMemoriesPrompt,
     extractMemoryCandidatePaths,
     MAP_MEMORIES_SYSTEM_PROMPT,
     type MapMemoryInput,
+    type ParsedMemoryMapping,
     parseMapMemoriesManifest,
     validateMapMemoriesManifest,
 } from "./map-memories-prompt";
@@ -113,6 +114,10 @@ type MapBatchFailureClass = "timeout" | "other";
 interface MapBatchOutcome {
     mapped: number;
     independent: number;
+    /** A response with a closing root element may still omit trailing ids. Those
+     * ids get one targeted in-run retry; if it omits them again, they stay unmapped
+     * for the next resumable run. */
+    requeue?: MapMemoryInput[];
     /** Failed batches make no writes. The run loop needs the timeout class to
      * distinguish a model-too-slow starvation streak from ordinary retries. */
     failure?: {
@@ -204,9 +209,9 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
     const inputs = selectMapMemoryInputs(args.db, args.projectIdentity, args.sessionDirectory);
     if (inputs.length === 0) return result;
 
-    const batches: MapMemoryInput[][] = [];
+    const batches: Array<{ inputs: MapMemoryInput[]; isOmissionRetry: boolean }> = [];
     for (let i = 0; i < inputs.length; i += MAP_BATCH_SIZE) {
-        batches.push(inputs.slice(i, i + MAP_BATCH_SIZE));
+        batches.push({ inputs: inputs.slice(i, i + MAP_BATCH_SIZE), isOmissionRetry: false });
     }
     result.remaining = inputs.length;
 
@@ -241,7 +246,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             const sliceMs = computeMapBatchSliceMs(remainingMs, batches.length - i);
             const batch = batches[i];
             if (!batch) break;
-            const outcome = await mapOneBatch(args, batch, sliceMs, abortController.signal);
+            const outcome = await mapOneBatch(args, batch.inputs, sliceMs, abortController.signal);
             const committed = outcome.mapped + outcome.independent;
             result.mapped += outcome.mapped;
             result.independent += outcome.independent;
@@ -249,6 +254,24 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             if (committed > 0) {
                 result.batches += 1;
                 args.onProgress?.(result.mapped + result.independent);
+            }
+            if (outcome.requeue?.length) {
+                if (!batch.isOmissionRetry) {
+                    // A closed root proves this is an omission rather than a truncated
+                    // prefix. Retry only the omitted tail once; repeat omissions stay
+                    // unmapped so a later run can resume without an unbounded loop.
+                    batches.splice(i + 1, 0, {
+                        inputs: outcome.requeue,
+                        isOmissionRetry: true,
+                    });
+                    log(
+                        `[dreamer] map-memories: committed ${committed}/${batch.inputs.length} mapping(s); requeueing ${outcome.requeue.length} omitted id(s) in a targeted retry`,
+                    );
+                } else {
+                    log(
+                        `[dreamer] map-memories: targeted retry still omitted ${outcome.requeue.length} id(s); leaving them unmapped for the next run`,
+                    );
+                }
             }
 
             if (outcome.failure?.class === "timeout") {
@@ -270,7 +293,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
         }
         result.complete = result.remaining === 0;
         log(
-            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
+            `[dreamer] map-memories: committed=${result.mapped + result.independent} mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
         );
         return result;
     } finally {
@@ -280,9 +303,9 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
 
 /**
  * Map ONE batch in its OWN child session. Per-batch try/finally guarantees the
- * child is deleted even on a mid-loop deadline throw. A batch that fails or emits
- * no manifest records nothing (its memories stay unmapped for the next run) —
- * never yields a partial-wrong mapping.
+ * child is deleted even on a mid-loop deadline throw. An unclosed manifest records
+ * nothing, while a closed manifest can safely bank its valid subset before a
+ * targeted retry handles any omissions.
  */
 async function mapOneBatch(
     args: MapMemoriesArgs,
@@ -343,14 +366,25 @@ async function mapOneBatch(
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("map-memories returned no output");
-                    validateMapMemoriesManifest(text, new Set(batch.map((memory) => memory.id)));
-                    return text;
+                    return validateMapMemoriesManifest(
+                        text,
+                        new Set(batch.map((memory) => memory.id)),
+                    );
                 },
             },
         );
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        return await applyBatchMappings(args, batch, run.validated);
+        const outcome = await applyParsedBatchMappings(args, batch, run.validated);
+        const returnedIds = new Set(
+            run.validated
+                .filter((entry) => batch.some((memory) => memory.id === entry.id))
+                .map((entry) => entry.id),
+        );
+        return {
+            ...outcome,
+            requeue: batch.filter((memory) => !returnedIds.has(memory.id)),
+        };
     } catch (error) {
         const desc = describeError(error);
         log(
@@ -387,27 +421,49 @@ async function mapOneBatch(
     }
 }
 
-/** Parse the complete manifest, normalize paths the same way verify does, and
- *  write the mappings under one lease-guarded transaction. The manifest must
- *  cover exactly this batch; unknown or missing ids reject the whole batch. */
+/** Parse a complete manifest and commit the entries that belong to this batch.
+ * A closed root proves the parser did not see a truncated prefix, so omitted ids
+ * may remain unmapped for a targeted retry; unknown ids are never written. */
 export async function applyBatchMappings(
     args: MapMemoriesArgs,
     batch: MapMemoryInput[],
     manifestText: string,
 ): Promise<{ mapped: number; independent: number }> {
-    const batchIds = new Set(batch.map((m) => m.id));
-    const parsed = parseMapMemoriesManifest(manifestText);
-    assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
-        batchIds,
+    return applyParsedBatchMappings(args, batch, parseMapMemoriesManifest(manifestText));
+}
+
+async function applyParsedBatchMappings(
+    args: MapMemoriesArgs,
+    batch: MapMemoryInput[],
+    parsed: ParsedMemoryMapping[],
+): Promise<{ mapped: number; independent: number }> {
+    const batchIds = new Set(batch.map((memory) => memory.id));
+    const valid = parsed.filter((entry) => batchIds.has(entry.id));
+    const unknown = parsed.filter((entry) => !batchIds.has(entry.id));
+    if (unknown.length > 0) {
+        log(
+            `[dreamer] map-memories warning: dropping ${unknown.length} unknown mapping entr${unknown.length === 1 ? "y" : "ies"} outside the current batch (${unknown.map((entry) => entry.id).join(", ")})`,
+        );
+    }
+    assertNoDuplicateManifestIds(
+        valid.map((entry) => entry.id),
         "mappings",
     );
-    if (parsed.length === 0) return { mapped: 0, independent: 0 };
+
+    // A closed root rules out truncation, but fewer than half of the requested ids
+    // is more likely a confused response to another request than an ordinary tail
+    // omission. Reject before any writes so an unrelated minority cannot be banked.
+    if (valid.length * 2 < batch.length) {
+        throw new Error(
+            `mappings manifest covers ${valid.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
+        );
+    }
+    if (valid.length === 0) return { mapped: 0, independent: 0 };
 
     // Pre-normalize each mapping's files OUTSIDE the transaction (path
     // normalization does git/realpath I/O). Independent → sentinel (empty set).
     const planned: Array<{ id: number; files: string[]; independent: boolean }> = [];
-    for (const p of parsed) {
+    for (const p of valid) {
         if (p.independent) {
             planned.push({ id: p.id, files: [], independent: true });
             continue;

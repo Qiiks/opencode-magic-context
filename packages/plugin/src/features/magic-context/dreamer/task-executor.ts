@@ -459,7 +459,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(
-                    `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
+                    `[dreamer] map-memories: committed=${result.mapped + result.independent} mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
                 );
                 if (!result.complete) {
                     if (result.stopReason === "timeout-circuit-breaker") {
@@ -476,7 +476,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         // Like a resumable verify-broad cycle, bank real progress as a
                         // completed scheduled run so lastRunAt advances, while the
                         // remaining gate set drives the next scheduled run.
-                        const progress = `map-memories: mapped ${result.mapped}, independent ${result.independent}, completed ${result.batches} batch(es), ${result.remaining} remain`;
+                        const progress = `map-memories: committed ${processed} mapping(s) (mapped ${result.mapped}, independent ${result.independent}); ${result.remaining} remain`;
                         recordRun("completed", null, { progress });
                         return { status: "completed" };
                     }
