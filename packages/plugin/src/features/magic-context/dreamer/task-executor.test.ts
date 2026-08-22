@@ -16,6 +16,7 @@ import { initializeDatabase } from "../storage-db";
 import { ensureProjectState, getProjectState } from "../storage-project-state";
 import { getUserMemoryCandidates, insertUserMemory } from "../user-memory/storage-user-memory";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
+import { MAP_BATCH_FLOOR_MS } from "./map-memories";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
 import { getDreamRuns } from "./storage-dream-runs";
 import {
@@ -522,6 +523,144 @@ describe("createDreamTaskExecutor — lease setup fence", () => {
         } finally {
             nowSpy.mockRestore();
         }
+    });
+});
+
+describe("createDreamTaskExecutor — map-memories disposition", () => {
+    test("records banked deadline progress as completed and advances lastRunAt", async () => {
+        db = freshDb();
+        const project = "/repo/map-banked-progress";
+        for (let index = 0; index < 81; index += 1) {
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Scheduled mapping fact ${index}.`,
+            });
+        }
+        const startedAt = Date.now();
+        const nowSpy = spyOn(Date, "now").mockReturnValue(startedAt);
+        try {
+            let promptCalls = 0;
+            let manifest = "";
+            const client = {
+                session: {
+                    list: mock(async () => ({ data: [] })),
+                    create: mock(async () => ({ data: { id: "map-child" } })),
+                    prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                        promptCalls += 1;
+                        const prompt = args.body?.parts?.[0]?.text ?? "";
+                        const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                            Number(match[1]),
+                        );
+                        manifest = `<mappings>${ids.map((id) => `<memory id="${id}" independent="true"/>`).join("")}</mappings>`;
+                        return {};
+                    }),
+                    messages: mock(async () => ({ data: assistantMessages(manifest) })),
+                    delete: mock(async () => {
+                        // The first batch is already committed when its child is
+                        // removed. Leave only one minute for the next loop turn.
+                        nowSpy.mockReturnValue(startedAt + MAP_BATCH_FLOOR_MS - 60_000);
+                        return {};
+                    }),
+                },
+            };
+            const task: DreamTaskRuntimeConfig = {
+                task: "map-memories",
+                schedule: "0 5 * * *",
+                timeoutMinutes: 4,
+            };
+            writeTaskScheduleState(db, {
+                projectPath: project,
+                task: task.task,
+                lastRunAt: 1_234,
+                nextDueAt: startedAt - 1,
+                schedule: task.schedule,
+                lastStatus: "completed",
+                lastError: null,
+                retryCount: 0,
+            });
+            const executor = createDreamTaskExecutor({
+                client: client as never,
+                sessionDirectory: project,
+                openOpenCodeDb: () => null,
+            });
+
+            await runDueTasksForProject({
+                db,
+                projectIdentity: project,
+                tasks: [task],
+                executor,
+                now: startedAt,
+            });
+
+            expect(promptCalls).toBe(1);
+            expect(getTaskScheduleState(db, project, task.task)).toMatchObject({
+                lastRunAt: startedAt + MAP_BATCH_FLOOR_MS - 60_000,
+                lastStatus: "completed",
+                retryCount: 0,
+            });
+            const run = getDreamRuns(db, project)[0];
+            expect(run?.tasks_succeeded).toBe(1);
+            expect(run?.tasks_failed).toBe(0);
+            const summary = JSON.parse(run?.tasks_json ?? "[]")[0] as {
+                progress?: string;
+                backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
+            };
+            expect(summary.progress).toContain("completed 1 batch(es), 1 remain");
+            expect(summary.backlog).toEqual({
+                pendingAtStart: 81,
+                totalAtStart: 81,
+                pendingAtEnd: 1,
+                totalAtEnd: 81,
+                processed: 80,
+            });
+        } finally {
+            nowSpy.mockRestore();
+        }
+    });
+
+    test("surfaces the mapping timeout breaker as a starvation failure", async () => {
+        db = freshDb();
+        const project = "/repo/map-timeout-starvation";
+        for (let index = 0; index < 241; index += 1) {
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Timeout-status mapping fact ${index}.`,
+            });
+        }
+        let promptCalls = 0;
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "map-timeout-child" } })),
+                prompt: mock(async () => {
+                    promptCalls += 1;
+                    throw new Error("prompt timed out after 99997ms");
+                }),
+                messages: mock(async () => ({ data: [] })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("map-memories", project);
+        expect(acquireLease(db, "holder-map-timeout", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "map-memories", schedule: "0 5 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-map-timeout", leaseKey },
+        );
+
+        expect(promptCalls).toBe(2);
+        expect(result).toMatchObject({ status: "failed", transient: true });
+        expect(result.error).toContain("map-memories starvation");
+        const run = getDreamRuns(db, project)[0];
+        expect(run?.tasks_failed).toBe(1);
+        expect(JSON.parse(run?.tasks_json ?? "[]")[0]?.error).toContain("starvation");
     });
 });
 

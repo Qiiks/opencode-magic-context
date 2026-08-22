@@ -17,6 +17,8 @@ import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
 import {
     applyBatchMappings,
+    computeMapBatchSliceMs,
+    MAP_BATCH_FLOOR_MS,
     type MapMemoriesArgs,
     mapMemories,
     selectMapMemoryInputs,
@@ -52,7 +54,9 @@ function mapArgs(db: Database, sessionDirectory: string, projectIdentity: string
         sessionDirectory,
         holderId,
         leaseKey,
-        deadline: Date.now() + 60_000,
+        // Every direct mapping test that reaches the loop needs enough budget to
+        // clear the production floor; deadline-stop fixtures override this value.
+        deadline: Date.now() + MAP_BATCH_FLOOR_MS + 60_000,
     };
 }
 
@@ -115,6 +119,21 @@ function successfulMapClient(onPrompt?: () => void) {
     };
 }
 
+/** The exact timeout-class error from the shared prompt helper. */
+function timeoutMapClient(onPrompt?: () => void) {
+    return {
+        session: {
+            create: async () => ({ data: { id: "map-child" } }),
+            prompt: async () => {
+                onPrompt?.();
+                throw new Error("prompt timed out after 99997ms");
+            },
+            messages: async () => ({ data: [] }),
+            delete: async () => ({}),
+        },
+    };
+}
+
 describe("mapMemories disposition", () => {
     test("banks a completed batch and reports the deadline remainder", async () => {
         const db = freshDb();
@@ -142,7 +161,165 @@ describe("mapMemories disposition", () => {
                 batches: 1,
                 remaining: 1,
                 complete: false,
+                stopReason: "deadline",
             });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("floors a 12-batch default-deadline backfill and banks its first completed batch", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-floor-primary";
+            const dir = tempProject();
+            // 881 memories produce 12 batches. The old even split assigned only
+            // 100 seconds (1,200,000 / 12) to each batch, below the agentic floor.
+            const defaultDeadlineMs = 20 * 60 * 1000;
+            expect(Math.floor(defaultDeadlineMs / 12)).toBe(100_000);
+            expect(computeMapBatchSliceMs(defaultDeadlineMs, 12)).toBe(MAP_BATCH_FLOOR_MS);
+            for (let index = 0; index < 881; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Large-backlog mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            args.deadline = Date.now() + defaultDeadlineMs;
+            let promptCalls = 0;
+            args.client = successfulMapClient(() => {
+                promptCalls += 1;
+                // One full floor-sized batch completed; no fair slice remains for
+                // batch two, so its untouched inputs must stay banked for resume.
+                args.deadline = Date.now() + 60_000;
+            }) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(1);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 80,
+                batches: 1,
+                remaining: 801,
+                complete: false,
+                stopReason: "deadline",
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(801);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("stops before the next batch when the remaining deadline cannot fit the floor", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-floor-stop";
+            const dir = tempProject();
+            for (let index = 0; index < 81; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Floor-boundary mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            args.client = successfulMapClient(() => {
+                promptCalls += 1;
+                args.deadline = Date.now() + 60_000;
+            }) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(1);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 80,
+                batches: 1,
+                remaining: 1,
+                complete: false,
+                stopReason: "deadline",
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("two consecutive batch timeouts trip the starvation circuit breaker", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-timeout-breaker";
+            const dir = tempProject();
+            // Three batches prove the third is left unattempted by the two-timeout breaker.
+            for (let index = 0; index < 241; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Timeout mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            args.client = timeoutMapClient(() => {
+                promptCalls += 1;
+            }) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(2);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 0,
+                batches: 0,
+                remaining: 241,
+                complete: false,
+                stopReason: "timeout-circuit-breaker",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a later run resumes the durable remainder after a floored partial run", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-floor-resume";
+            const dir = tempProject();
+            for (let index = 0; index < 161; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Resumable mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            args.client = successfulMapClient(() => {
+                args.deadline = Date.now() + 60_000;
+            }) as never;
+
+            const first = await mapMemories(args);
+            expect(first).toMatchObject({ independent: 80, batches: 1, remaining: 81 });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(81);
+
+            args.deadline = Date.now() + 2 * MAP_BATCH_FLOOR_MS;
+            args.client = successfulMapClient() as never;
+            const second = await mapMemories(args);
+
+            expect(second).toEqual({
+                mapped: 0,
+                independent: 81,
+                batches: 2,
+                remaining: 0,
+                complete: true,
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toEqual([]);
         } finally {
             closeQuietly(db);
         }
