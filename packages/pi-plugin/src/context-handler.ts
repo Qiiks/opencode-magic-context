@@ -165,8 +165,8 @@ import {
 import { escalationBands } from "@magic-context/core/shared/escalation-bands";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
-import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
+import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
@@ -3181,6 +3181,7 @@ export function registerPiContextHandler(
 							syntheticLeadingCount: result.syntheticLeadingCount,
 						}),
 						reducedSinceRefresh: false,
+						agentDropsAppliedThisPass: result.agentDropsAppliedThisPass,
 						oldestReclaimableToolTags,
 					};
 					setPiChannel1Baseline(sessionId, channelState);
@@ -4262,6 +4263,7 @@ interface RunPipelineResult {
 	droppedCount: number;
 	emergency: boolean;
 	bustedThisPass: boolean;
+	agentDropsAppliedThisPass: boolean;
 	targetCount: number;
 	reasoningWatermark: number;
 	activeTags: ReturnType<typeof getActiveTagsBySession>;
@@ -4387,6 +4389,7 @@ async function runCompactionOffPipeline(
 		droppedCount: 0,
 		emergency: false,
 		bustedThisPass: injectionResult?.m0Materialized === true,
+		agentDropsAppliedThisPass: false,
 		targetCount: 0,
 		reasoningWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
 		activeTags: [],
@@ -5708,6 +5711,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		droppedCount,
 		emergency,
 		bustedThisPass,
+		agentDropsAppliedThisPass: pendingOpsDidMutate,
 		targetCount: targets.size,
 		reasoningWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
 		activeTags,

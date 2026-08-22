@@ -479,7 +479,7 @@ function maybeInjectChannel1Nudge(
     // inside the recency reserve, so it grows T but not U.
     state.turnDeltaT += toolOutputTokens(out.output);
 
-    if (state.reducedSinceRefresh) return;
+    if (state.reducedSinceRefresh || state.agentDropsAppliedThisPass) return;
 
     const nudgeState = getChannel1NudgeState(args.db, sessionId);
     const decision = decideChannel1({

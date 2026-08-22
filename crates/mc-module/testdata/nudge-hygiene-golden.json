@@ -3,7 +3,7 @@
   "provenance": {
     "generator": "crates/mc-module/gen/gen-nudge-hygiene-golden.ts",
     "generator_version": "nudge-hygiene-ts-v2",
-    "input_sha256": "1ecce6c3143396936d12cc3054af8816fc3bd7d5fb377db085bfba2d86ad32c1"
+    "input_sha256": "971579002cdbadc99feb573914a1843f1ff9878de318aee3352ce13fca0e7883"
   },
   "cases": [
     {
@@ -63,6 +63,56 @@
         "u": 162006,
         "t": 249008,
         "band": "urgent"
+      }
+    },
+    {
+      "id": "queued-tool-arc-full-mass",
+      "protected_tags": 0,
+      "messages": [
+        {
+          "mid": "queued-owner",
+          "ordinal": 1,
+          "role": "assistant",
+          "blocks": [
+            {
+              "type": "tool_call",
+              "id": "queued-call",
+              "name": "read",
+              "input": {
+                "payload": "queued input has attributed mass"
+              }
+            }
+          ]
+        },
+        {
+          "mid": "queued-result",
+          "ordinal": 2,
+          "role": "user",
+          "blocks": [
+            {
+              "type": "tool_result",
+              "id": "queued-call",
+              "name": "read",
+              "unit": "queued output ",
+              "repeat": 4000
+            }
+          ]
+        }
+      ],
+      "tags": [
+        {
+          "tag_number": 7,
+          "block_id": "queued-result#0",
+          "kind": "tool"
+        }
+      ],
+      "pending_drop_tag_numbers": [
+        7
+      ],
+      "expected": {
+        "u": 0,
+        "t": 8010,
+        "band": "quiet"
       }
     },
     {

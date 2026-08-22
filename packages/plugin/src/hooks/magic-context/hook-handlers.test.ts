@@ -624,6 +624,45 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
 });
 
 describe("createToolExecuteAfterHook Channel-1 dampening", () => {
+    test("gives an applying drop pass one fire-free baseline before resuming", async () => {
+        const db = createTestDb();
+        const sessionId = "ses-channel1-drop-grace";
+        const state: Channel1State = {
+            baselineU: 90_000,
+            baselineT: 120_000,
+            turnDeltaU: 0,
+            turnDeltaT: 0,
+            usableWindow: 128_000,
+            realUserTurnCount: 1,
+            baselineGeneration: 2,
+            computedAt: 1,
+            evaluable: true,
+            generationInvalidated: false,
+            baselineParts: [],
+            contentSignature: "post-drop",
+            reducedSinceRefresh: false,
+            agentDropsAppliedThisPass: true,
+            oldestReclaimableToolTags: [],
+        };
+        const hook = createToolExecuteAfterHook({
+            db,
+            channel1StateBySession: new Map([[sessionId, state]]),
+        });
+
+        try {
+            const applyingPass = { output: "output on applying pass" };
+            await hook({ tool: "bash", sessionID: sessionId }, applyingPass);
+            expect(applyingPass.output).toBe("output on applying pass");
+
+            state.agentDropsAppliedThisPass = false;
+            const nextPass = { output: "output on next pass" };
+            await hook({ tool: "bash", sessionID: sessionId }, nextPass);
+            expect(nextPass.output).toContain("Housekeeping backlog: ~90k");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("uses real user turns for sticky refires, expiration, and escalation", async () => {
         const db = createTestDb();
         const sessionId = "ses-channel1-dampening";

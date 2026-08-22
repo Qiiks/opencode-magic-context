@@ -36,6 +36,34 @@ describe("model-resolution", () => {
         ]);
     });
 
+    test("does not inherit a block qualifier into unqualified fallbacks", () => {
+        const config = {
+            historian: {
+                opencode: {
+                    model: "open/primary",
+                    fallback_models: ["open/fallback"],
+                    variant: "primary-only",
+                },
+                pi: {
+                    model: "pi/primary",
+                    fallback_models: ["pi/fallback"],
+                    thinking_level: "high",
+                },
+            },
+        };
+
+        // Inheritance is deliberately absent because a fallback model may not support the
+        // qualifier selected for the primary model.
+        expect(resolveHistorianModel(config, "opencode")).toEqual({
+            primary: { model: "open/primary", qualifier: "primary-only" },
+            fallbacks: [{ model: "open/fallback" }],
+        });
+        expect(resolveHistorianModel(config, "pi")).toEqual({
+            primary: { model: "pi/primary", qualifier: "high" },
+            fallbacks: [{ model: "pi/fallback" }],
+        });
+    });
+
     test("reads historian attempts only from the requested harness", () => {
         const config = {
             historian: {

@@ -1,6 +1,7 @@
 import {
     closeSync,
     existsSync,
+    linkSync,
     openSync,
     readFileSync,
     renameSync,
@@ -309,27 +310,33 @@ export function migrateFlatDetailed(input: Buffer | string): FlatConfigMigration
 }
 
 function writeExclusiveBackup(backupPath: string, bytes: Buffer, mode: number): void {
-    let descriptor: number | undefined;
+    const temporaryPath = writeTemporaryCandidate(backupPath, bytes, mode);
     try {
-        descriptor = openSync(backupPath, "wx", mode);
-        writeFileSync(descriptor, bytes);
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
-        if (descriptor !== undefined) {
-            try {
-                closeSync(descriptor);
-            } catch {
-                // The original write error is the actionable failure.
-            }
-            try {
-                unlinkSync(backupPath);
-            } catch {
-                // A failed cleanup must not hide the original write error.
-            }
+        try {
+            // A hard link publishes the fully written candidate without replacing a concurrent backup.
+            linkSync(temporaryPath, backupPath);
+            return;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         }
-        throw error;
+
+        const existingBytes = readFileSync(backupPath);
+        if (existingBytes.equals(bytes)) return;
+
+        // A prefix may be a partial file left when the former direct-write approach crashed.
+        // Preserve any other content because it may be a complete backup from an earlier run.
+        if (bytes.subarray(0, existingBytes.length).equals(existingBytes)) {
+            renameSync(temporaryPath, backupPath);
+            return;
+        }
+    } finally {
+        try {
+            unlinkSync(temporaryPath);
+        } catch {
+            // The candidate may already be linked or renamed into place; cleanup failure must
+            // not obscure the result of creating or validating the permanent backup.
+        }
     }
-    if (descriptor !== undefined) closeSync(descriptor);
 }
 
 function writeTemporaryCandidate(configPath: string, bytes: Buffer, mode: number): string {

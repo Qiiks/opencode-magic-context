@@ -326,7 +326,21 @@ describe("per-harness raw config migration", () => {
         expect(second?.warnings).toEqual([]);
     });
 
-    it("never reads, overwrites, or removes an existing migration backup", () => {
+    it("repairs a truncated migration backup left by the direct-write protocol", () => {
+        const directory = temporaryDirectory();
+        const configPath = join(directory, "magic-context.jsonc");
+        const backupPath = `${configPath}.pre-per-harness.bak`;
+        const original = Buffer.from('{ "historian": { "model": "provider/model" } }\n');
+        writeFileSync(configPath, original);
+        writeFileSync(backupPath, original.subarray(0, 17));
+
+        const loaded = loadRawConfigFile({ configPath, tier: "user" });
+
+        expect(loaded?.migrated).toBe(true);
+        expect(readFileSync(backupPath)).toEqual(original);
+    });
+
+    it("leaves a completed migration backup with different bytes untouched", () => {
         const directory = temporaryDirectory();
         const configPath = join(directory, "magic-context.jsonc");
         const backupPath = `${configPath}.pre-per-harness.bak`;
@@ -340,6 +354,22 @@ describe("per-harness raw config migration", () => {
         expect(first?.migrated).toBe(true);
         expect(second?.migrated).toBe(false);
         expect(readFileSync(backupPath)).toEqual(sentinel);
+    });
+
+    it("accepts a matching migration backup without rewriting it", () => {
+        const directory = temporaryDirectory();
+        const configPath = join(directory, "magic-context.jsonc");
+        const backupPath = `${configPath}.pre-per-harness.bak`;
+        const original = Buffer.from('{ "historian": { "model": "provider/model" } }\n');
+        writeFileSync(configPath, original);
+        writeFileSync(backupPath, original);
+        const backupInode = statSync(backupPath).ino;
+
+        const loaded = loadRawConfigFile({ configPath, tier: "user" });
+
+        expect(loaded?.migrated).toBe(true);
+        expect(readFileSync(backupPath)).toEqual(original);
+        expect(statSync(backupPath).ino).toBe(backupInode);
     });
 
     it("reloads the winning candidate when a concurrent loader replaces the target", () => {

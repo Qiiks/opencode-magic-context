@@ -318,7 +318,11 @@ describe("Pi baseline persistence and defer deltas", () => {
 			tag(1, "queued:p0", "message"),
 			tag(2, "remaining:p0", "message"),
 		];
-		const stableId = withStableIds(messages, ["queued", "remaining", "untagged"]);
+		const stableId = withStableIds(messages, [
+			"queued",
+			"remaining",
+			"untagged",
+		]);
 		const initial = measurePiTailHygiene({
 			messages,
 			tags,
@@ -665,6 +669,7 @@ type HygieneFixture = {
 	protected_tags: number;
 	messages: FixtureMessage[];
 	tags: FixtureTag[];
+	pending_drop_tag_numbers?: number[];
 	expected: { u: number; t: number; band: string };
 };
 
@@ -794,6 +799,7 @@ describe("TS/Pi/module differential hygiene corpus", () => {
 			const measured = measurePiTailHygiene({
 				...adapted,
 				protectedTags: fixture.protected_tags,
+				pendingDropTagNumbers: new Set(fixture.pending_drop_tag_numbers ?? []),
 			});
 			for (const [label, actual, expected] of [
 				["U", measured.u, fixture.expected.u],

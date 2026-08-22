@@ -28,6 +28,8 @@ export interface Channel1State {
     baselineParts: TailHygienePartMeasurement[];
     contentSignature: string;
     reducedSinceRefresh: boolean;
+    /** Do not trigger a reduction nudge on the pass that applied queued agent drops. */
+    agentDropsAppliedThisPass?: boolean;
     oldestReclaimableToolTags: ToolReclaimHint[];
 }
 

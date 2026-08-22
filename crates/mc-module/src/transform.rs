@@ -46,8 +46,8 @@ use crate::selection::{
 };
 use crate::tail_hygiene::{
     effective_tail_hygiene, hygiene_band, measure_tail_hygiene_with_pending_drops,
-    real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS,
-    CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
+    queued_tag_numbers, real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand,
+    CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -1771,6 +1771,7 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     mutation_exempt_mid: Option<&'a str>,
     protected_tags: usize,
     pending_drop_target_ids: &'a HashSet<String>,
+    agent_drops_applied_this_pass: bool,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -5164,6 +5165,8 @@ fn apply_once(
         refreshed_coverage,
     );
     rearm_channel2_after_measured_collapse(&mut meta, is_bust_pass);
+    let agent_drops_applied_this_pass =
+        pending_agent_drops_applied_this_pass(&pending_agent_drops, &loaded.core, &core);
 
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
@@ -5178,6 +5181,7 @@ fn apply_once(
                 mutation_exempt_mid,
                 protected_tags: req.protected_tags,
                 pending_drop_target_ids: &pending_drop_target_ids,
+                agent_drops_applied_this_pass,
             },
             &mut meta,
         ) {
@@ -6555,6 +6559,18 @@ fn log_reasoning_drop_seed_skips(core: &CoreState, live: &[&FlatBlock], session_
             }
         }
     }
+}
+
+fn pending_agent_drops_applied_this_pass(
+    pending: &[PendingAgentDrop],
+    loaded_core: &CoreState,
+    final_core: &CoreState,
+) -> bool {
+    let frozen_before = frozen_red_targets(loaded_core);
+    let frozen_after = frozen_red_targets(final_core);
+    pending.iter().any(|drop| {
+        !frozen_before.contains(&drop.target_id) && frozen_after.contains(&drop.target_id)
+    })
 }
 
 /// Commands whose first application froze at least one previously unfrozen target.
@@ -9028,11 +9044,18 @@ fn maybe_append_channel1_nudge(
     let measured_reclaimable = input
         .baseline
         .map_or(0, |baseline| effective_tail_hygiene(baseline).0);
-    let cycle_reset = meta.channel1_reduce_suppressed
+    let cycle_reset = input.agent_drops_applied_this_pass
+        || meta.channel1_reduce_suppressed
         || measured_reclaimable < meta.channel1_last_nudge_undropped.max(0);
     if cycle_reset {
         meta.channel1_last_fire_level.clear();
         meta.channel1_last_fire_ordinal = 0;
+    }
+    if input.agent_drops_applied_this_pass {
+        meta.channel1_last_nudge_undropped = 0;
+        meta.channel1_last_nudge_level.clear();
+        meta.channel1_reduce_suppressed = false;
+        return None;
     }
     let decision = decide_channel1(input.baseline, meta);
     meta.channel1_last_nudge_undropped = decision.next_last_nudge;
@@ -9182,17 +9205,6 @@ fn active_tags_for_nudge(
 /// Reuse the durable CC tag accounting when present, and derive the same accounting basis
 /// from live CK text for profiles that historically did not mint overlay tags. The latter
 /// keeps OpenCode host directives useful without enabling CC-only prompt overlays.
-fn queued_tag_numbers(
-    tag_rows: &[McTagRow],
-    pending_drop_target_ids: &HashSet<String>,
-) -> HashSet<i64> {
-    tag_rows
-        .iter()
-        .filter(|row| pending_drop_target_ids.contains(&row.block_id))
-        .map(|row| row.tag_number)
-        .collect()
-}
-
 fn active_tags_for_channel2(
     core: &CoreState,
     meta: &ModuleMeta,
@@ -25415,6 +25427,67 @@ pub(crate) mod tests {
             assert!(tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
             assert!(!tail_bytes(&suppressed, "result4").contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn applying_agent_drops_gets_one_pass_without_a_channel1_refire() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let huge = "word ".repeat(80_000);
+            let mut messages = Vec::new();
+            for number in 1..=4 {
+                messages.push(assistant_tool_call(
+                    &format!("call{number}"),
+                    number * 2 - 1,
+                    &format!("c{number}"),
+                ));
+                messages.push(tool_result(
+                    &format!("result{number}"),
+                    number * 2,
+                    &format!("c{number}"),
+                    &huge,
+                ));
+            }
+            let mut initial_request = active_cc_req("drop-grace", "cfg0", messages.clone());
+            initial_request.protected_tags = 0;
+            let initial_request = with_usage(initial_request, 900, 1024);
+            run(&s, &initial_request, &spine());
+            let first = run(&s, &initial_request, &spine());
+            assert!(tail_bytes(&first, "result4").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+
+            s.append_pending_agent_drops_with_command(
+                "drop-grace",
+                Some("drop-two-arcs"),
+                &["result4#0".to_string()],
+                1,
+                false,
+            )
+            .unwrap();
+            messages.push(assistant_tool_call("call5", 9, "c5"));
+            messages.push(tool_result("result5", 10, "c5", &huge));
+            let mut applying_request = active_cc_req("drop-grace", "cfg1", messages);
+            applying_request.protected_tags = 0;
+            let applying_request = with_usage(applying_request, 900, 1024);
+
+            let applying = run(&s, &applying_request, &spine());
+            let after_applying = s.load("drop-grace").unwrap();
+            assert!(
+                frozen_red_targets(&after_applying.core).contains("result4#0"),
+                "pending drop was not applied: {:?}",
+                s.load_pending_agent_drops("drop-grace").unwrap(),
+            );
+            assert!(!tail_bytes(&applying, "result5").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+
+            let resumed = run(&s, &applying_request, &spine());
+            let resumed_result = tail_bytes(&resumed, "result5");
+            assert!(resumed_result.contains("<system-reminder>"));
+            assert!(resumed_result.contains("Housekeeping"));
+            assert!(!resumed_result.contains("Reminder: ctx_reduce housekeeping still pending"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 2);
         });
     }
 

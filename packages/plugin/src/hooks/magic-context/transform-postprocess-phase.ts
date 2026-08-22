@@ -2241,6 +2241,7 @@ export async function runPostTransformPhase(
                         baseline.baselineGeneration !== previous?.baselineGeneration
                             ? false
                             : (previous?.reducedSinceRefresh ?? false),
+                    agentDropsAppliedThisPass: pendingOpsDidMutate,
                     oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
                         args.db,
                         args.sessionId,

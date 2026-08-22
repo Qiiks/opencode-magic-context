@@ -40,6 +40,7 @@ type Fixture = {
     protected_tags: number;
     messages: FixtureMessage[];
     tags: FixtureTag[];
+    pending_drop_tag_numbers?: number[];
 };
 
 const repeated = (unit: string, repeat: number): string => unit.repeat(repeat);
@@ -54,6 +55,16 @@ const fixtures: Fixture[] = [
             { mid: "tool-result", ordinal: 3, role: "user", blocks: [{ type: "tool_result", id: "call-live", name: "read", unit: "result ", repeat: 162_000 }] },
         ],
         tags: [{ tag_number: 1, block_id: "tool-result#0", kind: "tool" }],
+    },
+    {
+        id: "queued-tool-arc-full-mass",
+        protected_tags: 0,
+        messages: [
+            { mid: "queued-owner", ordinal: 1, role: "assistant", blocks: [{ type: "tool_call", id: "queued-call", name: "read", input: { payload: "queued input has attributed mass" } }] },
+            { mid: "queued-result", ordinal: 2, role: "user", blocks: [{ type: "tool_result", id: "queued-call", name: "read", unit: "queued output ", repeat: 4_000 }] },
+        ],
+        tags: [{ tag_number: 7, block_id: "queued-result#0", kind: "tool" }],
+        pending_drop_tag_numbers: [7],
     },
     {
         id: "protected-recency-reserve",
@@ -202,6 +213,7 @@ function toMessages(fixture: Fixture): MessageLike[] {
                 case "file":
                     return { type: "file", mime: block.mime, url: block.url };
             }
+            throw new Error("unsupported hygiene fixture block");
         }),
     })) as MessageLike[];
 }
@@ -267,6 +279,9 @@ const cases = fixtures.map((fixture) => {
         messages: toMessages(fixture),
         tags: toTags(fixture),
         protectedTags: fixture.protected_tags,
+        pendingDropTagNumbers: fixture.pending_drop_tag_numbers
+            ? new Set(fixture.pending_drop_tag_numbers)
+            : undefined,
     });
     return {
         ...fixture,

@@ -231,7 +231,7 @@
               }
             },
             "variant": {
-              "description": "Default OpenCode reasoning variant.",
+              "description": "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
               "type": "string"
             }
           },
@@ -313,7 +313,7 @@
               }
             },
             "thinking_level": {
-              "description": "Default Pi thinking level.",
+              "description": "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
               "type": "string",
               "enum": [
                 "off",
@@ -532,7 +532,7 @@
               }
             },
             "variant": {
-              "description": "Default OpenCode reasoning variant.",
+              "description": "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
               "type": "string"
             },
             "tasks": {
@@ -598,7 +598,7 @@
                     }
                   },
                   "variant": {
-                    "description": "Default OpenCode reasoning variant for this task.",
+                    "description": "OpenCode reasoning variant for this task's primary entry when it declares none. Fallback entries declare variants per-entry.",
                     "type": "string"
                   },
                   "timeout_minutes": {
@@ -689,7 +689,7 @@
               }
             },
             "thinking_level": {
-              "description": "Default Pi thinking level.",
+              "description": "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
               "type": "string",
               "enum": [
                 "off",
@@ -782,7 +782,7 @@
                     }
                   },
                   "thinking_level": {
-                    "description": "Default Pi thinking level for this task.",
+                    "description": "Pi thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
                     "type": "string",
                     "enum": [
                       "off",
