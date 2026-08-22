@@ -524,6 +524,9 @@ fn fast_consumer_options() -> ConsumerOptions {
             max_attempts: 40,
         },
         restored_debounce: Duration::from_millis(10),
+        // Library default: this harness exercises route/store behavior, not
+        // half-open socket detection.
+        liveness_probe_window: ConsumerOptions::default().liveness_probe_window,
     }
 }
 
