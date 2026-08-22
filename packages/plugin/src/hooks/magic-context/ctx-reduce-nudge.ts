@@ -226,7 +226,10 @@ export function shouldUseStickyChannel1Reminder(input: {
     level: Channel1Level;
     currentRealUserTurnCount: number;
 }): boolean {
-    if (input.lastLevel !== input.level || input.lastOrdinal <= 0) return false;
+    // Never-fired is encoded by an empty lastLevel, never by ordinal zero: a
+    // conversation whose window holds no real user rows (a pure tool stream)
+    // legitimately fires at count 0 and must still dampen its re-fires.
+    if (input.lastLevel !== input.level) return false;
     // Older persisted blobs wrote a raw message ordinal. That value is larger
     // than the real-user counter whenever synthetic rows intervened, so expire
     // the incomparable state once and overwrite it on this fire.

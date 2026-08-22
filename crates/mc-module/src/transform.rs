@@ -9890,11 +9890,13 @@ fn should_use_sticky_channel1_reminder(
     level: Channel1Level,
     current_real_user_turn_count: u64,
 ) -> bool {
-    // Older module metadata stored a raw message ordinal here. A raw ordinal
-    // greater than the real-user counter is an incompatible legacy unit, so
-    // let one full reminder replace it instead of damping accidentally.
+    // Never-fired is encoded by an empty last_level, never by ordinal zero: a
+    // window with no real user rows (a pure tool stream) legitimately fires at
+    // count 0 and must still dampen its re-fires. Older module metadata stored
+    // a raw message ordinal here; a raw ordinal greater than the real-user
+    // counter is an incompatible legacy unit, so let one full reminder replace
+    // it instead of damping accidentally.
     last_level == level.as_str()
-        && last_ordinal > 0
         && current_real_user_turn_count >= last_ordinal
         && current_real_user_turn_count - last_ordinal < CHANNEL1_STICKY_REAL_USER_TURN_GAP
 }

@@ -208,6 +208,28 @@ describe("reminder rendering", () => {
         );
     });
 
+    it("dampens re-fires in a window with zero real user turns (pure tool stream)", () => {
+        // Regression: never-fired is signaled by an empty lastLevel, not by
+        // ordinal zero. A conversation whose window is all tool traffic fires
+        // at real-user count 0; its same-level re-fire must still collapse.
+        expect(
+            shouldUseStickyChannel1Reminder({
+                lastLevel: "urgent",
+                lastOrdinal: 0,
+                level: "urgent",
+                currentRealUserTurnCount: 0,
+            }),
+        ).toBe(true);
+        expect(
+            shouldUseStickyChannel1Reminder({
+                lastLevel: "",
+                lastOrdinal: 0,
+                level: "urgent",
+                currentRealUserTurnCount: 0,
+            }),
+        ).toBe(false);
+    });
+
     it("dampens same-level refires before three real user turns but not escalations", () => {
         expect(
             shouldUseStickyChannel1Reminder({
