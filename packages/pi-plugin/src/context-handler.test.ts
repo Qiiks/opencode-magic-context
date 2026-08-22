@@ -1599,7 +1599,7 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
-	it("replays a queued-pending-op defer pass byte-identically without a pending-ops read", async () => {
+	it("replays a queued-pending-op defer pass byte-identically while reading queue state for U", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-pending-read-gate";
 		try {
@@ -1632,6 +1632,7 @@ describe("registerPiContextHandler", () => {
 			await runDeferPass();
 			const baseline = await runDeferPass();
 			const baselineBytes = JSON.stringify(baseline.messages);
+			const baselineHygiene = getPiChannel1Baseline(sessionId);
 			const pendingTag = getTagsBySession(db, sessionId).find(
 				(tag) => tag.type === "message" && tag.tagNumber === 2,
 			);
@@ -1656,7 +1657,10 @@ describe("registerPiContextHandler", () => {
 			}
 
 			expect(JSON.stringify(queued.messages)).toBe(baselineBytes);
-			expect(pendingOpsReads).toBe(0);
+			expect(pendingOpsReads).toBe(1);
+			const queuedHygiene = getPiChannel1Baseline(sessionId);
+			expect(queuedHygiene?.baselineU).toBe(baselineHygiene?.baselineU);
+			expect(queuedHygiene?.turnDeltaU).toBeLessThan(baselineHygiene?.turnDeltaU ?? 0);
 			expect(getPendingOps(db, sessionId)).toHaveLength(1);
 		} finally {
 			clearContextHandlerSession(sessionId);

@@ -45,9 +45,9 @@ use crate::selection::{
     SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
-    effective_tail_hygiene, hygiene_band, measure_tail_hygiene, real_user_turn_count,
-    refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS,
-    CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
+    effective_tail_hygiene, hygiene_band, measure_tail_hygiene_with_pending_drops,
+    real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS,
+    CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -1770,6 +1770,7 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     channel1_appends: &'a [Channel1AppendRow],
     mutation_exempt_mid: Option<&'a str>,
     protected_tags: usize,
+    pending_drop_target_ids: &'a HashSet<String>,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -3654,6 +3655,10 @@ fn apply_once(
     let planning_started_at = Instant::now();
     let pending_drops_started_at = Instant::now();
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
+    let pending_drop_target_ids = pending_agent_drops
+        .iter()
+        .map(|drop| drop.target_id.clone())
+        .collect::<HashSet<_>>();
     timings.pending_drops = elapsed_ms(pending_drops_started_at);
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
@@ -5128,13 +5133,14 @@ fn apply_once(
 
     let hygiene_tag_rows =
         tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
-    let hygiene_measurement = measure_tail_hygiene(
+    let hygiene_measurement = measure_tail_hygiene_with_pending_drops(
         &projection,
         &core,
         meta.coverage_ordinal,
         &hygiene_tag_rows,
         req.protected_tags,
         &protected_block_ids,
+        &pending_drop_target_ids,
     );
     let current_hygiene_baseline = if is_bust_pass {
         let refreshed = refresh_tail_hygiene_baseline(
@@ -5171,6 +5177,7 @@ fn apply_once(
                 channel1_appends: &channel1_appends,
                 mutation_exempt_mid,
                 protected_tags: req.protected_tags,
+                pending_drop_target_ids: &pending_drop_target_ids,
             },
             &mut meta,
         ) {
@@ -5362,6 +5369,7 @@ fn apply_once(
             baseline: current_hygiene_baseline.as_ref(),
             mutation_exempt_mid,
             protected_tags: req.protected_tags,
+            pending_drop_target_ids: &pending_drop_target_ids,
         },
         &mut meta,
     );
@@ -9016,6 +9024,7 @@ fn maybe_append_channel1_nudge(
         input.tag_rows,
         input.mutation_exempt_mid,
     );
+    let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
     let measured_reclaimable = input
         .baseline
         .map_or(0, |baseline| effective_tail_hygiene(baseline).0);
@@ -9045,7 +9054,7 @@ fn maybe_append_channel1_nudge(
         &existing_blocks,
         input.mutation_exempt_mid,
     )?;
-    let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags);
+    let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags, &queued_tag_numbers);
     let current_real_user_turn_count = real_user_turn_count(input.projection);
     let sticky = should_use_sticky_channel1_reminder(
         &meta.channel1_last_fire_level,
@@ -9173,6 +9182,17 @@ fn active_tags_for_nudge(
 /// Reuse the durable CC tag accounting when present, and derive the same accounting basis
 /// from live CK text for profiles that historically did not mint overlay tags. The latter
 /// keeps OpenCode host directives useful without enabling CC-only prompt overlays.
+fn queued_tag_numbers(
+    tag_rows: &[McTagRow],
+    pending_drop_target_ids: &HashSet<String>,
+) -> HashSet<i64> {
+    tag_rows
+        .iter()
+        .filter(|row| pending_drop_target_ids.contains(&row.block_id))
+        .map(|row| row.tag_number)
+        .collect()
+}
+
 fn active_tags_for_channel2(
     core: &CoreState,
     meta: &ModuleMeta,
@@ -9219,6 +9239,7 @@ struct Channel2DirectiveInput<'a> {
     baseline: Option<&'a TailHygieneBaseline>,
     mutation_exempt_mid: Option<&'a str>,
     protected_tags: usize,
+    pending_drop_target_ids: &'a HashSet<String>,
 }
 
 struct Channel2Pressure {
@@ -9294,7 +9315,8 @@ fn channel2_pressure(
             input.tag_rows,
             input.mutation_exempt_mid,
         );
-        oldest_channel2_hint(&active_tags, input.protected_tags)
+        let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
+        oldest_channel2_hint(&active_tags, input.protected_tags, &queued_tag_numbers)
     } else {
         Vec::new()
     };
@@ -9439,11 +9461,13 @@ fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i
 fn oldest_channel2_hint(
     active_tags: &[ActiveTagForNudge],
     protected_tags: usize,
+    queued_tag_numbers: &HashSet<i64>,
 ) -> Vec<(i64, String)> {
     let protected_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
         .filter(|tag| tag.kind == "tool_result")
+        .filter(|tag| !queued_tag_numbers.contains(&tag.tag_number))
         .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
         .filter(|tag| tag.token_count >= 100)
         .take(4)
@@ -9621,6 +9645,7 @@ mod nudge_formula_tests {
                 tag(7, "read", 900),
             ],
             0,
+            &HashSet::new(),
         );
 
         assert_eq!(
@@ -9632,6 +9657,20 @@ mod nudge_formula_tests {
                 (7, "read".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn channel1_hint_excludes_queued_drops_but_keeps_unqueued_siblings() {
+        let tag = |tag_number: i64, tool_name: &str| ActiveTagForNudge {
+            tag_number,
+            kind: "tool_result".to_string(),
+            token_count: 900,
+            tool_name: tool_name.to_string(),
+        };
+        let queued = HashSet::from([1]);
+        let hint = oldest_reclaimable_hint(&[tag(1, "bash"), tag(2, "read")], 0, &queued);
+
+        assert_eq!(hint, vec![(2, "read".to_string())]);
     }
 
     #[test]
@@ -9658,6 +9697,7 @@ mod nudge_formula_tests {
                 },
             ],
             0,
+            &HashSet::new(),
         );
 
         assert!(hint.is_empty());
@@ -9786,6 +9826,7 @@ mod nudge_formula_tests {
                 baseline: Some(&due_baseline),
                 mutation_exempt_mid: None,
                 protected_tags: 0,
+                pending_drop_target_ids: &HashSet::new(),
             },
             &mut stale,
         )
@@ -9806,6 +9847,7 @@ mod nudge_formula_tests {
                 baseline: Some(&due_baseline),
                 mutation_exempt_mid: None,
                 protected_tags: 0,
+                pending_drop_target_ids: &HashSet::new(),
             },
             &mut stale,
         );
@@ -9861,12 +9903,14 @@ fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
 fn oldest_reclaimable_hint(
     active_tags: &[ActiveTagForNudge],
     protected_tags: usize,
+    queued_tag_numbers: &HashSet<i64>,
 ) -> Vec<(i64, String)> {
     let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     let mut candidates = active_tags
         .iter()
         .filter(|tag| {
             tag.kind == "tool_result"
+                && !queued_tag_numbers.contains(&tag.tag_number)
                 && tag.token_count >= AGE_RECLAIM_MIN_TOKENS as i64
                 && !is_reclaim_hint_excluded_tool(&tag.tool_name)
                 && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)

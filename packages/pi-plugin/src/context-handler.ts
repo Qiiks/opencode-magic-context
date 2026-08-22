@@ -3141,6 +3141,13 @@ export function registerPiContextHandler(
 				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
 					const tags = getTagsBySession(options.db, sessionId);
 					const protectedTags = options.protectedTags ?? 20;
+					// Queued ctx_reduce drops are completed agent decisions. Their bytes
+					// remain in T until a cache-busting materialization, but not in U.
+					const pendingDropTagNumbers = new Set(
+						getPendingOps(options.db, sessionId)
+							.filter((operation) => operation.operation === "drop")
+							.map((operation) => operation.tagId),
+					);
 					const stableId = (message: unknown): string | undefined =>
 						message && typeof message === "object"
 							? result.postCommitEntryIdByRef.get(message)
@@ -3149,6 +3156,7 @@ export function registerPiContextHandler(
 						messages: outputMessages,
 						tags,
 						protectedTags,
+						pendingDropTagNumbers,
 						stableId,
 						syntheticLeadingCount: result.syntheticLeadingCount,
 						cacheBusting: result.bustedThisPass,
@@ -3168,6 +3176,7 @@ export function registerPiContextHandler(
 							messages: outputMessages,
 							tags,
 							protectedTags,
+							pendingDropTagNumbers,
 							stableId,
 							syntheticLeadingCount: result.syntheticLeadingCount,
 						}),
@@ -3202,6 +3211,7 @@ export function registerPiContextHandler(
 							messages: outputMessages,
 							tags,
 							protectedTags,
+							pendingDropTagNumbers,
 							stableId,
 							syntheticLeadingCount: result.syntheticLeadingCount,
 							expectedSignature: baseline.contentSignature,

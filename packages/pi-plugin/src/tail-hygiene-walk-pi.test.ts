@@ -308,6 +308,77 @@ describe("Pi rendered-tail hygiene walk", () => {
 });
 
 describe("Pi baseline persistence and defer deltas", () => {
+	it("subtracts queued-drop mass through the defer delta without changing T or the frozen baseline", () => {
+		const messages = [
+			textMessage("user", "mass ".repeat(25_000)),
+			textMessage("user", "mass ".repeat(45_000)),
+			textMessage("user", "mass ".repeat(30_000)),
+		];
+		const tags = [
+			tag(1, "queued:p0", "message"),
+			tag(2, "remaining:p0", "message"),
+		];
+		const stableId = withStableIds(messages, ["queued", "remaining", "untagged"]);
+		const initial = measurePiTailHygiene({
+			messages,
+			tags,
+			protectedTags: 0,
+			stableId,
+		});
+		const queuedMass = measurePiTailHygiene({
+			messages: [messages[0]],
+			tags: [tags[0]],
+			protectedTags: 0,
+			stableId: withStableIds([messages[0]], ["queued"]),
+		}).u;
+		const baseline = refreshPiTailHygieneBaseline({
+			messages,
+			tags,
+			protectedTags: 0,
+			stableId,
+			cacheBusting: true,
+		});
+		const queued = measurePiTailHygiene({
+			messages,
+			tags,
+			protectedTags: 0,
+			pendingDropTagNumbers: new Set([1]),
+			stableId,
+		});
+		const defer = refreshPiTailHygieneBaseline({
+			messages,
+			tags,
+			protectedTags: 0,
+			pendingDropTagNumbers: new Set([1]),
+			stableId,
+			cacheBusting: false,
+			previous: baseline,
+		});
+
+		expect(queued.t).toBe(initial.t);
+		expect(queued.u).toBe(initial.u - queuedMass);
+		expect(defer.evaluable).toBe(true);
+		expect(defer.baselineU).toBe(baseline.baselineU);
+		expect(defer.baselineT).toBe(baseline.baselineT);
+		expect(effectivePiTailHygiene(defer)).toEqual({ u: queued.u, t: queued.t });
+		expect(
+			decideChannel1({
+				...baseline,
+				lastNudgeUndropped: 0,
+				lastNudgeLevel: "",
+				hasRecentReduce: false,
+			}).level,
+		).toBe("urgent");
+		expect(
+			decideChannel1({
+				...defer,
+				lastNudgeUndropped: 0,
+				lastNudgeLevel: "",
+				hasRecentReduce: false,
+			}).level,
+		).toBe("firm");
+	});
+
 	it("is deterministic across bust/defer and adds every typed append", () => {
 		const base = [textMessage("user", "base ".repeat(2_000))];
 		const baseTags = [tag(1, "base:p0", "message")];

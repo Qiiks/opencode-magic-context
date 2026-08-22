@@ -2216,11 +2216,19 @@ export async function runPostTransformPhase(
         if (args.ctxReduceAvailability.callable && !compactionOff) {
             try {
                 const tags = getTailHygieneTags(args.db, args.sessionId);
+                // A queued ctx_reduce drop is already actioned by the agent. Keep its
+                // still-rendered bytes in T, but exclude it from the actionable U backlog.
+                const pendingDropTagNumbers = new Set(
+                    getPendingOps(args.db, args.sessionId)
+                        .filter((operation) => operation.operation === "drop")
+                        .map((operation) => operation.tagId),
+                );
                 const previous = args.channel1StateBySession.get(args.sessionId);
                 const baseline = refreshTailHygieneBaseline({
                     messages: args.messages,
                     tags,
                     protectedTags: args.protectedTags,
+                    pendingDropTagNumbers,
                     cacheBusting: bustedThisPass,
                     previous,
                 });

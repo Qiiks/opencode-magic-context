@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
-import { buildChannel1Reminder } from "./ctx-reduce-nudge";
+import { buildChannel1Reminder, decideChannel1 } from "./ctx-reduce-nudge";
 import type { MessageLike } from "./tag-messages";
 import {
     assertTailHygieneContentUnchanged,
@@ -331,6 +331,93 @@ describe("tail hygiene baseline and defer-window deltas", () => {
         expect(effectiveTailHygiene(defer)).toEqual(effectiveTailHygiene(bust));
         expect(defer.baselineGeneration).toBe(bust.baselineGeneration);
         expect(defer.evaluable).toBe(true);
+    });
+
+    it("subtracts queued-drop mass through the defer delta without changing T or the frozen baseline", () => {
+        const messages = [
+            textMessage("queued", "mass ".repeat(25_000)),
+            textMessage("remaining", "mass ".repeat(45_000)),
+            textMessage("untagged", "mass ".repeat(30_000)),
+        ];
+        const tags = [
+            tag(1, "queued:p0", "message"),
+            tag(2, "remaining:p0", "message"),
+        ];
+        const initial = measureTailHygiene({ messages, tags, protectedTags: 0 });
+        const queuedMass = measureTailHygiene({
+            messages: [messages[0]],
+            tags: [tags[0]],
+            protectedTags: 0,
+        }).u;
+        const baseline = refreshTailHygieneBaseline({
+            messages,
+            tags,
+            protectedTags: 0,
+            cacheBusting: true,
+        });
+        const queued = measureTailHygiene({
+            messages,
+            tags,
+            protectedTags: 0,
+            pendingDropTagNumbers: new Set([1]),
+        });
+        const defer = refreshTailHygieneBaseline({
+            messages,
+            tags,
+            protectedTags: 0,
+            pendingDropTagNumbers: new Set([1]),
+            cacheBusting: false,
+            previous: baseline,
+        });
+
+        expect(queued.t).toBe(initial.t);
+        expect(queued.u).toBe(initial.u - queuedMass);
+        expect(defer.evaluable).toBe(true);
+        expect(defer.baselineU).toBe(baseline.baselineU);
+        expect(defer.baselineT).toBe(baseline.baselineT);
+        expect(effectiveTailHygiene(defer)).toEqual({ u: queued.u, t: queued.t });
+        expect(
+            decideChannel1({
+                ...baseline,
+                lastNudgeUndropped: 0,
+                lastNudgeLevel: "",
+                hasRecentReduce: false,
+            }).level,
+        ).toBe("urgent");
+        expect(
+            decideChannel1({
+                ...defer,
+                lastNudgeUndropped: 0,
+                lastNudgeLevel: "",
+                hasRecentReduce: false,
+            }).level,
+        ).toBe("firm");
+    });
+
+    it("replays a prior Channel-1 reminder byte-identically when queue state changes U", () => {
+        const original = nativeTool("owner", "call-replay", { path: "x" }, "tool output ".repeat(500));
+        const tags = [tag(1, "call-replay", "tool", { toolOwnerMessageId: "owner" })];
+        const reminder = buildChannel1Reminder("firm", 42_000, 128_000);
+        const served = structuredClone(original) as MessageLike;
+        (served.parts[0] as { state: { output: string } }).state.output += reminder;
+        const baseline = refreshTailHygieneBaseline({
+            messages: [served],
+            tags,
+            protectedTags: 0,
+            cacheBusting: true,
+        });
+        const replay = refreshTailHygieneBaseline({
+            messages: [served],
+            tags,
+            protectedTags: 0,
+            pendingDropTagNumbers: new Set([1]),
+            cacheBusting: false,
+            previous: baseline,
+        });
+
+        expect((served.parts[0] as { state: { output: string } }).state.output).toContain(reminder);
+        expect(replay.contentSignature).toBe(baseline.contentSignature);
+        expect(replay.evaluable).toBe(true);
     });
 
     it("walks typed appended deltas while protected and untagged tool output is T-only", () => {
