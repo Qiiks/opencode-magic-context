@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { queuePendingOp } from "./storage-ops";
 import {
     adoptFallbackTagMessageId,
     findAdoptableFallbackTags,
@@ -121,6 +122,43 @@ describe("storage-tags", () => {
             expect(hints).toEqual([
                 { tagNumber: 3, toolName: "grep" },
                 { tagNumber: 1, toolName: "read" },
+            ]);
+        });
+
+        it("#then excludes queued drops while retaining unqueued sibling candidates", () => {
+            db = makeMemoryDatabase();
+            insertTag(
+                db,
+                "ses-queued-hint",
+                "queued-output",
+                "tool",
+                9000,
+                1,
+                0,
+                "bash",
+                0,
+                null,
+                null,
+                { tokenCount: 900, inputTokenCount: 0, reasoningTokenCount: 0 },
+            );
+            insertTag(
+                db,
+                "ses-queued-hint",
+                "sibling-output",
+                "tool",
+                9000,
+                2,
+                0,
+                "read",
+                0,
+                null,
+                null,
+                { tokenCount: 900, inputTokenCount: 0, reasoningTokenCount: 0 },
+            );
+            queuePendingOp(db, "ses-queued-hint", 1, "drop", 1);
+
+            expect(getOldestActiveUnprotectedToolTags(db, "ses-queued-hint")).toEqual([
+                { tagNumber: 2, toolName: "read" },
             ]);
         });
 

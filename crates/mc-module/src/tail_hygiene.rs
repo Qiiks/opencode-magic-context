@@ -264,6 +264,7 @@ fn part_measurement(
     tokens: i64,
     tag_number: Option<i64>,
     protected: bool,
+    queued_for_drop: bool,
 ) -> TailHygienePartMeasurement {
     let kind_name = match kind {
         TailHygienePartKind::Text => "text",
@@ -276,7 +277,7 @@ fn part_measurement(
     hash_input.push_str(kind_name);
     hash_input.push('\0');
     hash_input.push_str(content);
-    let active = tag_number.is_some();
+    let active = tag_number.is_some() && !queued_for_drop;
     TailHygienePartMeasurement {
         key,
         content_hash: hex_digest(hash_input),
@@ -284,13 +285,22 @@ fn part_measurement(
         tokens,
         u_tokens: if active && !protected { tokens } else { 0 },
         tag_number,
-        tag_status: active.then(|| "active".to_string()),
+        tag_status: tag_number.map(|_| "active".to_string()),
         protected,
+        queued_for_drop,
     }
 }
 
 fn excluded_part(key: String, content: &str) -> TailHygienePartMeasurement {
-    part_measurement(key, TailHygienePartKind::Excluded, content, 0, None, false)
+    part_measurement(
+        key,
+        TailHygienePartKind::Excluded,
+        content,
+        0,
+        None,
+        false,
+        false,
+    )
 }
 
 fn projection_message_indexes(projection: &FlatProjection) -> HashMap<&str, usize> {
@@ -477,6 +487,26 @@ pub(crate) fn measure_tail_hygiene(
     protected_tags: usize,
     protected_block_ids: &HashSet<String>,
 ) -> TailHygieneMeasurement {
+    measure_tail_hygiene_with_pending_drops(
+        projection,
+        core,
+        coverage_ordinal,
+        tag_rows,
+        protected_tags,
+        protected_block_ids,
+        &HashSet::new(),
+    )
+}
+
+pub(crate) fn measure_tail_hygiene_with_pending_drops(
+    projection: &FlatProjection,
+    core: &CoreState,
+    coverage_ordinal: Option<u64>,
+    tag_rows: &[McTagRow],
+    protected_tags: usize,
+    protected_block_ids: &HashSet<String>,
+    pending_drop_target_ids: &HashSet<String>,
+) -> TailHygieneMeasurement {
     let (tags_by_block, tags_by_arc) = tag_numbers_by_block_and_arc(projection, tag_rows);
     let protected_numbers = protected_tag_numbers(tag_rows, protected_tags);
     let protected_arc_ids = projection
@@ -533,6 +563,7 @@ pub(crate) fn measure_tail_hygiene(
             protected_block_ids,
             &protected_arc_ids,
         );
+        let queued_for_drop = pending_drop_target_ids.contains(&block.id);
         let measured = match &block.wire.kind {
             mc_store::CkKind::Text { text }
                 if block.role == "user" || block.role == "assistant" =>
@@ -549,6 +580,7 @@ pub(crate) fn measure_tail_hygiene(
                         estimated_tokens(content),
                         tag_number,
                         protected,
+                        queued_for_drop,
                     )
                 }
             }
@@ -561,6 +593,7 @@ pub(crate) fn measure_tail_hygiene(
                     estimated_tokens(&content),
                     tag_number,
                     protected,
+                    queued_for_drop,
                 )
             }
             mc_store::CkKind::ToolResult { output, .. } => {
@@ -576,6 +609,7 @@ pub(crate) fn measure_tail_hygiene(
                         estimated_tokens(content),
                         tag_number,
                         protected,
+                        queued_for_drop,
                     )
                 }
             }
@@ -591,6 +625,7 @@ pub(crate) fn measure_tail_hygiene(
                         media_tokens(media, &content),
                         tag_number,
                         protected,
+                        queued_for_drop,
                     )
                 }
             }
@@ -619,11 +654,12 @@ pub(crate) fn measure_tail_hygiene(
 fn same_measured_prefix(
     baseline: &[TailHygienePartMeasurement],
     current: &[TailHygienePartMeasurement],
-) -> Option<i64> {
+) -> Option<(i64, i64)> {
     if current.len() < baseline.len() {
         return None;
     }
     let mut boundary_advance_u = 0i64;
+    let mut queued_drop_delta_u = 0i64;
     for (before, after) in baseline.iter().zip(current) {
         if before.key != after.key
             || before.content_hash != after.content_hash
@@ -639,12 +675,20 @@ fn same_measured_prefix(
             if after.tag_status.as_deref() != Some("active") {
                 return None;
             }
-            boundary_advance_u = boundary_advance_u.saturating_add(after.tokens);
+            boundary_advance_u = boundary_advance_u.saturating_add(after.u_tokens);
+        } else if before.queued_for_drop != after.queued_for_drop {
+            if before.tag_status.as_deref() != Some("active")
+                || after.tag_status.as_deref() != Some("active")
+            {
+                return None;
+            }
+            queued_drop_delta_u =
+                queued_drop_delta_u.saturating_add(after.u_tokens.saturating_sub(before.u_tokens));
         } else if before.u_tokens != after.u_tokens {
             return None;
         }
     }
-    Some(boundary_advance_u)
+    Some((boundary_advance_u, queued_drop_delta_u))
 }
 
 pub(crate) fn refresh_tail_hygiene_baseline(
@@ -676,7 +720,8 @@ pub(crate) fn refresh_tail_hygiene_baseline(
     }
 
     let previous = previous.expect("non-busting refresh has a previous baseline");
-    let Some(mut turn_delta_u) = same_measured_prefix(&previous.baseline_parts, &measured.parts)
+    let Some((boundary_advance_u, queued_drop_delta_u)) =
+        same_measured_prefix(&previous.baseline_parts, &measured.parts)
     else {
         let mut invalidated = previous.clone();
         invalidated.evaluable = false;
@@ -685,6 +730,9 @@ pub(crate) fn refresh_tail_hygiene_baseline(
         return invalidated;
     };
     let mut turn_delta_t = 0i64;
+    // Queue membership is an action-state delta: it reduces the actionable token
+    // backlog while the frozen baseline and still-rendered token total remain unchanged.
+    let mut turn_delta_u = boundary_advance_u.saturating_add(queued_drop_delta_u);
     for part in &measured.parts[previous.baseline_parts.len()..] {
         turn_delta_t = turn_delta_t.saturating_add(part.tokens);
         // A just-completed output is always in the newest recency reserve. Keeping it T-only
@@ -837,6 +885,56 @@ mod tests {
             "old protected mass should advance into U"
         );
         assert_eq!(defer.baseline_generation, baseline.baseline_generation);
+    }
+
+    #[test]
+    fn queued_drop_mass_uses_a_defer_delta_without_changing_t_or_the_frozen_baseline() {
+        let messages = vec![
+            text("queued", 1, &"mass ".repeat(25_000)),
+            text("remaining", 2, &"mass ".repeat(45_000)),
+            text("untagged", 3, &"mass ".repeat(30_000)),
+        ];
+        let tags = vec![tag(1, "queued#0"), tag(2, "remaining#0")];
+        let projection = project_messages(&messages).unwrap();
+        let initial = measure_tail_hygiene(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+        );
+        let baseline = refresh_tail_hygiene_baseline(initial.clone(), true, None, 10);
+        let queued_targets = HashSet::from(["queued#0".to_string()]);
+        let queued = measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+            &queued_targets,
+        );
+        let queued_only = project_messages(&[messages[0].clone()]).unwrap();
+        let queued_mass = measure_tail_hygiene(
+            &queued_only,
+            &CoreState::default(),
+            None,
+            &[tags[0].clone()],
+            0,
+            &HashSet::new(),
+        )
+        .u;
+        let defer = refresh_tail_hygiene_baseline(queued.clone(), false, Some(&baseline), 20);
+
+        assert_eq!(queued.t, initial.t);
+        assert_eq!(queued.u, initial.u - queued_mass);
+        assert!(defer.evaluable);
+        assert_eq!(defer.baseline_u, baseline.baseline_u);
+        assert_eq!(defer.baseline_t, baseline.baseline_t);
+        assert_eq!(effective_tail_hygiene(&defer), (queued.u, queued.t));
+        assert_eq!(hygiene_band(initial.u, initial.t), HygieneBand::Urgent);
+        assert_eq!(hygiene_band(queued.u, queued.t), HygieneBand::Firm);
     }
 
     #[test]

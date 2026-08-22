@@ -271,8 +271,14 @@ export function getOldestActiveUnprotectedToolTags(
         .prepare(
             `SELECT tag_number, tool_name
              FROM tags
-             WHERE session_id = ? AND status = 'active' AND type = 'tool'
-             ${valueFloor}
+               WHERE session_id = ? AND status = 'active' AND type = 'tool'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pending_ops
+                        WHERE pending_ops.session_id = tags.session_id
+                          AND pending_ops.tag_id = tags.tag_number
+                          AND pending_ops.operation = 'drop'
+                    )
+                    ${valueFloor}
              ${whereProtected}
              ORDER BY tag_number ASC, id ASC`,
         )

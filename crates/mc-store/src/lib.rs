@@ -3395,6 +3395,8 @@ pub struct TailHygienePartMeasurement {
     pub tag_number: Option<i64>,
     pub tag_status: Option<String>,
     pub protected: bool,
+    #[serde(default)]
+    pub queued_for_drop: bool,
 }
 
 /// Durable hygiene metrics used by both reminder channels, measured relative to the currently
