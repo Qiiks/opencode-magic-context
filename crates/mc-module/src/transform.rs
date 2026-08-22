@@ -45,9 +45,9 @@ use crate::selection::{
     SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
-    effective_tail_hygiene, hygiene_band, measure_tail_hygiene, refresh_tail_hygiene_baseline,
-    HygieneBand, CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS,
-    CHANNEL2_SEVERITY_THRESHOLD,
+    effective_tail_hygiene, hygiene_band, measure_tail_hygiene, real_user_turn_count,
+    refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS,
+    CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -9046,19 +9046,12 @@ fn maybe_append_channel1_nudge(
         input.mutation_exempt_mid,
     )?;
     let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags);
-    let current_ordinal = input
-        .projection
-        .blocks
-        .iter()
-        .filter(|block| !block.synthetic)
-        .map(|block| block.ordinal)
-        .max()
-        .unwrap_or(0);
+    let current_real_user_turn_count = real_user_turn_count(input.projection);
     let sticky = should_use_sticky_channel1_reminder(
         &meta.channel1_last_fire_level,
         meta.channel1_last_fire_ordinal,
         decision.level,
-        current_ordinal,
+        current_real_user_turn_count,
     );
     let reminder = build_channel1_reminder(
         decision.level,
@@ -9068,7 +9061,7 @@ fn maybe_append_channel1_nudge(
         sticky,
     );
     meta.channel1_last_fire_level = decision.level.as_str().to_string();
-    meta.channel1_last_fire_ordinal = current_ordinal;
+    meta.channel1_last_fire_ordinal = current_real_user_turn_count;
     Some(Channel1AppendRow {
         block_id,
         reminder_text: reminder,
@@ -9687,18 +9680,39 @@ mod nudge_formula_tests {
     }
 
     #[test]
-    fn same_level_refires_dampen_but_escalations_keep_the_full_body() {
+    fn same_level_refires_dampen_by_real_user_turn_but_expire_and_escalate() {
+        // The synthetic-row regression uses a real turn count of one both
+        // before and after the injected rows, so the same-level refire sticks.
         assert!(should_use_sticky_channel1_reminder(
             "firm",
-            10,
+            1,
             Channel1Level::Firm,
-            13,
+            1,
+        ));
+        assert!(should_use_sticky_channel1_reminder(
+            "firm",
+            1,
+            Channel1Level::Firm,
+            3,
         ));
         assert!(!should_use_sticky_channel1_reminder(
             "firm",
-            10,
+            1,
+            Channel1Level::Firm,
+            4,
+        ));
+        // A legacy raw message ordinal must not compare as a user-turn count.
+        assert!(!should_use_sticky_channel1_reminder(
+            "firm",
+            160_750,
+            Channel1Level::Firm,
+            1,
+        ));
+        assert!(!should_use_sticky_channel1_reminder(
+            "firm",
+            1,
             Channel1Level::Urgent,
-            11,
+            1,
         ));
         let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 128_000, &[], true);
         assert!(sticky.contains("Reminder: ctx_reduce housekeeping still pending —"));
@@ -9868,18 +9882,21 @@ fn oldest_reclaimable_hint(
     candidates
 }
 
-const CHANNEL1_STICKY_ORDINAL_GAP: u64 = 3;
+const CHANNEL1_STICKY_REAL_USER_TURN_GAP: u64 = 3;
 
 fn should_use_sticky_channel1_reminder(
     last_level: &str,
     last_ordinal: u64,
     level: Channel1Level,
-    current_ordinal: u64,
+    current_real_user_turn_count: u64,
 ) -> bool {
+    // Older module metadata stored a raw message ordinal here. A raw ordinal
+    // greater than the real-user counter is an incompatible legacy unit, so
+    // let one full reminder replace it instead of damping accidentally.
     last_level == level.as_str()
         && last_ordinal > 0
-        && current_ordinal >= last_ordinal
-        && current_ordinal - last_ordinal <= CHANNEL1_STICKY_ORDINAL_GAP
+        && current_real_user_turn_count >= last_ordinal
+        && current_real_user_turn_count - last_ordinal < CHANNEL1_STICKY_REAL_USER_TURN_GAP
 }
 
 fn build_channel1_reminder(

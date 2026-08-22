@@ -1146,7 +1146,7 @@ describe("registerPiContextHandler", () => {
 			turnDeltaU: 0,
 			turnDeltaT: 0,
 			usableWindow: 128_000,
-			messageOrdinal: 1,
+			realUserTurnCount: 1,
 			baselineGeneration: 1,
 			computedAt: 1,
 			evaluable: true,

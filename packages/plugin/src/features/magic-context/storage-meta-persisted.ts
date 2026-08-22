@@ -979,7 +979,7 @@ export function clearEmergencyDropSample(db: Database, sessionId: string): void 
 // ---- Channel 1 (in-turn tool-output ctx_reduce nudge) cadence + band state ----
 // `last_nudge_undropped` records the `undropped` estimate when Channel 1 last
 // fired. The existing `last_nudge_level` scalar holds the paired level and last
-// fire ordinal as JSON, so no schema change is needed for dampening.
+// real-user-turn counter as JSON, so no schema change is needed for dampening.
 export type PersistedChannel1NudgeLevel = "" | "gentle" | "firm" | "urgent";
 
 interface PersistedLastNudgeUndroppedRow {
@@ -992,6 +992,7 @@ interface PersistedLastNudgeLevelRow {
 
 export interface PersistedChannel1NudgeState {
     level: PersistedChannel1NudgeLevel;
+    /** Real-user-turn counter at the last fire; the JSON key stays stable. */
     ordinal: number;
 }
 

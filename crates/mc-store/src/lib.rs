@@ -3649,7 +3649,7 @@ pub struct ModuleMeta {
     /// Last emitted Channel-1 level, paired with its ordinal to choose full or sticky wording.
     #[serde(default)]
     pub channel1_last_fire_level: String,
-    /// Newest live message ordinal when the last Channel-1 reminder was emitted.
+    /// Real-user turn count when the last Channel-1 reminder was emitted.
     #[serde(default)]
     pub channel1_last_fire_ordinal: u64,
     /// Baseline calculated by one shared tail walk so both nudge channels use the same measurements.

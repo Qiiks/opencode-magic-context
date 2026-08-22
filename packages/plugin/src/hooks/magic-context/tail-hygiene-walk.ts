@@ -205,19 +205,46 @@ function collectToolPartIdentities(
     return identities;
 }
 
-function isSyntheticMessage(message: MessageLike): boolean {
-    const structuralHead =
-        message.info.id === undefined &&
-        message.info.role === "user" &&
-        message.parts.length > 0 &&
-        message.parts.every((part) => isRecord(part) && part.synthetic === true);
+function isMachineGeneratedUserPart(part: unknown): boolean {
+    if (!isRecord(part)) return false;
+    const metadata = isRecord(part.metadata) ? part.metadata : null;
+    const marker = metadata && isRecord(metadata.marker) ? metadata.marker : null;
+    // Keep the all-parts predicate aligned with hasNewerRealUserMessage: a
+    // row is synthetic only when every part is machine-generated. A real
+    // prompt can carry one synthetic @mention part without becoming injected.
     return (
-        structuralHead || message.info.summary === true || message.info.id === TODO_HEAD_ANCHOR_ID
+        part.synthetic === true ||
+        part.ignored === true ||
+        marker?.kind != null ||
+        isSyntheticTodoPart(part)
     );
 }
 
+export function isSyntheticMessage(message: MessageLike): boolean {
+    const syntheticUserRow =
+        message.info.role === "user" &&
+        message.parts.length > 0 &&
+        message.parts.every(isMachineGeneratedUserPart);
+    return (
+        syntheticUserRow || message.info.summary === true || message.info.id === TODO_HEAD_ANCHOR_ID
+    );
+}
+
+/**
+ * Counts user turns with the same all-parts synthetic predicate used by the
+ * mid-turn release valve. MC's reminder, Channel-2, and m0/m1 rows are
+ * injected user-shaped messages and must not advance a user-turn cadence.
+ */
+export function countRealUserMessages(messages: readonly MessageLike[]): number {
+    let count = 0;
+    for (const message of messages) {
+        if (message.info.role === "user" && !isSyntheticMessage(message)) count += 1;
+    }
+    return count;
+}
+
 function isSyntheticPart(part: unknown): boolean {
-    return (isRecord(part) && part.synthetic === true) || isSyntheticTodoPart(part);
+    return isMachineGeneratedUserPart(part);
 }
 
 export function stripChannel1ReminderSpans(output: string): string {

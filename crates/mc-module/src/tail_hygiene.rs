@@ -55,6 +55,20 @@ pub(crate) struct TailHygieneMeasurement {
     pub(crate) parts: Vec<TailHygienePartMeasurement>,
 }
 
+/// Count distinct user messages that reached the tail as authored turns.
+/// `FlatBlock::synthetic` is the codec's machine-origin marker: it is set for
+/// injected m0/m1 heads and Channel-2 rows, so those user-shaped rows do not
+/// advance Channel-1's cadence.
+pub(crate) fn real_user_turn_count(projection: &FlatProjection) -> u64 {
+    projection
+        .blocks
+        .iter()
+        .filter(|block| block.role == "user" && !block.synthetic)
+        .map(|block| block.mid.as_str())
+        .collect::<HashSet<_>>()
+        .len() as u64
+}
+
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))
 }
@@ -766,6 +780,22 @@ mod tests {
             created_at_ms: 0,
             source_bytes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn real_user_turn_count_ignores_interleaved_synthetic_user_rows() {
+        let real = text("real", 1, "continue");
+        let mut reminder = text(
+            "reminder",
+            2,
+            "<system-reminder>board stale</system-reminder>",
+        );
+        reminder.ck.meta.synthetic = true;
+        let mut channel2 = text("channel2", 3, "<system-reminder>reduce</system-reminder>");
+        channel2.ck.meta.synthetic = true;
+        let projection = project_messages(&[real, reminder, channel2]).unwrap();
+
+        assert_eq!(real_user_turn_count(&projection), 1);
     }
 
     #[test]

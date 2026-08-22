@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+	getChannel1NudgeState,
 	getChannel2NudgeClaim,
 	getChannel2NudgeClaimedAt,
 	getChannel2NudgeState,
@@ -17,6 +18,7 @@ import {
 	maybeDeliverChannel2Pi,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
+import { countRealPiUserMessages } from "./tail-hygiene-walk-pi";
 import { createTestDb } from "./test-utils.test";
 
 function channel2BaselineFields(baselineU: number, baselineT: number) {
@@ -26,7 +28,7 @@ function channel2BaselineFields(baselineU: number, baselineT: number) {
 		turnDeltaU: 0,
 		turnDeltaT: 0,
 		usableWindow: 128_000,
-		messageOrdinal: 1,
+		realUserTurnCount: 1,
 		baselineGeneration: 1,
 		computedAt: 1,
 		evaluable: true,
@@ -233,20 +235,39 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		clearPiChannel1State(SESSION);
 	});
 
-	it("freezes full and sticky variants while an escalation keeps the full body", () => {
+	it("uses real user turns for sticky refires, expiration, and escalation", () => {
 		const db = createTestDb();
 		const baseline = (
 			baselineU: number,
 			baselineT: number,
-			messageOrdinal: number,
+			realUserTurnCount: number,
 		) => ({
 			...channel2BaselineFields(baselineU, baselineT),
-			messageOrdinal,
+			realUserTurnCount,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [],
 		});
+		const realUserTurns = (
+			messages: readonly unknown[],
+			syntheticLeadingCount = 0,
+		) =>
+			countRealPiUserMessages({
+				messages,
+				tags: [],
+				protectedTags: 0,
+				syntheticLeadingCount,
+			});
+		const realTurn = { role: "user", content: "continue" };
+		const sameTurnWithSyntheticRows = [
+			{ role: "user", content: "m0 head" },
+			{ role: "user", content: "m1 head" },
+			realTurn,
+		];
+		const firstTurnCount = realUserTurns([realTurn]);
+		const sameTurnCount = realUserTurns(sameTurnWithSyntheticRows, 2);
+		expect(sameTurnCount).toBe(firstTurnCount);
 
-		setPiChannel1Baseline(SESSION, baseline(50_000, 120_000, 10));
+		setPiChannel1Baseline(SESSION, baseline(50_000, 120_000, firstTurnCount));
 		const first = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
@@ -262,17 +283,10 @@ describe("maybeChannel1ReminderForToolResult", () => {
 					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
 				)
 				.get(SESSION),
-		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":10}' });
-		expect(
-			maybeChannel1ReminderForToolResult({
-				db,
-				sessionId: SESSION,
-				toolName: "bash",
-				content: [{ type: "text", text: "first output" }, first],
-			}),
-		).toBeNull();
+		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":1}' });
 
-		setPiChannel1Baseline(SESSION, baseline(80_000, 180_000, 12));
+		// Live repro: m0/m1 are two synthetic user rows in the same real turn.
+		setPiChannel1Baseline(SESSION, baseline(80_000, 180_000, sameTurnCount));
 		const sticky = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
@@ -283,31 +297,80 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			"Reminder: ctx_reduce housekeeping still pending —",
 		);
 		expect(sticky?.text).not.toContain("Not a limit");
-		expect(
-			db
-				.prepare(
-					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
-				)
-				.get(SESSION),
-		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":12}' });
-		expect(
-			maybeChannel1ReminderForToolResult({
-				db,
-				sessionId: SESSION,
-				toolName: "bash",
-				content: [{ type: "text", text: "second output" }, sticky],
-			}),
-		).toBeNull();
 
-		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 13));
-		const escalation = maybeChannel1ReminderForToolResult({
+		const threeRealTurnsLater = [
+			{ role: "user", content: "m0 head" },
+			{ role: "user", content: "m1 head" },
+			...Array.from({ length: 4 }, (_, index) => ({
+				role: "user",
+				content: `real turn ${index}`,
+			})),
+		];
+		setPiChannel1Baseline(
+			SESSION,
+			baseline(110_000, 240_000, realUserTurns(threeRealTurnsLater, 2)),
+		);
+		const expired = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
 			toolName: "bash",
 			content: [{ type: "text", text: "third output" }],
 		});
+		expect(expired?.text).toContain(
+			"Housekeeping: ~110k of this session's ~128k window",
+		);
+		expect(expired?.text).not.toContain(
+			"Reminder: ctx_reduce housekeeping still pending",
+		);
+
+		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 4));
+		const escalation = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "fourth output" }],
+		});
 		expect(escalation?.text).toContain("Housekeeping backlog: ~120k");
 		expect(escalation?.text).not.toContain(
+			"Reminder: ctx_reduce housekeeping still pending",
+		);
+		clearPiChannel1State(SESSION);
+	});
+
+	it("expires a legacy raw ordinal before writing the real-user counter", () => {
+		const db = createTestDb();
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(80_000, 180_000),
+			realUserTurnCount: 1,
+			reducedSinceRefresh: false,
+			oldestReclaimableToolTags: [],
+		});
+		// The first delivery creates the session row; replace only the persisted
+		// ordinal with a legacy raw-message value before the re-evaluation.
+		maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "seed output" }],
+		});
+		db.prepare(
+			"UPDATE session_meta SET last_nudge_undropped = ?, last_nudge_level = ? WHERE session_id = ?",
+		).run(50_000, '{"level":"firm","ordinal":160750}', SESSION);
+		expect(getChannel1NudgeState(db, SESSION)).toEqual({
+			level: "firm",
+			ordinal: 160_750,
+		});
+
+		const block = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "legacy output" }],
+		});
+		expect(block?.text).toContain(
+			"Housekeeping: ~80k of this session's ~128k window",
+		);
+		expect(block?.text).not.toContain(
 			"Reminder: ctx_reduce housekeeping still pending",
 		);
 		expect(
@@ -316,7 +379,7 @@ describe("maybeChannel1ReminderForToolResult", () => {
 					"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
 				)
 				.get(SESSION),
-		).toEqual({ last_nudge_level: '{"level":"urgent","ordinal":13}' });
+		).toEqual({ last_nudge_level: '{"level":"firm","ordinal":1}' });
 		clearPiChannel1State(SESSION);
 	});
 });
