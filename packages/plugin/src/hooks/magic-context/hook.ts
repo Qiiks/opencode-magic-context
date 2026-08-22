@@ -60,6 +60,7 @@ import { getCurrentToolSetHash } from "../../features/magic-context/tool-definit
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
+import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
@@ -1298,6 +1299,20 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // falls back to the default threshold and displays a stale budget.
             const model = resolveLiveModel(sessionId);
             return model ? `${model.providerID}/${model.modelID}` : undefined;
+        },
+        getStatusDetail: (sessionId, moduleStatus) => {
+            const model = resolveLiveModel(sessionId);
+            return buildStatusDetail(
+                db,
+                sessionId,
+                sessionDirectoryBySession.get(sessionId) ?? deps.directory,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                deps.config as unknown as Record<string, unknown>,
+                deps.liveSessionState,
+                deps.config.memory?.injection_budget_tokens,
+                moduleStatus,
+                !compactionOff,
+            );
         },
         getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
         getTailHygiene: (sessionId) => channel1StateBySession.get(sessionId),

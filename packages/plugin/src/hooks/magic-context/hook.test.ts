@@ -508,7 +508,7 @@ describe("magic-context hook", () => {
                     parts: [
                         {
                             type: "text",
-                            text: expect.stringContaining("## Magic Status"),
+                            text: expect.stringContaining("## Magic Context Status"),
                             ignored: true,
                         },
                     ],

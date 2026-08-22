@@ -12,10 +12,13 @@ import {
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
 import { runSidekick } from "../../features/magic-context/sidekick/agent";
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import type { RustSessionStatus } from "../../plugin/rpc-handlers";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
+import type { StatusDetail } from "../../shared/rpc-types";
 import type { Database } from "../../shared/sqlite";
+import { formatStatusDetailMarkdown } from "../../shared/status-detail-text";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
@@ -524,6 +527,8 @@ export function createMagicContextCommandHandler(deps: {
     historyBudgetPercentage?: number;
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     getLiveModelKey?: (sessionId: string) => string | undefined;
+    /** Builds the status payload shared with the TUI dialog for a chat-only fallback. */
+    getStatusDetail?: (sessionId: string, moduleStatus?: RustSessionStatus) => StatusDetail;
     /** Optional live context limit resolver — used for tokens-based threshold display. */
     getContextLimit?: (sessionId: string) => number | undefined;
     getDreamerProgress?: () =>
@@ -776,52 +781,74 @@ export function createMagicContextCommandHandler(deps: {
                     sessionLog(sessionId, "command ctx-status: pushed show-status-dialog to TUI");
                     throwSentinel(input.command);
                 }
-                const liveModelKey = deps.getLiveModelKey?.(sessionId);
-                const liveContextLimit = deps.getContextLimit?.(sessionId);
-                const modelSlash = liveModelKey?.indexOf("/") ?? -1;
-                const windowGeometry =
-                    liveModelKey && modelSlash > 0
-                        ? resolveContextWindowGeometry(
-                              liveModelKey.slice(0, modelSlash),
-                              liveModelKey.slice(modelSlash + 1),
-                              { db: deps.db, sessionID: sessionId },
-                          )
-                        : undefined;
-                const rustTailHygiene = rustStatus?.tail_hygiene;
-                const tailHygiene = resolveTailHygieneStatus(
-                    deps.getTailHygiene?.(sessionId),
-                    rustTailHygiene && typeof rustTailHygiene === "object"
-                        ? (rustTailHygiene as WireTailHygieneBaseline)
-                        : undefined,
-                );
-                const statusOutput = executeStatus(
-                    deps.db,
-                    sessionId,
-                    deps.protectedTags,
-                    deps.executeThresholdPercentage,
-                    liveModelKey,
-                    deps.historyBudgetPercentage,
-                    deps.commitClusterTrigger,
-                    deps.executeThresholdTokens,
-                    liveContextLimit,
-                    deps.dreamer
-                        ? {
-                              backlog: readDreamTaskBacklogsSafely(
-                                  deps.db,
-                                  deps.dreamer.projectPath,
-                                  CANONICAL_DREAM_TASKS,
-                              ),
-                              progress: deps.getDreamerProgress?.() ?? null,
-                          }
-                        : undefined,
-                    windowGeometry,
-                    tailHygiene,
-                );
-                const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
-                const modeStatus = deps.compactionOff
-                    ? `**Compaction:** disabled (${COMPACTION_ENABLED_PATH}: false) — native compaction owns the context window.\n\n`
-                    : "";
-                const combinedStatus = `${modeStatus}${statusOutput}${moduleStatus}`;
+                let combinedStatus: string;
+                try {
+                    const detail = deps.getStatusDetail?.(
+                        sessionId,
+                        rustStatus as RustSessionStatus | undefined,
+                    );
+                    if (detail) {
+                        combinedStatus = formatStatusDetailMarkdown(detail);
+                    } else {
+                        // Compatibility for isolated handler consumers that have not yet
+                        // supplied the shared TUI status builder.
+                        const liveModelKey = deps.getLiveModelKey?.(sessionId);
+                        const liveContextLimit = deps.getContextLimit?.(sessionId);
+                        const modelSlash = liveModelKey?.indexOf("/") ?? -1;
+                        const windowGeometry =
+                            liveModelKey && modelSlash > 0
+                                ? resolveContextWindowGeometry(
+                                      liveModelKey.slice(0, modelSlash),
+                                      liveModelKey.slice(modelSlash + 1),
+                                      { db: deps.db, sessionID: sessionId },
+                                  )
+                                : undefined;
+                        const rustTailHygiene = rustStatus?.tail_hygiene;
+                        const tailHygiene = resolveTailHygieneStatus(
+                            deps.getTailHygiene?.(sessionId),
+                            rustTailHygiene && typeof rustTailHygiene === "object"
+                                ? (rustTailHygiene as WireTailHygieneBaseline)
+                                : undefined,
+                        );
+                        const statusOutput = executeStatus(
+                            deps.db,
+                            sessionId,
+                            deps.protectedTags,
+                            deps.executeThresholdPercentage,
+                            liveModelKey,
+                            deps.historyBudgetPercentage,
+                            deps.commitClusterTrigger,
+                            deps.executeThresholdTokens,
+                            liveContextLimit,
+                            deps.dreamer
+                                ? {
+                                      backlog: readDreamTaskBacklogsSafely(
+                                          deps.db,
+                                          deps.dreamer.projectPath,
+                                          CANONICAL_DREAM_TASKS,
+                                      ),
+                                      progress: deps.getDreamerProgress?.() ?? null,
+                                  }
+                                : undefined,
+                            windowGeometry,
+                            tailHygiene,
+                        );
+                        const moduleStatus = rustStatus
+                            ? `\n\n${formatRustStatusText(rustStatus)}`
+                            : "";
+                        const modeStatus = deps.compactionOff
+                            ? `**Compaction:** disabled (${COMPACTION_ENABLED_PATH}: false) — native compaction owns the context window.\n\n`
+                            : "";
+                        combinedStatus = `${modeStatus}${statusOutput}${moduleStatus}`;
+                    }
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        "shared ctx-status detail failed; using compatibility text:",
+                        error,
+                    );
+                    combinedStatus = executeStatus(deps.db, sessionId, deps.protectedTags);
+                }
                 result += result ? `\n\n${combinedStatus}` : combinedStatus;
             }
 
