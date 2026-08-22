@@ -30,7 +30,7 @@ import { computeNormalizedHash } from "../memory/normalize-hash";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
-import { assertManifestCoversExactly } from "./manifest-parser";
+import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import {
     DreamerModuleFailureError,
     type DreamerModuleRoute,
@@ -44,6 +44,7 @@ import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-sch
 import { partitionVerifyScope } from "./verify-gate";
 import {
     buildVerifyPrompt,
+    type ParsedVerifyManifest,
     parseVerifyManifest,
     VERIFY_SYSTEM_PROMPT,
     type VerifyPromptMemory,
@@ -290,23 +291,21 @@ async function verifyOneBatch(
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("verify returned no output");
-                    try {
-                        validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
-                    return text;
+                    // A provider outage can arrive as a closed but tiny XML fragment.
+                    // Detect that response shape before accepting a subset, so transport
+                    // garbage cannot bank a verdict simply because its root is complete.
+                    const providerFailure = providerOutputFailureFromInvalidManifest(
+                        messages,
+                        text,
+                    );
+                    if (providerFailure) throw providerFailure;
+                    return validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
                 },
             },
         );
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        return await applyVerifyManifest(args, batch, run.validated);
+        return await applyParsedVerifyManifest(args, batch, run.validated);
     } catch (error) {
         const desc = describeError(error);
         const providerFailure =
@@ -339,7 +338,9 @@ async function verifyOneBatch(
 }
 
 /**
- * Apply the manifest host-side. Only ids that were IN this batch are touched.
+ * Parse a complete manifest and commit the entries that belong to this batch.
+ * A closed root proves the parser did not see a truncated prefix, so omitted ids
+ * remain silent for the per-memory gate to select next run; unknown ids are never written.
  * - verified: re-record the (normalized) backing files with verified_at = now
  *   (banks the per-memory verify progress).
  * - update: rewrite the memory content via the cache-neutral mutation log, then
@@ -355,13 +356,42 @@ export async function applyVerifyManifest(
     batch: VerifyPromptMemory[],
     manifestText: string,
 ): Promise<{ verified: number; updated: number; archived: number }> {
+    return applyParsedVerifyManifest(args, batch, parseVerifyManifest(manifestText));
+}
+
+async function applyParsedVerifyManifest(
+    args: VerifyArgs,
+    batch: VerifyPromptMemory[],
+    parsed: ParsedVerifyManifest,
+): Promise<{ verified: number; updated: number; archived: number }> {
     const batchIds = new Set(batch.map((m) => m.id));
-    const parsed = parseVerifyManifest(manifestText);
-    assertManifestCoversExactly(
-        [...parsed.verified, ...parsed.updated, ...parsed.archived].map((entry) => entry.id),
-        batchIds,
-        "verify",
+    const valid = {
+        verified: parsed.verified.filter((entry) => batchIds.has(entry.id)),
+        updated: parsed.updated.filter((entry) => batchIds.has(entry.id)),
+        archived: parsed.archived.filter((entry) => batchIds.has(entry.id)),
+    };
+    const unknown = [...parsed.verified, ...parsed.updated, ...parsed.archived].filter(
+        (entry) => !batchIds.has(entry.id),
     );
+    if (unknown.length > 0) {
+        log(
+            `[dreamer] verify warning: dropping ${unknown.length} unknown verification entr${unknown.length === 1 ? "y" : "ies"} outside the current batch (${unknown.map((entry) => entry.id).join(", ")})`,
+        );
+    }
+    const validIds = [...valid.verified, ...valid.updated, ...valid.archived].map(
+        (entry) => entry.id,
+    );
+    assertNoDuplicateManifestIds(validIds, "verify");
+
+    // A closed root rules out truncation, but fewer than half of the requested ids
+    // is more likely a confused response to another request than an ordinary tail
+    // omission. Reject before any writes so an unrelated minority cannot be banked.
+    if (validIds.length * 2 < batch.length) {
+        throw new Error(
+            `verify manifest covers ${validIds.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
+        );
+    }
+    if (validIds.length === 0) return { verified: 0, updated: 0, archived: 0 };
     const now = Date.now();
 
     // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
@@ -371,11 +401,11 @@ export async function applyVerifyManifest(
         | { kind: "update"; id: number; files: string[]; content: string; hash: string }
         | { kind: "archive"; id: number; reason: string };
     const writes: VerifyWrite[] = [];
-    for (const v of parsed.verified) {
+    for (const v of valid.verified) {
         const files = await normalizeFiles(args, v.files);
         writes.push({ kind: "verify", id: v.id, files });
     }
-    for (const u of parsed.updated) {
+    for (const u of valid.updated) {
         const content = u.content.trim();
         // An empty/oversized "update" is unsafe — fall back to a plain re-verify
         // (bank the progress, keep the old content) rather than wipe a memory.
@@ -393,7 +423,7 @@ export async function applyVerifyManifest(
             hash: computeNormalizedHash(content),
         });
     }
-    for (const a of parsed.archived) {
+    for (const a of valid.archived) {
         writes.push({ kind: "archive", id: a.id, reason: a.reason });
     }
     if (writes.length === 0) return { verified: 0, updated: 0, archived: 0 };

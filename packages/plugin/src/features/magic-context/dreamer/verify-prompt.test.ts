@@ -48,12 +48,11 @@ describe("parseVerifyManifest", () => {
         ).toThrow(/JSON array unrecognized; expected <verify> with <verified> entries/);
     });
 
-    it("rejects duplicate ids and invalid entries", () => {
-        expect(() =>
-            parseVerifyManifest(
-                `<verify><verified id="9" files="a.ts"/><archive id="9" reason="r"/></verify>`,
-            ),
-        ).toThrow(/duplicate id/);
+    it("preserves ids for batch-aware duplicate validation and rejects invalid entries", () => {
+        const parsed = parseVerifyManifest(
+            `<verify><verified id="9" files="a.ts"/><archive id="9" reason="r"/></verify>`,
+        );
+        expect([...parsed.verified, ...parsed.archived].map((entry) => entry.id)).toEqual([9, 9]);
         expect(() =>
             parseVerifyManifest(`<verify><verified id="x" files="a.ts"/></verify>`),
         ).toThrow(/numeric id/);
@@ -67,19 +66,34 @@ describe("validateVerifyManifest", () => {
         );
     });
 
-    it("rejects missing and extra ids at retry time", () => {
-        expect(() =>
+    it("accepts a closed subset and unknown ids for apply-time filtering", () => {
+        expect(
             validateVerifyManifest(
                 `<verify><verified id="1" files="a.ts"/></verify>`,
                 new Set([1, 2]),
-            ),
-        ).toThrow(/missing id 2/);
-        expect(() =>
+            ).verified,
+        ).toHaveLength(1);
+        expect(
             validateVerifyManifest(
                 `<verify><verified id="1" files="a.ts"/><verified id="9" files="b.ts"/></verify>`,
                 new Set([1]),
+            ).verified,
+        ).toHaveLength(2);
+    });
+
+    it("rejects duplicate ids that belong to the requested batch", () => {
+        expect(() =>
+            validateVerifyManifest(
+                `<verify><verified id="1" files="a.ts"/><archive id="1" reason="r"/></verify>`,
+                new Set([1, 2]),
             ),
-        ).toThrow(/unknown id 9/);
+        ).toThrow(/duplicate id/);
+    });
+
+    it("still rejects an unclosed root before a partial prefix can apply", () => {
+        expect(() =>
+            validateVerifyManifest(`<verify><verified id="1" files="a.ts"/>`, new Set([1, 2])),
+        ).toThrow(/closing root/);
     });
 });
 

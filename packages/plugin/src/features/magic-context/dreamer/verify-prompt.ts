@@ -14,7 +14,6 @@
  */
 
 import {
-    assertManifestCoversExactly,
     assertNoDuplicateManifestIds,
     assertParsedManifestNonEmpty,
     describeUnrecognizedManifestShape,
@@ -128,12 +127,14 @@ export function parseVerifyManifest(text: string): ParsedVerifyManifest {
     if (verifyIds(out).length === 0 && body.trim().length > 0) {
         throw new Error(describeUnrecognizedManifestShape(text, "verify", "verified"));
     }
-    assertNoDuplicateManifestIds(verifyIds(out), "verify");
     return out;
 }
 
-/** Retry-time contract: non-empty parse + exact id coverage. Apply still
- *  re-asserts coverage as the final belt. */
+/** Retry responses must contain a non-empty manifest with syntactically valid
+ *  entries and a closing root element, so the response is complete rather than
+ *  truncated. The verifier commits valid expected ids and leaves omissions for
+ *  the per-memory gate to select next run. Duplicate expected ids are rejected;
+ *  duplicate unknown ids are ignored. */
 export function validateVerifyManifest(
     text: string,
     expectedIds: ReadonlySet<number>,
@@ -141,6 +142,9 @@ export function validateVerifyManifest(
     const parsed = parseVerifyManifest(text);
     const ids = verifyIds(parsed);
     assertParsedManifestNonEmpty(ids.length, expectedIds.size, text, "verify", "verified");
-    assertManifestCoversExactly(ids, expectedIds, "verify");
+    assertNoDuplicateManifestIds(
+        ids.filter((id) => expectedIds.has(id)),
+        "verify",
+    );
     return parsed;
 }
