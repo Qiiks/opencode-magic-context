@@ -1,6 +1,12 @@
 /// <reference types="bun-types" />
 
-import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+    __resetNotificationStateForTests,
+    drainNotifications,
+    registerNotificationSink,
+} from "../../shared/rpc-notifications";
+import type { StatusDetail } from "../../shared/rpc-types";
 import { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
@@ -258,7 +264,12 @@ describe("createMagicContextCommandHandler", () => {
     let db: Database;
 
     beforeEach(() => {
+        __resetNotificationStateForTests();
         db = createTestDb();
+    });
+
+    afterEach(() => {
+        __resetNotificationStateForTests();
     });
 
     it("ignores unrelated commands", async () => {
@@ -679,6 +690,148 @@ describe("createMagicContextCommandHandler", () => {
             expect(text).toContain("- Dropped: 0");
             expect(text).toContain("- Total queued: 0");
             expect(text).toContain("**Protected tags:** 2");
+        });
+    });
+
+    describe("TUI dialog routing", () => {
+        const statusDetail = (sessionId: string): StatusDetail =>
+            ({
+                sessionId,
+                usagePercentage: 75,
+                inputTokens: 96_000,
+                contextLimit: 128_000,
+                cacheTtl: "5m",
+                cacheRemainingMs: 42_000,
+                cacheExpired: false,
+                cacheNeverExpires: false,
+                historianRunning: false,
+                boundaryPresent: undefined,
+                coverageOrdinal: undefined,
+                memoryCount: 8,
+                memoryBlockCount: 3,
+                activeTags: 4,
+                droppedTags: 1,
+                pendingOpsCount: 2,
+                executeThreshold: 65,
+                executeThresholdClamped: false,
+                compaction_enabled: true,
+                recompProgress: null,
+                lastTransformError: null,
+            }) as StatusDetail;
+
+        it("renders shared status markdown through the normal response path without a live TUI sink", async () => {
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                getStatusDetail: statusDetail,
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-status", sessionID: "ses-sinkless", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+            );
+
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-sinkless",
+                expect.stringContaining("**Usage:** 75.0% (96,000 / 128,000 usable tokens)"),
+                {},
+            );
+            expect(drainNotifications()).toEqual([]);
+        });
+
+        it("uses the live TUI dialog instead of duplicating a Desktop response", async () => {
+            const received: Array<Record<string, unknown>> = [];
+            const unregister = registerNotificationSink({
+                sessionId: "ses-live",
+                protocol: 2,
+                send: (notification) => received.push(notification.payload),
+            });
+            const sendNotification = mock(async () => {});
+            const getStatusDetail = mock(statusDetail);
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                getStatusDetail,
+                sendNotification,
+            });
+
+            try {
+                await expectSentinel(
+                    handler["command.execute.before"](
+                        { command: "ctx-status", sessionID: "ses-live", arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+                );
+
+                expect(received).toEqual([{ action: "show-status-dialog" }]);
+                expect(getStatusDetail).not.toHaveBeenCalled();
+                expect(sendNotification).not.toHaveBeenCalled();
+            } finally {
+                unregister();
+            }
+        });
+
+        it("routes recomp confirmation to text when sinkless and to a dialog when live", async () => {
+            const sinklessNotification = mock(async () => {});
+            const sinklessHandler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                executeRecomp: async () => "should not run",
+                sendNotification: sinklessNotification,
+            });
+
+            await expectSentinel(
+                sinklessHandler["command.execute.before"](
+                    { command: "ctx-recomp", sessionID: "ses-recomp-sinkless", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
+            );
+            expect(sinklessNotification).toHaveBeenCalledWith(
+                "ses-recomp-sinkless",
+                expect.stringContaining("Recomp Confirmation Required"),
+                {},
+            );
+            expect(drainNotifications()).toEqual([]);
+
+            const received: Array<Record<string, unknown>> = [];
+            const unregister = registerNotificationSink({
+                sessionId: "ses-recomp-live",
+                protocol: 2,
+                send: (notification) => received.push(notification.payload),
+            });
+            const liveNotification = mock(async () => {});
+            const liveHandler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                executeRecomp: async () => "should not run",
+                sendNotification: liveNotification,
+            });
+
+            try {
+                await expectSentinel(
+                    liveHandler["command.execute.before"](
+                        { command: "ctx-recomp", sessionID: "ses-recomp-live", arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
+                );
+
+                expect(received).toEqual([{ action: "show-recomp-dialog" }]);
+                expect(liveNotification).not.toHaveBeenCalled();
+            } finally {
+                unregister();
+            }
         });
     });
 
