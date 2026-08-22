@@ -168,6 +168,10 @@ fn consumer_options() -> ConsumerOptions {
             max_attempts: 1,
         },
         restored_debounce: Duration::from_millis(10),
+        // Post-deadline liveness probe: keep the library default. This consumer's
+        // calls fail fast on their own deadline above; the probe window only
+        // shapes how quickly a silent half-open socket is declared dead.
+        liveness_probe_window: ConsumerOptions::default().liveness_probe_window,
     }
 }
 
