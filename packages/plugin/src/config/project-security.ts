@@ -22,8 +22,7 @@ const HARNESS_KEYS = ["opencode", "pi"] as const;
 /** Every historian model-resolution field, including per-harness qualifiers.
  *  Variant and thinking_level merge onto the user's historian model at resolve
  *  time, so leaving them would let a cloned repo force extra spend. */
-const HISTORIAN_USER_ONLY_FIELDS =
-    PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution;
+const HISTORIAN_USER_ONLY_FIELDS = PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution;
 const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"] as const;
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -62,7 +62,7 @@ function hasOwnPath(root: unknown, path: string): boolean {
             cursor = cursor[index];
             continue;
         }
-        if (!isPlainObject(cursor) || !Object.prototype.hasOwnProperty.call(cursor, part)) {
+        if (!isPlainObject(cursor) || !Object.hasOwn(cursor, part)) {
             return false;
         }
         cursor = cursor[part];
@@ -216,17 +216,25 @@ function historianUserOnlyPaths(): string[] {
 
 function dreamerKeepPaths(): string[] {
     const paths: string[] = [];
-    for (const field of ocInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution)) {
+    for (const field of ocInventoryKeys(
+        PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution,
+    )) {
         paths.push(`dreamer.opencode.${field}`);
     }
-    for (const field of piInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution)) {
+    for (const field of piInventoryKeys(
+        PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution,
+    )) {
         paths.push(`dreamer.pi.${field}`);
     }
     for (const task of CANONICAL_DREAM_TASKS) {
-        for (const field of ocInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.task.migrated_execution)) {
+        for (const field of ocInventoryKeys(
+            PER_HARNESS_MIGRATION_INVENTORY.task.migrated_execution,
+        )) {
             paths.push(`dreamer.opencode.tasks.${task}.${field}`);
         }
-        for (const field of piInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.task.migrated_execution)) {
+        for (const field of piInventoryKeys(
+            PER_HARNESS_MIGRATION_INVENTORY.task.migrated_execution,
+        )) {
             paths.push(`dreamer.pi.tasks.${task}.${field}`);
         }
         paths.push(`dreamer.tasks.${task}.schedule`);
@@ -279,7 +287,14 @@ function nestedEscalationPaths(): string[] {
 }
 
 function nestedMuralModelPaths(): string[] {
-    const paths = ["mural.model", "experimental.mural.model", "historian.opencode.mural.model", "historian.pi.mural.model", "dreamer.opencode.mural.model", "dreamer.pi.mural.model"];
+    const paths = [
+        "mural.model",
+        "experimental.mural.model",
+        "historian.opencode.mural.model",
+        "historian.pi.mural.model",
+        "dreamer.opencode.mural.model",
+        "dreamer.pi.mural.model",
+    ];
     for (const task of CANONICAL_DREAM_TASKS) {
         paths.push(`dreamer.opencode.tasks.${task}.mural.model`);
         paths.push(`dreamer.pi.tasks.${task}.mural.model`);
@@ -294,7 +309,11 @@ function loadWithUserAndProjectConfig(userConfigText: string, projectConfigText:
     mkdirSync(configDir, { recursive: true });
     mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });
     writeFileSync(join(configDir, "magic-context.jsonc"), userConfigText, "utf-8");
-    writeFileSync(join(projectDir, ".cortexkit", "magic-context.jsonc"), projectConfigText, "utf-8");
+    writeFileSync(
+        join(projectDir, ".cortexkit", "magic-context.jsonc"),
+        projectConfigText,
+        "utf-8",
+    );
 
     const origXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = xdg;
@@ -317,10 +336,16 @@ describe("hostile-config stripping matrix", () => {
             piInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution),
         );
         expect(objectShapeKeys(DreamerOpenCodeHarnessBlockSchema)).toEqual(
-            [...ocInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution), "tasks"].sort(),
+            [
+                ...ocInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution),
+                "tasks",
+            ].sort(),
         );
         expect(objectShapeKeys(DreamerPiHarnessBlockSchema)).toEqual(
-            [...piInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution), "tasks"].sort(),
+            [
+                ...piInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.dreamer.migrated_execution),
+                "tasks",
+            ].sort(),
         );
         expect(objectShapeKeys(OpenCodeTaskExecutionSchema)).toEqual(
             ocInventoryKeys(PER_HARNESS_MIGRATION_INVENTORY.task.migrated_execution),
@@ -355,7 +380,11 @@ describe("hostile-config stripping matrix", () => {
 
         expect(survived).toEqual([]);
         expect(removed.sort()).toEqual(
-            [...historianUserOnlyPaths(), ...nestedEscalationPaths(), ...nestedMuralModelPaths()].sort(),
+            [
+                ...historianUserOnlyPaths(),
+                ...nestedEscalationPaths(),
+                ...nestedMuralModelPaths(),
+            ].sort(),
         );
 
         for (const path of dreamerKeepPaths()) {
@@ -378,7 +407,11 @@ describe("hostile-config stripping matrix", () => {
         expect(readPath(raw, "dreamer.pi.tasks.verify.thinking_level")).toBe("high");
         expect(readPath(raw, "dreamer.pi.tasks.verify.timeout_minutes")).toBe(45);
 
-        for (const path of [...historianUserOnlyPaths(), ...nestedEscalationPaths(), ...nestedMuralModelPaths()]) {
+        for (const path of [
+            ...historianUserOnlyPaths(),
+            ...nestedEscalationPaths(),
+            ...nestedMuralModelPaths(),
+        ]) {
             expect(warningText).toContain(path);
         }
     });

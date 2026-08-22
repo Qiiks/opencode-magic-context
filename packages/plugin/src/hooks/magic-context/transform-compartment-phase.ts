@@ -5,8 +5,8 @@ import {
 import { type ContextDatabase, updateSessionMeta } from "../../features/magic-context/storage";
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
-import type { ModelInput } from "../../shared/model-resolution";
 import { sessionLog } from "../../shared/logger";
+import type { ModelInput } from "../../shared/model-resolution";
 import {
     type ActiveCompartmentRun,
     getActiveCompartmentRun,

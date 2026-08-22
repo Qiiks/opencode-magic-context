@@ -4,8 +4,8 @@ import {
     DEFAULT_HISTORY_BUDGET_PERCENTAGE,
     DEFAULT_LOCAL_EMBEDDING_MODEL,
     type MagicContextConfig,
-    PER_HARNESS_MIGRATION_INVENTORY,
     MagicContextConfigSchema,
+    PER_HARNESS_MIGRATION_INVENTORY,
 } from "./magic-context";
 
 describe("MagicContextConfigSchema", () => {

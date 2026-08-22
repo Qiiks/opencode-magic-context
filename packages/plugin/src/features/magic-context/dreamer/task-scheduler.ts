@@ -1,6 +1,6 @@
 import type { PiThinkingLevel } from "../../../config/schema/magic-context";
-import type { ModelInput } from "../../../shared/model-resolution";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
 import { nextDueAtMs } from "./cron";
 import {

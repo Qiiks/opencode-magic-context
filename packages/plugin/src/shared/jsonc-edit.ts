@@ -9,6 +9,7 @@ import {
     type ParseError,
     parseTree,
 } from "jsonc-parser/lib/esm/main.js";
+
 // ^ Deep ESM import on purpose. jsonc-parser has no "exports" map, and its
 // "main" points at a UMD build whose runtime-relative requires (./impl/format
 // etc.) survive bundling verbatim and then fail to resolve from inside a

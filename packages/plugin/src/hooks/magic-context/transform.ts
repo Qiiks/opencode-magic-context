@@ -51,11 +51,11 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
-import type { ModelInput } from "../../shared/model-resolution";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
+import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";

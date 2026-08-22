@@ -339,10 +339,7 @@ describe("tail hygiene baseline and defer-window deltas", () => {
             textMessage("remaining", "mass ".repeat(45_000)),
             textMessage("untagged", "mass ".repeat(30_000)),
         ];
-        const tags = [
-            tag(1, "queued:p0", "message"),
-            tag(2, "remaining:p0", "message"),
-        ];
+        const tags = [tag(1, "queued:p0", "message"), tag(2, "remaining:p0", "message")];
         const initial = measureTailHygiene({ messages, tags, protectedTags: 0 });
         const queuedMass = measureTailHygiene({
             messages: [messages[0]],
@@ -395,7 +392,12 @@ describe("tail hygiene baseline and defer-window deltas", () => {
     });
 
     it("replays a prior Channel-1 reminder byte-identically when queue state changes U", () => {
-        const original = nativeTool("owner", "call-replay", { path: "x" }, "tool output ".repeat(500));
+        const original = nativeTool(
+            "owner",
+            "call-replay",
+            { path: "x" },
+            "tool output ".repeat(500),
+        );
         const tags = [tag(1, "call-replay", "tool", { toolOwnerMessageId: "owner" })];
         const reminder = buildChannel1Reminder("firm", 42_000, 128_000);
         const served = structuredClone(original) as MessageLike;

@@ -1,7 +1,6 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
-import type { ModelHarness } from "../shared/model-resolution";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
@@ -57,6 +56,7 @@ import {
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
+import type { ModelHarness } from "../shared/model-resolution";
 import type { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./boot-quiet";

@@ -24,7 +24,7 @@ function readString(value: unknown): string | undefined {
 }
 
 function hasOwn(record: ConfigRecord, key: string): boolean {
-    return Object.prototype.hasOwnProperty.call(record, key);
+    return Object.hasOwn(record, key);
 }
 
 /**
