@@ -8,7 +8,13 @@ import {
     type Node,
     type ParseError,
     parseTree,
-} from "jsonc-parser";
+} from "jsonc-parser/lib/esm/main.js";
+// ^ Deep ESM import on purpose. jsonc-parser has no "exports" map, and its
+// "main" points at a UMD build whose runtime-relative requires (./impl/format
+// etc.) survive bundling verbatim and then fail to resolve from inside a
+// bundled chunk. When this module became reachable from the plugin entry (the
+// config raw-loader), that broken require made the ENTIRE plugin bundle fail
+// to load at boot. The ESM build bundles statically and safely.
 
 interface TokenLocation {
     offset: number;
