@@ -414,7 +414,14 @@ describe("mapMemories disposition", () => {
 
             const firstResult = await mapMemories(firstRun);
 
-            expect(partial.promptIds()).toEqual([[first.id, second.id], [second.id]]);
+            const [initialPrompt, retryPrompt] = partial.promptIds();
+            if (!initialPrompt || !retryPrompt) throw new Error("missing prompt fixture");
+            expect(initialPrompt).toHaveLength(2);
+            expect([...initialPrompt].sort((a, b) => a - b)).toEqual([first.id, second.id]);
+            // Mapping prioritizes by the memory query's recency ordering. The retry
+            // contract is that the unreturned id, rather than a fixed prompt position,
+            // is the one left for the next run.
+            expect(retryPrompt).toEqual([second.id]);
             expect(firstResult).toEqual({
                 mapped: 0,
                 independent: 1,
