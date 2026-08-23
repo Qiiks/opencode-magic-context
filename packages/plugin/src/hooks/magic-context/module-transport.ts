@@ -24,6 +24,18 @@ import { isRecord } from "../../shared/record-type-guard";
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
+/**
+ * Longest connection-backoff remainder a pass will wait through instead of
+ * failing. The backoff latch escalates 1s → 2s → 4s → 8s → 16s → 30s, so this
+ * budget admits the short rungs that follow an ordinary module bounce (a
+ * restart typically re-arms within seconds) while the 16s/30s rungs of a
+ * durably-down daemon still fail fast. A turn lost to a one-second latch
+ * remainder is exactly the outage LKG/raw fallbacks cannot recover, because
+ * the module is usually back before the user can retry manually.
+ */
+const CONNECT_BACKOFF_WAIT_BUDGET_MS = 12_000;
+/** Spread concurrent waiters so they do not hit the daemon on one instant. */
+const CONNECT_BACKOFF_WAIT_JITTER_MS = 100;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
@@ -474,6 +486,7 @@ export class SubcModuleTransport {
                         args.sessionId,
                         args.projectRoot,
                         attemptDeadlineMs,
+                        args.signal,
                     );
                     activeAttemptClient = ensuredRoute.client;
                     if (args.signal?.aborted) {
@@ -692,6 +705,7 @@ export class SubcModuleTransport {
         sessionId: string,
         rawProjectRoot: string,
         deadlineMs = Date.now() + this.requestTimeoutMs,
+        signal?: AbortSignal,
     ): Promise<EnsuredRoute> {
         // The transform and tool lanes can observe the same directory under different
         // spellings when the project is reached through a symlink (OpenCode reports the
@@ -705,7 +719,7 @@ export class SubcModuleTransport {
         const routeKey = `${sessionId}\0${projectRoot}`;
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
-        const client = await this.ensureConnected();
+        const client = await this.ensureConnected(signal);
         const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
         if (existing?.generation === generation) {
@@ -786,18 +800,60 @@ export class SubcModuleTransport {
         });
     }
 
-    private async ensureConnected(): Promise<SubcClient> {
+    private backoffActiveError(): Error & { code?: string } {
+        const error = new Error(
+            `subc connection backoff active until ${this.nextProbeMs}`,
+        ) as Error & {
+            code?: string;
+        };
+        error.code = "SUBC_CONNECTION_BACKOFF";
+        return error;
+    }
+
+    /** Sleep that ends early when the caller's pass is aborted. */
+    private sleepAbortable(durationMs: number, signal?: AbortSignal): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            if (signal?.aborted) {
+                reject(signal.reason ?? new Error("module transport call aborted"));
+                return;
+            }
+            const onAbort = (): void => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                reject(signal?.reason ?? new Error("module transport call aborted"));
+            };
+            const timer = setTimeout(
+                () => {
+                    signal?.removeEventListener("abort", onAbort);
+                    resolve();
+                },
+                Math.max(0, durationMs),
+            );
+            signal?.addEventListener("abort", onAbort, { once: true });
+        });
+    }
+
+    private async ensureConnected(signal?: AbortSignal): Promise<SubcClient> {
         if (this.client) return this.client;
         if (this.connectionPromise) return await this.connectionPromise;
-        const now = Date.now();
+        let now = Date.now();
         if (now < this.nextProbeMs) {
-            const error = new Error(
-                `subc connection backoff active until ${this.nextProbeMs}`,
-            ) as Error & {
-                code?: string;
-            };
-            error.code = "SUBC_CONNECTION_BACKOFF";
-            throw error;
+            const remainingMs = this.nextProbeMs - now;
+            if (remainingMs > CONNECT_BACKOFF_WAIT_BUDGET_MS) throw this.backoffActiveError();
+            // In-pass wait: sleep out the remainder on THIS pass's own timer and
+            // then make the normal connection attempt (which keeps its per-attempt
+            // deadline and one fresh-connection retry). The sleep is pass-scoped —
+            // it holds only the calling session's serial lane, never a global lock
+            // — so sibling sessions' passes wait or fail on their own schedule.
+            const jitterMs = Math.floor(Math.random() * CONNECT_BACKOFF_WAIT_JITTER_MS);
+            await this.sleepAbortable(remainingMs + jitterMs, signal);
+            // Another pass may have connected (or started connecting) while we slept.
+            if (this.client) return this.client;
+            if (this.connectionPromise) return await this.connectionPromise;
+            now = Date.now();
+            // A concurrent attempt can fail while we sleep and re-arm the latch
+            // past our wake time; fail fast like before instead of waiting again.
+            if (now < this.nextProbeMs) throw this.backoffActiveError();
         }
 
         const generation = this.connectionGeneration;

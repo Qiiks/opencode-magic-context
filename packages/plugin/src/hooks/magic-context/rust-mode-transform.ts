@@ -44,7 +44,10 @@ import {
     type ToolAvailabilityVerdict,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import {
+    EmergencyFailClosedError,
+    ENGINE_RECONNECTING_USER_MESSAGE,
+} from "./emergency-fail-closed";
 import {
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
@@ -52,6 +55,7 @@ import {
     resolveTrustedContextLimit,
 } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import { saveLkgSlotToDb } from "./lkg-persist";
 import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
 import {
     captureSlot,
@@ -157,14 +161,31 @@ async function resolveCombinedTodowriteVerdict(
 }
 const RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN = 4;
 
-function rawFallbackSerializedBytes(messages: readonly MessageLike[]): number | null {
+/**
+ * Serialize the raw array message-by-message with a running byte sum, aborting
+ * as soon as the sum proves the prompt is over the context limit. A refusal
+ * then costs a fraction of the full serialization and never runs the
+ * tokenizer; when the sum stays under the budget the total matches a
+ * whole-array serialization up to array punctuation.
+ */
+function rawFallbackSerializedBytes(
+    messages: readonly MessageLike[],
+    abortAboveBytes: number,
+): { bytes: number; aborted: boolean } | null {
+    let bytes = 0;
     try {
-        const serialized = JSON.stringify(messages);
-        return typeof serialized === "string" ? Buffer.byteLength(serialized) : null;
+        for (const message of messages) {
+            const serialized = JSON.stringify(message);
+            if (typeof serialized !== "string") return null;
+            // +1 accounts for the separator between array entries.
+            bytes += Buffer.byteLength(serialized) + 1;
+            if (bytes > abortAboveBytes) return { bytes, aborted: true };
+        }
     } catch {
         // Serialization is itself required before these messages can reach a provider.
         return null;
     }
+    return { bytes: bytes + 1, aborted: false };
 }
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
@@ -1356,8 +1377,7 @@ export function createRustModeTransform(
         state.parkCount += 1;
         state.passesSincePark = 0;
         state.warningSent = true;
-        const warning =
-            "Rust Magic Context is unavailable for this session; retry after the module recovers.";
+        const warning = ENGINE_RECONNECTING_USER_MESSAGE;
         sessionLog(
             sessionId,
             `mc_rust_park_transition failure_passes=${state.consecutiveFailures} pass_count=${state.passCount} park_count=${state.parkCount}`,
@@ -1538,7 +1558,7 @@ export function createRustModeTransform(
                   }
                 : undefined,
         );
-        const captured = captureSlot(plan.sessionId, {
+        const slot = {
             jsonPrefix: plan.jsonPrefix,
             inputIdSeq: plan.inputIds,
             inputContentDigests,
@@ -1549,8 +1569,13 @@ export function createRustModeTransform(
             capturedAt: plan.capturedAt,
             rowVersion: plan.rowVersion,
             captureSequence: plan.captureSequence,
-        });
+        };
+        const captured = captureSlot(plan.sessionId, slot);
         if (!captured) throw new Error("LKG slot rejected the prepared snapshot");
+        // Durability across restarts: store the exact accepted snapshot (the
+        // jsonPrefix string is reused as-is, never re-serialized). Best-effort —
+        // a write failure leaves the in-memory slot serving this process.
+        saveLkgSlotToDb(deps.db, plan.sessionId, slot);
         state.lkgLastCapturedRowVersion = plan.rowVersion;
         state.lkgSyncCaptureRequired = false;
         return "captured";
@@ -1654,32 +1679,41 @@ export function createRustModeTransform(
                     ? overflowState.detectedContextLimit
                     : undefined);
             if (contextLimit !== undefined) {
-                let estimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
-                try {
-                    estimate = rawFallbackEstimator({
-                        messages,
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: model?.providerID,
-                        modelID: model?.modelID,
-                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                    });
-                } catch {
-                    // The byte proxy below remains available when tokenization does not.
-                }
-                const rawBytes = rawFallbackSerializedBytes(messages);
                 // The local tokenizer is telemetry-grade and can materially undercount a new
                 // provider tokenizer. Four serialized bytes per context token is an independent,
                 // conservative risk budget for a raw full-history fallback.
+                const proxyBudgetBytes = contextLimit * RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN;
+                // Byte proxy first: once the running serialized sum crosses the budget,
+                // the refusal is proven and the tokenizer pass — seconds on giant
+                // histories — is skipped entirely on the failure path.
+                const proxy = rawFallbackSerializedBytes(messages, proxyBudgetBytes);
                 const proxyTokens =
-                    rawBytes === null
+                    proxy === null
                         ? contextLimit + 1
-                        : Math.ceil(rawBytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
+                        : Math.ceil(proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
+                let estimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
+                let estimatorRan = false;
+                if (proxy !== null && !proxy.aborted) {
+                    try {
+                        estimate = rawFallbackEstimator({
+                            messages,
+                            systemPromptTokens: sessionMeta.systemPromptTokens,
+                            providerID: model?.providerID,
+                            modelID: model?.modelID,
+                            agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                        });
+                        estimatorRan = true;
+                    } catch {
+                        // The byte proxy above remains available when tokenization does not.
+                    }
+                }
                 const refusalTokens = Math.max(estimate?.tokens ?? 0, proxyTokens);
                 if (refusalTokens > contextLimit) {
                     sessionLog(
                         sessionId,
-                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? "unavailable"} ` +
-                            `proxy_bytes=${rawBytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}`,
+                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? (estimatorRan ? "unavailable" : "skipped")} ` +
+                            `proxy_bytes=${proxy?.bytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}` +
+                            (proxy?.aborted === true ? " early_abort=true" : ""),
                     );
                     throw new RawFallbackContextLimitError(refusalTokens, contextLimit, { cause });
                 }
@@ -2804,10 +2838,9 @@ export function createRustModeTransform(
                 sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");
                 markFailure(sessionId, state, error);
                 finishPass(false, false);
-                throw new EmergencyFailClosedError(
-                    "Rust Magic Context was unavailable at a provider-proven context limit",
-                    { cause: error },
-                );
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, {
+                    cause: error,
+                });
             }
             // Validation happens before the caller-owned array is replaced, so the
             // original live array is still available for fail-open replay.
