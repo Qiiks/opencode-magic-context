@@ -15,6 +15,10 @@ import {
     sessionLogLines,
 } from "../src/rust-scenario-support";
 
+// Bun's per-test timeout does not extend setup or cleanup hooks. A cold hermetic
+// Cargo build can exceed Bun's 5s hook default when this drill is run directly.
+const FM_OC_3_TIMEOUT_MS = 300_000;
+
 describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-heal", () => {
     let h: RustTestHarness;
 
@@ -23,11 +27,11 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
             modelContextLimit: 100_000,
             magicContextConfig: { execute_threshold_percentage: 40, protected_tags: 1 },
         });
-    });
+    }, FM_OC_3_TIMEOUT_MS);
 
     afterEach(async () => {
         await h?.dispose();
-    });
+    }, FM_OC_3_TIMEOUT_MS);
 
     it(
         "recovers within the exported retry budget without restarting the session",
@@ -90,6 +94,6 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
             assertLoudModuleFailure(h, sessionId);
             assertMessagesHaveNoPlaceholders(h.lastMainMessages(), sessionId);
         },
-        300_000,
+        FM_OC_3_TIMEOUT_MS,
     );
 });
