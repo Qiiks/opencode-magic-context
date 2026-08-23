@@ -34,10 +34,11 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
             const sessionId = await h.createSession();
             await driveToSteadyState(h, sessionId, 2);
 
+            const armPrompt = `FM-OC-6 arm after SIGKILL: ${h.ballast(400)}`;
             let overflowSent = false;
             h.mock.addMatcher((body) => {
-                const system = JSON.stringify(body.system ?? "");
-                if (overflowSent || !system.includes("## Magic Context")) return null;
+                const messages = JSON.stringify(body.messages ?? []);
+                if (overflowSent || !messages.includes(armPrompt)) return null;
                 overflowSent = true;
                 return {
                     error: {
@@ -50,11 +51,11 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
             });
 
             await h.subc.killModuleAndWait();
-            try {
-                await h.sendPrompt(sessionId, `FM-OC-6 arm after SIGKILL: ${h.ballast(400)}`);
-            } catch {
-                // The raw continuation reaches the provider and arms recovery.
-            }
+            const armRequest = h.sendPrompt(sessionId, armPrompt).catch(() => undefined);
+            await h.waitFor(() => overflowSent, {
+                label: "FM-OC-6 arm request reached provider",
+            });
+            await armRequest;
             await h.waitFor(
                 () => {
                     const row = h

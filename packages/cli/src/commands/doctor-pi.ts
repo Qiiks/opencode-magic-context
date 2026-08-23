@@ -219,7 +219,7 @@ function printResult(prompts: PromptIO, result: CheckResult): void {
     if (result.status === "pass") prompts.log.success(line);
     else if (result.status === "info") prompts.log.info(line);
     else if (result.status === "warn") prompts.log.warn(line);
-    else console.error(line);
+    else prompts.log.error(line);
 }
 
 function summarize(results: CheckResult[]): Pick<HealthReport, "pass" | "warn" | "fail"> {
