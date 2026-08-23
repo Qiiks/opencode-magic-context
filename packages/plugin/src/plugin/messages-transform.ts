@@ -103,7 +103,12 @@ function enforcePersistedUserTerminatedTail(messages: MessageWithParts[]): void 
                 message.info.role !== "assistant" || assistantHasCompletedContent(message),
         )
     ) {
-        throw new AssistantTerminalRetryError();
+        // An assistant with real content at the array tail is OpenCode's NORMAL
+        // mid-turn continuation shape: tool results ride as parts on the streaming
+        // assistant, and the provider serializer emits the user-terminated wire
+        // itself. Leave the array untouched — refusing (or reordering) here kills
+        // every tool-using turn at its first continuation pass.
+        return;
     }
     moveUserToTail(messages, messages[userIndex], userIndex);
 }
@@ -141,7 +146,11 @@ function preserveUserTerminatedTail(
                 message.info.role !== "assistant" || assistantHasCompletedContent(message),
         )
     ) {
-        throw new AssistantTerminalRetryError();
+        // Real model output landed after the input user mid-transform. Moving the
+        // user below its own answer would rewrite causality, and refusing would
+        // fail a turn that the provider serializer handles correctly — so leave
+        // the array exactly as OpenCode built it.
+        return;
     }
     moveUserToTail(messages, userIndex >= 0 ? messages[userIndex] : inputTail, userIndex);
 }

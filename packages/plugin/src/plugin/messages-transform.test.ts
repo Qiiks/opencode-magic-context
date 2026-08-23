@@ -413,14 +413,11 @@ describe("createMessagesTransformHandler — issue #327 wire tail", () => {
             ],
         });
 
-        await expect(handler({}, output)).rejects.toEqual(
-            expect.objectContaining({
-                name: "AssistantTerminalRetryError",
-                code: "ASSISTANT_TERMINAL_RETRY",
-                message: ASSISTANT_TERMINAL_RETRY_MESSAGE,
-            }),
-        );
-        expect(called).toBe(false);
+        // Mid-turn continuation shape: the streaming assistant (with completed
+        // tool parts) legitimately terminates the array. The wrapper must pass it
+        // through untouched and still run the inner transform.
+        await handler({}, output);
+        expect(called).toBe(true);
         expect(output.messages.at(-1)?.info.id).toBe("assistant-completed");
     });
 
@@ -441,9 +438,11 @@ describe("createMessagesTransformHandler — issue #327 wire tail", () => {
             },
         });
 
-        await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(
-            AssistantTerminalRetryError,
-        );
+        const output = makeOutput();
+        await handler({}, output);
+        // Completed content appended mid-transform stays exactly where OpenCode
+        // put it — never reordered below its prompt, never refused.
+        expect(output.messages.at(-1)?.info.id).toBe("assistant-completed-late");
     });
 });
 
