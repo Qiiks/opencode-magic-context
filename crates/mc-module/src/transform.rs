@@ -1780,6 +1780,9 @@ struct Channel1NudgeInputs<'a, 'ctx> {
 #[derive(Debug)]
 pub enum TransformError {
     Store(McStoreError),
+    /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
+    /// below its own prompt would rewrite conversational causality.
+    AssistantTerminalRetry,
     /// Live-source ordinals must be unique + strictly increasing.
     OrdinalViolation,
     /// A non-synthetic item used a reserved `mc_*` id.
@@ -1824,6 +1827,10 @@ impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransformError::Store(e) => write!(f, "store: {e}"),
+            TransformError::AssistantTerminalRetry => write!(
+                f,
+                "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue."
+            ),
             TransformError::OrdinalViolation => {
                 write!(f, "live-source ordinals not strictly increasing")
             }
@@ -11484,6 +11491,104 @@ enum FrozenTrailingBlankDecision {
     Strip,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UserTerminatedTailDecision {
+    Unchanged,
+    Reanchor { user_mid: String },
+    RejectCompletedAssistant,
+}
+
+fn assistant_has_completed_content(message: &CkIngressMessage) -> bool {
+    message.ck.content.iter().any(|block| match &block.kind {
+        ck_wire::CkKind::Text { text } => !text.trim().is_empty(),
+        _ => true,
+    })
+}
+
+/// OpenCode marks notice-triggered user prompts synthetic, the same flag used by stale
+/// injected history. Only the newest user owns the live request; historical synthetic rows
+/// remain excluded by the ordinary tail filters.
+pub(crate) fn is_newest_synthetic_user_prompt(
+    request: &TransformRequest,
+    message: &CkIngressMessage,
+) -> bool {
+    message.ck.meta.synthetic
+        && message.ck.role == "user"
+        && request
+            .messages
+            .last()
+            .is_some_and(|newest| newest.mid == message.mid)
+}
+
+pub(crate) fn user_terminated_tail_decision(
+    request: &TransformRequest,
+) -> UserTerminatedTailDecision {
+    if !request.serve_native
+        || SerializerProfile::parse(&request.serializer_profile)
+            != Some(SerializerProfile::OpencodeAiSdk)
+        || request.provider_id.as_deref() != Some("anthropic")
+        || request
+            .messages
+            .last()
+            .map(|message| message.ck.role.as_str())
+            != Some("assistant")
+    {
+        return UserTerminatedTailDecision::Unchanged;
+    }
+
+    let Some(user_index) = request
+        .messages
+        .iter()
+        .rposition(|message| message.ck.role == "user")
+    else {
+        return UserTerminatedTailDecision::Unchanged;
+    };
+    let trailing = &request.messages[user_index + 1..];
+    // A blank/error shell contains no provider-authored content, so moving the existing
+    // user boundary past it is lossless. Reasoning, tools, media, opaque blocks, and
+    // non-blank text are completed content and must never be reordered below their prompt.
+    if trailing
+        .iter()
+        .all(|message| message.ck.role == "assistant" && !assistant_has_completed_content(message))
+    {
+        UserTerminatedTailDecision::Reanchor {
+            user_mid: request.messages[user_index].mid.clone(),
+        }
+    } else if request.prev_response_completed_at_ms.is_some() {
+        // The completion timestamp distinguishes a retry of finished output from an
+        // incomplete assistant snapshot that has not been observed complete.
+        UserTerminatedTailDecision::RejectCompletedAssistant
+    } else {
+        UserTerminatedTailDecision::Unchanged
+    }
+}
+
+fn enforce_user_terminated_tail(
+    request: &TransformRequest,
+    output: &mut Vec<ServedMessage>,
+) -> Result<(), TransformError> {
+    match user_terminated_tail_decision(request) {
+        UserTerminatedTailDecision::Unchanged => Ok(()),
+        UserTerminatedTailDecision::RejectCompletedAssistant => {
+            Err(TransformError::AssistantTerminalRetry)
+        }
+        UserTerminatedTailDecision::Reanchor { user_mid } => {
+            let user = request
+                .messages
+                .iter()
+                .find(|message| message.mid == user_mid)
+                .expect("the tail decision's user comes from this request");
+            let served_user = output
+                .iter()
+                .position(|message| message.meta.harness_id.as_deref() == Some(user_mid.as_str()))
+                .map(|index| output.remove(index))
+                .unwrap_or_else(|| ServedMessage::from_message(user.ck.clone()));
+            output.push(served_user);
+            Ok(())
+        }
+    }
+}
+
 fn frozen_trailing_blank_keep_count(core: &CoreState, mid: &str) -> Option<usize> {
     let unit = message_strip_unit(core, "trailing_blank_keep", mid)?;
     if unit.frozen_payload.is_empty() {
@@ -11910,9 +12015,12 @@ fn build_output_with_tags_inner(
     let output_mids = req
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic)
         .filter(|message| {
-            is_tail(message.ordinal, output_coverage)
+            !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
+        })
+        .filter(|message| {
+            is_newest_synthetic_user_prompt(req, message)
+                || is_tail(message.ordinal, output_coverage)
                 || (serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic)
                     && is_uncovered_leading_system(message, meta))
                 || lineage_anchor_mid == Some(message.mid.as_str())
@@ -11966,11 +12074,10 @@ fn build_output_with_tags_inner(
         .map(|anchor| synthetic_todo_render_anchor_mid(projection, anchor));
     let mut inserted_synthetic_todo = false;
     let tail_loop_started_at = Instant::now();
-    for msg in req
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-    {
+    for msg in req.messages.iter().filter(|message| {
+        !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
+    }) {
+        let keep_live_synthetic_prompt = is_newest_synthetic_user_prompt(req, msg);
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
             && is_uncovered_leading_system(msg, meta);
@@ -11980,7 +12087,8 @@ fn build_output_with_tags_inner(
             .and_then(split_block_id)
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
         let keep_split_invocation = split_coverage_invocation_mids.contains(msg.mid.as_str());
-        if !is_tail(msg.ordinal, output_coverage)
+        if !keep_live_synthetic_prompt
+            && !is_tail(msg.ordinal, output_coverage)
             && !keep_leading_system
             && !keep_lineage_anchor
             && !keep_split_invocation
@@ -12271,6 +12379,7 @@ fn build_output_with_tags_inner(
         );
     }
 
+    enforce_user_terminated_tail(req, &mut out)?;
     out = enforce_unique_tool_use_ids(out, &req.session_id);
 
     build_timings.total = elapsed_ms(build_output_started_at);
@@ -17818,6 +17927,208 @@ pub(crate) mod tests {
             &messages[0].content[1].kind,
             ck_wire::CkKind::Reasoning { text, .. } if text == "signed thinking"
         ));
+    }
+
+    #[test]
+    fn anthropic_retry_tail_reanchors_only_contentless_assistants_and_rejects_completed_content() {
+        fn message(
+            mid: &str,
+            ordinal: u64,
+            role: &str,
+            content: Vec<CkWireBlock>,
+        ) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    role,
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn request(session: &str, assistant_content: Vec<CkWireBlock>) -> TransformRequest {
+            let mut request = profile_req(
+                SerializerProfile::OpencodeAiSdk,
+                session,
+                "cfg",
+                vec![
+                    message(
+                        "prompt",
+                        1,
+                        "user",
+                        vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: "continue safely".to_string(),
+                        })],
+                    ),
+                    message("assistant-tail", 2, "assistant", assistant_content),
+                ],
+            );
+            request.provider_id = Some("anthropic".to_string());
+            request.serve_native = true;
+            request.prev_response_completed_at_ms = Some(1);
+            request
+        }
+
+        let blank_request = request(
+            "assistant-tail-blank",
+            vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: " \n\t".to_string(),
+            })],
+        );
+        assert_eq!(
+            user_terminated_tail_decision(&blank_request),
+            UserTerminatedTailDecision::Reanchor {
+                user_mid: "prompt".to_string()
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let blank_store = store(dir.path());
+        let blank_response = run(&blank_store, &blank_request, &spine());
+        let blank_roles = blank_response
+            .messages()
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert!(blank_roles.ends_with(&["assistant", "user"]));
+        assert_eq!(
+            blank_response
+                .messages()
+                .last()
+                .unwrap()
+                .meta
+                .harness_id
+                .as_deref(),
+            Some("prompt")
+        );
+        let first_bytes = blank_response
+            .messages()
+            .iter()
+            .map(|message| message.canonical_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let replay = run(&blank_store, &blank_request, &spine());
+        assert_eq!(
+            replay
+                .messages()
+                .iter()
+                .map(|message| message.canonical_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            first_bytes
+        );
+
+        for (session, completed_content) in [
+            (
+                "assistant-tail-reasoning",
+                vec![CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "completed thought".to_string(),
+                    signature: Some("sig".to_string()),
+                })],
+            ),
+            (
+                "assistant-tail-tool",
+                vec![CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: "call-completed".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "command": "true" }),
+                    provider_executed: false,
+                })],
+            ),
+        ] {
+            let completed_request = request(session, completed_content);
+            assert_eq!(
+                user_terminated_tail_decision(&completed_request),
+                UserTerminatedTailDecision::RejectCompletedAssistant
+            );
+            let completed_dir = tempfile::tempdir().unwrap();
+            let error = transform(
+                &store(completed_dir.path()),
+                &completed_request,
+                &pctx("git:proj", "/nonexistent-docs", 0),
+            )
+            .expect_err("completed assistant retry must reject before serving");
+            assert!(matches!(error, TransformError::AssistantTerminalRetry));
+            assert_eq!(
+                error.to_string(),
+                "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue."
+            );
+        }
+    }
+
+    #[test]
+    fn newest_synthetic_user_is_served_as_the_notice_triggered_live_prompt() {
+        let mut historical_notice = wire_item(
+            "user",
+            "notice-historical",
+            1,
+            &["<system-reminder>historical completion</system-reminder>"],
+        );
+        historical_notice.ck.meta.synthetic = true;
+        let mut live_notice = wire_item(
+            "user",
+            "msg_02d6ec606001jEBwnJuw1OX68F",
+            5,
+            &["<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>"],
+        );
+        live_notice.ck.meta.synthetic = true;
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "notice-triggered-engram",
+            "cfg",
+            vec![
+                historical_notice,
+                wire_item(
+                    "user",
+                    "msg_02d6ebbe0001hmD4CjOCNXDw8L",
+                    2,
+                    &["tool result"],
+                ),
+                reasoning_tool_shell_message(
+                    "msg_02d6ebe9800166UUl6XLz1oLIX",
+                    3,
+                    "call-status",
+                    true,
+                ),
+                reasoning_tool_shell_message(
+                    "msg_02d6f258c001Ev9GPM03YNW5Ql",
+                    4,
+                    "call-bash",
+                    true,
+                ),
+                live_notice,
+            ],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.prev_response_completed_at_ms = Some(1);
+
+        assert_eq!(
+            user_terminated_tail_decision(&request),
+            UserTerminatedTailDecision::Unchanged,
+            "the restored live prompt must make both assistant-terminal arms inapplicable"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let response = run(&store(dir.path()), &request, &spine());
+        assert_eq!(
+            response
+                .messages()
+                .last()
+                .unwrap()
+                .meta
+                .harness_id
+                .as_deref(),
+            Some("msg_02d6ec606001jEBwnJuw1OX68F")
+        );
+        assert_eq!(response.messages().last().unwrap().role, "user");
+        assert!(response
+            .messages()
+            .iter()
+            .all(|message| message.meta.harness_id.as_deref() != Some("notice-historical")));
     }
 
     #[test]

@@ -8085,10 +8085,15 @@ impl McHandler {
             )
         };
         let reject_transform = |e: crate::transform::TransformError| {
+            let code = if matches!(e, crate::transform::TransformError::AssistantTerminalRetry) {
+                "assistant_terminal_retry"
+            } else {
+                "transform_failed"
+            };
             let message = e.to_string();
             let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
             HandlerOutcome::Error {
-                code: "transform_failed".to_string(),
+                code: code.to_string(),
                 message,
             }
         };

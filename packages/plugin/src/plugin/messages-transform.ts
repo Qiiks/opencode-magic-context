@@ -24,6 +24,19 @@ import { log, sessionLog } from "../shared/logger";
 // covered defensively).
 const TRANSIENT_SQLITE_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
 
+export const ASSISTANT_TERMINAL_RETRY_MESSAGE =
+    "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue.";
+
+export class AssistantTerminalRetryError extends Error {
+    readonly code = "ASSISTANT_TERMINAL_RETRY";
+    readonly recoverable = true;
+
+    constructor() {
+        super(ASSISTANT_TERMINAL_RETRY_MESSAGE);
+        this.name = "AssistantTerminalRetryError";
+    }
+}
+
 type MessageWithParts = {
     info: import("@opencode-ai/sdk").Message;
     parts: import("@opencode-ai/sdk").Part[];
@@ -42,10 +55,64 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
     if (output.messages !== next) output.messages.splice(0, output.messages.length, ...next);
 }
 
+const ASSISTANT_METADATA_PART_TYPES = new Set([
+    "step-start",
+    "step-finish",
+    "snapshot",
+    "patch",
+    "agent",
+    "retry",
+    "subtask",
+    "compaction",
+]);
+
+function assistantHasCompletedContent(message: MessageWithParts): boolean {
+    return message.parts.some((part) => {
+        const value = part as unknown as Record<string, unknown>;
+        const type = typeof value.type === "string" ? value.type : "";
+        if (ASSISTANT_METADATA_PART_TYPES.has(type)) return false;
+        if (type === "text") return typeof value.text !== "string" || value.text.trim().length > 0;
+        return true;
+    });
+}
+
+function findLatestUserIndex(messages: readonly MessageWithParts[]): number {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index].info.role === "user") return index;
+    }
+    return -1;
+}
+
+function moveUserToTail(
+    messages: MessageWithParts[],
+    user: MessageWithParts,
+    userIndex: number,
+): void {
+    if (userIndex >= 0) messages.splice(userIndex, 1);
+    messages.push(user);
+}
+
+function enforcePersistedUserTerminatedTail(messages: MessageWithParts[]): void {
+    if (messages.at(-1)?.info.role !== "assistant") return;
+    const userIndex = findLatestUserIndex(messages);
+    const trailing = messages.slice(userIndex + 1);
+    if (
+        userIndex < 0 ||
+        trailing.some(
+            (message) =>
+                message.info.role !== "assistant" || assistantHasCompletedContent(message),
+        )
+    ) {
+        throw new AssistantTerminalRetryError();
+    }
+    moveUserToTail(messages, messages[userIndex], userIndex);
+}
+
 function preserveUserTerminatedTail(
     messages: MessageWithParts[],
-    inputTail: MessageWithParts | undefined,
+    inputMessages: readonly MessageWithParts[],
 ): void {
+    const inputTail = inputMessages.at(-1);
     if (inputTail?.info.role !== "user" || messages.at(-1)?.info.role !== "assistant") return;
 
     let userIndex = messages.lastIndexOf(inputTail);
@@ -60,13 +127,23 @@ function preserveUserTerminatedTail(
         }
     }
 
-    // OpenCode owns the hook array and can append a pending assistant shell while
-    // an asynchronous transform is awaiting storage or permission work. Keep any
-    // concurrently appended or injected messages, but re-anchor the input's user
-    // boundary at the wire tail so an empty shell cannot become assistant prefill.
-    const trailingUser = userIndex >= 0 ? messages[userIndex] : inputTail;
-    if (userIndex >= 0) messages.splice(userIndex, 1);
-    messages.push(trailingUser);
+    const originalIds = new Set(inputMessages.map((message) => message.info.id));
+    const trailing =
+        userIndex >= 0
+            ? messages.slice(userIndex + 1)
+            : messages.filter((message) => !originalIds.has(message.info.id));
+    // Historical assistants before the input user keep their causal position. Only content
+    // appended after that user participates in the race discriminator: blank/error shells
+    // may move before it, while completed model output must never be moved below its prompt.
+    if (
+        trailing.some(
+            (message) =>
+                message.info.role !== "assistant" || assistantHasCompletedContent(message),
+        )
+    ) {
+        throw new AssistantTerminalRetryError();
+    }
+    moveUserToTail(messages, userIndex >= 0 ? messages[userIndex] : inputTail, userIndex);
 }
 
 /**
@@ -77,9 +154,10 @@ function preserveUserTerminatedTail(
  *
  * Error handling is tiered:
  *
- * - **FailClosedBlockingError / EmergencyFailClosedError / RawFallbackContextLimitError**:
- *   Intentional loud aborts. Rethrown so the TUI surfaces the message and the turn does not
- *   silently fall through to native compaction or a provider-rejected raw prompt.
+ * - **FailClosedBlockingError / EmergencyFailClosedError / RawFallbackContextLimitError /
+ *   AssistantTerminalRetryError**: Intentional loud aborts. Rethrown so the TUI surfaces the
+ *   message and the turn does not silently fall through to native compaction or a
+ *   provider-rejected raw prompt.
  *
  * - **SQLITE_BUSY**: Transient, expected from concurrent plugin processes
  *   (second OpenCode instance, long dreamer/historian child session, slow
@@ -100,10 +178,11 @@ function preserveUserTerminatedTail(
  *
  * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
  * turns thrown errors into user-visible prompt failures. FailClosedBlockingError,
- * EmergencyFailClosedError, and RawFallbackContextLimitError are intentional exceptions.
+ * EmergencyFailClosedError, RawFallbackContextLimitError, and AssistantTerminalRetryError
+ * are intentional exceptions.
  * We accept degraded behavior (no injection / no drops this turn) rather than
- * blocking the user for ordinary bugs — but deterministic inoperability must
- * block loudly when fail_closed_blocking is on.
+ * blocking the user for ordinary bugs — but deterministic inoperability and an unsafe
+ * assistant-terminal retry must block loudly.
  *
  * Correctness is preserved because all persistent state mutations inside
  * the inner transform are idempotent across passes.
@@ -198,7 +277,12 @@ export function createMessagesTransformHandler(args: {
             await magicContext?.["experimental.chat.messages.transform"]?.(input, output);
             return output.messages;
         } catch (error) {
-            if (error instanceof RawFallbackContextLimitError) throw error;
+            if (
+                error instanceof RawFallbackContextLimitError ||
+                error instanceof AssistantTerminalRetryError
+            ) {
+                throw error;
+            }
             if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
                 if (!args.compactionOff) throw error;
                 // Inert by design: log a diagnostic and hand the harness back its
@@ -314,11 +398,12 @@ export function createMessagesTransformHandler(args: {
     };
 
     return async (input, output): Promise<MessageWithParts[]> => {
-        const inputTail = output.messages.at(-1);
+        const inputMessages = [...output.messages];
+        enforcePersistedUserTerminatedTail(output.messages);
         try {
             return await run(input, output);
         } finally {
-            preserveUserTerminatedTail(output.messages, inputTail);
+            preserveUserTerminatedTail(output.messages, inputMessages);
         }
     };
 }

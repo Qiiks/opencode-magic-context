@@ -1,4 +1,4 @@
-//! DG-1..3 differential goldens: TS emits fixtures, Rust consumes them in-process.
+//! DG-1..5 differential goldens: TS emits fixtures, Rust consumes them in-process.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -6,7 +6,10 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::ck_wire::{CkIngressMessage, CkWireMessage};
-use crate::transform::{TransformRequest, TransformResponse};
+use crate::transform::{
+    is_newest_synthetic_user_prompt, user_terminated_tail_decision, TransformRequest,
+    TransformResponse, UserTerminatedTailDecision,
+};
 
 use super::{attach_native_messages_incremental, NativeAttachmentCache, NativeCacheKeyMode};
 
@@ -39,25 +42,82 @@ struct Expected {
     wire: Vec<Value>,
 }
 
+fn rust_wire_for_case(case: &GoldenCase, input_wire: &[Value]) -> Vec<Value> {
+    let mut messages: Vec<CkWireMessage> =
+        serde_json::from_value(Value::Array(input_wire.to_vec())).expect("canonical DG CK wire");
+    if matches!(
+        case.family.as_str(),
+        "user-terminated-tail" | "newest-synthetic-user"
+    ) {
+        let ingress = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| CkIngressMessage {
+                mid: message
+                    .meta
+                    .harness_id
+                    .clone()
+                    .unwrap_or_else(|| format!("dg-{index}")),
+                ordinal: index as u64 + 1,
+                ck: message.clone(),
+            })
+            .collect::<Vec<_>>();
+        let request: TransformRequest = serde_json::from_value(json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "opencode-aisdk",
+            "provider_id": "anthropic",
+            "session_id": format!("dg-tail-{}", case.id),
+            "render_config": "dg",
+            "serve_native": true,
+            "prev_response_completed_at_ms": 1,
+            "messages": ingress,
+        }))
+        .expect("DG tail request");
+        if case.family == "user-terminated-tail" {
+            match user_terminated_tail_decision(&request) {
+                UserTerminatedTailDecision::Reanchor { user_mid } => {
+                    let index = messages
+                        .iter()
+                        .position(|message| message.meta.harness_id.as_deref() == Some(&user_mid))
+                        .expect("DG re-anchor user must be present");
+                    let user = messages.remove(index);
+                    messages.push(user);
+                }
+                decision => panic!("unexpected DG tail decision: {decision:?}"),
+            }
+        } else {
+            messages.retain(|message| {
+                let mid = message.meta.harness_id.as_deref().unwrap_or_default();
+                let ingress = request
+                    .messages
+                    .iter()
+                    .find(|ingress| ingress.mid == mid)
+                    .expect("DG message must retain its ingress identity");
+                !message.meta.synthetic || is_newest_synthetic_user_prompt(&request, ingress)
+            });
+        }
+    }
+    messages
+        .iter()
+        .map(|message| serde_json::to_value(message).expect("serialize CK wire"))
+        .collect()
+}
+
 #[test]
 fn dg_goldens_match_ts_wire_surface_and_gate_labels() {
     let golden: Golden = serde_json::from_str(include_str!("../testdata/differential-golden.json"))
         .expect("parse differential golden");
     assert_eq!(golden.schema, 1);
-    assert_eq!(golden.provenance.generator_version, "dg-reference-v1");
+    assert_eq!(golden.provenance.generator_version, "dg-reference-v3");
     assert_eq!(golden.provenance.input_sha256.len(), 64);
-    assert_eq!(golden.cases.len(), 3);
+    assert_eq!(golden.cases.len(), 5);
 
     for case in &golden.cases {
         let input_wire = case.input["messages"]
             .as_array()
             .expect("every DG input has messages");
-        let parsed: Vec<CkWireMessage> = serde_json::from_value(Value::Array(input_wire.clone()))
-            .expect("DG input must be canonical CK wire");
-        let rust_wire = parsed
-            .iter()
-            .map(|message| serde_json::to_value(message).expect("serialize CK wire"))
-            .collect::<Vec<_>>();
+        let rust_wire = rust_wire_for_case(case, input_wire);
         assert_eq!(rust_wire, case.expected.wire, "wire drift in {}", case.id);
         assert!(!case.family.is_empty());
         assert_eq!(
@@ -96,15 +156,20 @@ fn dg_golden_vacuity_guard_rejects_one_byte_fixture_perturbation_per_family() {
             let bytes = serde_json::to_vec(&perturbed).expect("serialize fixture");
             perturbed = Value::String(String::from_utf8_lossy(&bytes).to_string() + "x");
         }
+        let perturbed_wire = rust_wire_for_case(
+            case,
+            perturbed
+                .as_array()
+                .expect("the one-byte DG perturbation preserves the message array"),
+        );
         assert_ne!(
-            perturbed,
-            Value::Array(case.expected.wire.clone()),
+            perturbed_wire, case.expected.wire,
             "{} accepted a one-byte mutation",
             case.id
         );
         observed += 1;
     }
-    assert_eq!(observed, 3, "every DG family needs a vacuity mutation");
+    assert_eq!(observed, 5, "every DG family needs a vacuity mutation");
 }
 
 #[test]
@@ -112,11 +177,7 @@ fn dg_goldens_exercise_incremental_native_differential_mode() {
     let golden: Golden = serde_json::from_str(include_str!("../testdata/differential-golden.json"))
         .expect("parse differential golden");
     for case in &golden.cases {
-        let wire = case
-            .input
-            .get("messages")
-            .and_then(Value::as_array)
-            .expect("every DG input has messages");
+        let wire = &case.expected.wire;
         let served: Vec<CkWireMessage> =
             serde_json::from_value(Value::Array(wire.clone())).expect("canonical DG CK wire");
         let ingress = served

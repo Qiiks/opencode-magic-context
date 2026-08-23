@@ -1,5 +1,5 @@
 /**
- * DG-1..3 reference generator.
+ * DG-1..5 reference generator.
  *
  * The reference side intentionally owns only canonical JSON and wire-visible fields. Rust
  * consumes the exact request fixtures in-process; neither side derives expected bytes from the
@@ -8,12 +8,30 @@
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const generatorVersion = "dg-reference-v1";
-const textMessage = (role: string, text: string) => ({
+const generatorVersion = "dg-reference-v3";
+const textMessage = (role: string, text: string, id?: string) => ({
   role,
   content: [{ kind: { type: "text", text } }],
-  meta: {},
+  meta: id ? { harness_id: id } : {},
 });
+const syntheticTextMessage = (role: string, text: string, id: string) => ({
+  ...textMessage(role, text, id),
+  meta: { harness_id: id, synthetic: true },
+});
+const userTerminatedReference = (messages: readonly ReturnType<typeof textMessage>[]) => {
+  const output = [...messages];
+  const userIndex = output.findLastIndex((message) => message.role === "user");
+  const trailing = output.slice(userIndex + 1);
+  const contentless = trailing.every(
+    (message) =>
+      message.role === "assistant" &&
+      message.content.every(
+        (block) => block.kind.type === "text" && block.kind.text.trim().length === 0,
+      ),
+  );
+  if (userIndex >= 0 && contentless) output.push(...output.splice(userIndex, 1));
+  return output;
+};
 const scenarios = [
   {
     id: "DG-1-bust-veto",
@@ -33,6 +51,34 @@ const scenarios = [
     input: { session_id: "dg-session", markers: ["band-275", "band-276"], messages: [textMessage("tool", "bounded output")] },
     output: { status: "ok", action: "passthrough", decision: "materialize" },
   },
+  {
+    id: "DG-4-contentless-assistant-tail",
+    family: "user-terminated-tail",
+    input: {
+      session_id: "dg-assistant-tail",
+      markers: ["assistant-prefill", "contentless"],
+      messages: [textMessage("user", "retry prompt", "prompt"), textMessage("assistant", " \n", "dead-shell")],
+    },
+    output: { status: "ok", action: "passthrough", decision: "reanchor-user" },
+  },
+  {
+    id: "DG-5-newest-synthetic-live-prompt",
+    family: "newest-synthetic-user",
+    input: {
+      session_id: "dg-notice-triggered",
+      markers: ["synthetic-user", "live-prompt"],
+      messages: [
+        textMessage("user", "original prompt", "prompt"),
+        textMessage("assistant", "completed answer", "answer"),
+        syntheticTextMessage(
+          "user",
+          "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>",
+          "notice",
+        ),
+      ],
+    },
+    output: { status: "ok", action: "passthrough", decision: "preserve-live-prompt" },
+  },
 ] as const;
 
 const canonical = (value: unknown): string => JSON.stringify(value, null, 2) + "\n";
@@ -49,7 +95,13 @@ const golden = {
     family,
     input,
     // The TS reference's canonical transform output is the wire-visible surface plus gates.
-    expected: { ...output, wire: input.messages },
+    expected: {
+      ...output,
+      wire:
+        family === "user-terminated-tail"
+          ? userTerminatedReference(input.messages)
+          : input.messages,
+    },
   })),
 };
 
