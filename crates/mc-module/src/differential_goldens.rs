@@ -1,4 +1,4 @@
-//! DG-1..4 differential goldens: TS emits fixtures, Rust consumes them in-process.
+//! DG-1..5 differential goldens: TS emits fixtures, Rust consumes them in-process.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -7,7 +7,8 @@ use std::sync::Mutex;
 
 use crate::ck_wire::{CkIngressMessage, CkWireMessage};
 use crate::transform::{
-    user_terminated_tail_decision, TransformRequest, TransformResponse, UserTerminatedTailDecision,
+    is_newest_synthetic_user_prompt, user_terminated_tail_decision, TransformRequest,
+    TransformResponse, UserTerminatedTailDecision,
 };
 
 use super::{attach_native_messages_incremental, NativeAttachmentCache, NativeCacheKeyMode};
@@ -44,7 +45,10 @@ struct Expected {
 fn rust_wire_for_case(case: &GoldenCase, input_wire: &[Value]) -> Vec<Value> {
     let mut messages: Vec<CkWireMessage> =
         serde_json::from_value(Value::Array(input_wire.to_vec())).expect("canonical DG CK wire");
-    if case.family == "user-terminated-tail" {
+    if matches!(
+        case.family.as_str(),
+        "user-terminated-tail" | "newest-synthetic-user"
+    ) {
         let ingress = messages
             .iter()
             .enumerate()
@@ -70,16 +74,28 @@ fn rust_wire_for_case(case: &GoldenCase, input_wire: &[Value]) -> Vec<Value> {
             "messages": ingress,
         }))
         .expect("DG tail request");
-        match user_terminated_tail_decision(&request) {
-            UserTerminatedTailDecision::Reanchor { user_mid } => {
-                let index = messages
-                    .iter()
-                    .position(|message| message.meta.harness_id.as_deref() == Some(&user_mid))
-                    .expect("DG re-anchor user must be present");
-                let user = messages.remove(index);
-                messages.push(user);
+        if case.family == "user-terminated-tail" {
+            match user_terminated_tail_decision(&request) {
+                UserTerminatedTailDecision::Reanchor { user_mid } => {
+                    let index = messages
+                        .iter()
+                        .position(|message| message.meta.harness_id.as_deref() == Some(&user_mid))
+                        .expect("DG re-anchor user must be present");
+                    let user = messages.remove(index);
+                    messages.push(user);
+                }
+                decision => panic!("unexpected DG tail decision: {decision:?}"),
             }
-            decision => panic!("unexpected DG tail decision: {decision:?}"),
+        } else {
+            messages.retain(|message| {
+                let mid = message.meta.harness_id.as_deref().unwrap_or_default();
+                let ingress = request
+                    .messages
+                    .iter()
+                    .find(|ingress| ingress.mid == mid)
+                    .expect("DG message must retain its ingress identity");
+                !message.meta.synthetic || is_newest_synthetic_user_prompt(&request, ingress)
+            });
         }
     }
     messages
@@ -93,9 +109,9 @@ fn dg_goldens_match_ts_wire_surface_and_gate_labels() {
     let golden: Golden = serde_json::from_str(include_str!("../testdata/differential-golden.json"))
         .expect("parse differential golden");
     assert_eq!(golden.schema, 1);
-    assert_eq!(golden.provenance.generator_version, "dg-reference-v2");
+    assert_eq!(golden.provenance.generator_version, "dg-reference-v3");
     assert_eq!(golden.provenance.input_sha256.len(), 64);
-    assert_eq!(golden.cases.len(), 4);
+    assert_eq!(golden.cases.len(), 5);
 
     for case in &golden.cases {
         let input_wire = case.input["messages"]
@@ -153,7 +169,7 @@ fn dg_golden_vacuity_guard_rejects_one_byte_fixture_perturbation_per_family() {
         );
         observed += 1;
     }
-    assert_eq!(observed, 4, "every DG family needs a vacuity mutation");
+    assert_eq!(observed, 5, "every DG family needs a vacuity mutation");
 }
 
 #[test]

@@ -1,5 +1,5 @@
 /**
- * DG-1..4 reference generator.
+ * DG-1..5 reference generator.
  *
  * The reference side intentionally owns only canonical JSON and wire-visible fields. Rust
  * consumes the exact request fixtures in-process; neither side derives expected bytes from the
@@ -8,11 +8,15 @@
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const generatorVersion = "dg-reference-v2";
+const generatorVersion = "dg-reference-v3";
 const textMessage = (role: string, text: string, id?: string) => ({
   role,
   content: [{ kind: { type: "text", text } }],
   meta: id ? { harness_id: id } : {},
+});
+const syntheticTextMessage = (role: string, text: string, id: string) => ({
+  ...textMessage(role, text, id),
+  meta: { harness_id: id, synthetic: true },
 });
 const userTerminatedReference = (messages: readonly ReturnType<typeof textMessage>[]) => {
   const output = [...messages];
@@ -56,6 +60,24 @@ const scenarios = [
       messages: [textMessage("user", "retry prompt", "prompt"), textMessage("assistant", " \n", "dead-shell")],
     },
     output: { status: "ok", action: "passthrough", decision: "reanchor-user" },
+  },
+  {
+    id: "DG-5-newest-synthetic-live-prompt",
+    family: "newest-synthetic-user",
+    input: {
+      session_id: "dg-notice-triggered",
+      markers: ["synthetic-user", "live-prompt"],
+      messages: [
+        textMessage("user", "original prompt", "prompt"),
+        textMessage("assistant", "completed answer", "answer"),
+        syntheticTextMessage(
+          "user",
+          "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>",
+          "notice",
+        ),
+      ],
+    },
+    output: { status: "ok", action: "passthrough", decision: "preserve-live-prompt" },
   },
 ] as const;
 

@@ -2,8 +2,8 @@
   "schema": 1,
   "provenance": {
     "generator": "crates/mc-module/gen/gen-differential-golden.ts",
-    "generator_version": "dg-reference-v2",
-    "input_sha256": "181062c77a7dc74cf114d5a17f85bfd3ddabf32b5cb3e2eac0e9441f2b1604a1"
+    "generator_version": "dg-reference-v3",
+    "input_sha256": "9c09629eb0119da36a2c1177fde810507a35f268c89e288d992ba77a2232f6e0"
   },
   "cases": [
     {
@@ -209,6 +209,112 @@
             ],
             "meta": {
               "harness_id": "prompt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "DG-5-newest-synthetic-live-prompt",
+      "family": "newest-synthetic-user",
+      "input": {
+        "session_id": "dg-notice-triggered",
+        "markers": [
+          "synthetic-user",
+          "live-prompt"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "original prompt"
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "prompt"
+            }
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "completed answer"
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "answer"
+            }
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>"
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "notice",
+              "synthetic": true
+            }
+          }
+        ]
+      },
+      "expected": {
+        "status": "ok",
+        "action": "passthrough",
+        "decision": "preserve-live-prompt",
+        "wire": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "original prompt"
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "prompt"
+            }
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "completed answer"
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "answer"
+            }
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>"
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "notice",
+              "synthetic": true
             }
           }
         ]

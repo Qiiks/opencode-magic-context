@@ -11505,6 +11505,21 @@ fn assistant_has_completed_content(message: &CkIngressMessage) -> bool {
     })
 }
 
+/// OpenCode marks notice-triggered user prompts synthetic, the same flag used by stale
+/// injected history. Only the newest user owns the live request; historical synthetic rows
+/// remain excluded by the ordinary tail filters.
+pub(crate) fn is_newest_synthetic_user_prompt(
+    request: &TransformRequest,
+    message: &CkIngressMessage,
+) -> bool {
+    message.ck.meta.synthetic
+        && message.ck.role == "user"
+        && request
+            .messages
+            .last()
+            .is_some_and(|newest| newest.mid == message.mid)
+}
+
 pub(crate) fn user_terminated_tail_decision(
     request: &TransformRequest,
 ) -> UserTerminatedTailDecision {
@@ -12000,9 +12015,12 @@ fn build_output_with_tags_inner(
     let output_mids = req
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic)
         .filter(|message| {
-            is_tail(message.ordinal, output_coverage)
+            !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
+        })
+        .filter(|message| {
+            is_newest_synthetic_user_prompt(req, message)
+                || is_tail(message.ordinal, output_coverage)
                 || (serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic)
                     && is_uncovered_leading_system(message, meta))
                 || lineage_anchor_mid == Some(message.mid.as_str())
@@ -12056,11 +12074,10 @@ fn build_output_with_tags_inner(
         .map(|anchor| synthetic_todo_render_anchor_mid(projection, anchor));
     let mut inserted_synthetic_todo = false;
     let tail_loop_started_at = Instant::now();
-    for msg in req
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-    {
+    for msg in req.messages.iter().filter(|message| {
+        !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
+    }) {
+        let keep_live_synthetic_prompt = is_newest_synthetic_user_prompt(req, msg);
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
             && is_uncovered_leading_system(msg, meta);
@@ -12070,7 +12087,8 @@ fn build_output_with_tags_inner(
             .and_then(split_block_id)
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
         let keep_split_invocation = split_coverage_invocation_mids.contains(msg.mid.as_str());
-        if !is_tail(msg.ordinal, output_coverage)
+        if !keep_live_synthetic_prompt
+            && !is_tail(msg.ordinal, output_coverage)
             && !keep_leading_system
             && !keep_lineage_anchor
             && !keep_split_invocation
@@ -18040,6 +18058,77 @@ pub(crate) mod tests {
                 "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue."
             );
         }
+    }
+
+    #[test]
+    fn newest_synthetic_user_is_served_as_the_notice_triggered_live_prompt() {
+        let mut historical_notice = wire_item(
+            "user",
+            "notice-historical",
+            1,
+            &["<system-reminder>historical completion</system-reminder>"],
+        );
+        historical_notice.ck.meta.synthetic = true;
+        let mut live_notice = wire_item(
+            "user",
+            "msg_02d6ec606001jEBwnJuw1OX68F",
+            5,
+            &["<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>"],
+        );
+        live_notice.ck.meta.synthetic = true;
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "notice-triggered-engram",
+            "cfg",
+            vec![
+                historical_notice,
+                wire_item(
+                    "user",
+                    "msg_02d6ebbe0001hmD4CjOCNXDw8L",
+                    2,
+                    &["tool result"],
+                ),
+                reasoning_tool_shell_message(
+                    "msg_02d6ebe9800166UUl6XLz1oLIX",
+                    3,
+                    "call-status",
+                    true,
+                ),
+                reasoning_tool_shell_message(
+                    "msg_02d6f258c001Ev9GPM03YNW5Ql",
+                    4,
+                    "call-bash",
+                    true,
+                ),
+                live_notice,
+            ],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.prev_response_completed_at_ms = Some(1);
+
+        assert_eq!(
+            user_terminated_tail_decision(&request),
+            UserTerminatedTailDecision::Unchanged,
+            "the restored live prompt must make both assistant-terminal arms inapplicable"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let response = run(&store(dir.path()), &request, &spine());
+        assert_eq!(
+            response
+                .messages()
+                .last()
+                .unwrap()
+                .meta
+                .harness_id
+                .as_deref(),
+            Some("msg_02d6ec606001jEBwnJuw1OX68F")
+        );
+        assert_eq!(response.messages().last().unwrap().role, "user");
+        assert!(response
+            .messages()
+            .iter()
+            .all(|message| message.meta.harness_id.as_deref() != Some("notice-historical")));
     }
 
     #[test]
