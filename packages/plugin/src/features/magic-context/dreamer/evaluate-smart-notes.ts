@@ -39,6 +39,12 @@ export interface EvaluateSmartNotesArgs {
     /** Keyed lease this task holds (Dreamer v2: per-project evaluate-smart-notes domain). */
     leaseKey: string;
     deadline: number;
+    /**
+     * Wall-clock budget for one due-check sweep. Defaults to 10s in production;
+     * tests lower it so a sweep queued behind slow sandbox infrastructure cancels
+     * fast instead of eating the whole test timeout.
+     */
+    sweepBudgetMs?: number;
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
@@ -172,7 +178,7 @@ export async function evaluateSmartNotes(
             projectIdentity: args.projectIdentity,
             projectRoot,
             maxChecks: 10,
-            sweepBudgetMs: 10_000,
+            sweepBudgetMs: args.sweepBudgetMs ?? 10_000,
             leaseHeld,
             signal: leaseAbortController.signal,
             retinaHandoff: args.retinaHandoff,

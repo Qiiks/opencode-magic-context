@@ -146,19 +146,42 @@ describe("wake-plane smart-note gates", () => {
         for (const status of ["present", "absent", "unknown"] as const) {
             const db = freshDb();
             try {
-                dueCompiledNote(db);
+                const note = dueCompiledNote(db);
                 __wakePlaneTest.setCatalogProbe(async () => {
                     if (status === "unknown") throw new Error("daemon vanished");
                     return catalog(status === "present");
                 });
 
+                // The sweep budget is deliberately short: this test asserts the
+                // GATE (present blocks before the sandbox; absent/unknown attempt
+                // a check), not sweep endurance. On a slow CI runner the one-time
+                // QuickJS WASM compile can still be in flight, in which case each
+                // arm must cancel at the budget instead of waiting the default
+                // 15s — three default-budget arms sum to the 30s test timeout and
+                // used to flake this file.
                 const result = await runDueCompiledSmartNoteChecks({
                     db,
                     projectIdentity: PROJECT,
                     projectRoot: process.cwd(),
                     now: 0,
+                    sweepBudgetMs: 2_000,
                 });
                 expect(result.ran).toBe(status === "present" ? 0 : 1);
+                const row = db
+                    .prepare("SELECT check_next_due_at, check_status FROM notes WHERE id = ?")
+                    .get(note.id) as { check_next_due_at: number; check_status: string };
+                if (status === "present") {
+                    // Blocked before the sandbox: the compiled check is untouched.
+                    expect(result.surfaced).toBe(0);
+                    expect(row.check_next_due_at).toBe(0);
+                    expect(row.check_status).toBe("compiled");
+                } else {
+                    // The gate opened: the sweep attempted the check. Whether it
+                    // completed (rescheduled) or cancelled under load, it must not
+                    // have surfaced the note or damaged the compiled check.
+                    expect(result.surfaced).toBe(0);
+                    expect(row.check_status).toBe("compiled");
+                }
                 __wakePlaneTest.reset();
             } finally {
                 closeQuietly(db);
@@ -184,6 +207,7 @@ describe("wake-plane smart-note gates", () => {
                     projectIdentity: PROJECT,
                     projectRoot: process.cwd(),
                     now: 0,
+                    sweepBudgetMs: 2_000,
                 }),
             ).toMatchObject({ ran: 0 });
 
@@ -195,6 +219,7 @@ describe("wake-plane smart-note gates", () => {
                     projectIdentity: PROJECT,
                     projectRoot: process.cwd(),
                     now: 0,
+                    sweepBudgetMs: 2_000,
                 }),
             ).toMatchObject({ ran: 1 });
         } finally {
@@ -224,6 +249,7 @@ describe("wake-plane smart-note gates", () => {
                         holderId: "holder",
                         leaseKey,
                         deadline: Date.now() + 60_000,
+                        sweepBudgetMs: 2_000,
                     }),
                 ).resolves.toMatchObject({ ran: true, pending: 1 });
                 __wakePlaneTest.reset();

@@ -8,11 +8,7 @@ import {
 } from "../features/magic-context/fail-closed-block";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
-import {
-    ASSISTANT_TERMINAL_RETRY_MESSAGE,
-    AssistantTerminalRetryError,
-    createMessagesTransformHandler,
-} from "./messages-transform";
+import { createMessagesTransformHandler } from "./messages-transform";
 
 // Minimal fake message shape — just needs info + parts.
 function makeOutput(overrides?: { agent?: string; sessionID?: string }): any {
