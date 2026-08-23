@@ -422,6 +422,28 @@ git push origin "$BRANCH"
 git push origin "$TAG"
 echo ""
 
-echo "  ✓ Released $TAG"
-echo "  → GitHub Actions will now: test → build → publish"
-echo "  → Watch: https://github.com/cortexkit/magic-context/actions"
+echo "  ✓ Tag pushed: $TAG — waiting on the GitHub release workflow (test → build → publish)"
+
+# The release is NOT done when the tag is pushed: the publish happens in CI. Block
+# on the workflow run and exit with ITS status, so whoever invoked this script
+# (human terminal or a tracked agent task) gets exactly one truthful completion
+# signal for the WHOLE release — a silent CI failure here has cost hours before.
+RUN_ID=""
+for _ in $(seq 1 36); do
+    RUN_ID=$(gh run list --workflow=release.yml --limit 5 \
+        --json databaseId,headSha -q ".[] | select(.headSha == \"$(git rev-parse HEAD)\") | .databaseId" | head -1)
+    [ -n "$RUN_ID" ] && break
+    sleep 5
+done
+if [ -z "$RUN_ID" ]; then
+    echo "  ✗ release workflow run for $TAG not found after 3 minutes — check Actions manually" >&2
+    exit 1
+fi
+echo "  → Watching workflow run $RUN_ID (blocks until publish completes or fails)..."
+if ! gh run watch "$RUN_ID" --exit-status --interval 30 > /dev/null 2>&1; then
+    echo "" >&2
+    echo "  ✗ RELEASE FAILED in CI (run $RUN_ID). Failing jobs:" >&2
+    gh run view "$RUN_ID" --json jobs -q '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "    - " + .name' >&2
+    exit 1
+fi
+echo "  ✓ Released $TAG — CI publish completed"
