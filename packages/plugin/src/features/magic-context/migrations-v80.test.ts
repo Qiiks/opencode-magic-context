@@ -38,7 +38,7 @@ describe("migration v80: observed tool-set comparison telemetry", () => {
             expect(columnNames(db, "transform_decisions")).toEqual(
                 expect.arrayContaining(["m0_tool_set_hash_prev", "m0_tool_set_hash_new"]),
             );
-            expect(LATEST_SUPPORTED_VERSION).toBe(80);
+            expect(LATEST_SUPPORTED_VERSION).toBe(81);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);

@@ -2846,6 +2846,32 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "transform_decisions", "m0_tool_set_hash_new", "TEXT");
         },
     },
+    {
+        version: 81,
+        description: "persist last-known-good transform snapshots across restarts",
+        up(db: Database): void {
+            // Durable home for the LKG replay slot. The in-memory slot dies with
+            // the process, so a plugin restart right after a module bounce left
+            // the recovery ladder with nothing to replay. One row per session;
+            // json_prefix stores the exact serialized prefix captured by the
+            // applied pass (never re-serialized on write or read).
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS lkg_slots (
+                    session_id TEXT PRIMARY KEY,
+                    json_prefix TEXT NOT NULL,
+                    input_id_seq TEXT NOT NULL,
+                    input_content_digests TEXT NOT NULL,
+                    input_content_signatures TEXT,
+                    last_input_message_id TEXT NOT NULL,
+                    model_key TEXT,
+                    provider_key TEXT,
+                    captured_at INTEGER NOT NULL,
+                    row_version INTEGER,
+                    capture_sequence INTEGER
+                );
+            `);
+        },
+    },
 ];
 
 /**

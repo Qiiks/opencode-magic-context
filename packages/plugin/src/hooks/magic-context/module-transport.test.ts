@@ -976,6 +976,128 @@ describe("SubcModuleTransport", () => {
     });
 });
 
+describe("connection backoff in-pass wait", () => {
+    function makeBackoffTransport(): {
+        transport: SubcModuleTransport;
+        internals: {
+            nextProbeMs: number;
+            connectClient(): Promise<SubcClient>;
+        };
+        client: SubcClient;
+        connectCount: () => number;
+    } {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let connects = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async (_route: RouteHandle, body: unknown) => ({
+                result: { sessionId: (body as { session_id?: string }).session_id ?? "ok" },
+            }),
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            nextProbeMs: number;
+            connectClient(): Promise<SubcClient>;
+        };
+        internals.connectClient = async () => {
+            connects += 1;
+            return client;
+        };
+        return { transport, internals, client, connectCount: () => connects };
+    }
+
+    it("waits out an under-budget backoff remainder and serves the pass", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        // A latch armed by an earlier failure with only 300ms left — far under
+        // the wait budget. The pass must wait and connect, not fail.
+        internals.nextProbeMs = Date.now() + 300;
+        const startedAt = performance.now();
+
+        await expect(
+            transport.call({
+                sessionId: "session-backoff-wait",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-wait" },
+            }),
+        ).resolves.toEqual({ result: { sessionId: "session-backoff-wait" } });
+
+        const elapsedMs = performance.now() - startedAt;
+        expect(elapsedMs).toBeGreaterThanOrEqual(280);
+        // Remainder plus jitter only — no retry ladder, no budget overrun.
+        expect(elapsedMs).toBeLessThan(1_000);
+        expect(connectCount()).toBe(1);
+    });
+
+    it("fails fast when the backoff remainder exceeds the wait budget", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 20_000;
+        const startedAt = performance.now();
+
+        await expect(
+            transport.call({
+                sessionId: "session-backoff-over-budget",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        ).rejects.toMatchObject({ code: "SUBC_CONNECTION_BACKOFF" });
+
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectCount()).toBe(0);
+    });
+
+    it("does not serialize sibling sessions behind one session's backoff wait", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 500;
+        const startedAt = performance.now();
+
+        const [responseA, responseB] = await Promise.all([
+            transport.call({
+                sessionId: "session-backoff-a",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-a" },
+            }),
+            transport.call({
+                sessionId: "session-backoff-b",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, session_id: "session-backoff-b" },
+            }),
+        ]);
+
+        const wallMs = performance.now() - startedAt;
+        expect(responseA).toEqual({ result: { sessionId: "session-backoff-a" } });
+        expect(responseB).toEqual({ result: { sessionId: "session-backoff-b" } });
+        // Each pass waits on its own timer; a serialized (global) wait would pay
+        // the ~500ms remainder twice. The connection itself coalesces once.
+        expect(wallMs).toBeGreaterThanOrEqual(450);
+        expect(wallMs).toBeLessThan(900);
+        expect(connectCount()).toBe(1);
+    });
+
+    it("stops waiting when the pass is aborted mid-backoff", async () => {
+        const { transport, internals, connectCount } = makeBackoffTransport();
+        internals.nextProbeMs = Date.now() + 2_000;
+        const controller = new AbortController();
+        const startedAt = performance.now();
+        const call = transport.call({
+            sessionId: "session-backoff-abort",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+            signal: controller.signal,
+        });
+        setTimeout(() => controller.abort(new Error("turn cancelled")), 50);
+
+        await expect(call).rejects.toThrow("turn cancelled");
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectCount()).toBe(0);
+    });
+});
+
 describe("beforeDeadline orphan safety", () => {
     it("a request rejecting after the deadline lost the race never raises an unhandled rejection", async () => {
         const transport = new SubcModuleTransport("/nonexistent-connection-file");

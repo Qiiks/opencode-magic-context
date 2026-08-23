@@ -85,7 +85,7 @@ describe("storage-meta", () => {
             // encompassing transaction; message-index rows no longer need a
             // separate nested cleanup transaction.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(28);
+            expect(db.prepare).toHaveBeenCalledTimes(29);
         });
     });
 });

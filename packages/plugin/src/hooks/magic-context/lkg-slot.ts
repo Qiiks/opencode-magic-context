@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { sessionLog } from "../../shared/logger";
 import type { MessageLike } from "./transform-operations";
 
 export interface LkgSlot {
@@ -29,6 +30,25 @@ const LKG_METADATA_BYTES = 256;
 
 const slots = new Map<string, { slot: LkgSlot; bytes: number }>();
 let totalBytes = 0;
+
+/**
+ * Optional durable backing for slots. Registered by the hook once its database
+ * is open; drops clear the durable row and in-memory misses try to hydrate
+ * from it, so an applied pass's snapshot survives a process restart. Capture
+ * sites write the row themselves (they hold the db handle and must keep the
+ * capture path's single-stringify discipline), so the backend only needs
+ * load/clear.
+ */
+export interface LkgPersistenceBackend {
+    load(sessionId: string): LkgSlot | undefined;
+    clear(sessionId: string): void;
+}
+
+let persistenceBackend: LkgPersistenceBackend | undefined;
+
+export function registerLkgPersistence(backend: LkgPersistenceBackend | undefined): void {
+    persistenceBackend = backend;
+}
 
 function slotBytes(slot: LkgSlot): number {
     const digestBytes = slot.inputContentDigests.reduce(
@@ -212,25 +232,97 @@ export function captureSlot(sessionId: string, slot: LkgSlot): boolean {
     return true;
 }
 
-export function getSlot(sessionId: string): LkgSlot | undefined {
+/** Install a slot loaded from durable storage, applying the same size bounds. */
+function installHydratedSlot(sessionId: string, slot: LkgSlot): boolean {
+    const bytes = slotBytes(slot);
+    if (bytes > LKG_SINGLE_SLOT_BYTES) return false;
+    const prior = slots.get(sessionId);
+    if (prior) totalBytes -= prior.bytes;
+    slots.delete(sessionId);
+    while (totalBytes + bytes > LKG_TOTAL_BYTES) {
+        const oldest = slots.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        const evicted = slots.get(oldest);
+        slots.delete(oldest);
+        if (evicted) totalBytes -= evicted.bytes;
+    }
+    if (totalBytes + bytes > LKG_TOTAL_BYTES) {
+        if (prior) {
+            slots.set(sessionId, prior);
+            totalBytes += prior.bytes;
+        }
+        return false;
+    }
+    const entry = {
+        slot: {
+            ...slot,
+            inputIdSeq: [...slot.inputIdSeq],
+            inputContentDigests: [...slot.inputContentDigests],
+            inputContentSignatures: slot.inputContentSignatures
+                ? [...slot.inputContentSignatures]
+                : undefined,
+        },
+        bytes,
+    };
+    slots.set(sessionId, entry);
+    totalBytes += bytes;
+    return true;
+}
+
+function hydrateSlotFromPersistence(sessionId: string): LkgSlot | undefined {
+    const backend = persistenceBackend;
+    if (!backend) return undefined;
+    let loaded: LkgSlot | undefined;
+    try {
+        loaded = backend.load(sessionId);
+    } catch (error) {
+        sessionLog(sessionId, "LKG durable hydration failed:", error);
+        return undefined;
+    }
+    if (!loaded) return undefined;
+    // Hydration only restores the snapshot. Replay still runs every validity
+    // fence a live process would apply, so stale durable bytes are rejected
+    // exactly like stale in-memory bytes.
+    if (!installHydratedSlot(sessionId, loaded)) return undefined;
+    sessionLog(sessionId, "lkg_hydrated_from_disk");
     const entry = slots.get(sessionId);
-    if (!entry) return undefined;
-    touch(sessionId, entry);
+    return entry ? copySlotForRead(entry.slot) : undefined;
+}
+
+function copySlotForRead(slot: LkgSlot): LkgSlot {
     return {
-        ...entry.slot,
-        inputIdSeq: [...entry.slot.inputIdSeq],
-        inputContentDigests: [...entry.slot.inputContentDigests],
-        inputContentSignatures: entry.slot.inputContentSignatures
-            ? [...entry.slot.inputContentSignatures]
+        ...slot,
+        inputIdSeq: [...slot.inputIdSeq],
+        inputContentDigests: [...slot.inputContentDigests],
+        inputContentSignatures: slot.inputContentSignatures
+            ? [...slot.inputContentSignatures]
             : undefined,
     };
 }
 
+export function getSlot(sessionId: string): LkgSlot | undefined {
+    const entry = slots.get(sessionId);
+    if (!entry) return hydrateSlotFromPersistence(sessionId);
+    touch(sessionId, entry);
+    return copySlotForRead(entry.slot);
+}
+
 export function dropSlot(sessionId: string, _reason?: string): void {
     const entry = slots.get(sessionId);
-    if (!entry) return;
-    slots.delete(sessionId);
-    totalBytes -= entry.bytes;
+    if (entry) {
+        slots.delete(sessionId);
+        totalBytes -= entry.bytes;
+    }
+    // The durable row must follow the drop: a slot invalidated in memory
+    // (model change, reshape, recovery arm, deletion) is equally invalid after
+    // a restart. Clear best-effort; a missed clear still meets the replay fences.
+    const backend = persistenceBackend;
+    if (!backend) return;
+    try {
+        backend.clear(sessionId);
+    } catch (error) {
+        sessionLog(sessionId, "LKG durable clear failed:", error);
+    }
 }
 
 export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryNote | null {
@@ -258,6 +350,7 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
 export function resetLkgSlotsForTest(): void {
     slots.clear();
     totalBytes = 0;
+    persistenceBackend = undefined;
 }
 
 export function getLkgSlotStatsForTest(): { totalBytes: number; count: number } {

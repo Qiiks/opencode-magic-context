@@ -88,7 +88,8 @@ import {
 } from "./event-resolvers";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
-import { dropSlot } from "./lkg-slot";
+import { createDbLkgPersistence } from "./lkg-persist";
+import { dropSlot, registerLkgPersistence } from "./lkg-slot";
 import { SubcModuleTransport } from "./module-transport";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
@@ -1049,6 +1050,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 log(`[magic-context] rust park toast failed for ${sessionId}:`, error),
             );
     };
+
+    // Durable LKG replay: register the db-backed backend so slot drops clear the
+    // persisted row and in-memory misses (notably the first pass after a
+    // process restart) hydrate the snapshot captured by the last applied pass.
+    // Re-registration on a healed storage reopen replaces the stale handle.
+    registerLkgPersistence(createDbLkgPersistence(db));
 
     const transform = createTransform({
         tagger: deps.tagger,

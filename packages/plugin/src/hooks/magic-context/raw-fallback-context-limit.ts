@@ -1,3 +1,5 @@
+import { ENGINE_RECONNECTING_USER_MESSAGE } from "./emergency-fail-closed";
+
 export class RawFallbackContextLimitError extends Error {
     readonly code = "RAW_FALLBACK_CONTEXT_LIMIT";
     readonly recoverable = true;
@@ -7,10 +9,9 @@ export class RawFallbackContextLimitError extends Error {
         readonly contextLimitTokens: number,
         options?: { cause?: unknown },
     ) {
-        super(
-            `Magic Context could not safely serve the raw prompt: the best local estimate is ${estimatedTokens.toLocaleString()} tokens, above the known ${contextLimitTokens.toLocaleString()}-token context limit. Retry the turn so the module can reconnect.`,
-            options,
-        );
+        // The primary line stays calm and number-free; the estimate and limit
+        // remain readable on the fields above and in the refusal's log line.
+        super(ENGINE_RECONNECTING_USER_MESSAGE, options);
         this.name = "RawFallbackContextLimitError";
     }
 }

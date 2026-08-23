@@ -91,8 +91,9 @@ import {
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
 } from "./inject-compartments";
+import { saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, projectLkgEntry, resolveLkgModelKeys } from "./lkg-replay";
-import { dropSlot } from "./lkg-slot";
+import { dropSlot, getSlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
 import {
@@ -2374,6 +2375,17 @@ export function createTransform(deps: TransformDeps) {
                 modelKey,
                 providerKey,
             });
+            if (captured) {
+                // Keep the durable snapshot in step with the TS-mode capture too:
+                // replay consumes the last successful capture of either mode, and
+                // drops clear the durable row regardless of mode. Deferred so the
+                // pass tail does not pay a synchronous multi-MB write; the slot
+                // copy is detached from live messages.
+                const capturedSlot = getSlot(sessionId);
+                if (capturedSlot) {
+                    setImmediate(() => saveLkgSlotToDb(db, sessionId, capturedSlot));
+                }
+            }
             if (postTransformResult.bustedThisPass && !captured) {
                 dropSlot(sessionId, "lkg_refresh_declined");
             }

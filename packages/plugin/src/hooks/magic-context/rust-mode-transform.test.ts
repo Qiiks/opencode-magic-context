@@ -34,9 +34,13 @@ import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import {
+    EmergencyFailClosedError,
+    ENGINE_RECONNECTING_USER_MESSAGE,
+} from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
-import { getSlot } from "./lkg-slot";
+import { createDbLkgPersistence } from "./lkg-persist";
+import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { setRawMessageProvider } from "./read-session-chunk";
@@ -2406,7 +2410,9 @@ describe("Rust mode authority adapter", () => {
         await expect(
             transform.run(sessionId, input, output, makeMeta(db, sessionId)),
         ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
-        expect(estimatorCalls).toBe(1);
+        // The byte proxy proves the refusal before any tokenizer run, so an
+        // unavailable estimator is never even invoked on the failure path.
+        expect(estimatorCalls).toBe(0);
         expect(output.messages).toEqual([]);
     });
 
@@ -3631,5 +3637,339 @@ describe("Rust ladder observability constants", () => {
         expect(RUST_FAILURE_PARK_THRESHOLD).toBeGreaterThan(0);
         expect(RUST_PARK_RETRY_INTERVAL).toBeGreaterThan(0);
         expect(RUST_PARK_PROBE_PRESSURE_BYPASS_PCT).toBeLessThan(RUST_EMERGENCY_WALL_PCT);
+    });
+});
+
+describe("LKG durability across restarts", () => {
+    function durableSlotCount(db: ContextDatabase, sessionId: string): number {
+        const row = db
+            .prepare("SELECT COUNT(*) AS count FROM lkg_slots WHERE session_id = ?")
+            .get(sessionId) as { count: number };
+        return row.count;
+    }
+
+    function makeRestartModuleClient(
+        sessionId: string,
+        fail: () => boolean,
+    ): {
+        moduleClient: RustModeModuleClient;
+        servedNative: () => unknown[];
+    } {
+        const native = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "cached prefix" }],
+            },
+            {
+                info: { id: "out-1", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "served by module" }],
+            },
+        ];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (fail()) throw new Error("daemon unavailable");
+                return { decision: "HARD", native_messages: structuredClone(native) };
+            },
+        };
+        return { moduleClient, servedNative: () => structuredClone(native) };
+    }
+
+    function makeRestartInput(sessionId: string): MessageLike[] {
+        return [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "current prefix" }],
+            },
+        ] as MessageLike[];
+    }
+
+    it("replays the durably persisted snapshot after a simulated process restart", async () => {
+        const sessionId = `rust-lkg-restart-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let failTransform = false;
+        const { moduleClient, servedNative } = makeRestartModuleClient(
+            sessionId,
+            () => failTransform,
+        );
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeRestartInput(sessionId);
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)).toBeDefined();
+        expect(durableSlotCount(db, sessionId)).toBe(1);
+
+        // Simulated restart: the in-memory slot store is gone and hook init
+        // re-registers the durable backend; a fresh transform owns fresh state.
+        resetLkgSlotsForTest();
+        registerLkgPersistence(createDbLkgPersistence(db));
+        try {
+            expect(getSlot(sessionId)).toBeDefined(); // hydrated from disk
+            const restarted = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+            });
+            failTransform = true;
+            const output = { messages: [...input] as unknown[] };
+            await restarted.run(sessionId, input, output, makeMeta(db, sessionId));
+            expect(output.messages).toEqual(servedNative());
+            expect(restarted.getState(sessionId).consecutiveFailures).toBe(1);
+        } finally {
+            resetLkgSlotsForTest();
+        }
+    });
+
+    it("still refuses a model change on a hydrated slot", async () => {
+        const sessionId = `rust-lkg-restart-model-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let failTransform = false;
+        const { moduleClient } = makeRestartModuleClient(sessionId, () => failTransform);
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeRestartInput(sessionId);
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(durableSlotCount(db, sessionId)).toBe(1);
+
+        resetLkgSlotsForTest();
+        registerLkgPersistence(createDbLkgPersistence(db));
+        try {
+            const restarted = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+            });
+            failTransform = true;
+            // The session switched models across the restart: the replay model
+            // fence must drop the hydrated slot and the durable row with it.
+            const switchedInput = [
+                {
+                    info: {
+                        id: "m1",
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "other-model" },
+                    },
+                    parts: [{ type: "text", text: "current prefix" }],
+                },
+            ] as MessageLike[];
+            const output = { messages: [...switchedInput] as unknown[] };
+            await restarted.run(sessionId, switchedInput, output, makeMeta(db, sessionId));
+            expect(output.messages).toEqual(switchedInput); // raw fallback, not the stale prefix
+            expect(getSlot(sessionId)).toBeUndefined();
+            expect(durableSlotCount(db, sessionId)).toBe(0);
+        } finally {
+            resetLkgSlotsForTest();
+        }
+    });
+
+    it("still refuses an id-sequence divergence on a hydrated slot", async () => {
+        const sessionId = `rust-lkg-restart-ids-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let failTransform = false;
+        const { moduleClient } = makeRestartModuleClient(sessionId, () => failTransform);
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeRestartInput(sessionId);
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(durableSlotCount(db, sessionId)).toBe(1);
+
+        resetLkgSlotsForTest();
+        registerLkgPersistence(createDbLkgPersistence(db));
+        try {
+            const restarted = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+            });
+            failTransform = true;
+            // The conversation no longer contains the captured anchor message.
+            const divergedInput = [
+                {
+                    info: {
+                        id: "m2",
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "test-model" },
+                    },
+                    parts: [{ type: "text", text: "reshaped history" }],
+                },
+            ] as MessageLike[];
+            const output = { messages: [...divergedInput] as unknown[] };
+            await restarted.run(sessionId, divergedInput, output, makeMeta(db, sessionId));
+            expect(output.messages).toEqual(divergedInput);
+            expect(getSlot(sessionId)).toBeUndefined();
+            expect(durableSlotCount(db, sessionId)).toBe(0);
+        } finally {
+            resetLkgSlotsForTest();
+        }
+    });
+
+    it("clears the durable row when a slot is dropped", async () => {
+        const sessionId = `rust-lkg-drop-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const failTransform = false;
+        const { moduleClient } = makeRestartModuleClient(sessionId, () => failTransform);
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeRestartInput(sessionId);
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(durableSlotCount(db, sessionId)).toBe(1);
+
+        resetLkgSlotsForTest();
+        registerLkgPersistence(createDbLkgPersistence(db));
+        try {
+            // A drop with nothing in memory (the post-restart state) must still
+            // reach the durable row.
+            const { dropSlot } = await import("./lkg-slot");
+            dropSlot(sessionId, "test-drop");
+            expect(durableSlotCount(db, sessionId)).toBe(0);
+        } finally {
+            resetLkgSlotsForTest();
+        }
+    });
+});
+
+describe("raw fallback refusal copy and early abort", () => {
+    it("keeps the refusal copy calm and number-free while preserving the typed fields", () => {
+        const error = new RawFallbackContextLimitError(5_493_229, 1_000_000);
+        expect(error.message).toBe(ENGINE_RECONNECTING_USER_MESSAGE);
+        expect(error.message).not.toMatch(/\d/);
+        expect(error.estimatedTokens).toBe(5_493_229);
+        expect(error.contextLimitTokens).toBe(1_000_000);
+        expect(error.code).toBe("RAW_FALLBACK_CONTEXT_LIMIT");
+        expect(error.recoverable).toBe(true);
+    });
+
+    it("aborts the byte proxy early and never runs the estimator when the sum crosses the budget", async () => {
+        const sessionId = `rust-raw-early-abort-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        let estimatorCalls = 0;
+        const transform = createRustModeTransform(deps, {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => {
+                estimatorCalls += 1;
+                return {
+                    tokens: 10,
+                    trusted: true,
+                    messageTokens: { conversation: 10, toolCall: 0 },
+                    systemTokens: 0,
+                    toolDefinitionTokens: 0,
+                };
+            },
+        });
+        // Budget is 1,000 tokens = 4,000 proxy bytes. Three ~2,000-byte messages
+        // cross it mid-array; the tokenizer pass must never run.
+        const input = [0, 1, 2].map(
+            (index) =>
+                ({
+                    info: {
+                        id: `m${index + 1}`,
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "test-model" },
+                    },
+                    parts: [{ type: "text", text: "x".repeat(2_000) }],
+                }) as MessageLike,
+        );
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const output = { messages: [] as unknown[] };
+            await expect(
+                transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
+            expect(estimatorCalls).toBe(0);
+            expect(output.messages).toEqual([]);
+            const refusalLine = logSpy.mock.calls
+                .map((call) => String(call[1] ?? ""))
+                .find((line) => line.startsWith("raw_fallback_over_context_limit"));
+            expect(refusalLine).toBeDefined();
+            expect(refusalLine).toContain("early_abort=true");
+            expect(refusalLine).toContain("estimated=skipped");
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("uses the calm refusal copy for the rust emergency fail-closed throw", async () => {
+        const sessionId = `rust-fail-closed-copy-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 100_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("daemon unavailable");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 96_000, percentage: 96 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "hello" }],
+            },
+        ] as MessageLike[];
+
+        const failure = transform
+            .run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId))
+            .catch((error: unknown) => error);
+        await expect(failure).resolves.toBeInstanceOf(EmergencyFailClosedError);
+        const error = (await failure) as EmergencyFailClosedError;
+        expect(error.message).toBe(ENGINE_RECONNECTING_USER_MESSAGE);
+        expect(error.message).not.toMatch(/\d/);
+        expect(error.code).toBe("EMERGENCY_FAIL_CLOSED");
+    });
+
+    it("notifies parked sessions with the calm reconnect line", async () => {
+        const sessionId = `rust-park-copy-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const moduleClient: RustModeModuleClient = {
+            call: async () => {
+                throw new Error("daemon unavailable");
+            },
+        };
+        const parkedMessages: string[] = [];
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            notifyParked: (_sid, message) => {
+                parkedMessages.push(message);
+            },
+        });
+        for (let pass = 0; pass < RUST_FAILURE_PARK_THRESHOLD; pass += 1) {
+            const input = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                input,
+                { messages: input as unknown[] },
+                makeMeta(db, sessionId),
+            );
+        }
+        expect(parkedMessages).toEqual([ENGINE_RECONNECTING_USER_MESSAGE]);
     });
 });
