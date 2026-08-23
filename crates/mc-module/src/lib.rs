@@ -2418,17 +2418,18 @@ impl BoundaryTokenCache {
 // These cache budgets are sized for a representative workload of 4,600 messages and 15,000
 // blocks, whose native representation is roughly 49 MiB. After removal of sidecar trees, its
 // retained keys plus encoded and ingress chunks remain below 192 MiB, while the 256 MiB total
-// allows more than one large session. The ingress FlatProjection lives in its own cache so an oversized native
-// snapshot can drop sidecar trees without discarding the projection. Because these are charged
-// estimates, the total remains a hard upper bound so that one unusually large session cannot
-// cause unbounded cache growth.
+// allows more than one large session. The ingress FlatProjection lives in its own cache so an
+// oversized native snapshot can drop sidecar trees without discarding the projection. A single
+// delta-required core may exceed these admission targets; in that case every other native entry is
+// evicted and the honestly charged core remains visible in memory-holder telemetry.
 const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 // These three caches are independent by design: a serialized-output miss re-encodes canonical
 // CortexKit (CK) messages, while a projection or native-prefix miss either reconstructs from the
 // ready snapshot or asks
 // the adapter for a full request. No cache may interpret another cache's presence as authority.
-// Keep their aggregate process-retained ceiling explicit when any individual budget changes.
+// Keep the ordinary aggregate admission target explicit when any individual budget changes; an
+// oversized native delta core is the documented exception and remains honestly charged.
 const TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 const _: () = assert!(
     transform::SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES
@@ -2696,6 +2697,26 @@ impl NativeAttachmentCache {
         self.lru.retain(|candidate| candidate != session_id);
     }
 
+    fn evict_lru_for_core(
+        &mut self,
+        incoming_core_bytes: usize,
+        stats: &mut NativeAttachmentCacheStats,
+    ) {
+        while self.retained_bytes.saturating_add(incoming_core_bytes) > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+                stats.evicted = stats.evicted.saturating_add(1);
+                eprintln!(
+                    "native-attachment-cache evicted session={oldest} byte_charge={} retained_bytes={} total_budget={} reason=delta_core_admission",
+                    session.retained_bytes, self.retained_bytes, self.max_retained_bytes,
+                );
+            }
+        }
+    }
+
     fn snapshot(
         &mut self,
         session_id: &str,
@@ -2749,36 +2770,45 @@ impl NativeAttachmentCache {
         &mut self,
         session_id: &str,
         revert_epoch: u64,
-        mut snapshot: NativeAttachmentCacheSnapshot,
+        snapshot: NativeAttachmentCacheSnapshot,
         stats: &mut NativeAttachmentCacheStats,
         served_bytes: usize,
     ) {
         let requested_bytes = snapshot.retained_bytes(served_bytes);
-        let mut retained_bytes = requested_bytes;
-        let mut dropped_sidecar_trees = false;
+        let mut core_snapshot = snapshot.clone();
+        let dropped_sidecar_trees = core_snapshot.discard_optional_sidecar_trees();
+        let core_bytes = core_snapshot.retained_bytes(served_bytes);
 
-        if retained_bytes > self.max_entry_retained_bytes {
-            dropped_sidecar_trees = snapshot.discard_optional_sidecar_trees();
-            retained_bytes = snapshot.retained_bytes(served_bytes);
-        }
-        if retained_bytes > self.max_entry_retained_bytes
-            || retained_bytes > self.max_retained_bytes
-        {
-            stats.refused_store = stats.refused_store.saturating_add(1);
-            eprintln!(
-                "native-attachment-cache refused_store session={session_id} byte_charge={retained_bytes} requested_byte_charge={requested_bytes} entry_cap={} total_budget={}",
-                self.max_entry_retained_bytes, self.max_retained_bytes,
-            );
-            return;
-        }
-        if dropped_sidecar_trees {
+        // The current session's old generation cannot compete with its replacement. Evict other
+        // sessions before considering the optional sidecar so the structures that expand the next
+        // tail delta always survive, even when one giant core exceeds the configured targets.
+        self.remove(session_id);
+        self.evict_lru_for_core(core_bytes, stats);
+
+        let full_snapshot_fits = requested_bytes <= self.max_entry_retained_bytes
+            && self.retained_bytes.saturating_add(requested_bytes) <= self.max_retained_bytes;
+        let (snapshot, retained_bytes, degraded) = if full_snapshot_fits {
+            (snapshot, requested_bytes, false)
+        } else if dropped_sidecar_trees {
+            (core_snapshot, core_bytes, true)
+        } else {
+            (snapshot, requested_bytes, false)
+        };
+
+        if degraded {
             stats.degraded_store = stats.degraded_store.saturating_add(1);
             eprintln!(
-                "native-attachment-cache degraded_store session={session_id} requested_byte_charge={requested_bytes} stored_byte_charge={retained_bytes} dropped_sidecar_trees={dropped_sidecar_trees}",
+                "native-attachment-cache degraded_store session={session_id} requested_byte_charge={requested_bytes} stored_byte_charge={retained_bytes} dropped_sidecar_trees=true consequence=raw_sidecar_redecode delta_core_preserved=true",
+            );
+        }
+        if retained_bytes > self.max_retained_bytes {
+            eprintln!(
+                "native-attachment-cache oversized_core_store session={session_id} stored_byte_charge={retained_bytes} total_budget={} over_budget_by={} consequence=single_session_exceeds_native_cache_budget delta_core_preserved=true",
+                self.max_retained_bytes,
+                retained_bytes.saturating_sub(self.max_retained_bytes),
             );
         }
 
-        self.remove(session_id);
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
         self.sessions.insert(
             session_id.to_string(),
@@ -2790,19 +2820,6 @@ impl NativeAttachmentCache {
             },
         );
         self.lru.push_back(session_id.to_string());
-        while self.retained_bytes > self.max_retained_bytes {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
-            };
-            if let Some(session) = self.sessions.remove(&oldest) {
-                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
-                stats.evicted = stats.evicted.saturating_add(1);
-                eprintln!(
-                    "native-attachment-cache evicted session={oldest} byte_charge={} retained_bytes={} total_budget={}",
-                    session.retained_bytes, self.retained_bytes, self.max_retained_bytes,
-                );
-            }
-        }
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.stats = *stats;
         }
@@ -17922,10 +17939,20 @@ mod tests {
             GIANT_BLOCK_COUNT,
             GIANT_NATIVE_WIRE_BYTES,
         );
+        let served_bytes = served
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .sum::<usize>();
         let request = Arc::new(request);
+        let native_wire_bytes = serde_json::to_vec(request.native_messages.as_ref().unwrap())
+            .unwrap()
+            .len();
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
         handler.bind_route(7, binding(project.to_str().unwrap(), SESSION_ID));
+        const GIANT_CORE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+        *handler.native_attachments.lock().unwrap() =
+            NativeAttachmentCache::with_limits(GIANT_CORE_BUDGET_BYTES, GIANT_CORE_BUDGET_BYTES);
 
         let projection = Arc::new(
             crate::ck_wire::project_messages(&request.messages).expect("giant projection"),
@@ -17961,8 +17988,19 @@ mod tests {
             let cache = handler.native_attachments.lock().unwrap();
             let entry = &cache.sessions[SESSION_ID];
             let snapshot = &entry.snapshot;
-            assert!(entry.retained_bytes <= cache.max_entry_retained_bytes);
-            assert!(cache.retained_bytes <= cache.max_retained_bytes);
+            assert!(
+                entry.retained_bytes > cache.max_entry_retained_bytes,
+                "fixture core must exceed its ceiling: charge={} cap={}",
+                entry.retained_bytes,
+                cache.max_entry_retained_bytes
+            );
+            assert_eq!(cache.retained_bytes, entry.retained_bytes);
+            assert_eq!(entry.retained_bytes, snapshot.retained_bytes(served_bytes));
+            assert!(
+                entry.retained_bytes >= native_wire_bytes,
+                "retained core undercharged its native wire: charge={} wire={native_wire_bytes}",
+                entry.retained_bytes
+            );
             assert!(snapshot.sidecar.messages.is_empty());
             assert!(snapshot.sidecar_sizes.is_empty());
             assert_eq!(snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT);
@@ -18061,15 +18099,101 @@ mod tests {
             "{second_stats:?}"
         );
         assert!(second_stats.encoded_messages <= 2, "{second_stats:?}");
-        assert_eq!(second_stats.degraded_store, 0, "{second_stats:?}");
+        assert_eq!(second_stats.degraded_store, 1, "{second_stats:?}");
 
         let cache = handler.native_attachments.lock().unwrap();
         let entry = &cache.sessions[SESSION_ID];
-        assert!(entry.retained_bytes <= cache.max_entry_retained_bytes);
-        assert!(cache.retained_bytes <= cache.max_retained_bytes);
+        assert!(entry.retained_bytes > cache.max_entry_retained_bytes);
+        assert_eq!(cache.retained_bytes, entry.retained_bytes);
         assert_eq!(entry.snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT + 1);
-        assert_eq!(entry.snapshot.sidecar.messages.len(), 1);
-        assert_eq!(entry.snapshot.sidecar_sizes.len(), 1);
+        assert!(entry.snapshot.sidecar.messages.is_empty());
+        assert!(entry.snapshot.sidecar_sizes.is_empty());
+    }
+
+    #[test]
+    fn giant_delta_core_evicts_other_sessions_before_crossing_its_own_ceiling() {
+        let (request_a, served_a) = native_cache_fixture("native-core-priority-a", 8, 8, 64 * 1024);
+        let (request_b, served_b) =
+            native_cache_fixture("native-core-priority-b", 128, 128, 1024 * 1024);
+        let served_bytes_a = served_a
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .sum::<usize>();
+        let served_bytes_b = served_b
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .sum::<usize>();
+        let staging = Mutex::new(NativeAttachmentCache::new(usize::MAX / 4));
+        run_native_cache_pass(
+            &staging,
+            &request_a,
+            served_a,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        run_native_cache_pass(
+            &staging,
+            &request_b,
+            served_b,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let (snapshot_a, snapshot_b) = {
+            let mut staging = staging.lock().unwrap();
+            (
+                staging.snapshot("native-core-priority-a", 0).unwrap(),
+                staging.snapshot("native-core-priority-b", 0).unwrap(),
+            )
+        };
+        let mut degraded_b = snapshot_b.clone();
+        assert!(degraded_b.discard_optional_sidecar_trees());
+        let core_charge_b = degraded_b.retained_bytes(served_bytes_b);
+        let core_ceiling = core_charge_b.saturating_sub(1);
+        assert!(snapshot_a.retained_bytes(served_bytes_a) < core_ceiling);
+
+        let mut cache = NativeAttachmentCache::with_limits(core_ceiling, core_ceiling);
+        let mut stats_a = NativeAttachmentCacheStats::default();
+        cache.replace(
+            "native-core-priority-a",
+            0,
+            snapshot_a,
+            &mut stats_a,
+            served_bytes_a,
+        );
+        assert!(cache.sessions.contains_key("native-core-priority-a"));
+
+        let mut stats_b = NativeAttachmentCacheStats::default();
+        cache.replace(
+            "native-core-priority-b",
+            0,
+            snapshot_b,
+            &mut stats_b,
+            served_bytes_b,
+        );
+
+        assert_eq!(stats_b.evicted, 1, "{stats_b:?}");
+        assert_eq!(stats_b.degraded_store, 1, "{stats_b:?}");
+        assert_eq!(stats_b.refused_store, 0, "{stats_b:?}");
+        assert!(!cache.sessions.contains_key("native-core-priority-a"));
+        let entry = &cache.sessions["native-core-priority-b"];
+        assert_eq!(entry.retained_bytes, core_charge_b);
+        assert_eq!(cache.retained_bytes, core_charge_b);
+        assert!(cache.retained_bytes > cache.max_retained_bytes);
+        let fingerprint = request_b.full_array_fingerprint.as_deref().unwrap();
+        let (prefix, charges) = cache
+            .delta_native_prefix(
+                "native-core-priority-b",
+                0,
+                fingerprint,
+                request_b.messages.len(),
+            )
+            .expect("the over-ceiling core must remain available for delta reattachment");
+        assert_eq!(prefix.len(), request_b.messages.len());
+        assert_eq!(charges.len(), request_b.messages.len());
     }
 
     #[test]
@@ -18797,9 +18921,9 @@ mod tests {
         assert!(stats.encoded_messages > 0, "same-length edit was reused");
         assert_eq!(edited.native_messages.unwrap()[1]["info"]["meta"], "ccc");
 
-        let evicting_cache = Mutex::new(NativeAttachmentCache::new(1));
+        let evicted_cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
         run_native_cache_pass(
-            &evicting_cache,
+            &evicted_cache,
             &edited_request,
             edited_served.clone(),
             &BTreeMap::new(),
@@ -18807,8 +18931,12 @@ mod tests {
             0,
             NativeCacheKeyMode::Normal,
         );
+        evicted_cache
+            .lock()
+            .unwrap()
+            .remove("native-frontier-vacuity");
         let (_after_eviction, evicted_stats) = run_native_cache_pass(
-            &evicting_cache,
+            &evicted_cache,
             &edited_request,
             edited_served,
             &BTreeMap::new(),
@@ -19149,7 +19277,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_small_lru_evicts_attachment_without_dropping_projection() {
+    async fn handler_small_lru_preserves_projection_and_an_oversized_delta_core() {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let session_a = "projection-lru-a";
@@ -19245,12 +19373,12 @@ mod tests {
         )
         .await;
         assert_eq!(response_c["status"], "ok", "{response_c}");
-        assert!(!handler
-            .native_attachments
-            .lock()
-            .unwrap()
-            .sessions
-            .contains_key(session_c));
+        {
+            let native = handler.native_attachments.lock().unwrap();
+            let oversized_entry = &native.sessions[session_c];
+            assert!(oversized_entry.retained_bytes > native.max_retained_bytes);
+            assert_eq!(native.retained_bytes, oversized_entry.retained_bytes);
+        }
         assert!(
             handler
                 .projections
@@ -19258,7 +19386,7 @@ mod tests {
                 .unwrap()
                 .sessions
                 .contains_key(session_c),
-            "refusing an oversized native snapshot must not refuse the projection"
+            "preserving an oversized native core must not drop the independent projection"
         );
 
         let mut warm_delta = native_cache_request(

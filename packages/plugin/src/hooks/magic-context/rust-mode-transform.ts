@@ -83,7 +83,11 @@ import {
     mirrorModuleCompartments,
     syncModuleState,
 } from "./module-state-sync";
-import { isModuleTransportGenerationChangedResult } from "./module-transport";
+import {
+    isModuleTransportGenerationChangedResult,
+    TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS,
+    TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS,
+} from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
     encodeOpenCodeMessagesToCk,
@@ -1355,11 +1359,12 @@ export function createRustModeTransform(
 
     const callModule = async (
         args: Parameters<RustModeModuleClient["call"]>[0],
+        attemptTimeoutMs = timeoutMs,
     ): Promise<unknown> => {
         const controller = new AbortController();
         const timer = setTimeout(
             () => controller.abort(new Error("rust module request timed out")),
-            timeoutMs,
+            attemptTimeoutMs,
         );
         try {
             return await options.moduleClient.call({ ...args, signal: controller.signal });
@@ -2296,15 +2301,31 @@ export function createRustModeTransform(
                     const transportStartedAt = performance.now();
                     let moduleResponse: unknown;
                     try {
-                        moduleResponse = await callModule({
-                            sessionId,
-                            projectRoot,
-                            method: "transform",
-                            body: page,
-                            // A reconnect discards a collecting page series. Page zero can be
-                            // retried safely, but later pages must make the caller restart it.
-                            generationSensitive: paged && index > 0,
-                        });
+                        const attemptClass = paged
+                            ? index === pages.length - 1
+                                ? "transform_series_execute"
+                                : "transform_page_upload"
+                            : undefined;
+                        const attemptTimeoutMs =
+                            options.moduleTimeoutMs ??
+                            (attemptClass === "transform_series_execute"
+                                ? TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS
+                                : attemptClass === "transform_page_upload"
+                                  ? TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS
+                                  : timeoutMs);
+                        moduleResponse = await callModule(
+                            {
+                                sessionId,
+                                projectRoot,
+                                method: "transform",
+                                body: page,
+                                // A reconnect discards a collecting page series. Page zero can be
+                                // retried safely, but later pages must make the caller restart it.
+                                generationSensitive: paged && index > 0,
+                                attemptClass,
+                            },
+                            attemptTimeoutMs,
+                        );
                     } catch (error) {
                         if (paged && isTransformPageAttemptMismatch(error)) {
                             return {

@@ -1704,6 +1704,7 @@ export interface ModuleStateSyncClient {
         body: unknown;
         signal?: AbortSignal;
         generationSensitive?: boolean;
+        attemptClass?: "transform_page_upload" | "transform_series_execute";
     }): Promise<unknown>;
 }
 

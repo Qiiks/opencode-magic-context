@@ -436,6 +436,107 @@ describe("SubcModuleTransport", () => {
         expect(requestCount).toBe(2);
     });
 
+    it("uses a cold-start deadline only for a completed transform page series", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        const observedTimeouts: number[] = [];
+        const client = {
+            request: async (
+                _route: RouteHandle,
+                _body: unknown,
+                options: { timeoutMs: number },
+            ) => {
+                observedTimeouts.push(options.timeoutMs);
+                return { result: { ok: true } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-attempt-class\0/workspace/project",
+            generation: 0,
+        });
+        const base = {
+            sessionId: "session-attempt-class",
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+        };
+
+        await transport.call({
+            ...base,
+            body: { method: "transform", transform_page_complete: false },
+            attemptClass: "transform_page_upload",
+        });
+        await transport.call({
+            ...base,
+            body: { method: "transform", transform_page_complete: true },
+            attemptClass: "transform_series_execute",
+        });
+
+        expect(observedTimeouts).toHaveLength(2);
+        expect(observedTimeouts[0]).toBeGreaterThan(4_500);
+        expect(observedTimeouts[0]).toBeLessThanOrEqual(5_000);
+        expect(observedTimeouts[1]).toBeGreaterThan(29_000);
+        expect(observedTimeouts[1]).toBeLessThanOrEqual(30_000);
+    });
+
+    it("fails a completed-series deadline without reconnecting or retrying", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        let requestCount = 0;
+        let closeCount = 0;
+        const client = {
+            request: () => {
+                requestCount += 1;
+                return new Promise<never>(() => undefined);
+            },
+            close: () => {
+                closeCount += 1;
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-execute-timeout\0/workspace/project",
+            generation: 0,
+        });
+
+        await expect(
+            transport.call({
+                sessionId: "session-execute-timeout",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", transform_page_complete: true },
+                generationSensitive: true,
+                attemptClass: "transform_series_execute",
+                timeoutMs: 25,
+            }),
+        ).rejects.toMatchObject({ code: "ETIMEDOUT" });
+        expect(requestCount).toBe(1);
+        expect(closeCount).toBe(0);
+        expect(internals.client).toBe(client);
+    });
+
     it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "module-subc-restart-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
