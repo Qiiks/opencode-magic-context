@@ -11495,7 +11495,6 @@ enum FrozenTrailingBlankDecision {
 pub(crate) enum UserTerminatedTailDecision {
     Unchanged,
     Reanchor { user_mid: String },
-    RejectCompletedAssistant,
 }
 
 fn assistant_has_completed_content(message: &CkIngressMessage) -> bool {
@@ -11554,11 +11553,13 @@ pub(crate) fn user_terminated_tail_decision(
         UserTerminatedTailDecision::Reanchor {
             user_mid: request.messages[user_index].mid.clone(),
         }
-    } else if request.prev_response_completed_at_ms.is_some() {
-        // The completion timestamp distinguishes a retry of finished output from an
-        // incomplete assistant snapshot that has not been observed complete.
-        UserTerminatedTailDecision::RejectCompletedAssistant
     } else {
+        // An assistant with real content at the array tail is the harness's NORMAL
+        // mid-turn continuation shape: completed tool steps ride the streaming
+        // assistant, and the provider serializer emits the user-terminated wire
+        // itself. A completion timestamp cannot discriminate a stale retry from a
+        // step boundary (the previous STEP's response also completed), so serve the
+        // array untouched — refusing here kills every tool-using turn.
         UserTerminatedTailDecision::Unchanged
     }
 }
@@ -11569,9 +11570,6 @@ fn enforce_user_terminated_tail(
 ) -> Result<(), TransformError> {
     match user_terminated_tail_decision(request) {
         UserTerminatedTailDecision::Unchanged => Ok(()),
-        UserTerminatedTailDecision::RejectCompletedAssistant => {
-            Err(TransformError::AssistantTerminalRetry)
-        }
         UserTerminatedTailDecision::Reanchor { user_mid } => {
             let user = request
                 .messages
@@ -18032,30 +18030,45 @@ pub(crate) mod tests {
             ),
             (
                 "assistant-tail-tool",
-                vec![CkWireBlock::bare(ck_wire::CkKind::ToolCall {
-                    id: "call-completed".to_string(),
-                    name: "bash".to_string(),
-                    input: json!({ "command": "true" }),
-                    provider_executed: false,
-                })],
+                // A completed tool STEP: call plus its result, the shape OpenCode's
+                // mid-turn continuation actually serves (an unpaired trailing call
+                // never reaches the provider request — results attach first).
+                vec![
+                    CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                        id: "call-completed".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "true" }),
+                        provider_executed: false,
+                    }),
+                    CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                        id: "call-completed".to_string(),
+                        tool_name: "bash".to_string(),
+                        output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                            text: "done".to_string(),
+                        }),
+                        provider_executed: false,
+                    }),
+                ],
             ),
         ] {
             let completed_request = request(session, completed_content);
+            // Real-content assistant tails are the normal mid-turn continuation
+            // shape (completed tool steps ride the streaming assistant), so the
+            // serve must pass them through untouched — never reorder, never refuse.
             assert_eq!(
                 user_terminated_tail_decision(&completed_request),
-                UserTerminatedTailDecision::RejectCompletedAssistant
+                UserTerminatedTailDecision::Unchanged
             );
             let completed_dir = tempfile::tempdir().unwrap();
-            let error = transform(
+            let response = transform(
                 &store(completed_dir.path()),
                 &completed_request,
                 &pctx("git:proj", "/nonexistent-docs", 0),
             )
-            .expect_err("completed assistant retry must reject before serving");
-            assert!(matches!(error, TransformError::AssistantTerminalRetry));
+            .expect("mid-turn continuation tails serve untouched");
             assert_eq!(
-                error.to_string(),
-                "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue."
+                response.messages().last().map(|message| message.role.as_str()),
+                Some("assistant")
             );
         }
     }
