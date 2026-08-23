@@ -1742,6 +1742,60 @@ describe("Rust mode authority adapter", () => {
         }
     });
 
+    it("fails a completed-series timeout without uploading the page series again", async () => {
+        const sessionId = `rust-series-execute-timeout-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const transformCalls: Array<{
+            body: Record<string, unknown>;
+            attemptClass: string | undefined;
+        }> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body, attemptClass }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformCalls.push({ body: page, attemptClass });
+                if (page.transform_page_complete === true) {
+                    throw Object.assign(new Error("cold execute deadline"), { code: "ETIMEDOUT" });
+                }
+                return { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: [] as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformCalls.filter(
+                ({ body }) => body.transform_page_index === 0,
+            );
+            expect(seriesStarts).toHaveLength(1);
+            expect(transformCalls.at(-1)?.attemptClass).toBe("transform_series_execute");
+            expect(
+                transformCalls
+                    .slice(0, -1)
+                    .every(({ attemptClass }) => attemptClass === "transform_page_upload"),
+            ).toBe(true);
+            expect(output.messages).toEqual(messages);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(logged.some((message) => message.startsWith("transform_series_restart"))).toBe(
+                false,
+            );
+            expect(logged.some((message) => message.startsWith("rust transform failed"))).toBe(
+                true,
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
     it("falls through after a second paged transform series mismatch", async () => {
         const sessionId = `rust-series-restart-bound-${Date.now()}`;
         sessions.push(sessionId);

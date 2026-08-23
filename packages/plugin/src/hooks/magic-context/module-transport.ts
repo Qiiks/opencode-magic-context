@@ -38,7 +38,13 @@ const CONNECT_BACKOFF_WAIT_BUDGET_MS = 12_000;
 const CONNECT_BACKOFF_WAIT_JITTER_MS = 100;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
-const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
+export const TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS = 5_000;
+/**
+ * A completed giant page series makes the module assemble, project, and encode the whole cold
+ * snapshot. ASTRO-scale cold passes have exceeded five seconds while still making progress, so
+ * leave enough headroom for that one execute attempt without weakening steady-state deadlines.
+ */
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS = 30_000;
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
 export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
@@ -82,6 +88,16 @@ function isStaleOrDeadRouteFailure(error: unknown): boolean {
             name === "StaleRouteHandleError" ||
             /route handle \(\d+,\s*\d+\) is not live on the current connection/i.test(message) ||
             /\b(?:unknown|unrecognized) channel\b/i.test(message)
+        );
+    });
+}
+
+function isDeadlineFailure(error: unknown): boolean {
+    if (error instanceof SocketTimeoutError) return true;
+    return errorChainSome(error, (current) => {
+        const code = typeof current.code === "string" ? current.code : "";
+        return ["ETIMEDOUT", "request_deadline", "deadline_exceeded_no_drop_observed"].includes(
+            code,
         );
     });
 }
@@ -433,6 +449,8 @@ export class SubcModuleTransport {
         generationSensitive?: boolean;
         /** Producer-backed calls can outlive the default transport budget. */
         timeoutMs?: number;
+        /** Distinguishes cheap page admission from the cold execute on the completed series. */
+        attemptClass?: "transform_page_upload" | "transform_series_execute";
     }): Promise<unknown> {
         const wrapupInFlight = (this.wrapupSessions.get(args.sessionId) ?? 0) > 0;
         const attemptTimeoutMs =
@@ -440,9 +458,11 @@ export class SubcModuleTransport {
             (args.method === "session.wrapup" ||
             (args.method === "session.status" && wrapupInFlight)
                 ? MAX_WRAPUP_REQUEST_BUDGET_MS
-                : args.method === "transform"
-                  ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
-                  : this.requestTimeoutMs);
+                : args.attemptClass === "transform_series_execute"
+                  ? TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS
+                  : args.method === "transform"
+                    ? Math.min(this.requestTimeoutMs, TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS)
+                    : this.requestTimeoutMs);
         const tracksWrapup = args.method === "session.wrapup";
         if (tracksWrapup) {
             this.wrapupSessions.set(
@@ -469,7 +489,12 @@ export class SubcModuleTransport {
             throw error;
         }
         let activeAttemptClient: SubcClient | null = null;
-        const onAbort = () => this.invalidateConnection(activeAttemptClient ?? this.client);
+        const onAbort = () => {
+            // The completed-series deadline is a pass budget, not evidence that the socket died.
+            // Closing it would relabel a slow execute as reconnect and make the caller re-upload.
+            if (args.attemptClass === "transform_series_execute") return;
+            this.invalidateConnection(activeAttemptClient ?? this.client);
+        };
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -511,6 +536,15 @@ export class SubcModuleTransport {
                     }
                     return response;
                 } catch (error) {
+                    if (
+                        args.attemptClass === "transform_series_execute" &&
+                        isDeadlineFailure(error)
+                    ) {
+                        // A request deadline on the completed page series fails this pass. The
+                        // module may still finish the cold execute, so preserve the live route and
+                        // never turn the timeout into a generation change/re-upload loop.
+                        throw error;
+                    }
                     if (isConnectionFailure(error)) {
                         const previousGeneration =
                             ensuredRoute?.generation ?? this.connectionGeneration;
