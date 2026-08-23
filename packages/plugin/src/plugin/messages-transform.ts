@@ -99,8 +99,7 @@ function enforcePersistedUserTerminatedTail(messages: MessageWithParts[]): void 
     if (
         userIndex < 0 ||
         trailing.some(
-            (message) =>
-                message.info.role !== "assistant" || assistantHasCompletedContent(message),
+            (message) => message.info.role !== "assistant" || assistantHasCompletedContent(message),
         )
     ) {
         // An assistant with real content at the array tail is OpenCode's NORMAL
@@ -142,8 +141,7 @@ function preserveUserTerminatedTail(
     // may move before it, while completed model output must never be moved below its prompt.
     if (
         trailing.some(
-            (message) =>
-                message.info.role !== "assistant" || assistantHasCompletedContent(message),
+            (message) => message.info.role !== "assistant" || assistantHasCompletedContent(message),
         )
     ) {
         // Real model output landed after the input user mid-transform. Moving the
