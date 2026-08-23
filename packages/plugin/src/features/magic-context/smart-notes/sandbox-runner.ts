@@ -64,13 +64,51 @@ function getAsyncModule(): Promise<QuickJSAsyncWASMModule> {
  * chain for the next caller, so we continue the chain on both settle paths.
  */
 let sandboxRunChain: Promise<unknown> = Promise.resolve();
-function withSandboxLock<T>(fn: () => Promise<T>): Promise<T> {
-    const run = sandboxRunChain.then(fn, fn);
+function withSandboxLock<T>(
+    fn: () => Promise<T>,
+    signal?: AbortSignal,
+    cancelled?: () => T,
+): Promise<T> {
+    const start = () => (signal?.aborted && cancelled ? cancelled() : fn());
+    const run = sandboxRunChain.then(start, start);
     sandboxRunChain = run.then(
         () => undefined,
         () => undefined,
     );
-    return run;
+    return resolveBeforeAbort(run, signal, cancelled);
+}
+
+/**
+ * A sweep's deadline includes waiting for an earlier sandbox run. The lock entry
+ * remains in the chain after its caller gives up, but the caller must not wait
+ * for an unrelated suspended check before it can report cancellation.
+ */
+function resolveBeforeAbort<T>(
+    run: Promise<T>,
+    signal: AbortSignal | undefined,
+    cancelled: (() => T) | undefined,
+): Promise<T> {
+    if (!signal || !cancelled) return run;
+    if (signal.aborted) return Promise.resolve(cancelled());
+
+    return new Promise((resolve, reject) => {
+        const cleanup = () => signal.removeEventListener("abort", abort);
+        const abort = () => {
+            cleanup();
+            resolve(cancelled());
+        };
+        signal.addEventListener("abort", abort, { once: true });
+        void run.then(
+            (result) => {
+                cleanup();
+                resolve(result);
+            },
+            (error) => {
+                cleanup();
+                reject(error);
+            },
+        );
+    });
 }
 
 export interface RunCompiledSmartNoteCheckOptions {
@@ -147,7 +185,11 @@ export async function runCompiledSmartNoteCheck(
     // asyncify-suspended eval may exist at a time on the shared module. The
     // per-check timeout and host-capability controller start INSIDE the lock so
     // a check queued behind another doesn't burn its own budget waiting.
-    return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options));
+    return withSandboxLock(
+        () => runCompiledSmartNoteCheckLocked(options),
+        options.signal,
+        () => cancelledResult(options.signal?.reason),
+    );
 }
 
 async function runCompiledSmartNoteCheckLocked(

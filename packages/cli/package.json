@@ -33,7 +33,7 @@
         "README.md"
     ],
     "scripts": {
-        "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm --external node:sqlite --external jsonc-parser",
+        "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm --external node:sqlite",
         "typecheck": "tsc --noEmit",
         "test": "bun run src/test-runner.ts",
         "lint": "biome check src",
