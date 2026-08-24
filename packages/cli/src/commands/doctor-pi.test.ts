@@ -319,7 +319,7 @@ describe("Pi doctor", () => {
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
         expect(output).toContain(
-            "WARN Embedding provider: local — onnxruntime-node native binding missing",
+            "WARN Embedding provider: local — native runtime and WASM fallback both unavailable",
         );
         expect(output).toContain("postinstall likely failed");
         expect(output).toContain("Stale Pi extension cache found");
@@ -338,7 +338,7 @@ describe("Pi doctor", () => {
 
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
-        expect(output).toContain("PASS Embedding provider: local (native runtime present)");
+        expect(output).toContain("PASS Embedding provider: local (native runtime OK)");
     });
 
     it("repairs missing package entry and missing user config in --force mode", async () => {

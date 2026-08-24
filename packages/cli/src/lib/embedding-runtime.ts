@@ -4,16 +4,13 @@ import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
 
 /**
- * Detects whether the local-embedding native runtime (`onnxruntime-node`) is
- * actually present and usable in an installed plugin tree.
+ * Detects whether the local-embedding runtime can use native ONNX or its WASM
+ * fallback in an installed plugin tree.
  *
- * Why this check exists (issue #128): the plugin's `@huggingface/transformers`
- * Node entry does a STATIC `import "onnxruntime-node"`. When that package — or
- * its platform-specific native binary — failed to install (seen on Windows when
- * the binary download is interrupted), the import throws
- * `Cannot find package 'onnxruntime-node'` on EVERY embedding attempt, and the
- * runtime can only degrade. Doctor surfaces it ahead of time with an actionable
- * fix instead of leaving users to decode the cryptic resolver error.
+ * The plugin's `@huggingface/transformers` Node entry statically imports
+ * `onnxruntime-node`. When that package or its platform binary cannot load,
+ * doctor probes `onnxruntime-web` too, so it can distinguish native success,
+ * a usable slower fallback, and an installation where neither runtime works.
  */
 
 export type LocalEmbeddingRuntimeStatus =
@@ -21,12 +18,26 @@ export type LocalEmbeddingRuntimeStatus =
     | { state: "package-missing"; packageDir: string }
     | { state: "binary-missing"; packageDir: string; expectedBinary: string }
     | { state: "load-failed"; packageDir: string; reason: string }
+    | {
+          state: "wasm-fallback";
+          nativeFailure: NativeLocalEmbeddingRuntimeFailure;
+          wasmPath: string;
+      }
+    | {
+          state: "both-broken";
+          nativeFailure: NativeLocalEmbeddingRuntimeFailure;
+          wasmReason: string;
+      }
     | { state: "unknown"; reason: string };
 
-export type BrokenLocalEmbeddingRuntimeStatus = Extract<
+export type NativeLocalEmbeddingRuntimeFailure = Extract<
     LocalEmbeddingRuntimeStatus,
     { state: "package-missing" | "binary-missing" | "load-failed" }
 >;
+
+export type BrokenLocalEmbeddingRuntimeStatus =
+    | NativeLocalEmbeddingRuntimeFailure
+    | Extract<LocalEmbeddingRuntimeStatus, { state: "both-broken" }>;
 
 function describeError(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error ?? "unknown error");
@@ -127,7 +138,9 @@ function parseOnnxProbeVerdict(output: string): { ok: boolean; reason?: string }
     return null;
 }
 
-function probeOnnxRuntimeNodeLoad(packageDir: string): LocalEmbeddingRuntimeStatus | null {
+function probeOnnxRuntimeNodeLoad(
+    packageDir: string,
+): Extract<LocalEmbeddingRuntimeStatus, { state: "load-failed" }> | null {
     const result = runOnnxRuntimeNodeLoadProbeChildForRuntime(packageDir);
     const errorCode = (result.error as { code?: unknown } | null)?.code;
     if (errorCode === "ETIMEDOUT") {
@@ -176,9 +189,9 @@ function probeOnnxRuntimeNodeLoad(packageDir: string): LocalEmbeddingRuntimeStat
     };
 }
 
-export function isLocalEmbeddingRuntimeBroken(
+function isNativeLocalEmbeddingRuntimeFailure(
     status: LocalEmbeddingRuntimeStatus,
-): status is BrokenLocalEmbeddingRuntimeStatus {
+): status is NativeLocalEmbeddingRuntimeFailure {
     return (
         status.state === "package-missing" ||
         status.state === "binary-missing" ||
@@ -186,20 +199,46 @@ export function isLocalEmbeddingRuntimeBroken(
     );
 }
 
+function describeNativeFailure(status: NativeLocalEmbeddingRuntimeFailure): string {
+    return status.state === "package-missing"
+        ? "package is not installed"
+        : status.state === "binary-missing"
+          ? "expected platform binding file is absent"
+          : `binding failed to load: ${status.reason}`;
+}
+
+export function isLocalEmbeddingRuntimeBroken(
+    status: LocalEmbeddingRuntimeStatus,
+): status is BrokenLocalEmbeddingRuntimeStatus {
+    return status.state === "both-broken" || isNativeLocalEmbeddingRuntimeFailure(status);
+}
+
 export function formatLocalEmbeddingRuntimeDoctorWarning(
     status: BrokenLocalEmbeddingRuntimeStatus,
 ): string {
-    const cause =
-        status.state === "package-missing"
-            ? "package is not installed"
-            : status.state === "binary-missing"
-              ? "expected platform binding file is absent"
-              : `binding failed to load: ${status.reason}`;
+    if (status.state !== "both-broken") {
+        return (
+            "Embedding provider: local — onnxruntime-node native binding missing — " +
+            `${describeNativeFailure(status)}; its postinstall likely failed. Embeddings will not work. ` +
+            "Reinstall with network access to the npm registry and GitHub releases, " +
+            "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+        );
+    }
     return (
-        "Embedding provider: local — onnxruntime-node native binding missing — " +
-        `${cause}; its postinstall likely failed. Embeddings will not work. ` +
-        "Reinstall with network access to the npm registry and GitHub releases, " +
+        "Embedding provider: local — native runtime and WASM fallback both unavailable — " +
+        `native: ${describeNativeFailure(status.nativeFailure)}; WASM: ${status.wasmReason}; ` +
+        "their install or postinstall likely failed. Reinstall with network access to the npm registry and GitHub releases, " +
         "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+    );
+}
+
+export function formatLocalEmbeddingRuntimeWasmFallback(
+    status: Extract<LocalEmbeddingRuntimeStatus, { state: "wasm-fallback" }>,
+): string {
+    return (
+        "Embedding provider: local — onnxruntime-node native binding failed " +
+        `(${describeNativeFailure(status.nativeFailure)}); using onnxruntime-web (WASM) at ${status.wasmPath}. ` +
+        "WASM inference is slower than native; a remote `openai-compatible` provider may be faster."
     );
 }
 
@@ -216,6 +255,43 @@ function expectedBinaryRelPath(platform: NodeJS.Platform, arch: string): string 
     return join("bin", "napi-v6", platform, arch, "onnxruntime_binding.node");
 }
 
+type WasmRuntimeProbe = { state: "ok"; wasmPath: string } | { state: "failed"; reason: string };
+
+function probeWasmRuntimeFromRequire(requireFn: NodeRequire): WasmRuntimeProbe {
+    try {
+        const resolved = requireFn.resolve("onnxruntime-web");
+        const packageDir = packageDirFromResolved(resolved, "onnxruntime-web");
+        const loadFailure = probeOnnxRuntimeNodeLoad(packageDir);
+        if (loadFailure === null) return { state: "ok", wasmPath: packageDir };
+        return { state: "failed", reason: loadFailure.reason };
+    } catch (error) {
+        return {
+            state: "failed",
+            reason: `onnxruntime-web is not resolvable: ${describeError(error)}`,
+        };
+    }
+}
+
+function withWasmFallback(
+    native: LocalEmbeddingRuntimeStatus,
+    probeWasm: () => WasmRuntimeProbe,
+): LocalEmbeddingRuntimeStatus {
+    if (!isNativeLocalEmbeddingRuntimeFailure(native)) return native;
+
+    // Keep the tagged result rather than relying on a truthy probe value: both
+    // success and failure carry data, and doctor must report the distinction.
+    const wasm = probeWasm();
+    if (wasm.state === "ok") {
+        return { state: "wasm-fallback", nativeFailure: native, wasmPath: wasm.wasmPath };
+    }
+    return { state: "both-broken", nativeFailure: native, wasmReason: wasm.reason };
+}
+
+function probeWasmRuntimeAt(installRoot: string): WasmRuntimeProbe {
+    const requireFn = createRequire(join(installRoot, "package.json"));
+    return probeWasmRuntimeFromRequire(requireFn);
+}
+
 /**
  * Check a single install root (the directory that owns `node_modules`) for a
  * usable onnxruntime-node. `npm`/Bun hoist transitive deps, so the package lands
@@ -227,20 +303,26 @@ export function checkLocalEmbeddingRuntimeAt(
     arch: string = process.arch,
 ): LocalEmbeddingRuntimeStatus {
     const packageDir = join(installRoot, "node_modules", "onnxruntime-node");
+    let native: LocalEmbeddingRuntimeStatus;
     if (!existsSync(join(packageDir, "package.json"))) {
-        return { state: "package-missing", packageDir };
+        native = { state: "package-missing", packageDir };
+    } else {
+        const rel = expectedBinaryRelPath(platform, arch);
+        if (rel === null) {
+            // Unknown platform/arch — a direct package load still proves whether
+            // its own native-loader path works.
+            native = probeOnnxRuntimeNodeLoad(packageDir) ?? {
+                state: "ok",
+                binaryPath: packageDir,
+            };
+        } else {
+            const binaryPath = join(packageDir, rel);
+            native = existsSync(binaryPath)
+                ? (probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath })
+                : { state: "binary-missing", packageDir, expectedBinary: binaryPath };
+        }
     }
-    const rel = expectedBinaryRelPath(platform, arch);
-    if (rel === null) {
-        // Unknown platform/arch — the package is present, but a direct package
-        // load can still prove whether its own native-loader path works.
-        return probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath: packageDir };
-    }
-    const binaryPath = join(packageDir, rel);
-    if (!existsSync(binaryPath)) {
-        return { state: "binary-missing", packageDir, expectedBinary: binaryPath };
-    }
-    return probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath };
+    return withWasmFallback(native, () => probeWasmRuntimeAt(installRoot));
 }
 
 /**
@@ -261,13 +343,19 @@ export function checkLocalEmbeddingRuntime(
             reason: "no installed plugin tree found to inspect",
         };
     }
+    let firstFallback: Extract<LocalEmbeddingRuntimeStatus, { state: "wasm-fallback" }> | null =
+        null;
     let firstFailure: LocalEmbeddingRuntimeStatus | null = null;
     for (const root of existing) {
         const status = checkLocalEmbeddingRuntimeAt(root, platform, arch);
         if (status.state === "ok") return status;
+        if (status.state === "wasm-fallback") {
+            if (firstFallback === null) firstFallback = status;
+            continue;
+        }
         if (firstFailure === null) firstFailure = status;
     }
-    return firstFailure ?? { state: "unknown", reason: "no candidate roots" };
+    return firstFallback ?? firstFailure ?? { state: "unknown", reason: "no candidate roots" };
 }
 
 /** Slice a resolved module path back to its package directory (the dir that
@@ -277,6 +365,30 @@ function packageDirFromResolved(resolvedPath: string, packageName: string): stri
     const marker = `node_modules${sep}${packageName.split("/").join(sep)}`;
     const idx = resolvedPath.indexOf(marker);
     return idx >= 0 ? resolvedPath.slice(0, idx + marker.length) : dirname(resolvedPath);
+}
+
+function probeWasmRuntimeByResolution(pluginDir: string): WasmRuntimeProbe {
+    try {
+        const reqPlugin = createRequire(join(pluginDir, "package.json"));
+        const direct = probeWasmRuntimeFromRequire(reqPlugin);
+        if (
+            direct.state === "ok" ||
+            !direct.reason.startsWith("onnxruntime-web is not resolvable")
+        ) {
+            return direct;
+        }
+
+        // Use transformers as the resolution parent for pnpm's strict layout,
+        // where its direct runtime dependencies are not hoisted.
+        const tfResolved = reqPlugin.resolve("@huggingface/transformers");
+        const tfDir = packageDirFromResolved(tfResolved, "@huggingface/transformers");
+        return probeWasmRuntimeFromRequire(createRequire(join(tfDir, "package.json")));
+    } catch (error) {
+        return {
+            state: "failed",
+            reason: `could not resolve onnxruntime-web (${describeError(error)})`,
+        };
+    }
 }
 
 /**
@@ -334,10 +446,13 @@ export function checkLocalEmbeddingRuntimeByResolution(
         // the #128 missing-package case (only meaningful because we confirmed
         // the plugin dir exists above).
         if (resolveError === "ERR_MODULE_NOT_FOUND" || resolveError === "MODULE_NOT_FOUND") {
-            return {
-                state: "package-missing",
-                packageDir: join(pluginDir, "node_modules", "onnxruntime-node"),
-            };
+            return withWasmFallback(
+                {
+                    state: "package-missing",
+                    packageDir: join(pluginDir, "node_modules", "onnxruntime-node"),
+                },
+                () => probeWasmRuntimeByResolution(pluginDir),
+            );
         }
         return {
             state: "unknown",
@@ -350,14 +465,16 @@ export function checkLocalEmbeddingRuntimeByResolution(
     }
 
     const rel = expectedBinaryRelPath(platform, arch);
+    let native: LocalEmbeddingRuntimeStatus;
     if (rel === null) {
-        // Unknown platform/arch — package resolves, but a direct package load can
-        // still prove whether its own native-loader path works.
-        return probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath: onnxDir };
+        // Unknown platform/arch — package resolution plus a direct load can
+        // still prove whether the native loader works.
+        native = probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath: onnxDir };
+    } else {
+        const binaryPath = join(onnxDir, rel);
+        native = existsSync(binaryPath)
+            ? (probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath })
+            : { state: "binary-missing", packageDir: onnxDir, expectedBinary: binaryPath };
     }
-    const binaryPath = join(onnxDir, rel);
-    if (!existsSync(binaryPath)) {
-        return { state: "binary-missing", packageDir: onnxDir, expectedBinary: binaryPath };
-    }
-    return probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath };
+    return withWasmFallback(native, () => probeWasmRuntimeByResolution(pluginDir));
 }
