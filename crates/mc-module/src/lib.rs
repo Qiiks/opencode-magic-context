@@ -11684,6 +11684,7 @@ fn native_message_key(
     tag_number: u64,
     reasoning_should_clear: bool,
     mutation_exempt: bool,
+    reasoning_exempt: bool,
     mode: NativeCacheKeyMode,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -11707,6 +11708,7 @@ fn native_message_key(
     native_digest_field(&mut hasher, &tag_number.to_le_bytes());
     native_digest_field(&mut hasher, &[reasoning_should_clear as u8]);
     native_digest_field(&mut hasher, &[mutation_exempt as u8]);
+    native_digest_field(&mut hasher, &[reasoning_exempt as u8]);
     hasher.finalize().into()
 }
 
@@ -11760,13 +11762,17 @@ fn encode_full_native_messages(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let mut native_messages = codec::opencode::encode_opencode_with_transition_state(
-        &served_messages,
-        &sidecar,
-        Some(&request.session_id),
-        &mutation_exempt_mids,
-        transition_consumed,
-    );
+    let reasoning_exempt_mid =
+        transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+    let mut native_messages =
+        codec::opencode::encode_opencode_with_transition_state_and_reasoning_exemption(
+            &served_messages,
+            &sidecar,
+            Some(&request.session_id),
+            &mutation_exempt_mids,
+            reasoning_exempt_mid,
+            transition_consumed,
+        );
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
         transform::clear_served_native_reasoning_with_tags(
             profile,
@@ -11941,6 +11947,7 @@ fn attach_native_messages_incremental(
             Some(hash)
         });
         let mutation_exempt = slot.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let reasoning_exempt = slot.is_some_and(|mid| Some(mid) == newest_assistant_mid);
         let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
             served,
             request,
@@ -11955,6 +11962,7 @@ fn attach_native_messages_incremental(
             tag_number,
             reasoning_should_clear,
             mutation_exempt,
+            reasoning_exempt,
             mode,
         ));
     }
@@ -12028,7 +12036,10 @@ fn attach_native_messages_incremental(
         &sidecar,
         Some(&request.session_id),
         true,
-        &mutation_exempt_mids,
+        codec::opencode::NativeEncodeExemptions {
+            mutation_mids: &mutation_exempt_mids,
+            reasoning_mid: newest_assistant_mid,
+        },
         transition_consumed,
         suffix_start,
     );
@@ -18873,6 +18884,69 @@ mod tests {
             json!({ "type": "reasoning", "text": "" })
         );
         assert_eq!(native[1]["parts"][0]["text"], "signed-2");
+    }
+
+    #[test]
+    fn live_reasoning_exemption_survives_ck_native_vector_mismatch() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "incident_astro_signed_reasoning_tool_without_text")
+            .expect("ASTRO incident fixture generated from persisted rows");
+        let raw: Vec<Value> = serde_json::from_value(fixture["raw_messages"].clone()).unwrap();
+        let ingress: Vec<CkIngressMessage> =
+            serde_json::from_value(fixture["encoded_input"].clone()).unwrap();
+        let target_mid = fixture["target_mid"].as_str().unwrap();
+        let request = native_cache_request(
+            "live-reasoning-vector-mismatch",
+            ingress.clone(),
+            raw.clone(),
+            "live-reasoning-vector-fingerprint",
+        );
+        let mut served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let target = served
+            .iter_mut()
+            .find(|message| message.meta.harness_id.as_deref() == Some(target_mid))
+            .expect("served ASTRO target");
+        target
+            .content
+            .retain(|block| !matches!(&block.kind, ck_wire::CkKind::Reasoning { .. }));
+        target.mark_modified();
+
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let (response, _) = run_native_cache_pass_with_watermark(
+            &cache,
+            &request,
+            served,
+            u64::MAX,
+            &BTreeMap::from([(target_mid.to_string(), 1)]),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let native = response.native_messages.expect("native reasoning replay");
+        let target = native
+            .iter()
+            .find(|message| message["info"]["id"] == target_mid)
+            .expect("native ASTRO target");
+        assert_eq!(target["parts"][1], raw[0]["parts"][1]);
+        assert_eq!(
+            target["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["step-start", "reasoning", "tool", "step-finish"]
+        );
     }
 
     #[test]

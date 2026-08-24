@@ -153,6 +153,50 @@ The wire plus native-store evidence proves a served structural difference, but t
 
 **Disposition:** report-large. Follow-up should replay the same native tail through TypeScript and Rust, compare the exact retained message IDs/signatures after each pass class, and specifically test migration where an inherited high tag coexists with newly minted lower Rust tag numbers.
 
+## Follow-up B — post-start reasoning absence and recurrent text-order 400
+
+The latest module start was `2026-08-24T15:47:20Z`. A cutoff scan from that instant through the retained dump inventory found:
+
+- Rust: 79 bodies across ENGRAM and ASTRO, zero thinking blocks anywhere, and `newest_assistant_reasoning_presence={absent:79}`.
+- TypeScript: 309 bodies, 12,094 signed thinking blocks in total, and newest-assistant reasoning present in 104 bodies (`absent:205,present:104`).
+
+This is post-start traffic, so the original F5 difference did not close with the metadata-shell exemption alone. `scripts/audit-transform-wire-parity.py` now accepts `--after` and emits both `newest_assistant_reasoning_presence` and the complete newest-assistant block vector per lane.
+
+### Real-row and wire reproduction
+
+ENGRAM native message `msg_0348483e9001xBB7Ya0H5bfkvm`, created at `2026-08-24T16:04:54.889Z`, persisted this whole vector:
+
+```text
+[step-start, signed reasoning, text, completed bash tool, step-finish]
+```
+
+The next request, `2026-08-24T16-05-27-159Z-005347-ses_0ad83017cffexe0g5N8UG0y3LZ-direct-sticky-main.body.json`, returned 400. Its newest assistant at message 351 was:
+
+```text
+[tool_use(mcp_Bash), text("§5696§ Three construction sites …")]
+```
+
+The thinking block was absent and the persisted pre-tool text had moved after the tool. The durable module state had tags 5696/5697 for that message, reasoning watermark 16129, and no `reasoning_age` or `merged_reasoning` strip unit for the message. The newest-assistant exemption therefore had to survive both age state and native encode-back.
+
+The initial hypothesis was only partly correct. `encodeOpenCodeMessagesToCk` retains the reasoning block itself; it does not copy a signature nested under `metadata.anthropic.signature` into CK. Whole-vector matching can still accept that signature mismatch because it compares kinds, but any other CK/native vector disagreement enters the fallback. Replaying the persisted row with the reasoning carrier absent from CK reproduced the exact old fallback shape before this fix:
+
+```text
+[tool, step-finish, step-start, text]
+```
+
+After OpenCode's provider projection, that is the observed `[tool_use, text]` 400 shape. The same fallback also removed the signed native reasoning carrier.
+
+### Fix and non-vacuity
+
+The codec now has two independent belts:
+
+1. Unmatched blocks are inserted relative to their nearest matched native anchor. A unique same-kind persisted part is replaced at its original native index instead of being appended. A final serve-wide invariant moves post-tool text before the first tool unless the persisted native message itself had text after a tool.
+2. The newest replayable assistant's reasoning exemption is passed separately through full and incremental native encoding. If CK omits or cannot match that reasoning block, the codec reattaches the original native reasoning part, including its Anthropic signature, without exempting unrelated text or tool mutations. The native attachment cache key includes this reasoning-exemption bit.
+
+Generated TS fixtures pin the ASTRO `[step-start, reasoning, tool, step-finish]` row and the ENGRAM recurrence row. The ENGRAM regression failed red as `[tool, step-finish, step-start, text]`; disabling the serve-wide belt failed a fresh assistant as `[tool, text]`. The ASTRO regression failed red with no reasoning block, and disabling the incremental reasoning exemption made the full/incremental differential fail. All deliberate breaks were restored.
+
+**Disposition:** fixed in current source; no push or deploy was performed here. Production-wire confirmation remains required after the next deployment. This supersedes the claim that the metadata-shell exemption alone closed F5 and upgrades the coupled text-order fallback to P0.
+
 ## Exclusions observed
 
 ### X1 — `bg_7ce17719`: final assistant `[tool_use, text]` ordering
@@ -162,7 +206,7 @@ Two ENGRAM requests returned 400:
 - `2026-08-24T14-38-45-570Z-004516-…body.json`, message 337 was `[tool_use, text]`, followed by the matching user tool result.
 - `2026-08-24T14-48-44-816Z-004592-…body.json`, message 373 had the same shape.
 
-The same historical instances replay inside later 200 bodies, so the provider rejection is specifically tied to the newest/final assistant run. No additional independent ordering failure was found. Not fixed here.
+The same historical instances replay inside later 200 bodies, so the provider rejection is specifically tied to the newest/final assistant run. At audit time no additional independent ordering failure was found. Follow-up B supersedes that conclusion with the `16:05:27Z` recurrence and fixes the remaining fallback.
 
 ### X2 — `bg_4257e8ad`: `{reduced, summary}` tool-input envelope
 

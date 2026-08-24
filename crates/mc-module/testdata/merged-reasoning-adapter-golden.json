@@ -1,5 +1,5 @@
 {
-  "generator_version": 3,
+  "generator_version": 5,
   "cases": [
     {
       "name": "reasoning",
@@ -701,6 +701,288 @@
               "synthetic": false,
               "summary": false,
               "errored": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "incident_astro_signed_reasoning_tool_without_text",
+      "target_mid": "msg_034708489001DO2JIqA9aILSxN",
+      "target_reasoning_index": 1,
+      "expect_strip": false,
+      "source_part_types": [
+        "step-start",
+        "reasoning",
+        "tool",
+        "step-finish"
+      ],
+      "expected_native_part_types": [
+        "step-start",
+        "reasoning",
+        "tool",
+        "step-finish"
+      ],
+      "raw_messages": [
+        {
+          "info": {
+            "id": "msg_034708489001DO2JIqA9aILSxN",
+            "sessionID": "ses_08df2045bffeBcWcqw60elghER",
+            "role": "assistant",
+            "finish": "tool-calls"
+          },
+          "parts": [
+            {
+              "type": "step-start"
+            },
+            {
+              "type": "reasoning",
+              "text": "[redacted signed live thinking]",
+              "metadata": {
+                "anthropic": {
+                  "signature": "[redacted signature]"
+                }
+              }
+            },
+            {
+              "type": "tool",
+              "callID": "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
+              "tool": "athena_view",
+              "state": {
+                "status": "completed",
+                "input": {
+                  "work_item_id": "[redacted]"
+                },
+                "output": "[redacted tool result]"
+              }
+            },
+            {
+              "type": "step-finish",
+              "reason": "tool-calls"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "incident-astro-request-shell",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "step-start"
+            }
+          ]
+        }
+      ],
+      "reasoning_exempt_mid": "msg_034708489001DO2JIqA9aILSxN",
+      "encoded_input": [
+        {
+          "mid": "msg_034708489001DO2JIqA9aILSxN",
+          "ordinal": 1,
+          "ck": {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "opaque",
+                  "source": "opencode",
+                  "kind": "step-start",
+                  "raw": {
+                    "type": "step-start"
+                  }
+                }
+              },
+              {
+                "kind": {
+                  "type": "reasoning",
+                  "text": "[redacted signed live thinking]"
+                }
+              },
+              {
+                "kind": {
+                  "type": "tool_call",
+                  "id": "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
+                  "name": "athena_view",
+                  "input": {
+                    "work_item_id": "[redacted]"
+                  }
+                }
+              },
+              {
+                "kind": {
+                  "type": "tool_result",
+                  "id": "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
+                  "tool_name": "athena_view",
+                  "output": {
+                    "kind": {
+                      "type": "text",
+                      "text": "[redacted tool result]"
+                    }
+                  }
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "msg_034708489001DO2JIqA9aILSxN",
+              "ordinal": 1,
+              "synthetic": false,
+              "summary": false,
+              "errored": false,
+              "finish": "tool-calls"
+            }
+          }
+        },
+        {
+          "mid": "incident-astro-request-shell",
+          "ordinal": 2,
+          "ck": {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "opaque",
+                  "source": "opencode",
+                  "kind": "step-start",
+                  "raw": {
+                    "type": "step-start"
+                  }
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "incident-astro-request-shell",
+              "ordinal": 2,
+              "synthetic": false,
+              "summary": false,
+              "errored": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "incident_engram_text_after_tool_recurrence",
+      "target_mid": "msg_0348483e9001xBB7Ya0H5bfkvm",
+      "target_reasoning_index": 1,
+      "expect_strip": false,
+      "source_part_types": [
+        "step-start",
+        "reasoning",
+        "text",
+        "tool",
+        "step-finish"
+      ],
+      "expected_native_part_types": [
+        "step-start",
+        "text",
+        "tool",
+        "step-finish"
+      ],
+      "raw_messages": [
+        {
+          "info": {
+            "id": "msg_0348483e9001xBB7Ya0H5bfkvm",
+            "sessionID": "ses_0ad83017cffexe0g5N8UG0y3LZ",
+            "role": "assistant",
+            "finish": "tool-calls"
+          },
+          "parts": [
+            {
+              "type": "step-start"
+            },
+            {
+              "type": "reasoning",
+              "text": "[redacted signed live thinking]",
+              "metadata": {
+                "anthropic": {
+                  "signature": "[redacted signature]"
+                }
+              }
+            },
+            {
+              "type": "text",
+              "text": "Three construction sites, plus a third upstream break in the same window."
+            },
+            {
+              "type": "tool",
+              "callID": "toolu_01AveJRXHJBnmXzSD16U5zmi",
+              "tool": "bash",
+              "state": {
+                "status": "completed",
+                "input": {
+                  "command": "[redacted]"
+                },
+                "output": "[redacted tool result]"
+              }
+            },
+            {
+              "type": "step-finish",
+              "reason": "tool-calls"
+            }
+          ]
+        }
+      ],
+      "reasoning_exempt_mid": "msg_0348483e9001xBB7Ya0H5bfkvm",
+      "encoded_input": [
+        {
+          "mid": "msg_0348483e9001xBB7Ya0H5bfkvm",
+          "ordinal": 1,
+          "ck": {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "opaque",
+                  "source": "opencode",
+                  "kind": "step-start",
+                  "raw": {
+                    "type": "step-start"
+                  }
+                }
+              },
+              {
+                "kind": {
+                  "type": "reasoning",
+                  "text": "[redacted signed live thinking]"
+                }
+              },
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "Three construction sites, plus a third upstream break in the same window."
+                }
+              },
+              {
+                "kind": {
+                  "type": "tool_call",
+                  "id": "toolu_01AveJRXHJBnmXzSD16U5zmi",
+                  "name": "bash",
+                  "input": {
+                    "command": "[redacted]"
+                  }
+                }
+              },
+              {
+                "kind": {
+                  "type": "tool_result",
+                  "id": "toolu_01AveJRXHJBnmXzSD16U5zmi",
+                  "tool_name": "bash",
+                  "output": {
+                    "kind": {
+                      "type": "text",
+                      "text": "[redacted tool result]"
+                    }
+                  }
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "msg_0348483e9001xBB7Ya0H5bfkvm",
+              "ordinal": 1,
+              "synthetic": false,
+              "summary": false,
+              "errored": false,
+              "finish": "tool-calls"
             }
           }
         }
