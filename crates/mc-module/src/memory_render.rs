@@ -26,7 +26,8 @@ pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
 /// The non-empty placeholder emitted for the m1 delta block when it has no new content.
 /// The m1 block is never fully empty because the provider prompt-cache needs a stable
 /// breakpoint to anchor on, so even an empty update still emits this marker.
-pub const M1_PLACEHOLDER: &str = "(no new content since last materialization)";
+pub const M1_PLACEHOLDER: &str =
+    "<session-history-since>(no new content since last materialization)</session-history-since>";
 /// Default history budget when a caller doesn't supply one.
 pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
@@ -537,6 +538,14 @@ mod tests {
         };
         // no docs/profile/memory + no compartments → just the empty-history placeholder
         assert_eq!(render_m0(&inputs, |_| 0), M0_EMPTY_BODY);
+    }
+
+    #[test]
+    fn m1_placeholder_matches_typescript_wire() {
+        assert_eq!(
+            M1_PLACEHOLDER,
+            "<session-history-since>(no new content since last materialization)</session-history-since>"
+        );
     }
 
     #[test]
