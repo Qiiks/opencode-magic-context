@@ -1872,6 +1872,26 @@ mod tests {
 
     // --- CK-model unit tests (no TS equivalent) ---
 
+    #[derive(Deserialize)]
+    struct EditMarkerGoldenCase {
+        label: String,
+        input: serde_json::Value,
+        expected: serde_json::Value,
+    }
+
+    #[test]
+    fn edit_marker_payload_matches_typescript_golden() {
+        let cases: Vec<EditMarkerGoldenCase> =
+            serde_json::from_str(include_str!("../testdata/edit-marker-golden.json"))
+                .expect("parse edit-marker-golden.json");
+        assert!(!cases.is_empty(), "empty edit-marker golden");
+        for case in cases {
+            let actual: serde_json::Value = serde_json::from_str(&edit_marker_payload(&case.input))
+                .expect("Rust edit-marker payload must remain JSON");
+            assert_eq!(actual, case.expected, "{}", case.label);
+        }
+    }
+
     #[test]
     fn age_reclaim_requires_both_scheduler_pressure_and_a_ride() {
         let mut result = tool_result("c1", 1, "bash", 2_000);
