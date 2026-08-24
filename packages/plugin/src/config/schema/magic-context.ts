@@ -311,20 +311,47 @@ export const DreamerPiHarnessBlockSchema = z
 export type DreamerPiHarnessBlock = z.infer<typeof DreamerPiHarnessBlockSchema>;
 
 /**
- * User-owned model-selection overlay for one named profile. Profiles deliberately
- * mirror only the existing per-harness execution blocks: durable state, prompts,
- * schedules, and resource gates remain outside the profile trust boundary.
+ * A profile may select models but must not alter execution policy. Keep this
+ * separate from the full harness schemas, whose dreamer blocks also admit task
+ * overrides such as timeout_minutes.
  */
+const ProfileOpenCodeModelBlockSchema = z
+    .object({
+        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        fallback_models: z
+            .array(OcEntrySchema)
+            .optional()
+            .describe("Ordered fallback OpenCode model entries."),
+        variant: z
+            .string()
+            .optional()
+            .describe("OpenCode reasoning variant for the primary model entry."),
+    })
+    .strict()
+    .describe("Strict profile-only OpenCode model-selection block.");
+const ProfilePiModelBlockSchema = z
+    .object({
+        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        fallback_models: z
+            .array(PiEntrySchema)
+            .optional()
+            .describe("Ordered fallback Pi model entries."),
+        thinking_level: PiThinkingLevelSchema.describe(
+            "Pi thinking level for the primary model entry.",
+        ),
+    })
+    .strict()
+    .describe("Strict profile-only Pi model-selection block.");
 const ProfileHistorianSchema = z
     .object({
-        opencode: OpenCodeHarnessBlockSchema.optional(),
-        pi: PiHarnessBlockSchema.optional(),
+        opencode: ProfileOpenCodeModelBlockSchema.optional(),
+        pi: ProfilePiModelBlockSchema.optional(),
     })
     .strict();
 const ProfileDreamerSchema = z
     .object({
-        opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
-        pi: DreamerPiHarnessBlockSchema.optional(),
+        opencode: ProfileOpenCodeModelBlockSchema.optional(),
+        pi: ProfilePiModelBlockSchema.optional(),
     })
     .strict();
 const ProfileSidekickSchema = AgentOverrideConfigSchema.pick({
@@ -949,10 +976,10 @@ export const MagicContextConfigSchema = z
             .min(1)
             .optional()
             .describe(
-                "Select a named user-owned model profile. Project config may select a profile name, which overrides this user default; unknown names warn and use the base configuration.",
+                "Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration.",
             ),
         profiles: ConfigProfilesSchema.optional().describe(
-            "User-level named model profiles. A profile may contain only historian/dreamer harness model blocks and sidekick model-selection fields; project configs may select a name but cannot define profiles.",
+            "User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi thinking_level fields plus sidekick model-selection fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles.",
         ),
         historian: HistorianConfigSchema.describe(
             "Historian metadata plus independent strict OpenCode and Pi execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode or historian.pi.",

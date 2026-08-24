@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveHistorianModel } from "../shared/model-resolution";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
+import { resolveConfigProfile } from "./profiles";
 import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
 
 /**
@@ -1042,13 +1043,9 @@ describe("loadPluginConfig — user-owned model profiles", () => {
                         dreamer: {
                             opencode: {
                                 model: "anthropic/work-dreamer",
-                                tasks: {
-                                    verify: {
-                                        fallback_models: [
-                                            { model: "openai/work-verify", variant: "medium" },
-                                        ],
-                                    },
-                                },
+                                fallback_models: [
+                                    { model: "openai/work-dreamer-fallback", variant: "medium" },
+                                ],
                             },
                         },
                         sidekick: { model: "anthropic/work-sidekick" },
@@ -1072,8 +1069,8 @@ describe("loadPluginConfig — user-owned model profiles", () => {
             fallback_models: [{ model: "openai/work-fallback", variant: "low" }],
         });
         expect(result.dreamer?.opencode?.model).toBe("anthropic/work-dreamer");
-        expect(result.dreamer?.opencode?.tasks?.verify?.fallback_models).toEqual([
-            { model: "openai/work-verify", variant: "medium" },
+        expect(result.dreamer?.opencode?.fallback_models).toEqual([
+            { model: "openai/work-dreamer-fallback", variant: "medium" },
         ]);
         expect(result.sidekick?.model).toBe("anthropic/work-sidekick");
     });
@@ -1145,6 +1142,164 @@ describe("loadPluginConfig — user-owned model profiles", () => {
         );
     });
 
+    it("falls back loudly for inherited profile names without changing the resolved base config", () => {
+        const userConfig = JSON.stringify({
+            historian: { opencode: { model: "anthropic/base", fallback_models: ["openai/base"] } },
+            profiles: { known: { historian: { opencode: { model: "anthropic/known" } } } },
+        });
+        const base = loadWithUserConfig(userConfig);
+        const { configWarnings: _baseWarnings, ...baseWithoutWarnings } = base;
+        const hostileNames = [
+            "__proto__",
+            "constructor",
+            "prototype",
+            "toString",
+            "hasOwnProperty",
+            "valueOf",
+        ];
+
+        for (const name of hostileNames) {
+            const resolved = loadWithUserAndProjectConfig(
+                userConfig,
+                JSON.stringify({ profile: name }),
+            );
+            const { configWarnings: _warnings, ...resolvedWithoutWarnings } = resolved;
+
+            expect(resolved.profile).toBeUndefined();
+            expect(resolved.configWarnings?.join("\n")).toContain(
+                `Unknown profile "${name}" selected by project config`,
+            );
+            expect(resolvedWithoutWarnings).toEqual(baseWithoutWarnings);
+        }
+    });
+
+    it("ignores a profile inherited from a polluted Object prototype", () => {
+        const profileName = "profile_overlay_pollution_canary";
+        const previousDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, profileName);
+        const userBase = { historian: { opencode: { model: "anthropic/base" } } };
+        // Null-prototype input isolates lookup behavior from strict schema validation of inherited data.
+        const profileOpenCode = Object.assign(Object.create(null), {
+            model: "anthropic/known",
+        });
+        const profileHistorian = Object.assign(Object.create(null), {
+            opencode: profileOpenCode,
+        });
+        const knownProfile = Object.assign(Object.create(null), {
+            historian: profileHistorian,
+        });
+        const profiles = Object.assign(Object.create(null), {
+            known: knownProfile,
+        }) as Record<string, unknown>;
+        Object.defineProperty(Object.prototype, profileName, {
+            value: { historian: { opencode: { model: "attacker/inherited-overlay" } } },
+            enumerable: true,
+            configurable: true,
+        });
+
+        try {
+            const resolution = resolveConfigProfile({
+                userRaw: {
+                    ...userBase,
+                    profiles,
+                },
+                projectRaw: { profile: profileName },
+            });
+
+            expect(resolution.activeProfile).toBeUndefined();
+            expect(resolution.overlay).toEqual({});
+            expect(resolution.userBase).toEqual(userBase);
+            expect(resolution.projectBase).toEqual({});
+            expect(resolution.warnings).toEqual([
+                `Unknown profile "${profileName}" selected by project config; using base config without a profile.`,
+            ]);
+        } finally {
+            if (previousDescriptor) {
+                Object.defineProperty(Object.prototype, profileName, previousDescriptor);
+            } else {
+                delete (Object.prototype as Record<string, unknown>)[profileName];
+            }
+        }
+    });
+
+    it("treats empty, null, and non-string project selectors as no selection", () => {
+        const userConfig = JSON.stringify({
+            profile: "personal",
+            historian: { opencode: { model: "anthropic/base" } },
+            profiles: {
+                personal: { historian: { opencode: { model: "anthropic/personal" } } },
+            },
+        });
+        const invalidProjectSelectors = ["", null, { name: "work" }];
+
+        for (const profile of invalidProjectSelectors) {
+            const result = loadWithUserAndProjectConfig(userConfig, JSON.stringify({ profile }));
+
+            expect(result.profile).toBe("personal");
+            expect(result.historian?.opencode?.model).toBe("anthropic/personal");
+            expect(result.configWarnings?.join("\n")).toContain(
+                "Ignoring invalid profile selection from project config",
+            );
+        }
+    });
+
+    it("preserves an untouched historian Pi block when a profile overlays OpenCode", () => {
+        const piBase = {
+            model: { model: "github-copilot/base", thinking_level: "high" },
+            fallback_models: [
+                { model: "openai/base-fallback", thinking_level: "minimal" },
+                { model: "github-copilot/second-base-fallback", thinking_level: "medium" },
+            ],
+            thinking_level: "high",
+        };
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                profile: "work",
+                historian: {
+                    opencode: { model: "anthropic/base-opencode" },
+                    pi: piBase,
+                },
+                profiles: {
+                    work: {
+                        historian: { opencode: { model: "anthropic/work-opencode" } },
+                    },
+                },
+            }),
+        );
+
+        expect(result.historian?.opencode).toEqual({ model: "anthropic/work-opencode" });
+        expect(result.historian?.pi).toEqual(piBase);
+    });
+
+    it("replaces a base fallback_models array wholesale when a profile provides one", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                profile: "work",
+                historian: {
+                    opencode: {
+                        model: "anthropic/base",
+                        fallback_models: [
+                            { model: "openai/base-first", variant: "low" },
+                            { model: "anthropic/base-second", variant: "high" },
+                        ],
+                    },
+                },
+                profiles: {
+                    work: {
+                        historian: {
+                            opencode: {
+                                fallback_models: [{ model: "google/work-only", variant: "medium" }],
+                            },
+                        },
+                    },
+                },
+            }),
+        );
+
+        expect(result.historian?.opencode?.fallback_models).toEqual([
+            { model: "google/work-only", variant: "medium" },
+        ]);
+    });
+
     it("resolves profiles independently for two projects in one process", () => {
         const xdg = mkdtempSync(join(tmpdir(), "mc-profile-isolation-user-"));
         const projectA = mkdtempSync(join(tmpdir(), "mc-profile-isolation-a-"));
@@ -1173,10 +1328,13 @@ describe("loadPluginConfig — user-owned model profiles", () => {
         try {
             const work = loadPluginConfig(projectA);
             const personal = loadPluginConfig(projectB);
+            const workAgain = loadPluginConfig(projectA);
             expect(work.profile).toBe("work");
             expect(personal.profile).toBe("personal");
+            expect(workAgain.profile).toBe("work");
             expect(work.historian?.opencode?.model).toBe("anthropic/work");
             expect(personal.historian?.opencode?.model).toBe("anthropic/personal");
+            expect(workAgain.historian?.opencode?.model).toBe("anthropic/work");
         } finally {
             if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
             else process.env.XDG_CONFIG_HOME = previousXdg;

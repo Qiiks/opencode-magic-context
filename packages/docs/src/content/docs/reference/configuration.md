@@ -77,8 +77,8 @@ Named user-owned model-selection overlays. A project may select a profile name b
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `profile` | string | — | Select a named user-owned model profile. Project config may select a profile name, which overrides this user default; unknown names warn and use the base configuration. |
-| `profiles` | map<string, object> | — | User-level named model profiles. A profile may contain only historian/dreamer harness model blocks and sidekick model-selection fields; project configs may select a name but cannot define profiles. |
+| `profile` | string | — | Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration. |
+| `profiles` | map<string, object> | — | User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi thinking_level fields plus sidekick model-selection fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles. |
 
 ## Historian
 
