@@ -131,6 +131,12 @@ describe("capBodyToGithubLimit", () => {
         expect(capped).toBe(body);
     });
 
+    it("accepts a body exactly at the byte budget boundary", () => {
+        const body = "x".repeat(60_000);
+        expect(Buffer.byteLength(body, "utf8")).toBe(60_000);
+        expect(capBodyToGithubLimit(body, 60_000)).toBe(body);
+    });
+
     it("truncates the main log section when body exceeds budget", () => {
         const body = makeBody({ logLineCount: 5000, lineSize: 200 });
         const originalBytes = Buffer.byteLength(body, "utf8");

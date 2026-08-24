@@ -42,6 +42,11 @@ import {
     formatLocalEmbeddingRuntimeDoctorWarning,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
+import {
+    formatGithubIssueFallback,
+    type GhCommandResult,
+    submitGithubIssue,
+} from "../lib/github-issue";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
@@ -964,17 +969,32 @@ function repair(plan: RepairPlan, prompts: PromptIO): number {
     return fixed;
 }
 
-function ghAvailableAndAuthed(deps: DoctorDeps): boolean {
+function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
+    if (args[0] === "issue") {
+        const result = deps.spawnSync("gh", args, {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        return {
+            status: result.status,
+            stdout: String(result.stdout ?? ""),
+            stderr: String(result.stderr ?? ""),
+        };
+    }
+
     try {
-        deps.execFileSync("gh", ["--version"], {
-            stdio: ["ignore", "pipe", "ignore"],
+        const output = deps.execFileSync("gh", args, {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
         });
-        deps.execFileSync("gh", ["auth", "status"], {
-            stdio: ["ignore", "pipe", "ignore"],
-        });
-        return true;
-    } catch {
-        return false;
+        return { status: 0, stdout: String(output ?? ""), stderr: "" };
+    } catch (error) {
+        const result = error as { status?: number; stdout?: unknown; stderr?: unknown };
+        return {
+            status: typeof result.status === "number" ? result.status : 1,
+            stdout: String(result.stdout ?? ""),
+            stderr: String(result.stderr ?? ""),
+        };
     }
 }
 
@@ -1023,44 +1043,38 @@ async function runIssueFlow(options: {
             now: options.deps.now(),
             sessionFilter,
         });
-        spinner.stop(`Report written to ${bundled.path}`);
+        spinner.stop(
+            bundled.fullPath
+                ? `Report written to ${bundled.path}; full bundle at ${bundled.fullPath}`
+                : `Report written to ${bundled.path}`,
+        );
 
-        if (ghAvailableAndAuthed(options.deps)) {
-            const shouldSubmit = await options.prompts.confirm(
-                "Submit this issue on GitHub now?",
-                false,
+        const shouldSubmit = await options.prompts.confirm(
+            "Submit this issue on GitHub now?",
+            false,
+        );
+        if (shouldSubmit) {
+            const result = submitGithubIssue(`[pi] ${title}`, bundled.path, (args) =>
+                runGhCommandWithDeps(options.deps, args),
             );
-            if (shouldSubmit) {
-                const result = options.deps.spawnSync(
-                    "gh",
-                    [
-                        "issue",
-                        "create",
-                        "-R",
-                        "cortexkit/magic-context",
-                        "--title",
-                        `[pi] ${title}`,
-                        "--body-file",
-                        bundled.path,
-                    ],
-                    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
-                );
-                if (result.status === 0) {
-                    options.prompts.log.success(String(result.stdout).trim());
-                    options.prompts.outro("Issue submitted — thanks for the report!");
-                    return 0;
+            if (result.ok) {
+                options.prompts.log.success(result.output);
+                if (bundled.fullPath) {
+                    options.prompts.log.info(
+                        `Full diagnostics bundle available to drag onto the issue: ${bundled.fullPath}`,
+                    );
                 }
-                options.prompts.log.warn(String(result.stderr).trim() || "gh issue create failed");
+                options.prompts.outro("Issue submitted — thanks for the report!");
+                return 0;
             }
-        } else {
             options.prompts.log.warn(
-                "gh CLI is unavailable or not authenticated; printing report for manual issue creation",
+                formatGithubIssueFallback(result, bundled.fullPath ?? bundled.path),
             );
         }
 
         console.log(bundled.bodyMarkdown);
         options.prompts.log.info(
-            `Open https://github.com/cortexkit/magic-context/issues/new and attach ${bundled.path}`,
+            `Open https://github.com/cortexkit/magic-context/issues/new and drag ${bundled.fullPath ?? bundled.path} into the issue`,
         );
         options.prompts.outro("Issue report ready");
         return 0;

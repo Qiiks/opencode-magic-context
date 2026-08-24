@@ -1,4 +1,4 @@
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -37,6 +37,7 @@ import {
     formatLocalEmbeddingRuntimeDoctorWarning,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
+import { formatGithubIssueFallback, submitGithubIssue } from "../lib/github-issue";
 import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
@@ -262,15 +263,6 @@ function compareVersions(a: string, b: string): number {
 
 // ── Issue flow ──────────────────────────────────────────────────────
 
-function isGhInstalled(): boolean {
-    try {
-        execSync("gh --version", { stdio: "pipe" });
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 function openBrowser(url: string): void {
     try {
         if (process.platform === "darwin") {
@@ -322,8 +314,12 @@ async function runIssueFlow(): Promise<number> {
                             displayTitle.length > 50
                                 ? `${displayTitle.slice(0, 47)}...`
                                 : displayTitle;
+                        const childPrefix = session.parentSessionId ? "  ↳ " : "";
+                        const parentSuffix = session.parentSessionId
+                            ? ` (child of ${session.parentSessionId})`
+                            : "";
                         return {
-                            label: `${truncatedTitle} — ${session.sessionId}${index === 0 ? " (most recent)" : ""}`,
+                            label: `${childPrefix}${truncatedTitle} — ${session.sessionId}${parentSuffix}${index === 0 ? " (most recent)" : ""}`,
                             value: session.sessionId,
                         };
                     }),
@@ -338,39 +334,33 @@ async function runIssueFlow(): Promise<number> {
 
         s.start("Bundling issue report");
         const bundled = await bundleIssueReport(report, description, title, sessionFilter);
-        s.stop(`Report written to ${bundled.path}`);
+        s.stop(
+            bundled.fullPath
+                ? `Report written to ${bundled.path}; full bundle at ${bundled.fullPath}`
+                : `Report written to ${bundled.path}`,
+        );
 
         const shouldSubmit = await confirm("Submit this issue on GitHub now?", true);
-        if (shouldSubmit && isGhInstalled()) {
-            const result = spawnSync(
-                "gh",
-                [
-                    "issue",
-                    "create",
-                    "-R",
-                    "cortexkit/magic-context",
-                    "--title",
-                    title,
-                    "--body-file",
-                    bundled.path,
-                ],
-                { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
-            );
-
-            if (result.status === 0) {
-                log.success(result.stdout.trim());
+        if (shouldSubmit) {
+            const result = submitGithubIssue(title, bundled.path);
+            if (result.ok) {
+                log.success(result.output);
+                if (bundled.fullPath) {
+                    log.info(
+                        `Full diagnostics bundle available to drag onto the issue: ${bundled.fullPath}`,
+                    );
+                }
                 outro("Issue submitted — thanks for the report!");
                 return 0;
             }
 
-            log.warn(result.stderr.trim() || "gh issue create failed");
-        } else if (shouldSubmit && !isGhInstalled()) {
-            log.warn("gh CLI not found — falling back to browser");
+            const fallbackPath = bundled.fullPath ?? bundled.path;
+            log.warn(formatGithubIssueFallback(result, fallbackPath));
         }
 
         const url = `https://github.com/cortexkit/magic-context/issues/new?title=${encodeURIComponent(title)}&template=bug_report.yml`;
         log.info(
-            `Open this URL and paste the contents of ${bundled.path} into the Diagnostics field:`,
+            `Open this URL and drag ${bundled.fullPath ?? bundled.path} into the Diagnostics field:`,
         );
         log.info(url);
         openBrowser(url);

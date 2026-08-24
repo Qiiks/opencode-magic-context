@@ -36,8 +36,12 @@ function formatTimestamp(date: Date): string {
 }
 
 export interface BundledIssueReport {
+    /** Capped markdown suitable for a GitHub issue body. */
     path: string;
     bodyMarkdown: string;
+    /** Full sanitized markdown when the GitHub body had to be capped. */
+    fullPath?: string;
+    truncated: boolean;
 }
 
 /**
@@ -144,8 +148,21 @@ export async function bundleIssueReport(
     const sanitizedDescription = sanitizeDiagnosticText(description);
     const sanitizedTitle = sanitizeDiagnosticText(title).trim();
 
+    const selectedSession = sessionFilter
+        ? report.recentSessions.find((session) => session.sessionId === sessionFilter)
+        : undefined;
+    const sessionContext = selectedSession
+        ? [
+              "## Session context",
+              `- Selected session: ${sanitizeDiagnosticText(selectedSession.sessionId)}`,
+              `- Parent session: ${sanitizeDiagnosticText(selectedSession.parentSessionId ?? "none")}`,
+              "",
+          ]
+        : [];
+
     const rawBodyMarkdown = [
         ...(sanitizedTitle ? ["## Title", sanitizedTitle, ""] : []),
+        ...sessionContext,
         "## Description",
         sanitizedDescription,
         "",
@@ -186,8 +203,19 @@ export async function bundleIssueReport(
     // truncation marker inserted. The error and historian-failure sections
     // above survive intact — that's the whole point of extracting them.
     const bodyMarkdown = capBodyToGithubLimit(rawBodyMarkdown);
-
-    const path = join(process.cwd(), `magic-context-issue-${formatTimestamp(new Date())}.md`);
+    const truncated = bodyMarkdown !== rawBodyMarkdown;
+    const timestamp = formatTimestamp(new Date());
+    const path = join(process.cwd(), `magic-context-issue-${timestamp}.md`);
     writeFileSync(path, `${bodyMarkdown}\n`);
-    return { path, bodyMarkdown };
+
+    // Keep the complete sanitized report beside the capped issue body. This is
+    // intentionally a local attachment rather than a gist: users retain
+    // control of where the diagnostic bundle is uploaded when GitHub rejects or
+    // cannot create the issue.
+    const fullPath = truncated
+        ? join(process.cwd(), `magic-context-issue-${timestamp}-full.md`)
+        : undefined;
+    if (fullPath) writeFileSync(fullPath, `${rawBodyMarkdown}\n`);
+
+    return { path, bodyMarkdown, ...(fullPath ? { fullPath } : {}), truncated };
 }

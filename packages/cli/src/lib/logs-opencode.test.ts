@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DiagnosticReport } from "./diagnostics-opencode";
@@ -510,6 +510,92 @@ describe("bundleIssueReport secret redaction", () => {
             );
             expect(body).not.toContain("alice");
             expect(body).not.toContain("abc123");
+        } finally {
+            process.chdir(originalCwd);
+        }
+    });
+});
+
+describe("bundleIssueReport size and session fallbacks", () => {
+    it("writes the full sanitized bundle beside the capped body and records child linkage", async () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-issue-full-bundle-"));
+        tempDirs.push(root);
+        const logPath = join(root, "opencode.log");
+        writeFileSync(
+            logPath,
+            Array.from({ length: 400 }, (_, index) => `line ${index} ${"x".repeat(400)}`).join(
+                "\n",
+            ),
+        );
+        const report: DiagnosticReport = {
+            timestamp: "2026-05-11T12:00:00.000Z",
+            platform: "darwin",
+            arch: "arm64",
+            nodeVersion: "v24.0.0",
+            pluginVersion: "0.39.0",
+            opencodeInstalled: true,
+            opencodeVersion: "1.0.0",
+            opencodeInstallKind: "cli",
+            opencodeInstallations: [],
+            configPaths: {
+                configDir: join(root, "config"),
+                opencodeConfig: join(root, "config", "opencode.jsonc"),
+                opencodeConfigFormat: "jsonc",
+                magicContextConfig: join(root, "config", "magic-context.jsonc"),
+                tuiConfig: join(root, "config", "tui.jsonc"),
+                tuiConfigFormat: "jsonc",
+                omoConfig: null,
+            },
+            opencodeConfigHasPlugin: true,
+            tuiConfigHasPlugin: true,
+            magicContextConfig: { exists: true, flags: {} },
+            pluginCache: { path: join(root, "cache") },
+            storageDir: { path: join(root, "storage"), exists: true, contextDbSizeBytes: 0 },
+            conflicts: {
+                hasConflict: false,
+                reasons: [],
+                compactionEnabled: true,
+                nativeCompaction: { auto: false, prune: false },
+            },
+            logFile: { path: logPath, exists: true, sizeKb: 200 },
+            recentSessions: [
+                {
+                    sessionId: "ses_parent001",
+                    title: "Parent session",
+                    directory: root,
+                    lastActiveAt: "2026-05-11T12:00:00.000Z",
+                    parentSessionId: null,
+                },
+                {
+                    sessionId: "ses_child001",
+                    title: "Child session",
+                    directory: root,
+                    lastActiveAt: "2026-05-11T12:01:00.000Z",
+                    parentSessionId: "ses_parent001",
+                },
+            ],
+            historianDumps: { byProject: [], legacyDumps: { dir: root, count: 0, recent: [] } },
+            historianFailures: [],
+            historianRuns: [],
+        };
+        const originalCwd = process.cwd();
+        process.chdir(root);
+        try {
+            const bundled = await bundleIssueReport(
+                report,
+                "child report",
+                "diagnostic issue",
+                "ses_child001",
+            );
+            expect(bundled.truncated).toBe(true);
+            expect(bundled.fullPath).toBeDefined();
+            if (!bundled.fullPath) throw new Error("expected full fallback path");
+            expect(existsSync(bundled.fullPath)).toBe(true);
+            expect(Buffer.byteLength(bundled.bodyMarkdown, "utf8")).toBeLessThanOrEqual(60_000);
+            expect(readFileSync(bundled.fullPath, "utf8")).toContain("## Session context");
+            expect(readFileSync(bundled.fullPath, "utf8")).toContain(
+                "- Parent session: ses_parent001",
+            );
         } finally {
             process.chdir(originalCwd);
         }
