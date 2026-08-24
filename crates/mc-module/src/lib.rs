@@ -14680,6 +14680,10 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
+        // Introduced by subc-protocol 0.12: optional pre-validated capability
+        // declarations. MC requests nothing beyond its role grants, so None keeps
+        // the HELLO identical to the pre-field wire shape (serde skips None).
+        capabilities: None,
         provides: vec![ProviderRole::ToolProvider {
             tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
