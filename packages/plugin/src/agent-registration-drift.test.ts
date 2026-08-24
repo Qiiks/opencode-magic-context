@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+
 import {
     DREAMER_AGENT,
     DREAMER_CLASSIFIER_AGENT,
@@ -32,6 +33,15 @@ import {
 } from "./agents/permissions";
 import { SIDEKICK_AGENT } from "./agents/sidekick";
 import { SMART_NOTE_COMPILER_AGENT } from "./agents/smart-note-compiler";
+import { permissionDisabled } from "./hooks/magic-context/ctx-reduce-availability";
+
+function taskRules(task: Record<string, string>) {
+    return Object.entries(task).map(([pattern, action]) => ({
+        permission: "task",
+        pattern,
+        action: action as "ask" | "allow" | "deny",
+    }));
+}
 
 /**
  * `buildHiddenAgentRegistrations` deliberately uses INLINE literals for the
@@ -138,7 +148,7 @@ describe("hidden-agent registration drift guard", () => {
         }
     });
 
-    test("Task-routing denies preserve unrelated user permissions and win last", () => {
+    test("Task-routing denies preserve non-fleet task-policy emission byte-for-byte", () => {
         const userPermission = {
             "*": "allow",
             bash: { "git status*": "ask" },
@@ -162,6 +172,40 @@ describe("hidden-agent registration drift guard", () => {
         expect(userPermission.task[DREAMER_REVIEWER_AGENT]).toBe("allow");
         expect(Object.keys(permission).at(-1)).toBe("task");
         expect(Object.keys(permission.task).at(-1)).toBe(DREAMER_REVIEWER_AGENT);
+    });
+
+    test("ambient Task wildcard deny stays last so OpenCode hides the tool", () => {
+        const internalAgentIds = [DREAMER_REVIEWER_AGENT, SIDEKICK_AGENT];
+        // CKDESK's evaluated pre-fix rule order: the ambient whole-tool deny
+        // precedes our named routing denies, so Permission.disabled finds the
+        // named pattern last and leaves the tool visible.
+        const preFixTask = {
+            "*": "deny",
+            [DREAMER_REVIEWER_AGENT]: "deny",
+            [SIDEKICK_AGENT]: "deny",
+        };
+        expect(permissionDisabled("task", taskRules(preFixTask))).toBe(false);
+
+        const merged = denyTaskRoutingToAgents({ task: { "*": "deny" } }, internalAgentIds) as {
+            task: Record<string, string>;
+        };
+        expect(merged.task).toEqual({
+            [DREAMER_REVIEWER_AGENT]: "deny",
+            [SIDEKICK_AGENT]: "deny",
+            "*": "deny",
+        });
+        expect(permissionDisabled("task", taskRules(merged.task))).toBe(true);
+    });
+
+    test("Task wildcard re-emission is idempotent across repeated registration", () => {
+        const internalAgentIds = [DREAMER_REVIEWER_AGENT, SIDEKICK_AGENT];
+        const first = denyTaskRoutingToAgents({ task: { "*": "deny" } }, internalAgentIds);
+        const second = denyTaskRoutingToAgents(first, internalAgentIds);
+
+        expect(second).toEqual(first);
+        const task = (second as { task: Record<string, string> }).task;
+        expect(Object.keys(task).filter((pattern) => pattern === "*")).toHaveLength(1);
+        expect(Object.keys(task).at(-1)).toBe("*");
     });
 
     test("Task-routing denies support OpenCode's whole-permission action form", () => {

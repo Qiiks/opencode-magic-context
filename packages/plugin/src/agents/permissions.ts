@@ -123,9 +123,11 @@ function isPermissionMap(value: unknown): value is Record<string, unknown> {
  * Add final `permission.task` denies for Magic Context's internal workers.
  *
  * OpenCode accepts either a whole-permission action or a pattern map for
- * `permission.task`; its evaluator uses the last matching rule. Normalize the
- * whole-permission form, retain every unrelated user rule, then append our
- * exact agent-id denies after both the user's task patterns and any `*` rule.
+ * `permission.task`; its visibility evaluator uses the last matching rule.
+ * Normalize the whole-permission form, retain unrelated user rules, then append
+ * our exact agent-id denies. When the ambient task policy has a wildcard deny,
+ * re-emit that wildcard after the named denies so the Task tool is hidden rather
+ * than shown as a callable-but-refused tool.
  */
 export function denyTaskRoutingToAgents(
     permission: unknown,
@@ -143,8 +145,12 @@ export function denyTaskRoutingToAgents(
           ? task
           : {};
     const internalAgentIdSet = new Set(internalAgentIds);
+    const hasAmbientWildcardDeny = configuredTask["*"] === "deny";
     const retainedTask = Object.fromEntries(
-        Object.entries(configuredTask).filter(([agentId]) => !internalAgentIdSet.has(agentId)),
+        Object.entries(configuredTask).filter(
+            ([agentId]) =>
+                !internalAgentIdSet.has(agentId) && (agentId !== "*" || !hasAmbientWildcardDeny),
+        ),
     );
 
     return {
@@ -152,6 +158,10 @@ export function denyTaskRoutingToAgents(
         task: {
             ...retainedTask,
             ...Object.fromEntries(internalAgentIds.map((agentId) => [agentId, "deny"])),
+            // OpenCode's Permission.disabled uses findLast. Re-inserting the
+            // ambient wildcard after our named routing denies keeps its whole-tool
+            // deny as the final match and makes the Task tool invisible.
+            ...(hasAmbientWildcardDeny ? { "*": "deny" } : {}),
         },
     };
 }
