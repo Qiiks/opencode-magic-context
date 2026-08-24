@@ -120,7 +120,8 @@ describe("transform_decisions retention cap", () => {
             db
                 .prepare(
                     `SELECT materialize_reason, system_hash_prev, system_hash_new,
-                            m0_model_key_prev, m0_model_key_new
+                            m0_model_key_prev, m0_model_key_new,
+                            m0_tool_set_hash_prev, m0_tool_set_hash_new
                      FROM transform_decisions WHERE message_id = 'first-render-fold'`,
                 )
                 .get(),
@@ -130,6 +131,8 @@ describe("transform_decisions retention cap", () => {
             system_hash_new: null,
             m0_model_key_prev: null,
             m0_model_key_new: null,
+            m0_tool_set_hash_prev: null,
+            m0_tool_set_hash_new: null,
         });
     });
 

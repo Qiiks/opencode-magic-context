@@ -38,6 +38,16 @@ describe("migration v80: observed tool-set comparison telemetry", () => {
             expect(columnNames(db, "transform_decisions")).toEqual(
                 expect.arrayContaining(["m0_tool_set_hash_prev", "m0_tool_set_hash_new"]),
             );
+            const toolSetColumns = db
+                .prepare("PRAGMA table_info(transform_decisions)")
+                .all() as Array<{ name: string; notnull: number }>;
+            expect(
+                toolSetColumns
+                    .filter(({ name }) =>
+                        ["m0_tool_set_hash_prev", "m0_tool_set_hash_new"].includes(name),
+                    )
+                    .every(({ notnull }) => notnull === 0),
+            ).toBe(true);
             expect(LATEST_SUPPORTED_VERSION).toBe(81);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {

@@ -854,10 +854,11 @@ export interface MaterializeDecision {
     /**
      * Present when the decision site compared the cached and live tool-set
      * fingerprints. These operands are observational: a difference never
-     * triggers materialization.
+     * triggers materialization. A null previous value means the cached baseline
+     * had no recorded tool-set fingerprint yet.
      */
-    m0ToolSetHashPrev?: string;
-    m0ToolSetHashNew?: string;
+    m0ToolSetHashPrev?: string | null;
+    m0ToolSetHashNew?: string | null;
 }
 
 export interface MaterializeM0Result {
@@ -1593,7 +1594,7 @@ export function mustMaterialize(args: {
     const toolSetHashComparison =
         liveToolSetHash !== ""
             ? {
-                  m0ToolSetHashPrev: args.state.cachedM0ToolSetHash ?? "",
+                  m0ToolSetHashPrev: args.state.cachedM0ToolSetHash,
                   m0ToolSetHashNew: liveToolSetHash,
               }
             : null;

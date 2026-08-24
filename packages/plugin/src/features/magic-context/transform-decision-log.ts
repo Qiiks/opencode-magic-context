@@ -201,6 +201,8 @@ export function writeRustTransformDecision(args: {
         systemHashNew: null,
         m0ModelKeyPrev: null,
         m0ModelKeyNew: null,
+        m0ToolSetHashPrev: null,
+        m0ToolSetHashNew: null,
         emergency: false,
         droppedTokens: 0,
         droppedCount: 0,
