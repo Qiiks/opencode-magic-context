@@ -1,5 +1,5 @@
 {
-  "generator_version": 2,
+  "generator_version": 3,
   "cases": [
     {
       "name": "reasoning",
@@ -701,6 +701,148 @@
               "synthetic": false,
               "summary": false,
               "errored": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "incident_337_text_before_tool",
+      "target_mid": "msg_034356b50001Cbvu81faDbQTRW",
+      "expect_strip": false,
+      "source_part_order": [
+        "prt_034358925001Rh1YRViacgqaW7",
+        "prt_034358930001DHhVVQmRKFziFN",
+        "prt_034358991001ZC7E9bfKiYXbTH",
+        "prt_034358b2b001x9lN3yC9zUfB0J",
+        "prt_034358edc001qEZnQkRNpR0y5C"
+      ],
+      "source_part_types": [
+        "step-start",
+        "reasoning",
+        "text",
+        "tool",
+        "step-finish"
+      ],
+      "expected_native_part_types": [
+        "step-start",
+        "text",
+        "text",
+        "tool",
+        "step-finish"
+      ],
+      "raw_messages": [
+        {
+          "info": {
+            "id": "msg_034356b50001Cbvu81faDbQTRW",
+            "sessionID": "ses_0ad83017cffexe0g5N8UG0y3LZ",
+            "role": "assistant",
+            "finish": "tool-calls"
+          },
+          "parts": [
+            {
+              "id": "prt_034358925001Rh1YRViacgqaW7",
+              "type": "step-start"
+            },
+            {
+              "id": "prt_034358930001DHhVVQmRKFziFN",
+              "type": "reasoning",
+              "text": "All three values match, but hardcoding them is risky...",
+              "metadata": {
+                "anthropic": {
+                  "signature": "[redacted signature]"
+                }
+              }
+            },
+            {
+              "id": "prt_034358991001ZC7E9bfKiYXbTH",
+              "type": "text",
+              "text": "All three match the live keystore..."
+            },
+            {
+              "id": "prt_034358b2b001x9lN3yC9zUfB0J",
+              "type": "tool",
+              "callID": "toolu_019MxMREqQYT875aJy8Q5w6W",
+              "tool": "read",
+              "state": {
+                "status": "completed",
+                "input": {
+                  "filePath": "[redacted]"
+                },
+                "output": "[redacted tool result]"
+              }
+            },
+            {
+              "id": "prt_034358edc001qEZnQkRNpR0y5C",
+              "type": "step-finish",
+              "reason": "tool-calls"
+            }
+          ]
+        }
+      ],
+      "reasoning_exempt_mid": "msg_034356b50001Cbvu81faDbQTRW",
+      "target_reasoning_index": 1,
+      "encoded_input": [
+        {
+          "mid": "msg_034356b50001Cbvu81faDbQTRW",
+          "ordinal": 1,
+          "ck": {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "opaque",
+                  "source": "opencode",
+                  "kind": "step-start",
+                  "raw": {
+                    "id": "prt_034358925001Rh1YRViacgqaW7",
+                    "type": "step-start"
+                  }
+                }
+              },
+              {
+                "kind": {
+                  "type": "reasoning",
+                  "text": "All three values match, but hardcoding them is risky..."
+                }
+              },
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "All three match the live keystore..."
+                }
+              },
+              {
+                "kind": {
+                  "type": "tool_call",
+                  "id": "toolu_019MxMREqQYT875aJy8Q5w6W",
+                  "name": "read",
+                  "input": {
+                    "filePath": "[redacted]"
+                  }
+                }
+              },
+              {
+                "kind": {
+                  "type": "tool_result",
+                  "id": "toolu_019MxMREqQYT875aJy8Q5w6W",
+                  "tool_name": "read",
+                  "output": {
+                    "kind": {
+                      "type": "text",
+                      "text": "[redacted tool result]"
+                    }
+                  }
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "msg_034356b50001Cbvu81faDbQTRW",
+              "ordinal": 1,
+              "synthetic": false,
+              "summary": false,
+              "errored": false,
+              "finish": "tool-calls"
             }
           }
         }

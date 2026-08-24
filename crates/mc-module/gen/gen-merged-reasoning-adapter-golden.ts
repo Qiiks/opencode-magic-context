@@ -99,6 +99,50 @@ const liveContinuation = [
 	assistant("live-continuation-request-shell", [{ type: "step-start" }]),
 ];
 
+const incident337 = [
+	{
+		info: {
+			id: "msg_034356b50001Cbvu81faDbQTRW",
+			sessionID: "ses_0ad83017cffexe0g5N8UG0y3LZ",
+			role: "assistant",
+			finish: "tool-calls",
+		},
+		parts: [
+			{
+				id: "prt_034358925001Rh1YRViacgqaW7",
+				type: "step-start",
+			},
+			{
+				id: "prt_034358930001DHhVVQmRKFziFN",
+				type: "reasoning",
+				text: "All three values match, but hardcoding them is risky...",
+				metadata: { anthropic: { signature: "[redacted signature]" } },
+			},
+			{
+				id: "prt_034358991001ZC7E9bfKiYXbTH",
+				type: "text",
+				text: "All three match the live keystore...",
+			},
+			{
+				id: "prt_034358b2b001x9lN3yC9zUfB0J",
+				type: "tool",
+				callID: "toolu_019MxMREqQYT875aJy8Q5w6W",
+				tool: "read",
+				state: {
+					status: "completed",
+					input: { filePath: "[redacted]" },
+					output: "[redacted tool result]",
+				},
+			},
+			{
+				id: "prt_034358edc001qEZnQkRNpR0y5C",
+				type: "step-finish",
+				reason: "tool-calls",
+			},
+		],
+	},
+];
+
 const rawCases = [
 	...fixtures.map((fixture) => ({
 		name: fixture.name,
@@ -111,6 +155,27 @@ const rawCases = [
 		target_mid: "live-continuation-target",
 		expect_strip: false,
 		raw_messages: liveContinuation,
+	},
+	{
+		name: "incident_337_text_before_tool",
+		target_mid: "msg_034356b50001Cbvu81faDbQTRW",
+		expect_strip: false,
+		source_part_order: incident337[0]?.parts.map((part) => part.id),
+		source_part_types: [
+			"step-start",
+			"reasoning",
+			"text",
+			"tool",
+			"step-finish",
+		],
+		expected_native_part_types: [
+			"step-start",
+			"text",
+			"text",
+			"tool",
+			"step-finish",
+		],
+		raw_messages: incident337,
 	},
 ];
 
@@ -135,5 +200,5 @@ const cases = rawCases.map((fixture) => {
 
 writeFileSync(
 	output,
-	`${JSON.stringify({ generator_version: 2, cases }, null, 2)}\n`,
+	`${JSON.stringify({ generator_version: 3, cases }, null, 2)}\n`,
 );

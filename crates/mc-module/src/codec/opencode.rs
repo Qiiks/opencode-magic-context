@@ -179,18 +179,10 @@ pub fn decode_opencode_with_sidecar_and_base(
                         "subtask",
                     );
                 }
-                "step-finish" => {
-                    let block = opaque_block("step-finish", part.clone(), None);
-                    push_block(
-                        &mut content,
-                        &mut block_metas,
-                        block,
-                        part_index,
-                        part,
-                        "step-finish",
-                    );
-                }
-                "snapshot" | "patch" | "agent" | "retry" => {}
+                // OpenCode's model adapter treats step-finish as structural metadata. Keep it
+                // only in the native sidecar, just as the TypeScript CK adapter does, so both
+                // projections assign the same block indexes to authored text and tool parts.
+                "step-finish" | "snapshot" | "patch" | "agent" | "retry" => {}
                 _ => {
                     let block = opaque_block(&part_type, part.clone(), opaque_arc(part));
                     push_block(
@@ -709,7 +701,7 @@ fn encode_with_meta(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let matched_metas = match_block_metas(&msg.content, &meta.blocks, block_matches_meta);
+    let matched_metas = match_block_metas(&msg.content, &meta.blocks, true, block_matches_meta);
 
     let mut block_index = 0;
     while block_index < msg.content.len() {
@@ -2182,5 +2174,74 @@ mod tests {
         assert_eq!(served[0]["parts"][1]["text"], "§18240§ answer");
         assert_eq!(served[0]["parts"][2]["type"], "text");
         assert_eq!(served[0]["parts"][2]["text"], "");
+    }
+
+    #[test]
+    fn tagged_unstamped_text_stays_before_its_following_tool_part() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "incident_337_text_before_tool")
+            .expect("incident fixture generated from persisted rows");
+        let raw: Vec<Value> = serde_json::from_value(fixture["raw_messages"].clone()).unwrap();
+        let ingress: Vec<CkIngressMessage> =
+            serde_json::from_value(fixture["encoded_input"].clone()).unwrap();
+        let decoded = decode_opencode(&raw);
+        let mut output = ingress
+            .into_iter()
+            .map(|message| message.ck)
+            .collect::<Vec<_>>();
+        let incident = &mut output[0];
+        let text = incident
+            .content
+            .iter_mut()
+            .find_map(|block| match &mut block.kind {
+                CkKind::Text { text } if text.starts_with("All three match") => Some(text),
+                _ => None,
+            })
+            .expect("incident assistant text");
+        *text = "§5548§ All three match the live keystore...".to_string();
+        incident.mark_modified();
+        incident
+            .content
+            .iter_mut()
+            .filter(|block| matches!(block.kind, CkKind::Reasoning { .. }))
+            .for_each(|block| {
+                block.kind = CkKind::Text {
+                    text: String::new(),
+                };
+                block.mark_modified();
+            });
+
+        let served = encode_opencode_with_session(
+            &output,
+            &decoded.sidecar,
+            Some("ses_0ad83017cffexe0g5N8UG0y3LZ"),
+            None,
+        );
+        let parts = served[0]["parts"].as_array().expect("served parts");
+        let expected_types = fixture["expected_native_part_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part_type| part_type.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_types
+        );
+        assert_eq!(
+            parts[2]["text"],
+            "§5548§ All three match the live keystore..."
+        );
+        assert_eq!(parts[3]["callID"], "toolu_019MxMREqQYT875aJy8Q5w6W");
     }
 }

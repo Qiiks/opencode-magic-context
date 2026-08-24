@@ -20209,7 +20209,8 @@ mod tests {
             json!({
                 "type": "reasoning",
                 "text": "signed historical thinking",
-                "metadata": { "signature": "signature-assistant-old" }
+                "time": { "start": 1, "end": 2 },
+                "metadata": { "anthropic": { "signature": "signature-assistant-old" } }
             })
         );
 

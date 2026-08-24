@@ -229,15 +229,41 @@ fn alignment_candidate(
 pub(crate) fn match_block_metas<'a>(
     blocks: &[CkWireBlock],
     metas: &'a [BlockMeta],
+    allow_unstamped_positional_alignment: bool,
     mut matches: impl FnMut(&CkWireBlock, &BlockMeta) -> bool,
 ) -> MatchedBlockMetas<'a> {
+    let mut kind_matches = vec![vec![false; metas.len()]; blocks.len()];
     let mut candidates = vec![vec![None; metas.len()]; blocks.len()];
     for (block_index, block) in blocks.iter().enumerate() {
         for (meta_index, meta) in metas.iter().enumerate() {
-            let kind_matches = matches(block, meta);
+            let kind_matches_meta = matches(block, meta);
+            kind_matches[block_index][meta_index] = kind_matches_meta;
             candidates[block_index][meta_index] =
-                alignment_candidate(block, block_index, meta, kind_matches);
+                alignment_candidate(block, block_index, meta, kind_matches_meta);
         }
+    }
+
+    // The TypeScript adapter and the native decoder independently project the same persisted
+    // OpenCode parts. Adapter blocks do not carry the decoder's private origin stamp, but when
+    // the complete kind vector and every native block index agree, position is the stable origin
+    // identity. This lets an in-place tag edit update its original text part instead of appending
+    // after a later tool part. Any insertion or deletion breaks the whole-vector check and falls
+    // through to stamped/fingerprint alignment, preserving deletion-compaction safety.
+    let adapter_projection_matches = allow_unstamped_positional_alignment
+        && blocks.len() == metas.len()
+        && blocks
+            .iter()
+            .all(|block| stamped_block_identity(block).is_none())
+        && metas
+            .iter()
+            .enumerate()
+            .all(|(index, meta)| meta.block_index == index && kind_matches[index][index]);
+    if adapter_projection_matches {
+        return MatchedBlockMetas {
+            by_block: metas.iter().map(Some).collect(),
+            retained_native_indices: metas.iter().filter_map(|meta| meta.native_index).collect(),
+            decoded_native_indices: metas.iter().filter_map(|meta| meta.native_index).collect(),
+        };
     }
 
     // Origin indexes are stamped onto decoded blocks and survive reductions, overlays, and

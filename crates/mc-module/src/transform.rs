@@ -17851,7 +17851,7 @@ pub(crate) mod tests {
             "../testdata/merged-reasoning-adapter-golden.json"
         ))
         .unwrap();
-        assert_eq!(golden.generator_version, 2);
+        assert_eq!(golden.generator_version, 3);
         assert_eq!(
             golden
                 .cases
@@ -17864,6 +17864,7 @@ pub(crate) mod tests {
                 "redacted_thinking",
                 "reasoning_cache_control",
                 "live_tool_continuation_request_shell",
+                "incident_337_text_before_tool",
             ]
         );
 

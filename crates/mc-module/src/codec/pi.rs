@@ -362,7 +362,7 @@ fn decode_opaque_entry(
 
 fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Option<Value> {
     let mut raw = meta.raw.clone();
-    let matched_metas = match_block_metas(&msg.content, &meta.blocks, block_matches_meta);
+    let matched_metas = match_block_metas(&msg.content, &meta.blocks, false, block_matches_meta);
     if meta.role == "toolResult" || raw.get("role").and_then(Value::as_str) == Some("toolResult") {
         let (block, matched_meta) = msg
             .content
