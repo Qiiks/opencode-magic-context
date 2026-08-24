@@ -5,6 +5,14 @@ import { join } from "node:path";
 
 export type ProcessKind = "OpenCode server" | "OpenCode instance (TUI/CLI)" | "Pi" | "process";
 
+/** Best-effort process details captured while validating a migration blocker. */
+export interface ProcessProbeEvidence {
+    /** Epoch milliseconds, or null when the platform/probe cannot provide it. */
+    startTime: number | null;
+    /** The raw command line, or null when the platform/probe cannot provide it. */
+    commandLine: string | null;
+}
+
 export interface RpcPortFileRecord {
     port: number;
     pid: number;
@@ -141,6 +149,24 @@ function readPsProcessStartTime(pid: number): number | null {
     } catch {
         return null;
     }
+}
+
+/** Read a process start time without changing the guard's liveness decision. */
+export function readProcessStartTime(pid: number): number | null {
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    return rpcIdentityPlatform === "linux"
+        ? readLinuxProcessStartTime(pid)
+        : rpcIdentityPlatform === "win32"
+          ? null
+          : readPsProcessStartTime(pid);
+}
+
+/** Capture the command and start-time probes used to explain a blocker. */
+export function readProcessProbeEvidence(pid: number): ProcessProbeEvidence {
+    return {
+        startTime: readProcessStartTime(pid),
+        commandLine: readProcessCommand(pid),
+    };
 }
 
 interface ProcessListEntry {
@@ -319,28 +345,27 @@ function commandLooksLikeOpenCode(command: string): boolean {
  */
 export type PidIdentityPlausibility = "plausible" | "implausible" | "inconclusive";
 
-export function isPidIdentityPlausible(record: RpcPortFileRecord): PidIdentityPlausibility {
+export function isPidIdentityPlausible(
+    record: RpcPortFileRecord,
+    evidence?: ProcessProbeEvidence,
+): PidIdentityPlausibility {
     if (!Number.isInteger(record.pid) || record.pid <= 0) return "implausible";
 
     if (Number.isFinite(record.started_at) && record.started_at > 0) {
-        const processStartTime =
-            rpcIdentityPlatform === "linux"
-                ? readLinuxProcessStartTime(record.pid)
-                : rpcIdentityPlatform === "win32"
-                  ? null
-                  : readPsProcessStartTime(record.pid);
+        const processStartTime = evidence ? evidence.startTime : readProcessStartTime(record.pid);
         if (processStartTime === null) return "inconclusive";
         return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS
             ? "plausible"
             : "implausible";
     }
 
-    const command =
-        rpcIdentityPlatform === "linux"
-            ? readLinuxProcessCommand(record.pid)
-            : rpcIdentityPlatform === "win32"
-              ? (readWindowsProcess(record.pid).command ?? null)
-              : readPsProcessCommand(record.pid);
+    const command = evidence
+        ? evidence.commandLine
+        : rpcIdentityPlatform === "linux"
+          ? readLinuxProcessCommand(record.pid)
+          : rpcIdentityPlatform === "win32"
+            ? (readWindowsProcess(record.pid).command ?? null)
+            : readPsProcessCommand(record.pid);
     if (command === null) return "inconclusive";
     return commandLooksLikeOpenCode(command) ? "plausible" : "implausible";
 }

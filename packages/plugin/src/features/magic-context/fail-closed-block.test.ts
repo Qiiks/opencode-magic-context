@@ -109,6 +109,44 @@ describe("formatFailClosedBlockingMessage", () => {
         expect(message.match(/OpenCode server \(PID 1\)/g)).toHaveLength(1);
     });
 
+    it("renders probe evidence for every blocker and redacts command lines", () => {
+        const token = `sk-${"a".repeat(40)}`;
+        const message = formatFailClosedBlockingMessage({
+            kind: "migration_guard",
+            persistedVersion: 73,
+            supportedVersion: 74,
+            blockingProcesses: [
+                {
+                    kind: "OpenCode instance (TUI/CLI)",
+                    pid: 76165,
+                    startTime: Date.parse("2026-08-22T09:14:00Z"),
+                    commandLine: `opencode --directory /home/alice/proj --token=${token}`,
+                },
+                { kind: "Pi", pid: 76166, startTime: null, commandLine: null },
+            ],
+        });
+
+        expect(message).toContain("- PID 76165: OpenCode instance (TUI/CLI), started ");
+        expect(message).toContain("/home/<USER>/proj");
+        expect(message).toContain("token=<REDACTED:token>");
+        expect(message).not.toContain(token);
+        expect(message).toContain("- PID 76166: Pi, started unverified, cmd: unverified");
+    });
+
+    it("does not throw when all probe fields are unavailable", () => {
+        const reason: FailClosedReason = {
+            kind: "migration_guard",
+            persistedVersion: 73,
+            supportedVersion: 74,
+            blockingProcesses: [{ pid: 76167, startTime: null, commandLine: null }],
+        };
+
+        const error = createFailClosedBlockingError(reason);
+        expect(error.message).toContain(
+            "- PID 76167: process, started unverified, cmd: unverified",
+        );
+    });
+
     it("includes the storage cause and recovery command", () => {
         const message = formatFailClosedBlockingMessage(storageReason);
         expect(message).toContain("disk full");

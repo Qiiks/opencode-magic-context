@@ -70,8 +70,13 @@ describe("registerPiFailClosedSurface", () => {
 				persistedVersion: 73,
 				supportedVersion: 74,
 				blockingProcesses: [
-					{ kind: "OpenCode server", pid: 5736 },
-					{ kind: "Pi", pid: 5737 },
+					{
+						kind: "OpenCode server",
+						pid: 5736,
+						startTime: Date.parse("2026-08-22T09:14:00Z"),
+						commandLine: "opencode serve --directory /home/alice/project",
+					},
+					{ kind: "Pi", pid: 5737, startTime: null, commandLine: null },
 				],
 			},
 			tryReopen: async () => null,
@@ -88,6 +93,11 @@ describe("registerPiFailClosedSurface", () => {
 		const message = thrown instanceof Error ? thrown.message : String(thrown);
 		expect(message).toContain("OpenCode server (PID 5736)");
 		expect(message).toContain("Pi (PID 5737)");
+		expect(message).toContain("- PID 5736: OpenCode server, started ");
+		expect(message).toContain("/home/<USER>/project");
+		expect(message).toContain(
+			"- PID 5737: Pi, started unverified, cmd: unverified",
+		);
 		expect(message).toContain("an older Magic Context build");
 		expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
 	});
