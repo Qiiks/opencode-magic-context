@@ -40,6 +40,7 @@ import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    formatLocalEmbeddingRuntimeWasmFallback,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import {
@@ -783,8 +784,13 @@ async function runHealthChecks(options: {
                 add(
                     results,
                     "pass",
-                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime present)`,
+                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime OK)`,
                 );
+                runtimeReported = true;
+                break;
+            }
+            if (runtime.state === "wasm-fallback") {
+                add(results, "warn", formatLocalEmbeddingRuntimeWasmFallback(runtime));
                 runtimeReported = true;
                 break;
             }

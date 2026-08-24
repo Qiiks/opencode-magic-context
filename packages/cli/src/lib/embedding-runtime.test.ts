@@ -8,6 +8,7 @@ import {
     checkLocalEmbeddingRuntimeAt,
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    formatLocalEmbeddingRuntimeWasmFallback,
 } from "./embedding-runtime";
 
 afterEach(() => {
@@ -16,6 +17,16 @@ afterEach(() => {
 
 function makeRoot(): string {
     return mkdtempSync(join(tmpdir(), "mc-embruntime-"));
+}
+
+function installWasmPackage(root: string): void {
+    const pkgDir = join(root, "node_modules", "onnxruntime-web");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+        join(pkgDir, "package.json"),
+        JSON.stringify({ name: "onnxruntime-web", main: "index.js" }),
+    );
+    writeFileSync(join(pkgDir, "index.js"), "module.exports = {};\n");
 }
 
 function installPackage(root: string, withBinary: boolean): void {
@@ -45,22 +56,37 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
         }
     });
 
-    test("package missing entirely → package-missing (the #128 Windows case)", () => {
+    test("native package missing and WASM missing → both-broken", () => {
         const root = makeRoot();
         try {
             const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
-            expect(status.state).toBe("package-missing");
+            expect(status.state).toBe("both-broken");
+            if (status.state === "both-broken") {
+                expect(status.nativeFailure.state).toBe("package-missing");
+                expect(status.wasmReason).toContain("onnxruntime-web");
+                expect(formatLocalEmbeddingRuntimeDoctorWarning(status)).toContain(
+                    "native runtime and WASM fallback both unavailable",
+                );
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
-    test("package present but platform binary missing → binary-missing", () => {
+    test("native binary missing but WASM present → wasm-fallback", () => {
         const root = makeRoot();
         try {
             installPackage(root, false); // no .node binary
+            installWasmPackage(root);
             const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
-            expect(status.state).toBe("binary-missing");
+            expect(status.state).toBe("wasm-fallback");
+            if (status.state === "wasm-fallback") {
+                expect(status.nativeFailure.state).toBe("binary-missing");
+                expect(status.wasmPath).toContain("onnxruntime-web");
+                expect(formatLocalEmbeddingRuntimeWasmFallback(status)).toContain(
+                    "WASM inference is slower than native",
+                );
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -85,23 +111,33 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
         const root = makeRoot();
         try {
             installPackage(root, true);
+            installWasmPackage(root);
             __setEmbeddingRuntimeTestHooks({
-                runOnnxRuntimeNodeLoadProbeChild: () => ({
-                    stdout: JSON.stringify({
-                        ok: false,
-                        reason: "ERR_DLOPEN_FAILED: native binding failed",
-                    }),
-                    stderr: "",
-                    status: 0,
-                    signal: null,
-                }),
+                runOnnxRuntimeNodeLoadProbeChild: (packageDir) =>
+                    packageDir.endsWith("onnxruntime-web")
+                        ? {
+                              stdout: JSON.stringify({ ok: true }),
+                              stderr: "",
+                              status: 0,
+                              signal: null,
+                          }
+                        : {
+                              stdout: JSON.stringify({
+                                  ok: false,
+                                  reason: "ERR_DLOPEN_FAILED: native binding failed",
+                              }),
+                              stderr: "",
+                              status: 0,
+                              signal: null,
+                          },
             });
 
             const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
 
-            expect(status.state).toBe("load-failed");
-            if (status.state === "load-failed") {
-                expect(status.reason).toContain("ERR_DLOPEN_FAILED");
+            expect(status.state).toBe("wasm-fallback");
+            if (status.state === "wasm-fallback") {
+                expect(status.nativeFailure.state).toBe("load-failed");
+                expect(status.nativeFailure.reason).toContain("ERR_DLOPEN_FAILED");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -123,10 +159,13 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
 
             const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
 
-            expect(status.state).toBe("load-failed");
-            if (status.state === "load-failed") {
-                expect(status.reason).toContain("134");
-                expect(status.reason).toContain("dyld: abort");
+            expect(status.state).toBe("both-broken");
+            if (status.state === "both-broken") {
+                expect(status.nativeFailure.state).toBe("load-failed");
+                if (status.nativeFailure.state === "load-failed") {
+                    expect(status.nativeFailure.reason).toContain("134");
+                    expect(status.nativeFailure.reason).toContain("dyld: abort");
+                }
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -152,10 +191,13 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
 
             const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
 
-            expect(status.state).toBe("load-failed");
-            if (status.state === "load-failed") {
-                expect(status.reason).toContain("timed out");
-                expect(status.reason).toContain("probe hung");
+            expect(status.state).toBe("both-broken");
+            if (status.state === "both-broken") {
+                expect(status.nativeFailure.state).toBe("load-failed");
+                if (status.nativeFailure.state === "load-failed") {
+                    expect(status.nativeFailure.reason).toContain("timed out");
+                    expect(status.nativeFailure.reason).toContain("probe hung");
+                }
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -186,11 +228,11 @@ describe("checkLocalEmbeddingRuntime (multi-root)", () => {
         }
     });
 
-    test("existing root with missing package → package-missing", () => {
+    test("existing root with neither runtime → both-broken", () => {
         const root = makeRoot();
         try {
             const status = checkLocalEmbeddingRuntime([root], "win32", "x64");
-            expect(status.state).toBe("package-missing");
+            expect(status.state).toBe("both-broken");
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -238,7 +280,7 @@ describe("checkLocalEmbeddingRuntimeByResolution", () => {
         }
     });
 
-    test("resolvable package + matching binary that fails to load → load-failed", () => {
+    test("resolvable native load failure + WASM → wasm-fallback", () => {
         const dir = installResolvablePlugin(
             true,
             true,
@@ -247,35 +289,38 @@ describe("checkLocalEmbeddingRuntimeByResolution", () => {
                 "throw err;\n",
         );
         try {
+            installWasmPackage(dir);
             const status = checkLocalEmbeddingRuntimeByResolution(dir, "win32", "x64");
-            expect(status.state).toBe("load-failed");
-            if (status.state === "load-failed") {
-                expect(status.reason).toContain("ERR_DLOPEN_FAILED");
-                expect(formatLocalEmbeddingRuntimeDoctorWarning(status)).toContain(
-                    "onnxruntime-node native binding missing",
-                );
+            expect(status.state).toBe("wasm-fallback");
+            if (status.state === "wasm-fallback") {
+                expect(status.nativeFailure.state).toBe("load-failed");
+                if (status.nativeFailure.state === "load-failed") {
+                    expect(status.nativeFailure.reason).toContain("ERR_DLOPEN_FAILED");
+                }
             }
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
     });
 
-    test("resolvable package but missing platform binary → binary-missing", () => {
+    test("resolvable package with binary missing but WASM present → wasm-fallback", () => {
         const dir = installResolvablePlugin(true, false);
         try {
+            installWasmPackage(dir);
             expect(checkLocalEmbeddingRuntimeByResolution(dir, "win32", "x64").state).toBe(
-                "binary-missing",
+                "wasm-fallback",
             );
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }
     });
 
-    test("plugin exists but onnxruntime-node not resolvable → package-missing (#128)", () => {
+    test("plugin without a native package but with WASM → wasm-fallback", () => {
         const dir = installResolvablePlugin(false, false);
         try {
+            installWasmPackage(dir);
             expect(checkLocalEmbeddingRuntimeByResolution(dir, "win32", "x64").state).toBe(
-                "package-missing",
+                "wasm-fallback",
             );
         } finally {
             rmSync(dir, { recursive: true, force: true });

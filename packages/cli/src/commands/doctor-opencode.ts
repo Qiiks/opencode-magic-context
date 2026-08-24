@@ -35,6 +35,7 @@ import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    formatLocalEmbeddingRuntimeWasmFallback,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import { formatGithubIssueFallback, submitGithubIssue } from "../lib/github-issue";
@@ -403,6 +404,10 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
     unverified?: boolean;
 } {
     const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
+    if (runtime.state === "wasm-fallback") {
+        log.warn(formatLocalEmbeddingRuntimeWasmFallback(runtime));
+        return { issues: 0 };
+    }
     if (isLocalEmbeddingRuntimeBroken(runtime)) {
         log.warn(formatLocalEmbeddingRuntimeDoctorWarning(runtime));
         return { issues: 1, localRuntimeBroken: true };
@@ -411,7 +416,7 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success("Embedding provider: local (Xenova/all-MiniLM-L6-v2 bundled)");
+    log.success("Embedding provider: local (native runtime OK; Xenova/all-MiniLM-L6-v2 bundled)");
     return { issues: 0 };
 }
 
