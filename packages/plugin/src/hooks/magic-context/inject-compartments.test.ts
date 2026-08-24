@@ -3028,6 +3028,49 @@ describe("m[0]/m[1] materialization", () => {
         expect(result.m1Text).toContain("docs-hash-only CAS delta memory");
         expect(renderedText(bust[1])).toContain("docs-hash-only CAS delta memory");
     });
+    it("records NULL for an unmaterialized tool-set baseline", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const baselineSignals = {
+            systemHash: "sys-tool-observation-null",
+            modelKey: "model-tool-observation-null",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+        const state = readStateFromMeta();
+
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: baselineSignals,
+        });
+
+        // Simulate a cached m[0] created before tool-set telemetry existed.
+        state.cachedM0ToolSetHash = null;
+        db.prepare(
+            "UPDATE session_meta SET cached_m0_tool_set_hash = NULL WHERE session_id = ?",
+        ).run(SESSION_ID);
+
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+                hardSignals: { ...baselineSignals, toolSetHash: "tools-v2" },
+            }),
+        ).toEqual({
+            value: false,
+            reason: null,
+            m0ToolSetHashPrev: null,
+            m0ToolSetHashNew: "tools-v2",
+        });
+    });
+
     it("persists observed tool-set hashes without turning tool changes into a fold trigger", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
