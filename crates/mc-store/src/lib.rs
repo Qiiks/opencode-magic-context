@@ -72,6 +72,10 @@ pub struct HarnessMeta {
     /// compartment heading dates without making dates part of message identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<i64>,
+    /// Native message completion time. Temporal gap markers use this as the previous
+    /// message's effective end, falling back to `created_at_ms` when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3862,6 +3866,9 @@ pub struct TransformOverlayBatch<'a> {
     pub max_seen_ordinal: Option<u64>,
     pub tag_mints: &'a [McTagRow],
     pub temporal_marks: &'a [TemporalMarkInput],
+    /// Replace existing temporal bytes during a consumed renderer transition. Ordinary
+    /// first-sight decisions remain insert-only and frontier-gated.
+    pub rewrite_temporal_marks: bool,
     pub user_hint: Option<&'a UserHintDecisionInput>,
     pub channel1_append: Option<&'a Channel1AppendRow>,
     pub created_at_ms: i64,
@@ -3872,6 +3879,7 @@ impl TransformOverlayBatch<'_> {
         self.max_seen_ordinal.is_none()
             && self.tag_mints.is_empty()
             && self.temporal_marks.is_empty()
+            && !self.rewrite_temporal_marks
             && self.user_hint.is_none()
             && self.channel1_append.is_none()
     }
@@ -9219,7 +9227,22 @@ impl McStore {
                 )
                 .optional()?;
             for (ordinal, mark) in &temporal_marks {
-                if previous_frontier.is_none_or(|frontier| *ordinal > frontier) {
+                if overlays.rewrite_temporal_marks {
+                    tx.execute(
+                        "INSERT INTO mc_temporal_marks
+                             (session_id, block_id, marker_text, created_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(session_id, block_id) DO UPDATE SET
+                             marker_text = excluded.marker_text,
+                             created_at = excluded.created_at",
+                        params![
+                            session_id,
+                            mark.block_id,
+                            mark.marker_text,
+                            overlays.created_at_ms
+                        ],
+                    )?;
+                } else if previous_frontier.is_none_or(|frontier| *ordinal > frontier) {
                     tx.execute(
                         "INSERT OR IGNORE INTO mc_temporal_marks
                              (session_id, block_id, marker_text, created_at)
@@ -17647,6 +17670,7 @@ mod tests {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
                         temporal_marks: &temporal_marks,
+                        rewrite_temporal_marks: false,
                         user_hint: Some(&hint),
                         channel1_append: Some(&channel1),
                         created_at_ms: 10,
@@ -17733,6 +17757,7 @@ mod tests {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
                         temporal_marks: &marks,
+                        rewrite_temporal_marks: false,
                         user_hint: Some(&hint),
                         channel1_append: Some(&channel1),
                         created_at_ms: 1,

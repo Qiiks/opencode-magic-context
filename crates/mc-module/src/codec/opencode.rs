@@ -69,6 +69,12 @@ pub fn decode_opencode_with_sidecar_and_base(
         let role = string_field(info, "role")
             .or_else(|| string_field(raw_message, "role"))
             .unwrap_or_else(|| "user".to_string());
+        let created_at_ms = opencode_message_time(info, "created")
+            .or_else(|| integer_field(info, "time_created"))
+            .or_else(|| integer_field(info, "timeCreated"));
+        let completed_at_ms = opencode_message_time(info, "completed")
+            .or_else(|| integer_field(info, "time_completed"))
+            .or_else(|| integer_field(info, "timeCompleted"));
         let origin = opencode_origin(info).or_else(|| opencode_origin(raw_message));
         let parts = raw_message
             .get("parts")
@@ -207,6 +213,8 @@ pub fn decode_opencode_with_sidecar_and_base(
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),
                 synthetic,
+                created_at_ms,
+                completed_at_ms,
                 ..Default::default()
             },
         );
@@ -1270,6 +1278,14 @@ fn is_synthetic_message(parts: &[Value]) -> bool {
     !parts.is_empty() && parts.iter().all(is_synthetic_part)
 }
 
+fn opencode_message_time(info: &Value, key: &str) -> Option<i64> {
+    info.get("time").and_then(|time| integer_field(time, key))
+}
+
+fn integer_field(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64)
+}
+
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -1399,6 +1415,24 @@ mod tests {
                 },
             ),
         ]
+    }
+
+    #[test]
+    fn native_decoder_promotes_nested_message_times_from_temporal_golden() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../../testdata/temporal-parity-golden.json"))
+                .expect("temporal parity golden");
+        let raw = golden["cases"][0]["raw_messages"]
+            .as_array()
+            .expect("golden raw messages");
+        let decoded = decode_opencode(raw);
+        let assistant = decoded
+            .messages
+            .iter()
+            .find(|message| message.mid == "temporal-assistant-1")
+            .expect("timed assistant");
+        assert_eq!(assistant.ck.meta.created_at_ms, Some(10_000));
+        assert_eq!(assistant.ck.meta.completed_at_ms, Some(70_000));
     }
 
     #[test]
