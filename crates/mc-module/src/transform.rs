@@ -8097,6 +8097,9 @@ fn apply_tag_overlay_to_message(
         if !is_reduced(block) {
             let target = &mut message.content[block.block_index];
             let mut block_changed = false;
+            if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
+                block_changed |= prepend_temporal_to_block(target, prefix);
+            }
             if let Some(kind) = taggable_kind(block) {
                 if let Some(tag_number) = overlay.tag_by_block_id.get(&block.id) {
                     block_changed |= apply_tag_prefix_to_block(
@@ -8109,9 +8112,6 @@ fn apply_tag_overlay_to_message(
                 // A boundary-lineage alarm forces raw pass-through, so only tags stored
                 // before this request are available. Newly seen blocks wait for a normal
                 // accepted pass rather than consuming tag numbers on rejected lineage.
-            }
-            if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
-                block_changed |= prepend_temporal_to_block(target, prefix);
             }
             if let Some(hint) = overlay.user_hint_by_block_id.get(&block.id) {
                 block_changed |= append_user_hint_to_block(target, hint);
@@ -22302,7 +22302,7 @@ pub(crate) mod tests {
         assert_eq!(tail_ids(&boot), vec!["t11"]);
         assert_eq!(
             canonical_response_hash(&boot),
-            "e361c261f3bed5b1488bbc94b9d7ad2c2bc6cbedb4f0d9ea4abca474deae8ca7",
+            "d1b31ccee47cfd71f7e6a2050d32a2c2c5661bbd6538f211f8ae211b4f7ffbe0",
             "healthy HARD bytes must match the pre-detector golden",
         );
 
@@ -23990,7 +23990,7 @@ pub(crate) mod tests {
                 &pctx("git:proj", "/nonexistent-docs", 7_930_000),
             )
             .unwrap();
-            assert_eq!(tail_bytes(&first, "m3"), "<!-- +12m -->\n§3§ question");
+            assert_eq!(tail_bytes(&first, "m3"), "§3§ <!-- +12m -->\nquestion");
             active.prev_response_completed_at_ms = Some(800_000);
             let replay = transform(
                 &s,
@@ -24052,7 +24052,7 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(
                 tail_bytes(&response, "m3"),
-                "<!-- +12m -->\n§3§ question",
+                "§3§ <!-- +12m -->\nquestion",
                 "role=system reminders are skipped when resolving the authored tail"
             );
         });
@@ -24096,7 +24096,7 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(
                 tail_bytes(&response, "m3"),
-                "<!-- +12m -->\n§3§ question",
+                "§3§ <!-- +12m -->\nquestion",
                 "a standalone reminder-shaped user message is transport, not an authored tail"
             );
         });
@@ -24149,7 +24149,7 @@ pub(crate) mod tests {
                 &pctx("git:proj", "/nonexistent-docs", 700_000),
             )
             .unwrap();
-            assert_eq!(tail_bytes(&minted, "m1"), "<!-- +10m -->\n§1§ question");
+            assert_eq!(tail_bytes(&minted, "m1"), "§1§ <!-- +10m -->\nquestion");
             assert_eq!(s.overlay_watermark("temporal-frontier").unwrap(), Some(1));
         });
     }

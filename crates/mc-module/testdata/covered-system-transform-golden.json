@@ -19,7 +19,7 @@
       {
         "kind": {
           "type": "text",
-          "text": "(no new content since last materialization)"
+          "text": "<session-history-since>(no new content since last materialization)</session-history-since>"
         }
       }
     ],
