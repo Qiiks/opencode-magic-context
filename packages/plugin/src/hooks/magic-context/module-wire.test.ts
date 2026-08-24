@@ -58,13 +58,14 @@ describe("encodeOpenCodeMessagesToCk", () => {
             }>;
         };
 
-        expect(golden.generator_version).toBe(2);
+        expect(golden.generator_version).toBe(3);
         expect(golden.cases.map((fixture) => fixture.name)).toEqual([
             "reasoning",
             "thinking",
             "redacted_thinking",
             "reasoning_cache_control",
             "live_tool_continuation_request_shell",
+            "incident_337_text_before_tool",
         ]);
         for (const fixture of golden.cases) {
             expect(encodeOpenCodeMessagesToCk(fixture.raw_messages)).toEqual(fixture.encoded_input);
