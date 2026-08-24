@@ -613,6 +613,26 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
             (typeof info.absolute_ordinal === "number" && info.absolute_ordinal) ||
             index + 1;
         const role = typeof info.role === "string" ? info.role : "user";
+        const time =
+            info.time !== null && typeof info.time === "object"
+                ? (info.time as Record<string, unknown>)
+                : {};
+        const createdAtMs =
+            typeof time.created === "number"
+                ? time.created
+                : typeof info.time_created === "number"
+                  ? info.time_created
+                  : typeof info.timeCreated === "number"
+                    ? info.timeCreated
+                    : undefined;
+        const completedAtMs =
+            typeof time.completed === "number"
+                ? time.completed
+                : typeof info.time_completed === "number"
+                  ? info.time_completed
+                  : typeof info.timeCompleted === "number"
+                    ? info.timeCompleted
+                    : undefined;
         const parts = Array.isArray(raw.parts) ? raw.parts : [];
         const synthetic =
             parts.length > 0 &&
@@ -732,11 +752,8 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                     summary: info.summary === true,
                     errored: info.error !== undefined && info.error !== null,
                     ...(typeof info.finish === "string" ? { finish: info.finish } : {}),
-                    ...(typeof info.time_created === "number"
-                        ? { created_at_ms: info.time_created }
-                        : typeof info.timeCreated === "number"
-                          ? { created_at_ms: info.timeCreated }
-                          : {}),
+                    ...(createdAtMs === undefined ? {} : { created_at_ms: createdAtMs }),
+                    ...(completedAtMs === undefined ? {} : { completed_at_ms: completedAtMs }),
                 },
             },
         };

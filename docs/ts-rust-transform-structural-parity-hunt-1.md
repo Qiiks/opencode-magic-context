@@ -115,6 +115,8 @@ In recent accepted bodies:
 - Rust / ASTRO `2026-08-24T15-13-00-373Z-004837-…body.json` had 4 across 733 messages.
 - TypeScript / MC `2026-08-24T15-15-28-310Z-004862-…body.json` had 43 across 953 messages.
 
+The follow-up reran `scripts/audit-transform-wire-parity.py` against the five newest 2026-08-24 bodies in every then-present session. The fresh sample contained 10 Rust bodies from 2 sessions and 75 TypeScript bodies from 15 sessions. It found 25 Rust temporal carriers versus 1,138 TypeScript carriers, reproducing the coverage difference before the source fix.
+
 The bodies are different sessions, so counts alone do not prove a transform defect. Source behavior removes the confound:
 
 - TypeScript re-derives markers from every message's immutable `time.created/time.completed` on every pass (`temporal-awareness.ts:152-189`), and `transform.ts:1785-1787` explicitly promises retroactive annotation when the feature activates.
@@ -122,11 +124,13 @@ The bodies are different sessions, so counts alone do not prove a transform defe
 
 **Adjudication**
 
-TypeScript is the specification for historical coverage. Rust's no-retroactivity choice is understandable for cache safety, but it is not structurally or semantically equivalent. Achieving parity likely requires carrying historical message timestamps in the module request/state import and a controlled one-time bust/backfill policy.
+TypeScript is the specification for historical coverage. Rust's no-retroactivity choice was understandable for cache safety, but it was not structurally or semantically equivalent.
+
+The fix carries OpenCode's nested `info.time.created` and `info.time.completed` through CK harness metadata in both the plugin adapter and Rust codec. Rust now walks every message on the immutable TypeScript basis (`previous.completed ?? previous.created` to `current.created`), while retaining the proxy-observation fallback only for timestamp-free harnesses. Existing sessions whose persisted temporal bytes differ consume a dedicated `temporal_parity` renderer-transition class: all visible historical decisions are replaced atomically on one cache-busting fold, and subsequent passes replay the consumed result without trickling older marker changes.
 
 **Severity:** ICL/cosmetic temporal semantics + cache-stability trade-off.
 
-**Disposition:** report-large. Follow-up should add a same-input differential fixture with historical timestamps, define the migration/bust boundary, and then make Rust's historical carrier set and marker values match TypeScript.
+**Disposition:** fixed in follow-up A. A generator-owned, dump-derived cross-language golden pins the `+13h 29m` completed-time basis, the `+31m` created-time fallback after a transport reminder, historical carrier placement, and one-fold replay stability. The corresponding mutation drill proves that ignoring the prior completion time changes the served marker to `+13h 30m` and fails the regression.
 
 ### F5 — follow-up: Rust served no thinking blocks despite recent signed reasoning in native history
 

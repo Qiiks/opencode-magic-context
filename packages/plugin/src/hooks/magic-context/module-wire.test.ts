@@ -40,6 +40,33 @@ describe("encodeOpenCodeMessagesToCk", () => {
         });
     });
 
+    it("carries nested OpenCode timestamps from the generated temporal parity fixture", () => {
+        const golden = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/temporal-parity-golden.json",
+                ),
+                "utf8",
+            ),
+        ) as {
+            schema: number;
+            generator_version: number;
+            cases: Array<{ raw_messages: unknown[]; encoded_input: unknown[] }>;
+        };
+
+        expect(golden.schema).toBe(1);
+        expect(golden.generator_version).toBe(1);
+        for (const fixture of golden.cases) {
+            const encoded = encodeOpenCodeMessagesToCk(fixture.raw_messages);
+            expect(encoded).toEqual(fixture.encoded_input);
+            expect(encoded[1]?.ck.meta).toMatchObject({
+                created_at_ms: 10_000,
+                completed_at_ms: 70_000,
+            });
+        }
+    });
+
     it("matches the module golden generated from raw OpenCode reasoning parts", () => {
         const golden = JSON.parse(
             readFileSync(

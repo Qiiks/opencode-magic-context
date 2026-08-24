@@ -1731,6 +1731,7 @@ struct PendingOverlayDecisions {
     tag_mint_ms: f64,
     temporal_ms: f64,
     temporal_marks: Vec<TemporalMarkInput>,
+    rewrite_temporal_marks: bool,
     user_hint: Option<UserHintDecisionInput>,
     channel1_append: Option<Channel1AppendRow>,
 }
@@ -1746,6 +1747,7 @@ struct OverlayComputation<'a, 'ctx> {
     overlay_frontier: Option<u64>,
     tag_mint_enabled: bool,
     temporal_enabled: bool,
+    rewrite_temporal_marks: bool,
     mutation_exempt_mid: Option<&'a str>,
     lineage_anchor_mid: Option<&'a str>,
 }
@@ -3230,6 +3232,16 @@ fn apply_once(
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
+    // Legacy sessions stored the CC latch before the generic surface latch existed.
+    // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
+    let persisted_tagging_surface_active =
+        loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active;
+    let lineage_anchor_mid = loaded
+        .meta
+        .anchor_block_id
+        .as_deref()
+        .and_then(split_block_id)
+        .map(|(mid, _)| mid);
     let transition_detection_started_at = Instant::now();
     let transition_shapes = renderer_transition_shapes(
         &projection,
@@ -3241,18 +3253,30 @@ fn apply_once(
             .as_ref()
             .and_then(|pair| pair.anchor_mid.as_deref()),
     );
-    let detected_transition_classes = transition_shapes.classes();
+    let mut detected_transition_classes = transition_shapes.classes();
     let consumed_transition_classes = transition_consumed_classes(&loaded.core);
+    let temporal_parity_detected = !consumed_transition_classes
+        .contains(&RendererTransitionClass::TemporalParity)
+        && tagging_surface_requested
+        && (persisted_tagging_surface_active || !loaded.meta.initialized)
+        && ctx.temporal_awareness
+        && temporal_parity_transition_needed(
+            req,
+            &projection,
+            &transform_snapshot.temporal_marks,
+            overlay_frontier,
+            loaded.meta.initialized,
+            mutation_exempt_mid,
+            lineage_anchor_mid,
+        );
+    if temporal_parity_detected {
+        detected_transition_classes.insert(RendererTransitionClass::TemporalParity);
+    }
+    let rewrite_temporal_marks = temporal_parity_detected;
     let transition_due = loaded.meta.initialized
         && !req.is_subagent
         && !detected_transition_classes.is_subset(&consumed_transition_classes);
     timings.transition_detection = elapsed_ms(transition_detection_started_at);
-    let lineage_anchor_mid = loaded
-        .meta
-        .anchor_block_id
-        .as_deref()
-        .and_then(split_block_id)
-        .map(|(mid, _)| mid);
     if let Some(base) = loaded.meta.ordinal_continuation_base {
         let expected_boundary = base.checked_add(1).ok_or_else(|| {
             TransformError::LineageProtocol(
@@ -3290,10 +3314,6 @@ fn apply_once(
             req.session_id
         );
     }
-    // Legacy sessions stored the CC latch before the generic surface latch existed.
-    // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
-    let persisted_tagging_surface_active =
-        loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active;
     let surface_transition = persisted_tagging_surface_active != tagging_surface_requested;
     let surface_state = if surface_transition {
         SurfaceState::Transition
@@ -3645,6 +3665,7 @@ fn apply_once(
             overlay_frontier,
             tag_mint_enabled: tagging_active || caveman_tagging_requested,
             temporal_enabled: temporal_active,
+            rewrite_temporal_marks,
             mutation_exempt_mid,
             lineage_anchor_mid,
         })?;
@@ -5443,6 +5464,7 @@ fn apply_once(
                     tag_mints: &tag_rows[pending_overlays.tag_mint_start
                         ..pending_overlays.tag_mint_start + pending_overlays.tag_mint_count],
                     temporal_marks: &pending_overlays.temporal_marks,
+                    rewrite_temporal_marks: pending_overlays.rewrite_temporal_marks,
                     user_hint: pending_overlays.user_hint.as_ref(),
                     channel1_append: pending_overlays.channel1_append.as_ref(),
                     created_at_ms: ctx.now_ms,
@@ -8075,6 +8097,77 @@ pub fn temporal_gap_prefix(gap_ms: i64) -> Option<String> {
     Some(format!("<!-- {marker} -->\n"))
 }
 
+/// Reproduce the TypeScript temporal walk from immutable message timestamps. Every message
+/// advances the time basis, while only authored users receive a decision on their first visible
+/// text block.
+fn timestamp_temporal_marks(
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+) -> Vec<TemporalMarkInput> {
+    let mut previous = None;
+    let mut marks = Vec::new();
+    for message in &req.messages {
+        if is_authored_user_message(message)
+            && mutation_exempt_mid != Some(message.mid.as_str())
+            && lineage_anchor_mid != Some(message.mid.as_str())
+        {
+            let marker_text = previous.and_then(|prior: &CkIngressMessage| {
+                let previous_created = prior.ck.meta.created_at_ms?;
+                let current_created = message.ck.meta.created_at_ms?;
+                let previous_end = prior.ck.meta.completed_at_ms.unwrap_or(previous_created);
+                Some(
+                    current_created
+                        .checked_sub(previous_end)
+                        .and_then(temporal_gap_prefix)
+                        .unwrap_or_default(),
+                )
+            });
+            if let Some(marker_text) = marker_text {
+                if let Some(block_id) = projection.blocks.iter().find_map(|block| {
+                    (block.mid == message.mid
+                        && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                    .then(|| block.id.clone())
+                }) {
+                    marks.push(TemporalMarkInput {
+                        ordinal: message.ordinal,
+                        block_id,
+                        marker_text,
+                    });
+                }
+            }
+        }
+        previous = Some(message);
+    }
+    marks
+}
+
+fn temporal_parity_transition_needed(
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    temporal_rows: &[TemporalMarkRow],
+    overlay_frontier: Option<u64>,
+    initialized: bool,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+) -> bool {
+    let stored = temporal_rows
+        .iter()
+        .map(|row| (row.block_id.as_str(), row.marker_text.as_str()))
+        .collect::<HashMap<_, _>>();
+    timestamp_temporal_marks(req, projection, mutation_exempt_mid, lineage_anchor_mid)
+        .into_iter()
+        .any(|mark| match stored.get(mark.block_id.as_str()) {
+            Some(marker_text) => *marker_text != mark.marker_text.as_str(),
+            None => {
+                !mark.marker_text.is_empty()
+                    && (overlay_frontier.is_some_and(|frontier| mark.ordinal <= frontier)
+                        || (initialized && overlay_frontier.is_none()))
+            }
+        })
+}
+
 fn apply_tag_overlay_to_message(
     message: &mut CkWireMessage,
     ingress: &CkIngressMessage,
@@ -8455,6 +8548,7 @@ fn compute_active_overlay_decisions(
         overlay_frontier: frontier,
         tag_mint_enabled,
         temporal_enabled,
+        rewrite_temporal_marks,
         mutation_exempt_mid,
         lineage_anchor_mid,
     } = input;
@@ -8501,13 +8595,48 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| (row.block_id.as_str(), row.created_at_ms))
         .collect::<HashMap<_, _>>();
+    let canonical_marks = if temporal_enabled {
+        timestamp_temporal_marks(req, projection, mutation_exempt_mid, lineage_anchor_mid)
+    } else {
+        Vec::new()
+    };
+    let canonical_ids = canonical_marks
+        .iter()
+        .map(|mark| mark.block_id.clone())
+        .collect::<HashSet<_>>();
     let mut decided_temporal = temporal_rows
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
+    let mut temporal_marks = Vec::new();
+    for mark in canonical_marks {
+        if let Some(existing) = temporal_rows
+            .iter_mut()
+            .find(|row| row.block_id == mark.block_id)
+        {
+            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                existing.marker_text = mark.marker_text.clone();
+                temporal_marks.push(mark);
+            }
+            continue;
+        }
+        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+        if !rewrite_temporal_marks && !is_new {
+            continue;
+        }
+        temporal_rows.push(TemporalMarkRow {
+            block_id: mark.block_id.clone(),
+            marker_text: mark.marker_text.clone(),
+            created_at: ctx.now_ms,
+        });
+        decided_temporal.insert(mark.block_id.clone());
+        temporal_marks.push(mark);
+    }
+
+    // Timestamp-free callers retain the legacy first-sight basis for the live tail. OpenCode
+    // supplies immutable per-message times, so its messages are already covered above.
     let authored_tail = eligible_authored_user_tail(req);
     let mut previous_new_user_mint = None;
-    let mut temporal_marks = Vec::new();
     for message in req.messages.iter().filter(|message| {
         !message.ck.meta.synthetic
             && message.ck.role != "system"
@@ -8539,7 +8668,8 @@ fn compute_active_overlay_decisions(
             previous_new_user_mint = None;
             continue;
         };
-        if decided_temporal.contains(block_id.as_str()) {
+        if canonical_ids.contains(block_id.as_str()) || decided_temporal.contains(block_id.as_str())
+        {
             previous_new_user_mint = Some(current_mint);
             continue;
         }
@@ -8549,10 +8679,8 @@ fn compute_active_overlay_decisions(
             continue;
         }
         let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
-            // The gap pairs the proxy's INGRESS observation with its completion
-            // observation. Module-side now_ms would add queue plus blocking-arm
-            // latency to every gap, so a missing or invalid ingress time freezes
-            // the no-marker decision rather than guessing from a later clock.
+            // Timestamp-free harnesses pair the proxy's INGRESS observation with its completion
+            // observation. Module-side now_ms includes queue and blocking-arm latency.
             let observed_now = u64::try_from(ctx.now_ms).unwrap_or(0);
             req.request_observed_at_ms
                 .filter(|observed| *observed > 0 && *observed <= observed_now)
@@ -8568,8 +8696,6 @@ fn compute_active_overlay_decisions(
                 })
                 .unwrap_or_default()
         } else {
-            // Multiple newly observed consecutive user messages have no provider response
-            // boundary. Mint times are retained only for that rare between-users fallback.
             previous_new_user_mint
                 .and_then(|previous| current_mint.checked_sub(previous))
                 .and_then(temporal_gap_prefix)
@@ -8615,6 +8741,7 @@ fn compute_active_overlay_decisions(
     let max_seen_ordinal =
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
     let temporal_ms = elapsed_ms(temporal_started_at);
+    let rewrite_temporal_marks = rewrite_temporal_marks && !temporal_marks.is_empty();
 
     Ok(PendingOverlayDecisions {
         max_seen_ordinal,
@@ -8625,6 +8752,7 @@ fn compute_active_overlay_decisions(
         tag_mint_ms,
         temporal_ms,
         temporal_marks,
+        rewrite_temporal_marks,
         user_hint: None,
         channel1_append: None,
     })
@@ -10790,6 +10918,7 @@ enum RendererTransitionClass {
     SplitCoverage,
     SyntheticAnchorSplit,
     ReductionEnvelope,
+    TemporalParity,
 }
 
 fn v1_transition_classes() -> BTreeSet<RendererTransitionClass> {
@@ -24041,6 +24170,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn temporal_gap_dump_golden_backfills_all_historical_markers_in_one_transition() {
+        run_active_surface_test(|| {
+            let golden: Value =
+                serde_json::from_str(include_str!("../testdata/temporal-parity-golden.json"))
+                    .expect("temporal parity golden");
+            assert_eq!(golden["schema"], 1);
+            assert_eq!(golden["generator_version"], 1);
+            let fixture = &golden["cases"][0];
+            let messages: Vec<CkIngressMessage> =
+                serde_json::from_value(fixture["encoded_input"].clone())
+                    .expect("golden CK ingress");
+            let expected: BTreeMap<String, String> =
+                serde_json::from_value(fixture["expected_text_by_mid"].clone())
+                    .expect("golden expected text");
+
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let mut untimed = messages.clone();
+            for message in &mut untimed {
+                message.ck.meta.created_at_ms = None;
+                message.ck.meta.completed_at_ms = None;
+            }
+            let baseline_request = active_opencode_req("temporal-dump-golden", "cfg0", untimed);
+            run(&s, &baseline_request, &spine());
+            run(&s, &baseline_request, &spine());
+
+            let request = active_opencode_req("temporal-dump-golden", "cfg0", messages.clone());
+            let transitioned = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 50_569_000),
+            )
+            .unwrap();
+            assert_eq!(transitioned.action, "HARD");
+            let tags = s
+                .load_tags_for_session("temporal-dump-golden")
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.block_id, row.tag_number))
+                .collect::<HashMap<_, _>>();
+            for (mid, expected_text) in &expected {
+                let actual = tail_bytes(&transitioned, mid);
+                let tag = tags
+                    .get(&format!("{mid}#0"))
+                    .unwrap_or_else(|| panic!("missing tag for {mid}"));
+                assert_eq!(
+                    strip_tag_prefix(actual, *tag),
+                    expected_text.as_str(),
+                    "{mid}"
+                );
+            }
+            assert_eq!(
+                s.load_temporal_marks("temporal-dump-golden")
+                    .unwrap()
+                    .into_iter()
+                    .filter(|row| !row.marker_text.is_empty())
+                    .count(),
+                2,
+                "both historical markers must commit in the transition fold"
+            );
+
+            let transitioned_bytes = serde_json::to_vec(transitioned.messages()).unwrap();
+            let transitioned_row = transitioned.row_version;
+            let replay = transform(
+                &s,
+                &request,
+                &pctx("git:proj", "/nonexistent-docs", 50_869_000),
+            )
+            .unwrap();
+            assert_ne!(replay.action, "HARD");
+            assert_eq!(replay.row_version, transitioned_row);
+            assert_eq!(
+                serde_json::to_vec(replay.messages()).unwrap(),
+                transitioned_bytes
+            );
+        });
+    }
+
+    #[test]
     fn temporal_gap_overlay_replays_and_false_window_is_verbatim() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -24327,7 +24535,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn temporal_gap_midlife_activation_has_zero_gaps() {
+    fn temporal_gap_timestamp_free_midlife_activation_has_zero_gaps() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
