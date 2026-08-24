@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import type { readFileSync } from "node:fs";
+
 import {
     __resetRpcIdentityTestHooks,
     __setRpcIdentityTestHooks,
@@ -12,6 +13,7 @@ import {
     isPidAlive,
     isPidIdentityPlausible,
     type RpcPortFileRecord,
+    readProcessProbeEvidence,
 } from "./rpc-utils";
 
 const PID = 1234;
@@ -207,6 +209,36 @@ describe("isPidAlive", () => {
 
         expect(isPidAlive(PID)).toBe("inconclusive");
         expect(isPidIdentityPlausible(record(0))).toBe("inconclusive");
+    });
+});
+
+describe("readProcessProbeEvidence", () => {
+    test("captures the same Linux start-time and command probes used by the guard", () => {
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            nowMs: () => NOW_MS,
+            readFileSync: linuxFiles({
+                [`/proc/${PID}/stat`]: procStat(10_000),
+                "/proc/uptime": `${UPTIME_SECONDS}.0 0.0`,
+                [`/proc/${PID}/cmdline`]:
+                    "/usr/local/bin/opencode\u0000--directory\u0000/home/alice/project",
+            }),
+        });
+
+        expect(readProcessProbeEvidence(PID)).toEqual({
+            startTime: 1_100_000,
+            commandLine: "/usr/local/bin/opencode\u0000--directory\u0000/home/alice/project",
+        });
+    });
+
+    test("returns unavailable fields instead of throwing when probes fail", () => {
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            readFileSync: linuxFiles({}),
+        });
+
+        expect(() => readProcessProbeEvidence(PID)).not.toThrow();
+        expect(readProcessProbeEvidence(PID)).toEqual({ startTime: null, commandLine: null });
     });
 });
 

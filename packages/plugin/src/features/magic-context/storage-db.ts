@@ -20,18 +20,21 @@ import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
     classifyProcessKind,
-    discoverLivePiProcessIds,
     inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
-    readProcessCommand,
+    readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
-import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
+import {
+    attachFailClosedBlockingProcessEvidence,
+    type FailClosedBlockingProcess,
+    type FailClosedProcessKind,
+} from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -424,13 +427,21 @@ function classifyDiscoveryRecordKind(record: {
     return null;
 }
 
-function classifyRpcProcess(record: {
-    pid: number;
-    kind?: string;
-    harness?: string;
-}): FailClosedProcessKind {
+function classifyRpcProcess(
+    record: {
+        pid: number;
+        kind?: string;
+        harness?: string;
+    },
+    commandLine?: string | null,
+): FailClosedProcessKind {
     return (
-        classifyDiscoveryRecordKind(record) ?? classifyProcessKind(readProcessCommand(record.pid))
+        classifyDiscoveryRecordKind(record) ??
+        classifyProcessKind(
+            commandLine === undefined
+                ? readProcessProbeEvidence(record.pid).commandLine
+                : commandLine,
+        )
     );
 }
 
@@ -521,18 +532,26 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             continue;
         }
         const liveness = isPidAlive(record.pid);
-        const identity = liveness === "dead" ? "implausible" : isPidIdentityPlausible(record);
-        if (liveness === "alive" && identity === "plausible") {
+        if (liveness === "dead") {
+            staleFiles.push(portFile);
+            continue;
+        }
+        const evidence = readProcessProbeEvidence(record.pid);
+        const identity = isPidIdentityPlausible(record, evidence);
+        if (identity === "plausible") {
             pids.add(record.pid);
-            const detected = {
-                kind: classifyRpcProcess(record),
-                pid: record.pid,
-            } satisfies FailClosedBlockingProcess;
+            const detected = attachFailClosedBlockingProcessEvidence(
+                {
+                    kind: classifyRpcProcess(record, evidence.commandLine),
+                    pid: record.pid,
+                } satisfies FailClosedBlockingProcess,
+                evidence,
+            );
             const previous = processByPid.get(record.pid);
             if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
                 processByPid.set(record.pid, detected);
             }
-        } else if (liveness === "dead" || identity === "implausible") {
+        } else if (identity === "implausible") {
             staleFiles.push(portFile);
         } else {
             inconclusivePids.add(record.pid);
@@ -573,11 +592,19 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
+function createPiBlockingProcess(pid: number): FailClosedBlockingProcess {
+    return attachFailClosedBlockingProcessEvidence(
+        { kind: "Pi", pid },
+        readProcessProbeEvidence(pid),
+    );
+}
+
 /** Return the live processes that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
     const openCode = discovery.state === "live" ? (discovery.serverProcesses ?? []) : [];
-    const pi = discoverLivePiProcessIds().map((pid) => ({ kind: "Pi" as const, pid }));
+    const piDiscovery = inspectLivePiProcesses();
+    const pi = piDiscovery.processIds.map(createPiBlockingProcess);
     return [...openCode, ...pi];
 }
 
@@ -668,10 +695,7 @@ function enforceMigrationOnOpenGuard(
         (discovery.state === "live"
             ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
             : []);
-    const blockingProcesses = [
-        ...serverProcesses,
-        ...piPids.map((pid) => ({ kind: "Pi" as const, pid })),
-    ];
+    const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
     if (
         (discovery.state === "absent" ||
             discovery.state === "stale" ||
