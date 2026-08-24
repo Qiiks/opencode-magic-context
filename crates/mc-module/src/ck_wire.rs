@@ -520,7 +520,41 @@ pub fn split_block_id(id: &str) -> Option<(&str, usize)> {
     Some((mid, index))
 }
 
-pub fn reduced_block(block: &CkWireBlock, reduced: &str, file_path: Option<&str>) -> CkWireBlock {
+fn is_reduction_envelope(input: &Value) -> bool {
+    input.get("reduced") == Some(&Value::Bool(true))
+        && input.get("summary").is_some_and(Value::is_string)
+}
+
+fn reduced_tool_call_input(original: &Value, reduced: &str) -> Value {
+    // Frozen payloads normally contain the clamped argument object. A short-lived renderer also
+    // persisted the wrapper itself, so unwrap that legacy form without ever serving its foreign
+    // keys. Malformed historical payloads fall back to the original real argument object.
+    let parsed = serde_json::from_str::<Value>(reduced)
+        .ok()
+        .filter(Value::is_object);
+    if let Some(parsed) = parsed {
+        if !is_reduction_envelope(&parsed) {
+            return parsed;
+        }
+        if let Some(recovered) = parsed
+            .get("summary")
+            .and_then(Value::as_str)
+            .and_then(|summary| serde_json::from_str::<Value>(summary).ok())
+            .filter(Value::is_object)
+            .filter(|input| !is_reduction_envelope(input))
+        {
+            return recovered;
+        }
+    }
+
+    if original.is_object() && !is_reduction_envelope(original) {
+        original.clone()
+    } else {
+        Value::Object(serde_json::Map::new())
+    }
+}
+
+pub fn reduced_block(block: &CkWireBlock, reduced: &str) -> CkWireBlock {
     let kind = match &block.kind {
         CkKind::ToolResult {
             id,
@@ -538,22 +572,15 @@ pub fn reduced_block(block: &CkWireBlock, reduced: &str, file_path: Option<&str>
         CkKind::ToolCall {
             id,
             name,
+            input: original_input,
             provider_executed,
             ..
-        } => {
-            let mut input = serde_json::Map::new();
-            input.insert("reduced".to_string(), Value::Bool(true));
-            input.insert("summary".to_string(), Value::String(reduced.to_string()));
-            if let Some(path) = file_path {
-                input.insert("path".to_string(), Value::String(path.to_string()));
-            }
-            CkKind::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                input: Value::Object(input),
-                provider_executed: *provider_executed,
-            }
-        }
+        } => CkKind::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input: reduced_tool_call_input(original_input, reduced),
+            provider_executed: *provider_executed,
+        },
         CkKind::Reasoning { .. } => CkKind::Reasoning {
             text: reduced.to_string(),
             signature: None,
@@ -776,6 +803,37 @@ mod tests {
                 HarnessMeta::default(),
             ),
         }
+    }
+
+    #[test]
+    fn reduced_tool_call_inputs_keep_real_argument_keys() {
+        let original = CkWireBlock::bare(CkKind::ToolCall {
+            id: "edit-call".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "filePath": "/workspace/src/lib.rs",
+                "oldString": "old region that is intentionally bulky",
+                "newString": "new region that is intentionally bulky",
+            }),
+            provider_executed: false,
+        });
+        let payload = serde_json::json!({
+            "filePath": "/workspace/src/lib.rs",
+            "oldString": "old region...[truncated]",
+            "newString": "new region...[truncated]",
+        })
+        .to_string();
+
+        let reduced = reduced_block(&original, &payload);
+        let CkKind::ToolCall { input, .. } = reduced.kind else {
+            panic!("reduced tool call must remain a tool call");
+        };
+        assert_eq!(input, serde_json::from_str::<Value>(&payload).unwrap());
+        assert!(input.get("filePath").is_some());
+        assert!(input.get("oldString").is_some());
+        assert!(input.get("newString").is_some());
+        assert!(input.get("reduced").is_none());
+        assert!(input.get("summary").is_none());
     }
 
     #[test]

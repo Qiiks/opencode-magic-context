@@ -5331,7 +5331,10 @@ fn apply_once(
         timings: build_timings,
     } = built_output;
     #[cfg(test)]
-    assert_no_orphaned_tool_arcs(&ck_messages);
+    {
+        assert_no_orphaned_tool_arcs(&ck_messages);
+        assert_no_foreign_reduction_input_keys(ck_messages.iter().map(Deref::deref));
+    }
     timings.build_output = elapsed_ms(build_output_started_at);
     timings.blocks_by_mid = build_timings.blocks_by_mid;
     timings.build_frozen_unit_index = build_timings.frozen_unit_index;
@@ -10786,6 +10789,7 @@ enum RendererTransitionClass {
     UnmatchedPair,
     SplitCoverage,
     SyntheticAnchorSplit,
+    ReductionEnvelope,
 }
 
 fn v1_transition_classes() -> BTreeSet<RendererTransitionClass> {
@@ -10803,6 +10807,7 @@ struct RendererTransitionShapes {
     unmatched_tool_pair_call_ids: Vec<String>,
     split_coverage_arc_ids: Vec<String>,
     synthetic_anchor_split_arc_ids: Vec<String>,
+    reduction_envelope_call_ids: Vec<String>,
 }
 
 impl RendererTransitionShapes {
@@ -10819,6 +10824,9 @@ impl RendererTransitionShapes {
         }
         if !self.synthetic_anchor_split_arc_ids.is_empty() {
             classes.insert(RendererTransitionClass::SyntheticAnchorSplit);
+        }
+        if !self.reduction_envelope_call_ids.is_empty() {
+            classes.insert(RendererTransitionClass::ReductionEnvelope);
         }
         classes
     }
@@ -10838,6 +10846,11 @@ fn renderer_transition_shapes(
         .iter()
         .filter_map(|unit| unit.key.strip_prefix(RED_KEY_PREFIX))
         .collect::<HashSet<_>>();
+    let reduced_call_targets = frozen_units
+        .iter()
+        .filter(|unit| matches!(unit.kind.as_str(), "skeleton" | "edit_marker"))
+        .filter_map(|unit| unit.key.strip_prefix(RED_KEY_PREFIX))
+        .collect::<HashSet<_>>();
     let split_coverage_arc_ids = split_coverage_tool_arcs(projection, coverage_ordinal)
         .into_iter()
         .map(|arc| arc.arc_id)
@@ -10847,10 +10860,18 @@ fn renderer_transition_shapes(
             .into_iter()
             .map(|arc| arc.arc_id)
             .collect();
+    let reduction_envelope_call_ids = projection
+        .blocks
+        .iter()
+        .filter(|block| reduced_call_targets.contains(block.id.as_str()))
+        .filter(|block| matches!(&block.wire.kind, ck_wire::CkKind::ToolCall { .. }))
+        .map(|block| block.id.clone())
+        .collect();
     if frozen_targets.is_empty() {
         return RendererTransitionShapes {
             split_coverage_arc_ids,
             synthetic_anchor_split_arc_ids,
+            reduction_envelope_call_ids,
             ..Default::default()
         };
     }
@@ -10902,6 +10923,7 @@ fn renderer_transition_shapes(
         unmatched_tool_pair_call_ids,
         split_coverage_arc_ids,
         synthetic_anchor_split_arc_ids,
+        reduction_envelope_call_ids,
     }
 }
 
@@ -11300,6 +11322,28 @@ fn duplicate_tool_use_locations(messages: &[ServedMessage]) -> Vec<(String, usiz
         }
     }
     duplicates
+}
+
+#[cfg(test)]
+fn assert_no_foreign_reduction_input_keys<'a>(
+    messages: impl IntoIterator<Item = &'a CkWireMessage>,
+) {
+    let foreign = messages
+        .into_iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match &block.kind {
+            ck_wire::CkKind::ToolCall { id, input, .. }
+                if input.get("reduced").is_some() || input.get("summary").is_some() =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        foreign.is_empty(),
+        "served tool inputs contain foreign reduction-envelope keys: {foreign:?}"
+    );
 }
 
 #[cfg(test)]
@@ -12192,7 +12236,6 @@ fn build_output_with_tags_inner(
                                 display_payload
                                     .as_deref()
                                     .unwrap_or(unit.frozen_payload.as_str()),
-                                block.file_path.as_deref(),
                             );
                         }
                     }
@@ -14433,6 +14476,7 @@ pub(crate) mod tests {
         let response = transform(s, req, &ctx).unwrap();
         assert_no_duplicate_tool_use_ids(response.messages());
         assert_no_orphaned_tool_arcs(response.messages());
+        assert_no_foreign_reduction_input_keys(response.messages().iter().map(Deref::deref));
         response
     }
 
@@ -14493,6 +14537,42 @@ pub(crate) mod tests {
             .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
             .expect("renderer transition marker must be durable");
         serde_json::from_str(&marker.frozen_payload).unwrap()
+    }
+
+    #[test]
+    fn served_tool_input_invariant_detects_reduction_envelope_mutation() {
+        let mutated = CkWireMessage::from_parts(
+            "assistant",
+            vec![CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "mutated-envelope-call".to_string(),
+                name: "edit".to_string(),
+                input: json!({
+                    "reduced": true,
+                    "summary": r#"{"filePath":"src/lib.rs","oldString":"old","newString":"new"}"#,
+                }),
+                provider_executed: false,
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta::default(),
+        );
+
+        let failure = std::panic::catch_unwind(|| {
+            assert_no_foreign_reduction_input_keys([&mutated]);
+        })
+        .expect_err("the serve-wide invariant must reject the historical envelope shape");
+        let output = failure
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                failure
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+            })
+            .expect("invariant failure must record a string diagnostic");
+        assert!(output.contains("mutated-envelope-call"));
+        assert!(output.contains("foreign reduction-envelope keys"));
+        eprintln!("mutation invariant output: {output}");
     }
 
     #[test]
@@ -21176,13 +21256,13 @@ pub(crate) mod tests {
                 reduce(
                     "m2414#0",
                     "skeleton",
-                    r#"{"detail":"xxxxx…","path":"a.txt"}"#,
+                    r#"{"detail":"xxxxx...[truncated]","path":"a.txt"}"#,
                 ),
                 reduce("m2414#1", "drop", "[dropped]"),
                 reduce(
                     "m2414#2",
                     "skeleton",
-                    r#"{"detail":"yyyyy…","path":"b.txt"}"#,
+                    r#"{"detail":"yyyyy...[truncated]","path":"b.txt"}"#,
                 ),
                 reduce("m2414#3", "drop", "[dropped]"),
             ]),
@@ -21240,9 +21320,22 @@ pub(crate) mod tests {
             .map(|part| part["callID"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(tool_ids, vec!["astro-call-a", "astro-call-b"]);
-        assert!(assistant["parts"].as_array().unwrap().iter().all(|part| {
+        let parts = assistant["parts"].as_array().unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["state"]["input"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({ "detail": "xxxxx...[truncated]", "path": "a.txt" }),
+                json!({ "detail": "yyyyy...[truncated]", "path": "b.txt" }),
+            ],
+            "model-visible native calls must retain only real argument keys"
+        );
+        assert!(parts.iter().all(|part| {
             part["state"]["status"] == "completed"
-                && part["state"]["input"]["reduced"] == true
+                && part["state"]["input"].get("reduced").is_none()
+                && part["state"]["input"].get("summary").is_none()
                 && part["state"]["output"] == "[dropped]"
         }));
     }
@@ -30248,6 +30341,92 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frozen_reduction_envelope_heals_in_one_class_scoped_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![
+            assistant_edit_call("envelope-call", 1, "edit-envelope", "src/lib.rs"),
+            edit_result("envelope-result", 2, "edit-envelope", "edit completed"),
+            item("envelope-tail", 3, "stable tail"),
+        ];
+        let request =
+            active_opencode_req("reduction-envelope-transition", "cfg0", messages.clone());
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+
+        let healed_input = json!({
+            "filePath": "src/lib.rs",
+            "oldString": "old-edit-envelope",
+            "newString": "new-edit-envelope",
+        });
+        let historical_envelope = json!({
+            "reduced": true,
+            "summary": serde_json::to_string(&healed_input).unwrap(),
+        })
+        .to_string();
+        append_historical_frozen_reductions(
+            &store,
+            "reduction-envelope-transition",
+            &[
+                red_unit("envelope-call#0", "edit_marker", &historical_envelope),
+                red_unit("envelope-result#0", "drop", "[dropped]"),
+            ],
+        );
+
+        let before = store.load("reduction-envelope-transition").unwrap();
+        let detected = renderer_transition_shapes(
+            &project_messages(&messages).unwrap(),
+            &before.core.frozen_units,
+            before.meta.coverage_ordinal,
+            None,
+        )
+        .classes();
+        assert_eq!(
+            detected,
+            BTreeSet::from([RendererTransitionClass::ReductionEnvelope])
+        );
+
+        let healed = run(&store, &request, &spine());
+        assert_eq!(healed.action, "HARD");
+        assert_eq!(
+            healed.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let healed_call = healed
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { id, input, .. } if id == "edit-envelope" => Some(input),
+                _ => None,
+            })
+            .expect("healed edit call remains model-visible");
+        assert_eq!(healed_call, &healed_input);
+        assert!(healed_call.get("reduced").is_none());
+        assert!(healed_call.get("summary").is_none());
+
+        let stored = store.load("reduction-envelope-transition").unwrap();
+        assert_eq!(
+            transition_consumed_classes(&stored.core),
+            BTreeSet::from([RendererTransitionClass::ReductionEnvelope])
+        );
+        assert_eq!(
+            stored
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+                .count(),
+            1,
+            "the entire reduction-envelope class must ride one durable fold"
+        );
+
+        let healed_bytes = serde_json::to_vec(healed.messages()).unwrap();
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), healed_bytes);
+    }
+
+    #[test]
     fn poisoned_reasoning_transition_salts_one_hard_and_preserves_row_version_monotonicity() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -30345,7 +30524,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn consumed_v1_shape_without_v2_shape_does_not_refire_or_change_bytes() {
+    fn consumed_v1_shape_folds_once_for_new_reduction_envelope_class() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let messages = vec![
@@ -30399,8 +30578,8 @@ pub(crate) mod tests {
         let replay =
             transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
                 .unwrap();
-        assert_eq!(replay.response.action, "SOFT+");
-        assert_ne!(
+        assert_eq!(replay.response.action, "HARD");
+        assert_eq!(
             replay.response.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
@@ -30410,16 +30589,17 @@ pub(crate) mod tests {
         );
         let after = store.load("consumed-v1-only").unwrap();
         assert!(after.row_version.unwrap() >= before.row_version.unwrap());
+        let mut expected_classes = v1_transition_classes();
+        expected_classes.insert(RendererTransitionClass::ReductionEnvelope);
+        assert_eq!(transition_consumed_classes(&after.core), expected_classes);
+        let stable =
+            transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(stable.response.action, "SOFT+");
         assert_eq!(
-            transition_consumed_classes(&after.core),
-            v1_transition_classes()
+            serde_json::to_vec(stable.response.messages()).unwrap(),
+            golden_bytes
         );
-        assert!(after
-            .core
-            .frozen_units
-            .iter()
-            .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
-            .is_some_and(|unit| unit.frozen_payload.is_empty()));
     }
 
     #[test]
@@ -30510,7 +30690,10 @@ pub(crate) mod tests {
             transition.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
-        let expected = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        let expected = BTreeSet::from([
+            RendererTransitionClass::UnmatchedPair,
+            RendererTransitionClass::ReductionEnvelope,
+        ]);
         assert_eq!(
             stored_transition_marker_classes(&initial_store, session),
             expected
@@ -30579,7 +30762,10 @@ pub(crate) mod tests {
             unmatched_transition.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
-        let unmatched_only = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        let unmatched_only = BTreeSet::from([
+            RendererTransitionClass::UnmatchedPair,
+            RendererTransitionClass::ReductionEnvelope,
+        ]);
         assert_eq!(
             stored_transition_marker_classes(&store, session),
             unmatched_only,
@@ -30611,6 +30797,7 @@ pub(crate) mod tests {
         let expected = BTreeSet::from([
             RendererTransitionClass::PoisonedReasoning,
             RendererTransitionClass::UnmatchedPair,
+            RendererTransitionClass::ReductionEnvelope,
         ]);
         assert_eq!(stored_transition_marker_classes(&store, session), expected);
 
@@ -30845,6 +31032,7 @@ pub(crate) mod tests {
         .classes();
         let mut expected_classes = v1_transition_classes();
         expected_classes.insert(RendererTransitionClass::SplitCoverage);
+        expected_classes.insert(RendererTransitionClass::ReductionEnvelope);
         assert_eq!(detected, expected_classes);
 
         let folded =

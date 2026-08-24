@@ -1,0 +1,30 @@
+[
+  {
+    "label": "edit-marker: file path verbatim and diff prefixes clamped",
+    "input": {
+      "filePath": "/workspace/packages/plugin/src/hooks/magic-context/edit-marker.ts",
+      "oldString": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀tail",
+      "newString": "new contents new contents new contents new contents new contents new contents new contents new contents ",
+      "occurrence": 2
+    },
+    "expected": {
+      "filePath": "/workspace/packages/plugin/src/hooks/magic-context/edit-marker.ts",
+      "oldString": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...[truncated]",
+      "newString": "new contents new contents new contents n...[truncated]",
+      "occurrence": 2
+    }
+  },
+  {
+    "label": "write-marker: path and small metadata survive",
+    "input": {
+      "path": "/workspace/crates/mc-module/src/selection.rs",
+      "content": "written contents written contents written contents written contents written contents written contents written contents written contents ",
+      "mode": "overwrite"
+    },
+    "expected": {
+      "path": "/workspace/crates/mc-module/src/selection.rs",
+      "content": "written contents written contents writte...[truncated]",
+      "mode": "overwrite"
+    }
+  }
+]

@@ -2015,11 +2015,9 @@ mod tests {
             .map(|block| {
                 let reduced = match &block.kind {
                     CkKind::ToolCall { .. } => {
-                        crate::ck_wire::reduced_block(&block, "reduced call skeleton", None)
+                        crate::ck_wire::reduced_block(&block, "reduced call skeleton")
                     }
-                    CkKind::ToolResult { .. } => {
-                        crate::ck_wire::reduced_block(&block, "[dropped]", None)
-                    }
+                    CkKind::ToolResult { .. } => crate::ck_wire::reduced_block(&block, "[dropped]"),
                     _ => block,
                 };
                 CkWireBlock::bare(reduced.kind)
