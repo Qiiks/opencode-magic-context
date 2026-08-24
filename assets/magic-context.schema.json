@@ -51,12 +51,12 @@
       "type": "string"
     },
     "profile": {
-      "description": "Select a named user-owned model profile. Project config may select a profile name, which overrides this user default; unknown names warn and use the base configuration.",
+      "description": "Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration.",
       "type": "string",
       "minLength": 1
     },
     "profiles": {
-      "description": "User-level named model profiles. A profile may contain only historian/dreamer harness model blocks and sidekick model-selection fields; project configs may select a name but cannot define profiles.",
+      "description": "User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi thinking_level fields plus sidekick model-selection fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles.",
       "type": "object",
       "propertyNames": {
         "type": "string",
@@ -97,7 +97,7 @@
                     ]
                   },
                   "fallback_models": {
-                    "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                    "description": "Ordered fallback OpenCode model entries.",
                     "type": "array",
                     "items": {
                       "anyOf": [
@@ -125,12 +125,12 @@
                     }
                   },
                   "variant": {
-                    "description": "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+                    "description": "OpenCode reasoning variant for the primary model entry.",
                     "type": "string"
                   }
                 },
                 "additionalProperties": false,
-                "description": "Strict OpenCode model-resolution block. It accepts no Pi vocabulary."
+                "description": "Strict profile-only OpenCode model-selection block."
               },
               "pi": {
                 "type": "object",
@@ -170,7 +170,7 @@
                     ]
                   },
                   "fallback_models": {
-                    "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                    "description": "Ordered fallback Pi model entries.",
                     "type": "array",
                     "items": {
                       "anyOf": [
@@ -207,7 +207,7 @@
                     }
                   },
                   "thinking_level": {
-                    "description": "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+                    "description": "Pi thinking level for the primary model entry.",
                     "type": "string",
                     "enum": [
                       "off",
@@ -221,7 +221,7 @@
                   }
                 },
                 "additionalProperties": false,
-                "description": "Strict Pi model-resolution block. It accepts no OpenCode vocabulary."
+                "description": "Strict profile-only Pi model-selection block."
               }
             },
             "additionalProperties": false
@@ -258,7 +258,7 @@
                     ]
                   },
                   "fallback_models": {
-                    "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                    "description": "Ordered fallback OpenCode model entries.",
                     "type": "array",
                     "items": {
                       "anyOf": [
@@ -286,87 +286,12 @@
                     }
                   },
                   "variant": {
-                    "description": "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+                    "description": "OpenCode reasoning variant for the primary model entry.",
                     "type": "string"
-                  },
-                  "tasks": {
-                    "description": "OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes.",
-                    "type": "object",
-                    "propertyNames": {
-                      "type": "string"
-                    },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {
-                        "model": {
-                          "description": "OpenCode model entry for this task.",
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "object",
-                              "properties": {
-                                "model": {
-                                  "type": "string",
-                                  "description": "OpenCode model ID (for example, provider/model)."
-                                },
-                                "variant": {
-                                  "description": "OpenCode reasoning variant for this entry.",
-                                  "type": "string"
-                                }
-                              },
-                              "required": [
-                                "model"
-                              ],
-                              "additionalProperties": false
-                            }
-                          ]
-                        },
-                        "fallback_models": {
-                          "description": "Ordered OpenCode fallback entries for this task.",
-                          "type": "array",
-                          "items": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "object",
-                                "properties": {
-                                  "model": {
-                                    "type": "string",
-                                    "description": "OpenCode model ID (for example, provider/model)."
-                                  },
-                                  "variant": {
-                                    "description": "OpenCode reasoning variant for this entry.",
-                                    "type": "string"
-                                  }
-                                },
-                                "required": [
-                                  "model"
-                                ],
-                                "additionalProperties": false
-                              }
-                            ]
-                          }
-                        },
-                        "variant": {
-                          "description": "OpenCode reasoning variant for this task's primary entry when it declares none. Fallback entries declare variants per-entry.",
-                          "type": "string"
-                        },
-                        "timeout_minutes": {
-                          "description": "Minutes allowed for this task before it is aborted.",
-                          "type": "number",
-                          "minimum": 5
-                        }
-                      },
-                      "additionalProperties": false
-                    }
                   }
                 },
                 "additionalProperties": false,
-                "description": "Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary."
+                "description": "Strict profile-only OpenCode model-selection block."
               },
               "pi": {
                 "type": "object",
@@ -406,7 +331,7 @@
                     ]
                   },
                   "fallback_models": {
-                    "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                    "description": "Ordered fallback Pi model entries.",
                     "type": "array",
                     "items": {
                       "anyOf": [
@@ -443,7 +368,7 @@
                     }
                   },
                   "thinking_level": {
-                    "description": "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+                    "description": "Pi thinking level for the primary model entry.",
                     "type": "string",
                     "enum": [
                       "off",
@@ -454,112 +379,10 @@
                       "xhigh",
                       "max"
                     ]
-                  },
-                  "tasks": {
-                    "description": "Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
-                    "type": "object",
-                    "propertyNames": {
-                      "type": "string"
-                    },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {
-                        "model": {
-                          "description": "Pi model entry for this task.",
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "object",
-                              "properties": {
-                                "model": {
-                                  "type": "string",
-                                  "description": "Pi model ID (for example, provider/model)."
-                                },
-                                "thinking_level": {
-                                  "description": "Pi thinking level for this entry.",
-                                  "type": "string",
-                                  "enum": [
-                                    "off",
-                                    "minimal",
-                                    "low",
-                                    "medium",
-                                    "high",
-                                    "xhigh",
-                                    "max"
-                                  ]
-                                }
-                              },
-                              "required": [
-                                "model"
-                              ],
-                              "additionalProperties": false
-                            }
-                          ]
-                        },
-                        "fallback_models": {
-                          "description": "Ordered Pi fallback entries for this task.",
-                          "type": "array",
-                          "items": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "object",
-                                "properties": {
-                                  "model": {
-                                    "type": "string",
-                                    "description": "Pi model ID (for example, provider/model)."
-                                  },
-                                  "thinking_level": {
-                                    "description": "Pi thinking level for this entry.",
-                                    "type": "string",
-                                    "enum": [
-                                      "off",
-                                      "minimal",
-                                      "low",
-                                      "medium",
-                                      "high",
-                                      "xhigh",
-                                      "max"
-                                    ]
-                                  }
-                                },
-                                "required": [
-                                  "model"
-                                ],
-                                "additionalProperties": false
-                              }
-                            ]
-                          }
-                        },
-                        "thinking_level": {
-                          "description": "Pi thinking level for this task's primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
-                          "type": "string",
-                          "enum": [
-                            "off",
-                            "minimal",
-                            "low",
-                            "medium",
-                            "high",
-                            "xhigh",
-                            "max"
-                          ]
-                        },
-                        "timeout_minutes": {
-                          "description": "Minutes allowed for this task before it is aborted.",
-                          "type": "number",
-                          "minimum": 5
-                        }
-                      },
-                      "additionalProperties": false
-                    }
                   }
                 },
                 "additionalProperties": false,
-                "description": "Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary."
+                "description": "Strict profile-only Pi model-selection block."
               }
             },
             "additionalProperties": false

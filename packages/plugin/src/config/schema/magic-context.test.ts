@@ -286,7 +286,7 @@ describe("MagicContextConfigSchema", () => {
     });
 
     describe("config profiles", () => {
-        it("admits only user-owned model-selection overlays and preserves harness qualifiers", () => {
+        it("admits model-selection fields and preserves per-entry harness qualifiers", () => {
             const result = MagicContextConfigSchema.parse({
                 profile: "work",
                 profiles: {
@@ -297,23 +297,36 @@ describe("MagicContextConfigSchema", () => {
                                 fallback_models: [
                                     { model: "openai/work-fallback", variant: "low" },
                                 ],
+                                variant: "high",
                             },
                             pi: {
                                 model: {
                                     model: "github-copilot/work-historian",
                                     thinking_level: "high",
                                 },
+                                thinking_level: "high",
                             },
                         },
                         dreamer: {
                             opencode: {
-                                tasks: {
-                                    verify: {
-                                        fallback_models: [
-                                            { model: "openai/work-verify", variant: "medium" },
-                                        ],
-                                    },
+                                model: { model: "anthropic/work-dreamer", variant: "medium" },
+                                fallback_models: [
+                                    { model: "openai/work-dreamer-fallback", variant: "low" },
+                                ],
+                                variant: "medium",
+                            },
+                            pi: {
+                                model: {
+                                    model: "github-copilot/work-dreamer",
+                                    thinking_level: "high",
                                 },
+                                fallback_models: [
+                                    {
+                                        model: "openai/work-dreamer-fallback",
+                                        thinking_level: "minimal",
+                                    },
+                                ],
+                                thinking_level: "high",
                             },
                         },
                         sidekick: {
@@ -327,19 +340,74 @@ describe("MagicContextConfigSchema", () => {
             expect(result.profiles?.work?.historian?.opencode?.fallback_models).toEqual([
                 { model: "openai/work-fallback", variant: "low" },
             ]);
-            expect(
-                result.profiles?.work?.dreamer?.opencode?.tasks?.verify?.fallback_models,
-            ).toEqual([{ model: "openai/work-verify", variant: "medium" }]);
+            expect(result.profiles?.work?.dreamer?.opencode).toEqual({
+                model: { model: "anthropic/work-dreamer", variant: "medium" },
+                fallback_models: [{ model: "openai/work-dreamer-fallback", variant: "low" }],
+                variant: "medium",
+            });
+            expect(result.profiles?.work?.dreamer?.pi?.fallback_models).toEqual([
+                { model: "openai/work-dreamer-fallback", thinking_level: "minimal" },
+            ]);
             expect(result.profiles?.work?.sidekick?.model).toBe("anthropic/work-sidekick");
         });
 
-        it("rejects durable state and agent metadata in a profile", () => {
-            for (const profiles of [
+        it("rejects timeout_minutes in a dreamer profile", () => {
+            const profiles = {
+                work: {
+                    dreamer: {
+                        opencode: {
+                            tasks: { verify: { timeout_minutes: 30 } },
+                        },
+                    },
+                },
+            };
+
+            expect(MagicContextConfigSchema.safeParse({ profiles }).success).toBe(false);
+        });
+
+        it("rejects task execution and every other non-model field class in profiles", () => {
+            const profilesWithExcludedFields = [
                 { work: { embedding: { provider: "off" } } },
                 { work: { historian: { two_pass: true } } },
+                { work: { historian: { opencode: { prompt: "override" } } } },
+                { work: { dreamer: { opencode: { tasks: {} } } } },
+                {
+                    work: {
+                        dreamer: {
+                            opencode: {
+                                tasks: {
+                                    verify: {
+                                        model: "anthropic/task-model",
+                                        fallback_models: ["openai/task-fallback"],
+                                        variant: "high",
+                                        timeout_minutes: 30,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                {
+                    work: {
+                        dreamer: {
+                            pi: {
+                                tasks: {
+                                    verify: {
+                                        model: "github-copilot/task-model",
+                                        fallback_models: ["openai/task-fallback"],
+                                        thinking_level: "high",
+                                        timeout_minutes: 30,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
                 { work: { dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } } } },
                 { work: { sidekick: { timeout_ms: 60_000 } } },
-            ]) {
+            ];
+
+            for (const profiles of profilesWithExcludedFields) {
                 expect(MagicContextConfigSchema.safeParse({ profiles }).success).toBe(false);
             }
         });

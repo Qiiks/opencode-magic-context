@@ -83,8 +83,7 @@ export function resolveConfigProfile(args: {
         };
     }
 
-    const overlay = profiles[selection.name];
-    if (!overlay) {
+    if (!Object.hasOwn(profiles, selection.name)) {
         warnings.push(
             `Unknown profile "${selection.name}" selected by ${selection.source} config; using base config without a profile.`,
         );
@@ -96,6 +95,7 @@ export function resolveConfigProfile(args: {
         };
     }
 
+    const overlay = profiles[selection.name];
     return {
         userBase: withoutProfileFields(args.userRaw),
         projectBase: withoutProfileFields(args.projectRaw),
