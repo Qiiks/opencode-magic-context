@@ -1378,8 +1378,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
-    CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
-      ON message_history_index(harness, session_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS message_history_source (
       session_id TEXT NOT NULL,
@@ -2105,6 +2103,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "recomp_compartments", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "recomp_facts", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "message_history_index", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
+    // This index needs the harness column, which older persisted message-history
+    // tables lack. Create it only after the startup heal so legacy opens reach
+    // the migration runner instead of failing before it can repair the store.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
+        ON message_history_index(harness, session_id, updated_at);
+    `);
     ensureColumn(db, "workspaces", "share_categories", `TEXT NOT NULL DEFAULT '["CONSTRAINTS"]'`);
     // notes table is created by migration v1 (not initializeDatabase). It
     // exists by the time runMigrations() returns, but ensureColumn's PRAGMA
