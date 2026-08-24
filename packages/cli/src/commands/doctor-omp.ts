@@ -16,6 +16,11 @@ import {
 import { openExistingContextDatabase } from "../lib/database-access";
 import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import {
+    formatGithubIssueFallback,
+    type GhCommandResult,
+    submitGithubIssue,
+} from "../lib/github-issue";
+import {
     detectOmpBinary,
     getOmpSetting,
     getOmpVersion,
@@ -380,6 +385,35 @@ function timestamp(date: Date): string {
         .replace(/\.\d{3}Z$/, "Z");
 }
 
+function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
+    if (args[0] === "issue") {
+        const result = deps.spawnSync("gh", args, {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        return {
+            status: result.status,
+            stdout: String(result.stdout ?? ""),
+            stderr: String(result.stderr ?? ""),
+        };
+    }
+
+    try {
+        const output = deps.execFileSync("gh", args, {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        return { status: 0, stdout: String(output ?? ""), stderr: "" };
+    } catch (error) {
+        const result = error as { status?: number; stdout?: unknown; stderr?: unknown };
+        return {
+            status: typeof result.status === "number" ? result.status : 1,
+            stdout: String(result.stdout ?? ""),
+            stderr: String(result.stderr ?? ""),
+        };
+    }
+}
+
 async function runIssueFlow(options: {
     cwd: string;
     prompts: PromptIO;
@@ -408,38 +442,19 @@ async function runIssueFlow(options: {
     const path = join(options.cwd, `magic-context-omp-issue-${timestamp(options.deps.now())}.md`);
     writeFileAtomic(path, `${body}\n`);
     options.prompts.log.success(`Sanitized report written to ${path}`);
-    try {
-        options.deps.execFileSync("gh", ["--version"], { stdio: "ignore" });
-    } catch {
-        options.prompts.log.info("gh CLI unavailable; submit the generated report manually");
-        return 0;
-    }
-    try {
-        options.deps.execFileSync("gh", ["auth", "status"], { stdio: "ignore" });
-    } catch {
-        options.prompts.log.info(
-            "gh CLI is installed but not authenticated; submit the generated report manually",
-        );
-        return 0;
-    }
     if (await options.prompts.confirm("Submit this issue on GitHub now?", false)) {
-        const result = options.deps.spawnSync(
-            "gh",
-            [
-                "issue",
-                "create",
-                "-R",
-                "cortexkit/magic-context",
-                "--title",
-                `[omp] ${title}`,
-                "--body-file",
-                path,
-            ],
-            { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+        const result = submitGithubIssue(`[omp] ${title}`, path, (args) =>
+            runGhCommandWithDeps(options.deps, args),
         );
-        if (result.status === 0) options.prompts.log.success(String(result.stdout).trim());
-        else options.prompts.log.warn(String(result.stderr).trim());
+        if (result.ok) {
+            options.prompts.log.success(result.output);
+        } else {
+            options.prompts.log.warn(formatGithubIssueFallback(result, path));
+        }
     }
+    options.prompts.log.info(
+        `Open https://github.com/cortexkit/magic-context/issues/new and drag ${path} into the issue`,
+    );
     return 0;
 }
 

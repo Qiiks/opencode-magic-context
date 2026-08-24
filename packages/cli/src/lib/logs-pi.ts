@@ -26,8 +26,12 @@ function formatTimestamp(date: Date): string {
 }
 
 export interface BundledIssueReport {
+    /** Capped markdown suitable for a GitHub issue body. */
     path: string;
     bodyMarkdown: string;
+    /** Full sanitized markdown when the GitHub body had to be capped. */
+    fullPath?: string;
+    truncated: boolean;
 }
 
 /**
@@ -100,12 +104,19 @@ export async function bundleIssueReport(
     // log block gets shrunk from the top (older lines first) and a
     // truncation marker inserted. The error section above survives intact.
     const bodyMarkdown = capBodyToGithubLimit(rawBodyMarkdown);
+    const truncated = bodyMarkdown !== rawBodyMarkdown;
 
     const cwd = options.cwd ?? process.cwd();
-    const path = join(
-        cwd,
-        `magic-context-pi-issue-${formatTimestamp(options.now ?? new Date())}.md`,
-    );
+    const timestamp = formatTimestamp(options.now ?? new Date());
+    const path = join(cwd, `magic-context-pi-issue-${timestamp}.md`);
     writeFileSync(path, `${bodyMarkdown}\n`);
-    return { path, bodyMarkdown };
+
+    // Keep the complete sanitized report as a local attachment when the issue
+    // body had to be reduced to fit GitHub's limit.
+    const fullPath = truncated
+        ? join(cwd, `magic-context-pi-issue-${timestamp}-full.md`)
+        : undefined;
+    if (fullPath) writeFileSync(fullPath, `${rawBodyMarkdown}\n`);
+
+    return { path, bodyMarkdown, ...(fullPath ? { fullPath } : {}), truncated };
 }

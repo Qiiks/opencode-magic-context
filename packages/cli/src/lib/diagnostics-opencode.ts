@@ -79,9 +79,10 @@ export interface DiagnosticReport {
         sizeKb: number;
     };
     /**
-     * Recent active OpenCode sessions (top 5 by `session.time_updated`). Used
-     * to anchor historian-dump lookups to real project directories and to
-     * power the session picker in the `--issue` flow.
+     * Recent active OpenCode sessions (five parent groups, with up to three
+     * newest children per group). Used to anchor historian-dump lookups to
+     * real project directories and to power the session picker in the `--issue`
+     * flow.
      *
      * Populated only when bun:sqlite is available (under Bun) and OpenCode's
      * own DB at ~/.local/share/opencode/opencode.db exists. Empty array on
@@ -147,6 +148,8 @@ export interface RecentSessionSummary {
     directory: string;
     /** ISO timestamp of last activity (`session.time_updated`). */
     lastActiveAt: string;
+    /** Direct parent session ID for a child session, or null for a root. */
+    parentSessionId?: string | null;
 }
 
 export interface HistorianDumpSummary {
@@ -435,17 +438,96 @@ function collectHistorianDumps(
     };
 }
 
+const RECENT_SESSION_GROUP_LIMIT = 5;
+const CHILD_SESSIONS_PER_PARENT_LIMIT = 3;
+
+export interface RecentSessionDatabase {
+    prepare(sql: string): { all: () => unknown[] };
+}
+
+/**
+ * Select recent OpenCode sessions for the issue picker from an injectable DB
+ * seam. Five parent groups keep the default picker compact; each group can
+ * show its three newest children, so a recent subagent remains selectable
+ * without turning the prompt into an unbounded session dump.
+ */
+export function collectRecentSessionsFromDatabase(
+    database: RecentSessionDatabase,
+): RecentSessionSummary[] {
+    const rows = database
+        .prepare(
+            `WITH active AS (
+                SELECT id, directory, title, time_updated, parent_id
+                FROM session
+                WHERE time_archived IS NULL
+            ),
+            root_activity AS (
+                SELECT p.id AS root_id,
+                       MAX(
+                           CASE
+                               WHEN c.time_updated > p.time_updated THEN c.time_updated
+                               ELSE p.time_updated
+                           END
+                       ) AS latest_activity
+                FROM active p
+                LEFT JOIN active c ON c.parent_id = p.id
+                WHERE p.parent_id IS NULL
+                GROUP BY p.id
+            ),
+            selected_roots AS (
+                SELECT p.id, p.directory, p.title, p.time_updated, r.latest_activity
+                FROM active p
+                JOIN root_activity r ON r.root_id = p.id
+                ORDER BY r.latest_activity DESC
+                LIMIT ${RECENT_SESSION_GROUP_LIMIT}
+            ),
+            ranked_children AS (
+                SELECT c.id, c.directory, c.title, c.time_updated, c.parent_id,
+                       r.latest_activity,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY c.parent_id
+                           ORDER BY c.time_updated DESC
+                       ) AS child_rank
+                FROM active c
+                JOIN selected_roots r ON c.parent_id = r.id
+            )
+            SELECT id, directory, title, time_updated, NULL AS parent_id,
+                   latest_activity, 0 AS row_kind, 0 AS child_rank
+            FROM selected_roots
+            UNION ALL
+            SELECT id, directory, title, time_updated, parent_id,
+                   latest_activity, 1 AS row_kind, child_rank
+            FROM ranked_children
+            WHERE child_rank <= ${CHILD_SESSIONS_PER_PARENT_LIMIT}
+            ORDER BY latest_activity DESC, row_kind ASC, child_rank ASC, time_updated DESC`,
+        )
+        .all() as Array<{
+        id: unknown;
+        directory: unknown;
+        title: unknown;
+        time_updated: unknown;
+        parent_id: unknown;
+    }>;
+
+    return rows.flatMap((row) => {
+        const sessionId = typeof row.id === "string" ? row.id : null;
+        const directory = typeof row.directory === "string" ? row.directory : null;
+        if (!sessionId || !directory) return [];
+        const title = typeof row.title === "string" ? row.title : "";
+        const lastActiveAt =
+            typeof row.time_updated === "number" ? new Date(row.time_updated).toISOString() : "";
+        const parentSessionId =
+            typeof row.parent_id === "string" && row.parent_id.length > 0 ? row.parent_id : null;
+        return [{ sessionId, title, directory, lastActiveAt, parentSessionId }];
+    });
+}
+
 /**
  * Read recent active OpenCode sessions from OpenCode's own SQLite DB.
  *
- * Returns the top 5 sessions by `session.time_updated` (descending), filtered
- * to non-archived rows. The list anchors historian-dump lookups to real
- * project directories and powers the `--issue` flow's session picker.
- *
- * Same bun:sqlite gating as collectHistorianFailures: only attempts the
- * import under Bun. Returns [] on Node runs (the typical `npx` invocation)
- * and on machines without OpenCode installed. Doctor degrades gracefully —
- * historian dumps fall back to the legacy tmp-dir listing on the empty path.
+ * OpenCode's database is only available in the Bun runtime used by OpenCode
+ * itself. The published CLI normally runs under Node, so it returns [] there
+ * and the rest of doctor continues with its other diagnostics.
  */
 async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
     // env-first: honor XDG/HOME overrides (and sandboxed doctor test runs)
@@ -477,38 +559,10 @@ async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
         return [];
     }
 
-    let db: { prepare: (sql: string) => { all: () => unknown[] }; close: () => void } | null = null;
+    let db: (RecentSessionDatabase & { close: () => void }) | null = null;
     try {
         db = new DatabaseClass(opencodeDbPath, { readonly: true });
-        const rows = db
-            .prepare(
-                // session.time_updated is refreshed within a few seconds of each
-                // new message (verified live), so it's a safe recency proxy.
-                // Filter time_archived to skip user-archived sessions and exclude
-                // parent_id IS NOT NULL to skip subagent child sessions —
-                // historian artifacts live under the parent project, not the
-                // child's directory.
-                "SELECT id, directory, title, time_updated FROM session " +
-                    "WHERE time_archived IS NULL AND parent_id IS NULL " +
-                    "ORDER BY time_updated DESC LIMIT 5",
-            )
-            .all() as Array<{
-            id: unknown;
-            directory: unknown;
-            title: unknown;
-            time_updated: unknown;
-        }>;
-        return rows.flatMap((row) => {
-            const sessionId = typeof row.id === "string" ? row.id : null;
-            const directory = typeof row.directory === "string" ? row.directory : null;
-            if (!sessionId || !directory) return [];
-            const title = typeof row.title === "string" ? row.title : "";
-            const lastActiveAt =
-                typeof row.time_updated === "number"
-                    ? new Date(row.time_updated).toISOString()
-                    : "";
-            return [{ sessionId, title, directory, lastActiveAt }];
-        });
+        return collectRecentSessionsFromDatabase(db);
     } catch {
         return [];
     } finally {
@@ -871,6 +925,7 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         title: sanitizeDiagnosticText(session.title),
         directory: sanitizeString(session.directory),
         lastActiveAt: session.lastActiveAt,
+        parentSessionId: session.parentSessionId ?? null,
     }));
 
     return [
