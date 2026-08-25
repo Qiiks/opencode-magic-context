@@ -317,11 +317,13 @@ outside Pi's extension API.
 
 ---
 
-## 10. Cleared reasoning: Pi EMPTIES (drops signature); OpenCode writes `[cleared]`→sentinel, gated
+## 10. Cleared reasoning: historical-cleared / newest-native
 
 When Magic Context clears an aged reasoning/thinking block, the two harnesses use
 DIFFERENT mechanisms because their serializers differ. The divergence is
-deliberate and source-justified.
+deliberate and source-justified. Both preserve the same scope invariant: historical
+reasoning selected for clearing is removed from provider wire, while the newest
+provider-visible assistant keeps its native reasoning bytes and position.
 
 - **OpenCode** (`clearOldReasoning` + `stripClearedReasoning`, `strip-content.ts`):
   rewrites the thinking text to `[cleared]`, then — **only for canonical Anthropic**
@@ -330,7 +332,11 @@ deliberate and source-justified.
   (signature gone). For NON-canonical providers OpenCode now **gates the clear OFF
   entirely** (reasoning left intact), because OpenCode's non-Anthropic adapters
   forward empty parts and would otherwise leave a literal `[cleared]` (or a stale
-  signature) on the wire. (#162 D2.)
+  signature) on the wire. In Rust-native replay, a changed historical assistant
+  likewise drops its native reasoning carriers while retaining every other native
+  part and its text/tool order; only the newest provider-visible assistant may replay
+  the complete native vector with thinking byte-identical at its native position.
+  (#162 D2.)
 
 - **Pi** (`reasoning-replay-pi.ts`): EMPTIES the thinking text (`thinking = ""`)
   and **drops the now-stale `thinkingSignature`**, with NO per-provider gate —

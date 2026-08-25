@@ -278,18 +278,28 @@ async function dropAndMaterialize(
     return { body: (await mainRequestForMarker(inspectMarker)).body, dropEmitted: wasDropEmitted() };
 }
 
-/** Find all thinking/redacted_thinking blocks across all messages in a captured request. */
-function findThinkingBlocks(req: RequestWithMessages): AnthropicContentBlock[] {
-    const out: AnthropicContentBlock[] = [];
-    for (const msg of req.body.messages ?? []) {
+interface ThinkingBlockLocation {
+    messageIndex: number;
+    block: AnthropicContentBlock;
+}
+
+/** Find thinking/redacted_thinking blocks and their provider-wire message positions. */
+function findThinkingBlockLocations(req: RequestWithMessages): ThinkingBlockLocation[] {
+    const out: ThinkingBlockLocation[] = [];
+    for (const [messageIndex, msg] of (req.body.messages ?? []).entries()) {
         if (!Array.isArray(msg.content)) continue;
         for (const block of msg.content) {
             if (block.type === "thinking" || block.type === "redacted_thinking") {
-                out.push(block);
+                out.push({ messageIndex, block });
             }
         }
     }
     return out;
+}
+
+/** Find all thinking/redacted_thinking blocks across all messages in a captured request. */
+function findThinkingBlocks(req: RequestWithMessages): AnthropicContentBlock[] {
+    return findThinkingBlockLocations(req).map(({ block }) => block);
 }
 
 describe("thinking-block safety (Anthropic 400 regression)", () => {
@@ -390,13 +400,30 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 }
 
                 if (RUST_MODE) {
-                    // PARITY.md defines cleared historical reasoning as the Rust-native
-                    // representation. Absence is safe: no signed block reaches Anthropic
-                    // with mutated sibling text, and no nudge marker may appear anywhere.
-                    expect(findThinkingBlocks(asAnthropic(lastReq))).toHaveLength(0);
+                    const request = asAnthropic(lastReq);
+                    const messages = request.body.messages ?? [];
+                    let newestAssistantIdx = -1;
+                    for (const [messageIndex, message] of messages.entries()) {
+                        if (message.role === "assistant") newestAssistantIdx = messageIndex;
+                    }
+                    expect(newestAssistantIdx).toBeGreaterThanOrEqual(0);
+
+                    const thinkingLocations = findThinkingBlockLocations(request);
+                    expect(thinkingLocations.length).toBeGreaterThan(0);
+                    for (const { messageIndex, block } of thinkingLocations) {
+                        expect(messageIndex).toBe(newestAssistantIdx);
+                        expect(block.thinking).toBe(signedThinking);
+                        expect(block.signature).toBe(signature);
+                    }
                     for (const assistant of assistants) {
-                        const serialized = JSON.stringify(assistant.content);
-                    expect(serialized).not.toContain('<instruction name="context_');
+                        if (!Array.isArray(assistant.content)) continue;
+                        for (const block of assistant.content) {
+                            if (block.type !== "text") continue;
+                            expect(block.text ?? "").not.toContain('<instruction name="context_');
+                            expect(block.text ?? "").not.toContain("context_iteration");
+                            expect(block.text ?? "").not.toContain("context_warning");
+                            expect(block.text ?? "").not.toContain("context_critical");
+                        }
                     }
                 } else {
                     // TypeScript preserves historical signed reasoning, so this branch must
