@@ -5200,7 +5200,10 @@ fn apply_once(
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 ctx,
-                usable_window_tokens: context_limit_tokens.round() as i64,
+                usable_window_tokens: effective_nudge_window_tokens(
+                    req.geometry.as_ref(),
+                    context_limit_tokens,
+                ),
                 core: &core,
                 projection: &projection,
                 tag_rows: &hygiene_tag_rows,
@@ -5397,7 +5400,10 @@ fn apply_once(
         &req.channel2_nudge_state,
         ctx.now_ms,
         Channel2DirectiveInput {
-            usable_window_tokens: context_limit_tokens.round() as i64,
+            usable_window_tokens: effective_nudge_window_tokens(
+                req.geometry.as_ref(),
+                context_limit_tokens,
+            ),
             core: &core,
             projection: &projection,
             tag_rows: &hygiene_tag_rows,
@@ -5797,6 +5803,20 @@ fn effective_context_limit_tokens(
         }
     }
     200_000.0
+}
+
+fn effective_nudge_window_tokens(
+    geometry: Option<&TransformGeometry>,
+    scheduler_context_limit_tokens: f64,
+) -> i64 {
+    // Keep the usage-reported context limit for scheduler calculations. Reminder text describes
+    // context available after host reserves, so prefer the host's `usable_soft` geometry.
+    geometry
+        .filter(|geometry| geometry.usable_soft >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT)
+        .map_or(scheduler_context_limit_tokens, |geometry| {
+            geometry.usable_soft as f64
+        })
+        .round() as i64
 }
 
 fn effective_hard_context_limit_tokens(
@@ -13427,6 +13447,30 @@ pub(crate) mod tests {
             effective_context_limit_tokens(&ModuleUsage::default(), Some(&implausible)),
             200_000.0
         );
+    }
+
+    #[test]
+    fn nudge_display_denominator_prefers_geometry_usable_soft() {
+        let geometry = TransformGeometry {
+            usable_soft: 872_000,
+            usable_hard: 1_000_000,
+            derivation: "models.dev/1000000; usableSoft=872000".to_string(),
+        };
+        let scheduler_denominator = effective_context_limit_tokens(
+            &ModuleUsage {
+                current_total_input_tokens: 600_000,
+                context_limit_tokens: 1_000_000,
+                ..ModuleUsage::default()
+            },
+            Some(&geometry),
+        );
+
+        assert_eq!(scheduler_denominator, 1_000_000.0);
+        assert_eq!(
+            effective_nudge_window_tokens(Some(&geometry), scheduler_denominator),
+            872_000
+        );
+        assert_eq!(effective_nudge_window_tokens(None, 128_000.0), 128_000);
     }
 
     #[test]
