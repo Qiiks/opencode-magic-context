@@ -1,5 +1,5 @@
 {
-  "generator_version": 5,
+  "generator_version": 6,
   "cases": [
     {
       "name": "reasoning",
@@ -708,8 +708,15 @@
     },
     {
       "name": "incident_astro_signed_reasoning_tool_without_text",
-      "target_mid": "msg_034708489001DO2JIqA9aILSxN",
+      "target_mid": "msg_03724c745001WO47gldfQGbrqY",
       "target_reasoning_index": 1,
+      "provider_error_path": "messages.151.content.26",
+      "failing_provider_part_types": [
+        "text",
+        "thinking",
+        "thinking",
+        "tool_use"
+      ],
       "expect_strip": false,
       "source_part_types": [
         "step-start",
@@ -726,7 +733,7 @@
       "raw_messages": [
         {
           "info": {
-            "id": "msg_034708489001DO2JIqA9aILSxN",
+            "id": "msg_03724c745001WO47gldfQGbrqY",
             "sessionID": "ses_08df2045bffeBcWcqw60elghER",
             "role": "assistant",
             "finish": "tool-calls"
@@ -746,12 +753,12 @@
             },
             {
               "type": "tool",
-              "callID": "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
-              "tool": "athena_view",
+              "callID": "toolu_01HhvtLQasFDWBB19QP5WvqK",
+              "tool": "read",
               "state": {
                 "status": "completed",
                 "input": {
-                  "work_item_id": "[redacted]"
+                  "filePath": "[redacted]"
                 },
                 "output": "[redacted tool result]"
               }
@@ -774,10 +781,10 @@
           ]
         }
       ],
-      "reasoning_exempt_mid": "msg_034708489001DO2JIqA9aILSxN",
+      "reasoning_exempt_mid": "msg_03724c745001WO47gldfQGbrqY",
       "encoded_input": [
         {
-          "mid": "msg_034708489001DO2JIqA9aILSxN",
+          "mid": "msg_03724c745001WO47gldfQGbrqY",
           "ordinal": 1,
           "ck": {
             "role": "assistant",
@@ -801,18 +808,18 @@
               {
                 "kind": {
                   "type": "tool_call",
-                  "id": "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
-                  "name": "athena_view",
+                  "id": "toolu_01HhvtLQasFDWBB19QP5WvqK",
+                  "name": "read",
                   "input": {
-                    "work_item_id": "[redacted]"
+                    "filePath": "[redacted]"
                   }
                 }
               },
               {
                 "kind": {
                   "type": "tool_result",
-                  "id": "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
-                  "tool_name": "athena_view",
+                  "id": "toolu_01HhvtLQasFDWBB19QP5WvqK",
+                  "tool_name": "read",
                   "output": {
                     "kind": {
                       "type": "text",
@@ -823,7 +830,7 @@
               }
             ],
             "meta": {
-              "harness_id": "msg_034708489001DO2JIqA9aILSxN",
+              "harness_id": "msg_03724c745001WO47gldfQGbrqY",
               "ordinal": 1,
               "synthetic": false,
               "summary": false,

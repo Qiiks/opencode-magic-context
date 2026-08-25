@@ -457,17 +457,21 @@ pub(crate) fn encode_opencode_chunks_with_transition_state(
         // identity. A positional synthetic fallback can instead attach an input nudge's
         // native envelope to a fresh module-authored m0/m1 message.
         let meta = meta_for_ck(sidecar, msg, absolute_index);
+        let preserve_native_reasoning =
+            meta.is_some_and(|meta| exemptions.reasoning_mid == Some(meta.mid.as_str()));
         let mut value = match meta {
             Some(meta) if exemptions.mutation_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
-            Some(meta) => encode_with_meta(
-                msg,
-                meta,
-                preserve_compaction,
-                exemptions.reasoning_mid == Some(meta.mid.as_str()),
-            ),
+            Some(meta) => {
+                encode_with_meta(msg, meta, preserve_compaction, preserve_native_reasoning)
+            }
             None => encode_new_message(msg, session_id),
         };
         preserve_persisted_text_tool_order(&mut value, meta.map(|meta| &meta.raw));
+        if preserve_native_reasoning {
+            if let Some(meta) = meta {
+                enforce_latest_assistant_native_reasoning(&mut value, &meta.raw);
+            }
+        }
         encoded.push(EncodedOpencodeChunk {
             start_index: absolute_index,
             end_index: absolute_index.saturating_add(1),
@@ -739,6 +743,32 @@ fn tool_output_from_part(part: &Value, is_error: bool, output_text: String) -> C
     } else {
         CkOutputKind::Content { blocks }
     })
+}
+
+fn is_native_reasoning_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("reasoning" | "thinking" | "redacted_thinking")
+    )
+}
+
+// Anthropic binds the latest assistant's thinking blocks to their native bytes and content-array
+// positions. Its provider projection may regroup OpenCode part kinds, so even a suffix insertion
+// can move thinking. Preserve the complete native part vector whenever signed reasoning is live.
+fn enforce_latest_assistant_native_reasoning(message: &mut Value, persisted: &Value) {
+    let Some(persisted_parts) = persisted.get("parts").and_then(Value::as_array) else {
+        return;
+    };
+    if !persisted_parts.iter().any(is_native_reasoning_part)
+        || message.get("parts").and_then(Value::as_array) == Some(persisted_parts)
+    {
+        return;
+    }
+    let Some(message) = message.as_object_mut() else {
+        *message = persisted.clone();
+        return;
+    };
+    message.insert("parts".to_string(), Value::Array(persisted_parts.clone()));
 }
 
 fn has_text_after_tool(parts: &[Value]) -> bool {
@@ -2378,7 +2408,7 @@ mod tests {
     }
 
     #[test]
-    fn unstamped_live_reasoning_tool_vector_reattaches_signed_native_part() {
+    fn unstamped_live_reasoning_tool_vector_replays_complete_native_parts() {
         let golden: Value = serde_json::from_str(include_str!(
             "../../testdata/merged-reasoning-adapter-golden.json"
         ))
@@ -2419,7 +2449,7 @@ mod tests {
             &decoded.sidecar,
             Some("ses_08df2045bffeBcWcqw60elghER"),
             &[],
-            Some("msg_034708489001DO2JIqA9aILSxN"),
+            fixture["target_mid"].as_str(),
             true,
         );
         let parts = served[0]["parts"].as_array().expect("served parts");
@@ -2437,7 +2467,48 @@ mod tests {
             expected_types
         );
         assert_eq!(parts[1], raw[0]["parts"][1]);
-        assert_eq!(parts[2]["state"]["output"], "§7685§ [redacted tool result]");
+        assert_eq!(served[0]["parts"], raw[0]["parts"]);
+    }
+
+    #[test]
+    fn unmatched_tag_overlay_cannot_shift_or_duplicate_latest_native_reasoning() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "incident_astro_signed_reasoning_tool_without_text")
+            .expect("ASTRO provider rejection fixture generated from persisted rows");
+        let raw: Vec<Value> = serde_json::from_value(fixture["raw_messages"].clone()).unwrap();
+        let ingress: Vec<CkIngressMessage> =
+            serde_json::from_value(fixture["encoded_input"].clone()).unwrap();
+        let decoded = decode_opencode(&raw);
+        let mut output = ingress
+            .into_iter()
+            .map(|message| message.ck)
+            .collect::<Vec<_>>();
+        let target = &mut output[0];
+        let reasoning_index = fixture["target_reasoning_index"].as_u64().unwrap() as usize;
+        let mut inserted = CkWireBlock::bare(CkKind::Text {
+            text: ".".to_string(),
+        });
+        inserted.mark_modified();
+        target.content.insert(reasoning_index, inserted);
+        target.mark_modified();
+
+        let served = encode_opencode_with_transition_state_and_reasoning_exemption(
+            &output,
+            &decoded.sidecar,
+            Some("ses_08df2045bffeBcWcqw60elghER"),
+            &[],
+            fixture["target_mid"].as_str(),
+            true,
+        );
+
+        assert_eq!(served[0], raw[0]);
     }
 
     #[test]
