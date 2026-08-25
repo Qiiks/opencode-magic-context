@@ -9,7 +9,7 @@
 set -u
 MAX_HOURS="${1:-8}"
 DEADLINE=$(( $(date +%s) + MAX_HOURS * 3600 ))
-SEEN_FILE="${TMPDIR:-/tmp}/mc-ci-sentinel-seen"
+SEEN_FILE="${HOME}/.local/share/cortexkit/mc-ci-sentinel-seen"
 touch "$SEEN_FILE"
 
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
