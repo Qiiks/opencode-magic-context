@@ -2,15 +2,17 @@
 
 ## Decision
 
-Adopt **B: a dedicated `m1bench` self-hosted runner for tag-triggered release
-gates**. The implemented release job is disabled by default behind the explicit
-repository variable `RUST_E2E_M1BENCH_ENABLED=true`; disabled state produces a
-GitHub Actions warning and a visibly skipped job, not a silent green pass. See
-[the operator runbook](../.github/RUST_E2E_CI.md).
+Adopt **A: GitHub-hosted Linux runners with two repository-scoped read-only
+deploy keys** for the tag-triggered release gate and scheduled nightly drift
+gate. `cortexkit/commons` and `cortexkit/subconscious` are checked out beside
+Magic Context, then the shared harness script builds and tests the current source
+pair. Missing credentials produce a named GitHub Actions warning and a visibly
+skipped Rust job, not a silent green pass. See [the operator
+runbook](../.github/RUST_E2E_CI.md).
 
-This is the smallest secure change that exercises the actual current-source
-Rust stack on every configured release. It does not mint secrets, register a
-runner, or change SUBC infrastructure.
+This replaces option B because its `m1bench` runner is retired and no longer
+exists. The pivot does not mint secrets, alter sibling infrastructure, or make
+a broad token available to the workflow.
 
 ## Source findings
 
@@ -34,21 +36,21 @@ contract:
 
 The required source is broader than the daemon checkout. Root `Cargo.toml`
 points `cortexkit-*` dependencies at `../commons` and all `subc-*` dependencies
-at `../subconscious`. The existing prerequisite detector enforces both
-siblings. A daemon binary alone cannot compile current `ck-mc`, and the
-harness intentionally avoids pairing `ck-mc` with a stale prebuilt component.
+at `../subconscious`. The existing prerequisite detector enforces both siblings.
+A daemon binary alone cannot compile current `ck-mc`, and the harness
+intentionally avoids pairing `ck-mc` with a stale prebuilt component.
 
 The group contains 31 manifest-derived Rust tests and executes serially with a
-600-second Bun timeout. The new shared script checks its manifest selection and
+600-second Bun timeout. The shared script checks its manifest selection and
 requires a positive pass summary, so a crash, timeout, or zero-test run fails.
 
 ## Options
 
 | Shape | Feasibility now | Planning duration* | Cost class | Security posture |
 | --- | --- | --- | --- | --- |
-| A. GitHub-hosted runner + private source credentials | Technically feasible on Linux, but needs two sibling checkouts and credentials | Cold 25–45 min; cached 12–25 min | Medium recurring hosted minutes and cache storage | Read-only private-source credentials are injected into a public-repo release workflow; tag protection is mandatory |
-| B. `m1bench` self-hosted runner | Feasible now because the intended runner already has the private sibling/toolchain shape | Cold after cache wipe 25–45 min; warm 10–25 min | Low GitHub-minute cost; dedicated Mac capacity and maintenance | No Actions secret/PAT; persistent private source on runner means trusted tag code and host hardening remain in scope |
-| C. Prebuilt private daemon artifact | Not sufficient as stated; needs an artifact-and-private-crate/source contract | Once upstream work exists: cold 10–25 min; warm 5–15 min | Upfront SUBC/registry/release work; low per-run cost | Best steady-state boundary if signed, pinned, and short-lived authenticated, but unavailable now |
+| A. GitHub-hosted runner + private source credentials | Technically feasible on Linux; requires two sibling checkouts and credentials | Cold 25–45 min; cached 12–25 min | Medium recurring hosted minutes and cache storage | Read-only private-source credentials are injected only into protected tag/scheduled workflow code |
+| B. `m1bench` self-hosted runner | **RETIRED:** the machine no longer exists | N/A | N/A | N/A |
+| C. Prebuilt daemon artifact | Not sufficient as stated; needs an artifact-and-private-crate/source contract | Once upstream work exists: cold 10–25 min; warm 5–15 min | Upfront SUBC/registry/release work; low per-run cost | Best steady-state boundary if signed, pinned, and short-lived authenticated, but unavailable now |
 
 \*These are conservative planning estimates, not measurements. Evidence for
 scope is the two release Cargo builds, serial 31-file suite, and 600-second
@@ -59,35 +61,24 @@ no comparable CI timing trace to justify a more precise number.
 ### A — hosted runner + deploy keys
 
 **Pros:** ephemeral worker, Linux execution is source-feasible, and
-`actions/cache` can retain the e2e-owned Cargo target directory.
+`actions/cache` retains the e2e-owned Cargo target directory.
 
-**Blockers/cost:** it needs read access to both `commons` and `subconscious`, not
-only the daemon repository. Two per-repository read-only deploy keys minimize
-scope, but they are still private-source credentials available to release-tag
-workflow code. It also pays fresh hosted-cache restore and dependency build
-costs.
+**Controls/cost:** the jobs use independent read-only deploy keys for `commons`
+and `subconscious`; no personal access token is used. They cache only
+`packages/e2e-tests/.cache/rust-e2e-cargo-target`, keyed from all three Cargo
+lockfiles plus OS and architecture. The release job remains tag-only and the
+nightly drift job is schedule-only, so neither can run against pull-request
+code. This retains the hosted-minute and cache-storage cost described above.
 
-**Disposition:** documented only. Do not add a broad PAT or unprotected secret
-path merely to make this lane run.
+**Disposition:** selected and implemented. The jobs emit a summary line with
+both checked-out sibling SHAs so the first secret-backed run is immediately
+auditable.
 
-### B — m1bench runner
+### B — m1bench runner — RETIRED
 
-**Pros:** source and toolchains remain local to the dedicated host; no
-credential is exposed to Actions; current Cargo paths work without source
-rewrites; Cargo's e2e-owned target remains cacheable. It directly meets the
-owner directive to run the Rust leg inside every enabled release pipeline.
-
-**Controls:** the self-hosted job exists only in the tag-only release workflow,
-uses labels `[self-hosted, m1bench]`, uses a read-only `GITHUB_TOKEN`, and is
-not present on `pull_request`. The preflight warning plus skipped job makes an
-unprovisioned runner visible. If explicitly enabled runner capacity disappears,
-the release blocks queued rather than publishing an untested Rust build.
-
-**Residual risk:** a writer able to create a matching tag can execute code on a
-persistent runner holding private sibling sources. Use a dedicated account and
-host, protected tags/workflows, no unrelated credentials, and regular reimage.
-
-**Disposition:** selected and implemented.
+**Disposition:** retired because `m1bench` no longer exists. No self-hosted
+runner label, enable variable, or persistent source checkout remains in the
+workflows. It is not a fallback for the hosted leg.
 
 ### C — prebuilt artifact
 
@@ -99,21 +90,15 @@ path dependencies or the harness's same-revision coherence guarantee. SUBC and
 commons must publish either compatible private Rust crates or a signed source
 bundle alongside a platform binary and compatibility manifest.
 
-**Disposition:** scoped in the runbook for the owning teams; not implemented in
-this repository.
+**Disposition:** scoped to the owning teams; not implemented in this repository.
 
-## Implemented release behavior
+## Implemented behavior
 
-`release.yml` adds a hosted preflight and the self-hosted `E2E (Rust hermetic)`
-job. The latter waits for the existing host E2E jobs, restores/saves the
-isolated Cargo target cache using all three Cargo lockfiles, builds the plugin,
-installs OpenCode, and invokes `scripts/run-rust-hermetic-e2e.sh`. All npm
-publish jobs explicitly accept the Rust job's `skipped` result only when the
-preflight emitted the visible disabled warning; a failed enabled Rust job blocks
-publishing.
-
-No nightly `ci.yml` self-hosted job is added. Release tags are the required
-release gate, and avoiding a master-push self-hosted execution surface until
-runner operation is established is the safer initial rollout. A future nightly
-job must use an explicit `github.event_name == 'push'` and protected-master
-condition; it must never run on `pull_request` or fork code.
+`release.yml` uses a hosted credential preflight and `E2E (Rust hermetic)` job.
+`ci.yml` has the same hosted job behind its nightly schedule. Both jobs wait for
+the host E2E jobs, clone both private siblings with the two deploy keys,
+restore/save the isolated Cargo target cache using all three Cargo lockfiles,
+build the plugin, install OpenCode, and invoke
+`scripts/run-rust-hermetic-e2e.sh`. The release publish jobs explicitly accept a
+Rust job's `skipped` result only after the preflight emits the visible missing-
+credential warning; a credential-backed Rust failure blocks publishing.
