@@ -308,9 +308,10 @@ jobs:
           MC_E2E_MODE: ts
         run: |
           # The mode validator independently checks tests/**/*.test.ts and
-          # derives this OpenCode list. Rust is intentionally absent from public
-          # CI because its private ../commons and ../subconscious path-deps are
-          # not provisioned here; the local release gate runs that host group.
+          # derives this OpenCode list. Rust is intentionally absent from PR and
+          # ordinary master CI because it requires private ../commons and
+          # ../subconscious source. The tag-only release workflow runs that lane
+          # on its protected m1bench runner; never add it to pull_request.
           cd packages/e2e-tests
           files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness opencode | tr '\n' ' ')
           echo "Running OpenCode host tests from mode manifest: $files"
