@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("dump_dir", type=Path)
     parser.add_argument("--date", default="2026-08-24")
     parser.add_argument("--per-session", type=int, default=6)
+    parser.add_argument(
+        "--after",
+        help="include dump filenames at or after this UTC timestamp prefix",
+    )
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args()
 
@@ -60,9 +64,13 @@ def session_from_name(path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def choose_paths(root: Path, date: str, per_session: int) -> list[Path]:
+def choose_paths(
+    root: Path, date: str, per_session: int, after: str | None = None
+) -> list[Path]:
     grouped: dict[str, list[Path]] = collections.defaultdict(list)
     for path in root.glob(f"{date}*.body.json"):
+        if after is not None and path.name < after:
+            continue
         session = session_from_name(path)
         if session is not None:
             grouped[session].append(path)
@@ -166,6 +174,8 @@ def summarize_lane(dumps: list[Dump]) -> dict[str, Any]:
     placeholder_values: collections.Counter[Any] = collections.Counter()
     thinking_shapes: collections.Counter[Any] = collections.Counter()
     reasoning_order_shapes: collections.Counter[Any] = collections.Counter()
+    newest_assistant_reasoning_presence: collections.Counter[Any] = collections.Counter()
+    newest_assistant_reasoning_shapes: collections.Counter[Any] = collections.Counter()
     cache_placements: collections.Counter[Any] = collections.Counter()
     message_block_key_shapes: collections.Counter[Any] = collections.Counter()
     anomalies: collections.Counter[Any] = collections.Counter()
@@ -221,6 +231,45 @@ def summarize_lane(dumps: list[Dump]) -> dict[str, Any]:
                 if isinstance(message, dict)
             )
         ] += 1
+
+        newest_assistant = next(
+            (
+                (message_index, message)
+                for message_index, message in reversed(list(enumerate(messages)))
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            ),
+            None,
+        )
+        if newest_assistant is None:
+            newest_assistant_reasoning_presence["missing_assistant"] += 1
+            newest_assistant_reasoning_shapes[("missing_assistant",)] += 1
+        else:
+            message_index, message = newest_assistant
+            message_blocks = blocks(message)
+            types = tuple(block.get("type") for block in message_blocks)
+            reasoning_blocks = [
+                (block_index, block)
+                for block_index, block in enumerate(message_blocks)
+                if block.get("type") in ("thinking", "reasoning", "redacted_thinking")
+            ]
+            presence = "present" if reasoning_blocks else "absent"
+            signed_count = sum(bool(block.get("signature")) for _, block in reasoning_blocks)
+            newest_assistant_reasoning_presence[presence] += 1
+            newest_assistant_reasoning_shapes[
+                (presence, types, len(reasoning_blocks), signed_count)
+            ] += 1
+            evidence_key = f"newest_assistant_reasoning_{presence}"
+            if len(special_evidence[evidence_key]) < 6:
+                if reasoning_blocks:
+                    block_index, block = reasoning_blocks[0]
+                    value = block.get("thinking", block.get("text", block.get("data", "")))
+                    special_evidence[evidence_key].append(
+                        evidence(dump, message_index, block_index, str(value))
+                    )
+                else:
+                    special_evidence[evidence_key].append(
+                        evidence(dump, message_index, -1, f"types={types}")
+                    )
 
         tool_ids: collections.Counter[str] = collections.Counter()
         result_ids: collections.Counter[str] = collections.Counter()
@@ -368,6 +417,12 @@ def summarize_lane(dumps: list[Dump]) -> dict[str, Any]:
         "placeholder_values": counter_dict(placeholder_values),
         "thinking_shapes": counter_dict(thinking_shapes),
         "reasoning_order_shapes_top40": counter_dict(reasoning_order_shapes, 40),
+        "newest_assistant_reasoning_presence": counter_dict(
+            newest_assistant_reasoning_presence
+        ),
+        "newest_assistant_reasoning_shapes_top40": counter_dict(
+            newest_assistant_reasoning_shapes, 40
+        ),
         "cache_placements": counter_dict(cache_placements),
         "block_key_shapes_top40": counter_dict(message_block_key_shapes, 40),
         "synthetic_todo": todo_summary,
@@ -378,11 +433,14 @@ def summarize_lane(dumps: list[Dump]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    dumps = load_dumps(choose_paths(args.dump_dir, args.date, args.per_session))
+    dumps = load_dumps(
+        choose_paths(args.dump_dir, args.date, args.per_session, args.after)
+    )
     report = {
         "method": {
             "date": args.date,
             "per_session": args.per_session,
+            "after": args.after,
             "rust_sessions": sorted(RUST_SESSIONS),
         },
         "lanes": {

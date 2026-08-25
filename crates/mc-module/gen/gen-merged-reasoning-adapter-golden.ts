@@ -99,6 +99,71 @@ const liveContinuation = [
 	assistant("live-continuation-request-shell", [{ type: "step-start" }]),
 ];
 
+const incidentAstroReasoningTool = [
+	{
+		info: {
+			id: "msg_034708489001DO2JIqA9aILSxN",
+			sessionID: "ses_08df2045bffeBcWcqw60elghER",
+			role: "assistant",
+			finish: "tool-calls",
+		},
+		parts: [
+			{ type: "step-start" },
+			{
+				type: "reasoning",
+				text: "[redacted signed live thinking]",
+				metadata: { anthropic: { signature: "[redacted signature]" } },
+			},
+			{
+				type: "tool",
+				callID: "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
+				tool: "athena_view",
+				state: {
+					status: "completed",
+					input: { work_item_id: "[redacted]" },
+					output: "[redacted tool result]",
+				},
+			},
+			{ type: "step-finish", reason: "tool-calls" },
+		],
+	},
+	assistant("incident-astro-request-shell", [{ type: "step-start" }]),
+];
+
+const incidentEngramTextOrderRecurrence = [
+	{
+		info: {
+			id: "msg_0348483e9001xBB7Ya0H5bfkvm",
+			sessionID: "ses_0ad83017cffexe0g5N8UG0y3LZ",
+			role: "assistant",
+			finish: "tool-calls",
+		},
+		parts: [
+			{ type: "step-start" },
+			{
+				type: "reasoning",
+				text: "[redacted signed live thinking]",
+				metadata: { anthropic: { signature: "[redacted signature]" } },
+			},
+			{
+				type: "text",
+				text: "Three construction sites, plus a third upstream break in the same window.",
+			},
+			{
+				type: "tool",
+				callID: "toolu_01AveJRXHJBnmXzSD16U5zmi",
+				tool: "bash",
+				state: {
+					status: "completed",
+					input: { command: "[redacted]" },
+					output: "[redacted tool result]",
+				},
+			},
+			{ type: "step-finish", reason: "tool-calls" },
+		],
+	},
+];
+
 const incident337 = [
 	{
 		info: {
@@ -157,6 +222,35 @@ const rawCases = [
 		raw_messages: liveContinuation,
 	},
 	{
+		name: "incident_astro_signed_reasoning_tool_without_text",
+		target_mid: "msg_034708489001DO2JIqA9aILSxN",
+		target_reasoning_index: 1,
+		expect_strip: false,
+		source_part_types: ["step-start", "reasoning", "tool", "step-finish"],
+		expected_native_part_types: [
+			"step-start",
+			"reasoning",
+			"tool",
+			"step-finish",
+		],
+		raw_messages: incidentAstroReasoningTool,
+	},
+	{
+		name: "incident_engram_text_after_tool_recurrence",
+		target_mid: "msg_0348483e9001xBB7Ya0H5bfkvm",
+		target_reasoning_index: 1,
+		expect_strip: false,
+		source_part_types: [
+			"step-start",
+			"reasoning",
+			"text",
+			"tool",
+			"step-finish",
+		],
+		expected_native_part_types: ["step-start", "text", "tool", "step-finish"],
+		raw_messages: incidentEngramTextOrderRecurrence,
+	},
+	{
 		name: "incident_337_text_before_tool",
 		target_mid: "msg_034356b50001Cbvu81faDbQTRW",
 		expect_strip: false,
@@ -200,5 +294,5 @@ const cases = rawCases.map((fixture) => {
 
 writeFileSync(
 	output,
-	`${JSON.stringify({ generator_version: 3, cases }, null, 2)}\n`,
+	`${JSON.stringify({ generator_version: 5, cases }, null, 2)}\n`,
 );

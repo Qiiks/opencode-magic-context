@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -323,6 +323,7 @@ pub fn encode_opencode_with_session_exemptions(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn encode_opencode_with_transition_state(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
@@ -330,14 +331,47 @@ pub(crate) fn encode_opencode_with_transition_state(
     mutation_exempt_mids: &[&str],
     transition_consumed: bool,
 ) -> Vec<MessageV2Json> {
-    encode_opencode_impl(
+    encode_opencode_with_transition_state_and_reasoning_exemption(
+        messages,
+        sidecar,
+        session_id,
+        mutation_exempt_mids,
+        None,
+        transition_consumed,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NativeEncodeExemptions<'a> {
+    pub(crate) mutation_mids: &'a [&'a str],
+    pub(crate) reasoning_mid: Option<&'a str>,
+}
+
+pub(crate) fn encode_opencode_with_transition_state_and_reasoning_exemption(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+    mutation_exempt_mids: &[&str],
+    reasoning_exempt_mid: Option<&str>,
+    transition_consumed: bool,
+) -> Vec<MessageV2Json> {
+    let encoded = encode_opencode_chunks_with_transition_state(
         messages,
         sidecar,
         session_id,
         true,
-        mutation_exempt_mids,
+        NativeEncodeExemptions {
+            mutation_mids: mutation_exempt_mids,
+            reasoning_mid: reasoning_exempt_mid,
+        },
         transition_consumed,
+        0,
     )
+    .into_iter()
+    .map(|chunk| chunk.value)
+    .collect::<Vec<_>>();
+    assert_unique_tool_use_ids(&encoded);
+    encoded
 }
 
 #[derive(Debug, Clone)]
@@ -360,7 +394,10 @@ fn encode_opencode_impl(
         sidecar,
         session_id,
         preserve_compaction,
-        mutation_exempt_mids,
+        NativeEncodeExemptions {
+            mutation_mids: mutation_exempt_mids,
+            reasoning_mid: None,
+        },
         transition_consumed,
         0,
     )
@@ -376,7 +413,7 @@ pub(crate) fn encode_opencode_chunks_with_transition_state(
     sidecar: &DecodeSidecar,
     session_id: Option<&str>,
     preserve_compaction: bool,
-    mutation_exempt_mids: &[&str],
+    exemptions: NativeEncodeExemptions<'_>,
     _transition_consumed: bool,
     base_index: usize,
 ) -> Vec<EncodedOpencodeChunk> {
@@ -420,11 +457,17 @@ pub(crate) fn encode_opencode_chunks_with_transition_state(
         // identity. A positional synthetic fallback can instead attach an input nudge's
         // native envelope to a fresh module-authored m0/m1 message.
         let meta = meta_for_ck(sidecar, msg, absolute_index);
-        let value = match meta {
-            Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
-            Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
+        let mut value = match meta {
+            Some(meta) if exemptions.mutation_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
+            Some(meta) => encode_with_meta(
+                msg,
+                meta,
+                preserve_compaction,
+                exemptions.reasoning_mid == Some(meta.mid.as_str()),
+            ),
             None => encode_new_message(msg, session_id),
         };
+        preserve_persisted_text_tool_order(&mut value, meta.map(|meta| &meta.raw));
         encoded.push(EncodedOpencodeChunk {
             start_index: absolute_index,
             end_index: absolute_index.saturating_add(1),
@@ -698,10 +741,59 @@ fn tool_output_from_part(part: &Value, is_error: bool, output_text: String) -> C
     })
 }
 
+fn has_text_after_tool(parts: &[Value]) -> bool {
+    let mut saw_tool = false;
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("tool") => saw_tool = true,
+            Some("text") if saw_tool => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+// Anthropic rejects a live assistant whose text follows tool_use. OpenCode persists authored
+// assistant text before its tool part, so encode-back may retain a post-tool order only when that
+// exceptional order already existed in the native message rather than being created by fallback.
+fn preserve_persisted_text_tool_order(message: &mut Value, persisted: Option<&Value>) {
+    let info = message.get("info").unwrap_or(message);
+    if info.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let persisted_parts = persisted
+        .and_then(|message| message.get("parts"))
+        .and_then(Value::as_array);
+    if persisted_parts.is_some_and(|parts| has_text_after_tool(parts)) {
+        return;
+    }
+    let Some(parts) = message.get_mut("parts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(first_tool) = parts
+        .iter()
+        .position(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+    else {
+        return;
+    };
+    let mut moved_text = Vec::new();
+    let mut index = first_tool.saturating_add(1);
+    while index < parts.len() {
+        if parts[index].get("type").and_then(Value::as_str) == Some("text") {
+            moved_text.push(parts.remove(index));
+        } else {
+            index += 1;
+        }
+    }
+    parts.splice(first_tool..first_tool, moved_text);
+    debug_assert!(!has_text_after_tool(parts));
+}
+
 fn encode_with_meta(
     msg: &CkWireMessage,
     meta: &HarnessMessageMeta,
     preserve_compaction: bool,
+    preserve_native_reasoning: bool,
 ) -> Value {
     let mut raw = meta.raw.clone();
     let mut parts = raw
@@ -710,6 +802,34 @@ fn encode_with_meta(
         .cloned()
         .unwrap_or_default();
     let matched_metas = match_block_metas(&msg.content, &meta.blocks, true, block_matches_meta);
+    let matched_meta_block_indexes = matched_metas
+        .by_block
+        .iter()
+        .flatten()
+        .map(|meta| meta.block_index)
+        .collect::<BTreeSet<_>>();
+    let matched_native_indices = matched_metas
+        .by_block
+        .iter()
+        .flatten()
+        .filter_map(|meta| meta.native_index)
+        .collect::<BTreeSet<_>>();
+    // The newest replayable assistant must carry its provider-signed reasoning into a tool-use
+    // continuation. Preserve the native carrier even when CK omitted it or could not align it.
+    let native_reasoning_to_reattach = if preserve_native_reasoning {
+        meta.blocks
+            .iter()
+            .filter(|meta| matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning"))
+            .filter_map(|meta| {
+                let native_index = meta.native_index?;
+                (!matched_native_indices.contains(&native_index))
+                    .then_some((meta.block_index, native_index))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut pending_parts = Vec::new();
 
     let mut block_index = 0;
     while block_index < msg.content.len() {
@@ -751,7 +871,11 @@ fn encode_with_meta(
                     // part into adjacent call and result blocks. This provider-validity invariant
                     // cannot depend on whether an older renderer-transition marker was persisted:
                     // two independently emitted shells carry the same callID.
-                    parts.push(render_tool_pair_as_part(block, result));
+                    pending_parts.push((
+                        block_index,
+                        None,
+                        render_tool_pair_as_part(block, result),
+                    ));
                     block_index += 2;
                     continue;
                 }
@@ -777,11 +901,56 @@ fn encode_with_meta(
                 continue;
             }
         }
-        parts.push(render_block_as_part(block));
+        let mut positional_candidates = meta.blocks.iter().filter(|candidate| {
+            !matched_meta_block_indexes.contains(&candidate.block_index)
+                && candidate
+                    .native_index
+                    .is_none_or(|index| !matched_native_indices.contains(&index))
+                && block_matches_meta(block, candidate)
+        });
+        let positional_candidate = positional_candidates.next().filter(|_| {
+            positional_candidates.next().is_none()
+                && (!matches!(
+                    &block.kind,
+                    CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                ) || preserve_native_reasoning)
+        });
+        if let Some(candidate) = positional_candidate {
+            if let Some(native_index) = candidate.native_index {
+                if let Some(source_part) = parts.get(native_index) {
+                    let mut replacement = source_part.clone();
+                    if !matches!(
+                        &block.kind,
+                        CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                    ) {
+                        update_part_from_block(&mut replacement, block);
+                    }
+                    pending_parts.push((block_index, Some(native_index), replacement));
+                    block_index += 1;
+                    continue;
+                }
+            }
+        }
+
+        let reasoning_reattaches_from_native = preserve_native_reasoning
+            && matches!(
+                &block.kind,
+                CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+            )
+            && !native_reasoning_to_reattach.is_empty();
+        if !reasoning_reattaches_from_native {
+            pending_parts.push((block_index, None, render_block_as_part(block)));
+        }
         block_index += 1;
     }
+    for (source_block_index, native_index) in native_reasoning_to_reattach {
+        if let Some(part) = parts.get(native_index) {
+            pending_parts.push((source_block_index, Some(native_index), part.clone()));
+        }
+    }
+    pending_parts.sort_by_key(|(source_block_index, _, _)| *source_block_index);
 
-    parts = matched_metas.remove_unretained_native_parts(parts);
+    parts = matched_metas.remove_unretained_native_parts_with_insertions(parts, pending_parts);
     if !preserve_compaction {
         parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("compaction"));
     }
@@ -2206,6 +2375,194 @@ mod tests {
         assert_eq!(served[0]["parts"][1]["text"], "§18240§ answer");
         assert_eq!(served[0]["parts"][2]["type"], "text");
         assert_eq!(served[0]["parts"][2]["text"], "");
+    }
+
+    #[test]
+    fn unstamped_live_reasoning_tool_vector_reattaches_signed_native_part() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "incident_astro_signed_reasoning_tool_without_text")
+            .expect("ASTRO incident fixture generated from persisted rows");
+        let raw: Vec<Value> = serde_json::from_value(fixture["raw_messages"].clone()).unwrap();
+        let ingress: Vec<CkIngressMessage> =
+            serde_json::from_value(fixture["encoded_input"].clone()).unwrap();
+        let decoded = decode_opencode(&raw);
+        let mut output = ingress
+            .into_iter()
+            .map(|message| message.ck)
+            .collect::<Vec<_>>();
+        let target = &mut output[0];
+        target
+            .content
+            .retain(|block| !matches!(&block.kind, CkKind::Reasoning { .. }));
+        let result = target
+            .content
+            .iter_mut()
+            .find(|block| matches!(&block.kind, CkKind::ToolResult { .. }))
+            .expect("completed live tool result");
+        if let CkKind::ToolResult { output, .. } = &mut result.kind {
+            output.kind = CkOutputKind::Text {
+                text: "§7685§ [redacted tool result]".to_string(),
+            };
+        }
+        result.mark_modified();
+        target.mark_modified();
+
+        let served = encode_opencode_with_transition_state_and_reasoning_exemption(
+            &output,
+            &decoded.sidecar,
+            Some("ses_08df2045bffeBcWcqw60elghER"),
+            &[],
+            Some("msg_034708489001DO2JIqA9aILSxN"),
+            true,
+        );
+        let parts = served[0]["parts"].as_array().expect("served parts");
+        let expected_types = fixture["expected_native_part_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part_type| part_type.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_types
+        );
+        assert_eq!(parts[1], raw[0]["parts"][1]);
+        assert_eq!(parts[2]["state"]["output"], "§7685§ [redacted tool result]");
+    }
+
+    #[test]
+    fn served_assistant_text_after_tool_requires_persisted_order() {
+        let fresh = CkWireMessage::from_parts(
+            "assistant",
+            vec![
+                CkWireBlock::bare(CkKind::ToolCall {
+                    id: "fresh-call".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "command": "true" }),
+                    provider_executed: false,
+                }),
+                CkWireBlock::bare(CkKind::Text {
+                    text: "fresh trailing text".to_string(),
+                }),
+            ],
+            None,
+            ProviderExtras::new(),
+            HarnessMeta {
+                harness_id: Some("fresh-text-tool-order".to_string()),
+                ..Default::default()
+            },
+        );
+        let fresh_served = encode_opencode(
+            &[fresh],
+            &DecodeSidecar::new("opencode"),
+            Some("text-tool-invariant"),
+        );
+        let fresh_parts = fresh_served[0]["parts"].as_array().unwrap();
+        assert_eq!(
+            fresh_parts
+                .iter()
+                .map(|part| part["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["text", "tool"]
+        );
+        assert!(!has_text_after_tool(fresh_parts));
+
+        let persisted = vec![json!({
+            "info": { "id": "persisted-text-tool-order", "role": "assistant" },
+            "parts": [
+                {
+                    "type": "tool",
+                    "callID": "persisted-call",
+                    "tool": "bash",
+                    "state": { "status": "running", "input": { "command": "true" } }
+                },
+                { "type": "text", "text": "persisted trailing text" }
+            ]
+        })];
+        let decoded = decode_opencode(&persisted);
+        let persisted_served = encode_opencode(
+            &[decoded.messages[0].ck.clone()],
+            &decoded.sidecar,
+            Some("text-tool-invariant"),
+        );
+        let persisted_parts = persisted_served[0]["parts"].as_array().unwrap();
+        assert!(has_text_after_tool(
+            persisted[0]["parts"].as_array().unwrap()
+        ));
+        assert!(has_text_after_tool(persisted_parts));
+        assert_eq!(persisted_served[0], persisted[0]);
+    }
+
+    #[test]
+    fn unmatched_mutated_text_stays_at_its_persisted_pre_tool_position() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "incident_engram_text_after_tool_recurrence")
+            .expect("ENGRAM recurrence fixture generated from persisted rows");
+        let raw: Vec<Value> = serde_json::from_value(fixture["raw_messages"].clone()).unwrap();
+        let ingress: Vec<CkIngressMessage> =
+            serde_json::from_value(fixture["encoded_input"].clone()).unwrap();
+        let decoded = decode_opencode(&raw);
+        let mut output = ingress
+            .into_iter()
+            .map(|message| message.ck)
+            .collect::<Vec<_>>();
+        let target = &mut output[0];
+        target
+            .content
+            .retain(|block| !matches!(&block.kind, CkKind::Reasoning { .. }));
+        let text = target
+            .content
+            .iter_mut()
+            .find_map(|block| match &mut block.kind {
+                CkKind::Text { text } if text.starts_with("Three construction sites") => Some(text),
+                _ => None,
+            })
+            .expect("incident assistant text");
+        let expected_text =
+            "§5696§ Three construction sites, plus a third upstream break in the same window."
+                .to_string();
+        *text = expected_text.clone();
+        target.mark_modified();
+
+        let served = encode_opencode_with_session(
+            &output,
+            &decoded.sidecar,
+            Some("ses_0ad83017cffexe0g5N8UG0y3LZ"),
+            None,
+        );
+        let parts = served[0]["parts"].as_array().expect("served parts");
+        let expected_types = fixture["expected_native_part_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part_type| part_type.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_types
+        );
+        assert_eq!(parts[1]["text"], expected_text);
+        assert_eq!(parts[2]["callID"], "toolu_01AveJRXHJBnmXzSD16U5zmi");
     }
 
     #[test]
