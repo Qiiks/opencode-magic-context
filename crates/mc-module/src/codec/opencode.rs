@@ -461,9 +461,13 @@ pub(crate) fn encode_opencode_chunks_with_transition_state(
             meta.is_some_and(|meta| exemptions.reasoning_mid == Some(meta.mid.as_str()));
         let mut value = match meta {
             Some(meta) if exemptions.mutation_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
-            Some(meta) => {
-                encode_with_meta(msg, meta, preserve_compaction, preserve_native_reasoning)
-            }
+            Some(meta) => encode_with_meta(
+                msg,
+                meta,
+                preserve_compaction,
+                preserve_native_reasoning,
+                exemptions.reasoning_mid.is_some(),
+            ),
             None => encode_new_message(msg, session_id),
         };
         preserve_persisted_text_tool_order(&mut value, meta.map(|meta| &meta.raw));
@@ -824,6 +828,7 @@ fn encode_with_meta(
     meta: &HarnessMessageMeta,
     preserve_compaction: bool,
     preserve_native_reasoning: bool,
+    clear_historical_reasoning: bool,
 ) -> Value {
     let mut raw = meta.raw.clone();
     let mut parts = raw
@@ -983,6 +988,18 @@ fn encode_with_meta(
     parts = matched_metas.remove_unretained_native_parts_with_insertions(parts, pending_parts);
     if !preserve_compaction {
         parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("compaction"));
+    }
+
+    // Only the newest provider-visible assistant may replay signed reasoning beside changed
+    // native parts. Historical mutations keep every non-reasoning part in its encoded order but
+    // drop the native reasoning carriers before OpenCode projects the message onto provider wire.
+    let native_parts_changed = meta.raw.get("parts").and_then(Value::as_array) != Some(&parts);
+    if msg.role == "assistant"
+        && native_parts_changed
+        && clear_historical_reasoning
+        && !preserve_native_reasoning
+    {
+        parts.retain(|part| !is_native_reasoning_part(part));
     }
 
     if let Some(obj) = raw.as_object_mut() {
@@ -2468,6 +2485,87 @@ mod tests {
         );
         assert_eq!(parts[1], raw[0]["parts"][1]);
         assert_eq!(served[0]["parts"], raw[0]["parts"]);
+    }
+
+    #[test]
+    fn tag_mutation_clears_historical_thinking_but_replays_newest_native_vector() {
+        fn native_assistant(mid: &str, thinking: &str, signature: &str, text: &str) -> Value {
+            json!({
+                "info": { "id": mid, "role": "assistant" },
+                "parts": [
+                    { "type": "step-start" },
+                    { "type": "thinking", "thinking": thinking, "signature": signature },
+                    { "type": "text", "text": text },
+                    {
+                        "type": "tool",
+                        "callID": format!("call-{mid}"),
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": { "command": "true" },
+                            "output": "done"
+                        }
+                    },
+                    { "type": "step-finish", "reason": "tool-calls" }
+                ]
+            })
+        }
+
+        let raw = vec![
+            native_assistant(
+                "historical",
+                "historical thinking",
+                "sig-historical",
+                "older",
+            ),
+            native_assistant("newest", "newest thinking", "sig-newest", "latest"),
+        ];
+        let decoded = decode_opencode(&raw);
+        let mut output = decoded
+            .messages
+            .into_iter()
+            .map(|message| message.ck)
+            .collect::<Vec<_>>();
+        for (index, tag) in ["§1§ ", "§2§ "].into_iter().enumerate() {
+            let message = &mut output[index];
+            let text = message
+                .content
+                .iter_mut()
+                .find_map(|block| match &mut block.kind {
+                    CkKind::Text { text } => Some(text),
+                    _ => None,
+                })
+                .expect("assistant text");
+            text.insert_str(0, tag);
+            message.mark_modified();
+        }
+
+        let served = encode_opencode_with_transition_state_and_reasoning_exemption(
+            &output,
+            &decoded.sidecar,
+            Some("ses-thinking-scope"),
+            &[],
+            Some("newest"),
+            true,
+        );
+        let historical_parts = served[0]["parts"].as_array().expect("historical parts");
+        assert!(
+            historical_parts
+                .iter()
+                .all(|part| !is_native_reasoning_part(part)),
+            "historical thinking must not survive tag-mutated native replay: {historical_parts:?}"
+        );
+        assert_eq!(
+            historical_parts
+                .iter()
+                .map(|part| part["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["step-start", "text", "tool", "step-finish"]
+        );
+        assert_eq!(historical_parts[1]["text"], "§1§ older");
+        assert_eq!(historical_parts[2]["callID"], "call-historical");
+        assert_eq!(served[1], raw[1]);
+        assert_eq!(served[1]["parts"][1], raw[1]["parts"][1]);
     }
 
     #[test]
