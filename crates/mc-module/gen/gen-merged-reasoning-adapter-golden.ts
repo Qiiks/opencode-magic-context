@@ -102,7 +102,7 @@ const liveContinuation = [
 const incidentAstroReasoningTool = [
 	{
 		info: {
-			id: "msg_034708489001DO2JIqA9aILSxN",
+			id: "msg_03724c745001WO47gldfQGbrqY",
 			sessionID: "ses_08df2045bffeBcWcqw60elghER",
 			role: "assistant",
 			finish: "tool-calls",
@@ -116,11 +116,11 @@ const incidentAstroReasoningTool = [
 			},
 			{
 				type: "tool",
-				callID: "toolu_01MDaTCVJhxgEQaLSwKLk3Vv",
-				tool: "athena_view",
+				callID: "toolu_01HhvtLQasFDWBB19QP5WvqK",
+				tool: "read",
 				state: {
 					status: "completed",
-					input: { work_item_id: "[redacted]" },
+					input: { filePath: "[redacted]" },
 					output: "[redacted tool result]",
 				},
 			},
@@ -223,8 +223,10 @@ const rawCases = [
 	},
 	{
 		name: "incident_astro_signed_reasoning_tool_without_text",
-		target_mid: "msg_034708489001DO2JIqA9aILSxN",
+		target_mid: "msg_03724c745001WO47gldfQGbrqY",
 		target_reasoning_index: 1,
+		provider_error_path: "messages.151.content.26",
+		failing_provider_part_types: ["text", "thinking", "thinking", "tool_use"],
 		expect_strip: false,
 		source_part_types: ["step-start", "reasoning", "tool", "step-finish"],
 		expected_native_part_types: [
@@ -294,5 +296,5 @@ const cases = rawCases.map((fixture) => {
 
 writeFileSync(
 	output,
-	`${JSON.stringify({ generator_version: 5, cases }, null, 2)}\n`,
+	`${JSON.stringify({ generator_version: 6, cases }, null, 2)}\n`,
 );

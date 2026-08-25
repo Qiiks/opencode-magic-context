@@ -18060,7 +18060,7 @@ pub(crate) mod tests {
             "../testdata/merged-reasoning-adapter-golden.json"
         ))
         .unwrap();
-        assert_eq!(golden.generator_version, 5);
+        assert_eq!(golden.generator_version, 6);
         assert_eq!(
             golden
                 .cases

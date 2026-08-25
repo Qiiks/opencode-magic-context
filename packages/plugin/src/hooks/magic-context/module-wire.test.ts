@@ -85,13 +85,15 @@ describe("encodeOpenCodeMessagesToCk", () => {
             }>;
         };
 
-        expect(golden.generator_version).toBe(3);
+        expect(golden.generator_version).toBe(6);
         expect(golden.cases.map((fixture) => fixture.name)).toEqual([
             "reasoning",
             "thinking",
             "redacted_thinking",
             "reasoning_cache_control",
             "live_tool_continuation_request_shell",
+            "incident_astro_signed_reasoning_tool_without_text",
+            "incident_engram_text_after_tool_recurrence",
             "incident_337_text_before_tool",
         ]);
         for (const fixture of golden.cases) {

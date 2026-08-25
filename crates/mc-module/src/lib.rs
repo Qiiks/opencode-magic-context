@@ -18950,6 +18950,66 @@ mod tests {
     }
 
     #[test]
+    fn latest_reasoning_content_guard_covers_full_and_incremental_native_attachment() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "incident_astro_signed_reasoning_tool_without_text")
+            .expect("ASTRO provider rejection fixture generated from persisted rows");
+        let raw: Vec<Value> = serde_json::from_value(fixture["raw_messages"].clone()).unwrap();
+        let ingress: Vec<CkIngressMessage> =
+            serde_json::from_value(fixture["encoded_input"].clone()).unwrap();
+        let target_mid = fixture["target_mid"].as_str().unwrap();
+        let request = native_cache_request(
+            "latest-reasoning-content-guard",
+            ingress.clone(),
+            raw.clone(),
+            "latest-reasoning-content-fingerprint",
+        );
+        let mut served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let target = served
+            .iter_mut()
+            .find(|message| message.meta.harness_id.as_deref() == Some(target_mid))
+            .expect("served ASTRO target");
+        let reasoning_index = fixture["target_reasoning_index"].as_u64().unwrap() as usize;
+        target.content.insert(
+            reasoning_index,
+            ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: ".".to_string(),
+            }),
+        );
+        target.mark_modified();
+
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        for _ in 0..2 {
+            let (response, _) = run_native_cache_pass_with_watermark(
+                &cache,
+                &request,
+                served.clone(),
+                u64::MAX,
+                &BTreeMap::from([(target_mid.to_string(), 1)]),
+                true,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            let native = response.native_messages.expect("native reasoning replay");
+            let target = native
+                .iter()
+                .find(|message| message["info"]["id"] == target_mid)
+                .expect("native ASTRO target");
+            assert_eq!(target.as_ref(), &raw[0]);
+        }
+    }
+
+    #[test]
     fn frontier_vacuity_covers_opaque_repeats_eviction_and_same_length_edits() {
         let baseline_ingress = vec![ck("frontier-1", 1, "aaa"), ck("frontier-2", 2, "bbb")];
         let baseline_native = vec![
