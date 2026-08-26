@@ -608,6 +608,24 @@ jobs:
     # page on GitHub while one of the @cortexkit/* packages was missing
     # from npm.
     needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, publish-npm, publish-npm-pi, publish-npm-cli]
+    # Explicit per-need conditions instead of the default success(): the default
+    # evaluates the TRANSITIVE needs chain, so the rust-hermetic leg's designed
+    # loud-skip (missing CI credentials) silently skipped this job and the
+    # Discord announcement behind it at v0.40.1 — publishes succeeded while the
+    # release page never appeared. Mirror the publish jobs' armor: run whenever
+    # every DIRECT need succeeded, regardless of upstream skips.
+    if: >-
+      always() &&
+      needs.test.result == 'success' &&
+      needs.test-pi.result == 'success' &&
+      needs.test-cli.result == 'success' &&
+      needs.e2e-opencode.result == 'success' &&
+      needs.e2e-pi.result == 'success' &&
+      needs.e2e-host-opencode.result == 'success' &&
+      needs.e2e-host-pi.result == 'success' &&
+      needs.publish-npm.result == 'success' &&
+      needs.publish-npm-pi.result == 'success' &&
+      needs.publish-npm-cli.result == 'success'
     steps:
       - uses: actions/checkout@v5
 
@@ -679,7 +697,9 @@ jobs:
     name: Announce on Discord
     runs-on: ubuntu-latest
     needs: github-release
-    if: success()
+    # always() + explicit result check for the same transitive-skip reason as
+    # github-release above — a skipped upstream leg must not eat the announcement.
+    if: always() && needs.github-release.result == 'success'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
