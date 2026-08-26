@@ -660,6 +660,8 @@ interface RunPostTransformPhaseArgs {
         projectPath?: string;
         projectDirectory?: string;
         injectDocs?: boolean;
+        /** False suppresses every memory-derived m[0]/m[1] surface. */
+        memoryEnabled?: boolean;
         memoryInjectionBudgetTokens?: number;
         historyBudgetTokens?: number;
         temporalAwareness?: boolean;
@@ -906,6 +908,7 @@ export async function runPostTransformPhase(
                   projectPath: args.m0M1.projectPath,
                   projectDirectory: args.m0M1.projectDirectory,
                   injectDocs: args.m0M1.injectDocs,
+                  memoryEnabled: args.m0M1.memoryEnabled,
                   muralEnabled: args.m0M1.muralEnabled,
                   memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                   historyBudgetTokens: args.m0M1.historyBudgetTokens,
@@ -933,6 +936,7 @@ export async function runPostTransformPhase(
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
+                memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
                 temporalAwareness: args.m0M1.temporalAwareness,
@@ -1540,6 +1544,7 @@ export async function runPostTransformPhase(
                 projectPath: args.m0M1.projectPath,
                 projectDirectory: args.m0M1.projectDirectory,
                 injectDocs: args.m0M1.injectDocs,
+                memoryEnabled: args.m0M1.memoryEnabled,
                 memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                 historyBudgetTokens: args.m0M1.historyBudgetTokens,
                 temporalAwareness: args.m0M1.temporalAwareness,
