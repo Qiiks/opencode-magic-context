@@ -79,8 +79,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use subc_client_rs::{
-    async_trait, HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx,
-    RouteBindRequest, RouteHandle,
+    async_trait, build_provenance, HandlerOutcome, HealthReport, HealthStatus, ModuleHandler,
+    RequestCtx, RouteBindRequest, RouteHandle,
 };
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
@@ -14695,6 +14695,12 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         // declarations. MC requests nothing beyond its role grants, so None keeps
         // the HELLO identical to the pre-field wire shape (serde skips None).
         capabilities: None,
+        // Introduced by subc-protocol 0.13: build provenance for the deploy ladder.
+        // The git sha is stamped by the release build command (MC_BUILD_SHA env at
+        // compile time); a bare `cargo build` leaves it absent rather than wrong.
+        // The daemon renders these in module status, which gives deploy
+        // verification a queryable build identity instead of binary archaeology.
+        provenance: Some(build_provenance(option_env!("MC_BUILD_SHA"), None, None)),
         provides: vec![ProviderRole::ToolProvider {
             tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
