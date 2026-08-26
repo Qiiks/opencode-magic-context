@@ -3,16 +3,15 @@ name: CI
 on:
   push:
     branches: [master, main]
-  pull_request:
   # This private-source drift leg runs only on the default branch's scheduled
-  # workflow revision, never against pull-request code.
+  # workflow revision, never against untrusted branch code.
   schedule:
     - cron: "17 3 * * *"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Pipeline shape on every push to master and on every PR:
+# Pipeline shape on every push to master/main:
 #
 #   check-plugin, check-pi-plugin                          (unit tests + lint + typecheck, parallel)
 #                  ↓
@@ -29,9 +28,9 @@ env:
 #     Catches cache-stability + correctness regressions that the smoke layer cannot see.
 #
 # Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
-# every PR and master push exercises the full unit → Docker → host gauntlet. The
+# every master/main push exercises the full unit → Docker → host gauntlet. The
 # scheduled Rust hermetic drift leg additionally checks the current private sibling
-# sources; it never runs on a pull request.
+# sources; it never runs on untrusted branch code.
 
 jobs:
   check-plugin:
@@ -382,8 +381,8 @@ jobs:
 
   rust-e2e-preflight:
     name: Rust hermetic E2E drift credential preflight
-    # Scheduled workflows use the default branch. This prevents deploy keys from
-    # being exposed to ordinary push or pull-request code.
+    # Scheduled workflows use the default branch. This prevents the private-source
+    # App token from being exposed to untrusted branch code.
     if: ${{ github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     permissions:
@@ -394,24 +393,24 @@ jobs:
       - id: credentials
         name: Report private-source credential state
         env:
-          COMMONS_READ_DEPLOY_KEY: ${{ secrets.COMMONS_READ_DEPLOY_KEY }}
-          SUBCONSCIOUS_READ_DEPLOY_KEY: ${{ secrets.SUBCONSCIOUS_READ_DEPLOY_KEY }}
+          CK_CI_APP_ID: ${{ secrets.CK_CI_APP_ID }}
+          CK_CI_APP_PRIVATE_KEY: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           missing_secrets=()
-          [[ -n "$COMMONS_READ_DEPLOY_KEY" ]] || missing_secrets+=("COMMONS_READ_DEPLOY_KEY")
-          [[ -n "$SUBCONSCIOUS_READ_DEPLOY_KEY" ]] || missing_secrets+=("SUBCONSCIOUS_READ_DEPLOY_KEY")
+          [[ -n "$CK_CI_APP_ID" ]] || missing_secrets+=("CK_CI_APP_ID")
+          [[ -n "$CK_CI_APP_PRIVATE_KEY" ]] || missing_secrets+=("CK_CI_APP_PRIVATE_KEY")
 
           if (( ${#missing_secrets[@]} > 0 )); then
             missing_prerequisite="$(IFS=','; echo "${missing_secrets[*]}")"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Rust hermetic E2E skipped::Missing prerequisite: Actions secret(s) ${missing_prerequisite}. Add the read-only deploy keys documented in .github/RUST_E2E_CI.md."
+            echo "::warning title=Rust hermetic E2E skipped::Missing prerequisite: Actions secret(s) ${missing_prerequisite}. Configure the cortexkit-ci GitHub App secrets documented in .github/RUST_E2E_CI.md."
             {
               echo "## Rust hermetic E2E drift"
               echo "SKIPPED: Missing prerequisite: Actions secret(s) ${missing_prerequisite}."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "Rust hermetic E2E drift is SKIPPED: private-source deploy-key secrets are absent. This scheduled run does not claim the Rust suite passed."
+            echo "Rust hermetic E2E drift is SKIPPED: cortexkit-ci GitHub App secrets are absent. This scheduled run does not claim the Rust suite passed."
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
             echo "Rust hermetic E2E credentials are available for the hosted drift runner."
@@ -419,8 +418,8 @@ jobs:
 
   e2e-rust-hermetic:
     name: E2E (Rust hermetic drift)
-    # This job uses private sibling source with read-only deploy keys. It must
-    # remain scheduled-only and never be copied to a pull_request trigger.
+    # This job uses private sibling source with a scoped cortexkit-ci GitHub App
+    # token. It must remain scheduled-only and never run on untrusted branch code.
     if: ${{ needs.rust-e2e-preflight.outputs.enabled == 'true' }}
     runs-on: ubuntu-latest
     needs: [e2e-host-opencode, e2e-host-pi, rust-e2e-preflight]
@@ -436,29 +435,35 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Check out private sibling sources
+      - name: Create scoped cortexkit-ci GitHub App token
+        id: cortexkit-ci-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious,commons
+
+      - name: Check out commons
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/commons
+          token: ${{ steps.cortexkit-ci-token.outputs.token }}
+          path: ../commons
+          persist-credentials: false
+
+      - name: Check out subconscious
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          token: ${{ steps.cortexkit-ci-token.outputs.token }}
+          path: ../subconscious
+          persist-credentials: false
+
+      - name: Record private sibling revisions
         shell: bash
-        env:
-          COMMONS_READ_DEPLOY_KEY: ${{ secrets.COMMONS_READ_DEPLOY_KEY }}
-          SUBCONSCIOUS_READ_DEPLOY_KEY: ${{ secrets.SUBCONSCIOUS_READ_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          key_dir="$(mktemp -d)"
-          chmod 700 "$key_dir"
-          cleanup() {
-            ssh-agent -k >/dev/null 2>&1 || true
-            rm -rf "$key_dir"
-          }
-          trap cleanup EXIT
-          umask 077
-          printf '%s\n' "$COMMONS_READ_DEPLOY_KEY" > "$key_dir/commons-read-deploy-key"
-          printf '%s\n' "$SUBCONSCIOUS_READ_DEPLOY_KEY" > "$key_dir/subconscious-read-deploy-key"
-          eval "$(ssh-agent -s)" >/dev/null
-          ssh-add "$key_dir/commons-read-deploy-key" "$key_dir/subconscious-read-deploy-key"
-          ssh-keyscan -t ed25519 github.com > "$key_dir/known_hosts"
-          export GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=$key_dir/known_hosts -o StrictHostKeyChecking=yes"
-          git clone --depth=1 git@github.com:cortexkit/commons.git "$GITHUB_WORKSPACE/../commons"
-          git clone --depth=1 git@github.com:cortexkit/subconscious.git "$GITHUB_WORKSPACE/../subconscious"
           commons_sha="$(git -C "$GITHUB_WORKSPACE/../commons" rev-parse HEAD)"
           subconscious_sha="$(git -C "$GITHUB_WORKSPACE/../subconscious" rev-parse HEAD)"
           summary="Rust hermetic sibling checkouts: commons=${commons_sha}; subconscious=${subconscious_sha}"

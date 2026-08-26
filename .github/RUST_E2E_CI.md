@@ -13,12 +13,12 @@ source workspaces, builds the current `ck-subc` and `ckdev-mc-e2e` pair into its
 e2e-owned Cargo target directory, and requires a real positive Bun pass summary.
 A missing prerequisite, crash, or zero-test run is never treated as a pass.
 
-## Active design: option A — GitHub-hosted Ubuntu runners
+## Active design: GitHub-hosted Ubuntu runners
 
 The release workflow runs `E2E (Rust hermetic)` on `ubuntu-latest` for `v*` tags.
 The nightly drift job in `ci.yml` runs the same hosted leg at 03:17 UTC from the
-default branch. The latter is deliberately schedule-only: it does not run on
-pushes or pull requests, so private-source credentials cannot reach PR code.
+default branch. The release leg is tag-only and the drift leg is schedule-only;
+private-source credentials are never made available to untrusted branch code.
 
 Ubuntu is the correct hosted OS for this stack. The harness rejects only Windows
 and otherwise uses portable Unix facilities (process spawning, signals, XDG
@@ -35,72 +35,51 @@ Each job checks out `cortexkit/commons` and `cortexkit/subconscious` beside
 `Cargo.lock`, both sibling lockfiles, runner OS, and architecture. The shared
 script performs the authoritative builds into that cache and runs the suite.
 
-## Required Actions secrets
+## Active credential flow: cortexkit-ci GitHub App
 
-Create these **repository** Actions secrets on `cortexkit/magic-context`:
+The active jobs consume these **repository** Actions secrets on
+`cortexkit/magic-context`:
 
-| Secret | Value shape | Repository granted access |
-| --- | --- | --- |
-| `COMMONS_READ_DEPLOY_KEY` | Complete unencrypted OpenSSH `ed25519` private key, including `-----BEGIN OPENSSH PRIVATE KEY-----` and `-----END OPENSSH PRIVATE KEY-----`; do not base64-encode or quote it. | `cortexkit/commons` only |
-| `SUBCONSCIOUS_READ_DEPLOY_KEY` | Complete unencrypted OpenSSH `ed25519` private key, including its begin/end lines; do not base64-encode or quote it. | `cortexkit/subconscious` only |
+| Secret | Use |
+| --- | --- |
+| `CK_CI_APP_ID` | App ID supplied to `actions/create-github-app-token@v1` |
+| `CK_CI_APP_PRIVATE_KEY` | Private key supplied to `actions/create-github-app-token@v1` |
 
-The workflow's raw `ssh-agent` step writes both keys to a temporary `0700`
-directory, adds them only long enough to clone the siblings, then stops the
-agent and removes the temporary key files before installing dependencies or
-running repository code. Do not replace these with a personal access token or a
-single reused deploy key: GitHub deploy keys are repository-scoped, and two
-independent read-only keys keep the blast radius to the required sources.
+Both secrets are already provisioned. This runbook documents consumption of the
+existing secrets; it does not require operator key-minting or secret creation.
 
-### Mint and install the read-only deploy keys
+Each private-source job follows the same flow:
 
-Run the following from an administrator workstation authenticated to GitHub with
-permission to manage deploy keys on both sibling repositories and Actions
-secrets on `cortexkit/magic-context`. The commands keep key contents out of
-shell arguments and history.
+1. `actions/create-github-app-token@v1` creates a short-lived installation token
+   using `CK_CI_APP_ID` and `CK_CI_APP_PRIVATE_KEY`.
+2. The action sets `owner: cortexkit` and
+   `repositories: subconscious,commons` **explicitly**. The explicit repository
+   list scopes the one-hour installation token to exactly the two sibling
+   repositories rather than granting the App's all-repositories reach.
+3. Each `actions/checkout@v5` sibling checkout uses
+   `${{ steps.cortexkit-ci-token.outputs.token }}` and sets
+   `persist-credentials: false`. The checkout still authenticates the clone, but
+   does not leave a live token in the repository's local Git configuration for
+   later build or test steps.
 
-```bash
-KEY_DIR="$HOME/.config/cortexkit/magic-context-rust-e2e-deploy-keys"
-install -d -m 700 "$KEY_DIR"
+Both private-source jobs declare `permissions: contents: read`. The release
+workflow's broader top-level permissions do not widen those job-level floors.
+The jobs remain protected by their tag-only or schedule-only reachability; do not
+copy either private-source job to a pull-request or other unprotected trigger.
 
-ssh-keygen -t ed25519 -a 100 \
-  -f "$KEY_DIR/commons-read-deploy-key" \
-  -N '' \
-  -C 'git@github.com:cortexkit/commons.git'
-ssh-keygen -t ed25519 -a 100 \
-  -f "$KEY_DIR/subconscious-read-deploy-key" \
-  -N '' \
-  -C 'git@github.com:cortexkit/subconscious.git'
+## Missing-secret degradation
 
-# `gh repo deploy-key add` is read-only unless --allow-write is supplied.
-gh repo deploy-key add "$KEY_DIR/commons-read-deploy-key.pub" \
-  --repo cortexkit/commons \
-  --title 'magic-context Rust hermetic CI (read-only)'
-gh repo deploy-key add "$KEY_DIR/subconscious-read-deploy-key.pub" \
-  --repo cortexkit/subconscious \
-  --title 'magic-context Rust hermetic CI (read-only)'
-
-# Read private-key contents from stdin; never paste them into a command line.
-gh secret set COMMONS_READ_DEPLOY_KEY --repo cortexkit/magic-context \
-  < "$KEY_DIR/commons-read-deploy-key"
-gh secret set SUBCONSCIOUS_READ_DEPLOY_KEY --repo cortexkit/magic-context \
-  < "$KEY_DIR/subconscious-read-deploy-key"
-```
-
-Confirm that both secret names appear in **Settings → Secrets and variables →
-Actions** for `cortexkit/magic-context`, then remove the local private-key copies
-according to the team's approved key-retention policy. Keep each public key
-listed as a read-only deploy key on only its matching sibling repository.
-
-No repository variable enables this lane. If either secret is absent, the
-credential-preflight job succeeds with a GitHub Actions warning titled **Rust
-hermetic E2E skipped** and a run-summary entry naming the exact missing secret.
-The Rust job is visibly skipped. Release publishing accepts only that explicit
-skipped state; an enabled Rust job that fails blocks publishing.
+The credential-preflight job checks both `CK_CI_APP_ID` and
+`CK_CI_APP_PRIVATE_KEY` without printing their values. If either is absent, the
+job emits a warning naming the exact missing secret, writes a `SKIPPED` entry to
+the job summary, and exposes `enabled=false`. The Rust job is visibly skipped,
+not reported as passed. Release publishing accepts only that explicit skipped
+state; an enabled Rust job that fails blocks publishing.
 
 ## First hosted-run check
 
-After minting the secrets, inspect the **E2E (Rust hermetic)** job summary. Its
-first line has this exact shape, with the two 40-character commit IDs:
+After the first run, inspect the **E2E (Rust hermetic)** job summary. Its first
+line has this exact shape, with the two 40-character commit IDs:
 
 ```text
 Rust hermetic sibling checkouts: commons=<sha>; subconscious=<sha>
@@ -109,26 +88,47 @@ Rust hermetic sibling checkouts: commons=<sha>; subconscious=<sha>
 Confirm both SHAs are the intended sibling revisions, then confirm the shared
 script's `Build ck-subc and ckdev-mc-e2e, then run Rust hermetic e2e` step passed.
 The nightly drift job writes the same line. This makes the first secret-backed
-run verifiable at a glance without revealing either key.
+run verifiable at a glance without revealing either secret.
 
 ## Security and maintenance
 
-Read-only deploy keys still let trusted workflow code read private sibling
-source. Protect release tags and workflow changes, restrict who can modify the
-default branch, and rotate or revoke each key immediately if a secret may have
-been exposed. The release job is tag-only and the CI job is schedule-only; do
-not add either private-source job to `pull_request`, fork-triggered, or manual
-unprotected workflows.
+The short-lived App installation token can read only the explicitly listed
+private sibling repositories for this job. Protect release tags and workflow
+changes, restrict who can modify the default branch, and rotate or revoke the
+App credential immediately if a secret may have been exposed. Keep the release
+job tag-only and the CI Rust job schedule-only; do not add either private-source
+job to a pull-request, fork-triggered, or manual unprotected workflow.
+
+## Fallback appendix — deploy-key checkout (NOT ACTIVE)
+
+> **NOT ACTIVE:** The current release and nightly jobs use the scoped
+> `cortexkit-ci` GitHub App flow above. No deploy-key secret or operator key
+> minting is required for the active lane. This appendix preserves the former
+> checkout's names and repository-scoped shape only as a fallback reference; do
+> not configure it unless the workflow is deliberately changed and reviewed.
+
+The former checkout used two independent read-only repository Actions secrets:
+
+| Secret | Former repository access |
+| --- | --- |
+| `COMMONS_READ_DEPLOY_KEY` | `cortexkit/commons` only |
+| `SUBCONSCIOUS_READ_DEPLOY_KEY` | `cortexkit/subconscious` only |
+
+That inactive shape wrote the keys to a temporary `0700` directory, loaded them
+into an `ssh-agent` only long enough to clone the siblings, then stopped the
+agent and removed the temporary key files. It used separate keys because deploy
+keys are repository-scoped. These names may remain here for historical fallback
+reference only; they must not appear in either workflow's active path.
 
 ## Option B: m1bench self-hosted runner — RETIRED
 
 > **RETIRED:** `m1bench` no longer exists. No workflow targets a self-hosted
 > `m1bench` label or relies on a persistent runner checkout.
 
-The former option B design used a dedicated Mac runner with pre-provisioned
-sibling source. It is retained here only as historical context. Do not recreate
-its repository variable, runner label, or persistent sibling checkout path;
-option A's hosted deploy-key design is the active release and nightly gate.
+The former option used a dedicated Mac runner with pre-provisioned sibling
+source. Do not recreate its repository variable, runner label, or persistent
+sibling checkout path; the hosted App-token design above is the active release
+and nightly gate.
 
 ## Alternative C: prebuilt daemon artifact (not wired)
 
