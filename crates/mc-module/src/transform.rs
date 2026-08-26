@@ -2514,7 +2514,10 @@ fn compose_additive_m0(
     } else {
         crate::project_docs::ProjectDocs::default()
     };
-    let mural = crate::m0_compose::resolved_mural(m0_mural_input(req, serializer_profile));
+    let mural = ctx
+        .memory_enabled
+        .then(|| crate::m0_compose::resolved_mural(m0_mural_input(req, serializer_profile)))
+        .flatten();
     let mut m0_bytes = render_m0(
         &M0Inputs {
             project_docs: &docs.rendered_block,

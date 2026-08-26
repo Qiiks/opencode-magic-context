@@ -2230,6 +2230,7 @@ export function createTransform(deps: TransformDeps) {
                 projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
                 injectDocs: deps.injectDocs,
+                memoryEnabled: deps.memoryConfig?.enabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
                 temporalAwareness: deps.experimentalTemporalAwareness,
