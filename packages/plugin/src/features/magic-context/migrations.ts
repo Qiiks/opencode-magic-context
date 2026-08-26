@@ -1,6 +1,7 @@
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -2970,6 +2971,7 @@ export function runMigrations(db: Database): void {
         let migration: Migration | undefined;
         let currentVersion = 0;
         try {
+            const transactionStartedAt = performance.now();
             const applied = db
                 .transaction(() => {
                     currentVersion = getCurrentVersion(db);
@@ -3004,6 +3006,7 @@ export function runMigrations(db: Database): void {
                     return true;
                 })
                 .immediate();
+            logSlowWriteTransaction("migration-runner", transactionStartedAt);
 
             if (!applied || !migration) break;
             if (migration.version <= 61) touchedLegacyAuthorityBatch = true;
@@ -3040,7 +3043,9 @@ export function runMigrations(db: Database): void {
 
     if (touchedLegacyAuthorityBatch) {
         try {
+            const transactionStartedAt = performance.now();
             db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+            logSlowWriteTransaction("migration-runner", transactionStartedAt);
         } catch (error) {
             throw new Error(
                 `Migration authority-trigger postcondition failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`,
