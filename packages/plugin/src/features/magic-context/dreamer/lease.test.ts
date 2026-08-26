@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
+import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
@@ -148,6 +149,61 @@ describe("dreamer lease (atomic CAS)", () => {
             count: 0,
         });
         closeQuietly(db);
+    });
+
+    it("logs a slow guarded write after COMMIT with its lease domain", () => {
+        const db = makeDb();
+        const events: string[] = [];
+        const realExec = db.exec.bind(db);
+        const execSpy = spyOn(db, "exec").mockImplementation((sql: string) => {
+            events.push(sql);
+            return realExec(sql);
+        });
+        const logSpy = spyOn(logger, "log").mockImplementation((message: string) => {
+            events.push(`log:${message}`);
+        });
+        const nowSpy = spyOn(performance, "now")
+            .mockImplementationOnce(() => 0)
+            .mockImplementationOnce(() => 1_001);
+        try {
+            expect(acquireLease(db, "holder-a", "memory:proj")).toBe(true);
+            db.prepare("CREATE TABLE guarded_write_timing (value TEXT)").run();
+            runLeaseGuardedWrite(db, "holder-a", "memory:proj", () => {
+                events.push("body");
+                db.prepare("INSERT INTO guarded_write_timing (value) VALUES ('committed')").run();
+            });
+
+            const commitIndex = events.indexOf("COMMIT");
+            const logIndex = events.findIndex((event) => event.startsWith("log:"));
+            expect(commitIndex).toBeGreaterThanOrEqual(0);
+            expect(logIndex).toBeGreaterThan(commitIndex);
+            expect(logSpy).toHaveBeenCalledWith(
+                expect.stringContaining("site=lease-guarded-write:memory:proj"),
+            );
+            expect(logSpy.mock.calls[0]?.[0]).toMatch(/held=1001\.0ms/);
+        } finally {
+            nowSpy.mockRestore();
+            logSpy.mockRestore();
+            execSpy.mockRestore();
+            closeQuietly(db);
+        }
+    });
+
+    it("does not log a guarded write below the slow-write threshold", () => {
+        const db = makeDb();
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        const nowSpy = spyOn(performance, "now")
+            .mockImplementationOnce(() => 0)
+            .mockImplementationOnce(() => 999);
+        try {
+            expect(acquireLease(db, "holder-a", "memory:proj")).toBe(true);
+            runLeaseGuardedWrite(db, "holder-a", "memory:proj", () => {});
+            expect(logSpy).not.toHaveBeenCalled();
+        } finally {
+            nowSpy.mockRestore();
+            logSpy.mockRestore();
+            closeQuietly(db);
+        }
     });
 
     it("allows exactly one winner across separate DB handles", () => {

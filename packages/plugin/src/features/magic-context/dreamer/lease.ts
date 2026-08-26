@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../../shared/write-transaction-timing";
 import { deleteDreamState, getDreamState, setDreamState } from "./storage-dream-state";
 
 const LEASE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — renewed periodically during task execution
@@ -105,13 +106,17 @@ export function leaseOwnershipMatches(
 // = false under WAL snapshot isolation and both write — double-acquiring the
 // lease and spawning duplicate dreamer workers. busy_timeout (set in
 // initializeDatabase) makes the loser wait rather than throw SQLITE_BUSY.
-function runImmediate<T>(db: Database, body: () => T): T {
+function runImmediate<T>(db: Database, body: () => T, site?: string): T {
+    const transactionStartedAt = site === undefined ? undefined : performance.now();
     db.exec("BEGIN IMMEDIATE");
     let committed = false;
     try {
         const result = body();
         db.exec("COMMIT");
         committed = true;
+        if (site !== undefined && transactionStartedAt !== undefined) {
+            logSlowWriteTransaction(site, transactionStartedAt);
+        }
         return result;
     } finally {
         if (!committed) {
@@ -191,15 +196,19 @@ export function runLeaseGuardedWrite<T>(
     leaseKey: string,
     fn: () => T,
 ): T {
-    return runImmediate(db, () => {
-        // The lease is checked after BEGIN IMMEDIATE has acquired SQLite's write
-        // lock. That removes the deferred-transaction gap where another process
-        // could steal the lease after a peek but before the durable mutation.
-        if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
-            throw new Error("Dream lease lost before guarded write");
-        }
-        return fn();
-    });
+    return runImmediate(
+        db,
+        () => {
+            // The lease is checked after BEGIN IMMEDIATE has acquired SQLite's write
+            // lock. That removes the deferred-transaction gap where another process
+            // could steal the lease after a peek but before the durable mutation.
+            if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
+                throw new Error("Dream lease lost before guarded write");
+            }
+            return fn();
+        },
+        `lease-guarded-write:${leaseKey}`,
+    );
 }
 
 /** Renewal beat interval. The lease TTL is LEASE_DURATION_MS (2×), so a single
