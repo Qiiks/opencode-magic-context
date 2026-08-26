@@ -55,8 +55,9 @@ use mc_store::{
     LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
     PendingAgentDrop, PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint,
-    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TemporalMarkInput,
-    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TailHygienePartKind,
+    TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
+    UserHintDecisionInput, UserHintRow,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -9249,7 +9250,7 @@ fn maybe_append_channel1_nudge(
     let reminder = build_channel1_reminder(
         decision.level,
         decision.reclaimable_tokens,
-        input.usable_window_tokens,
+        reclaimable_tool_output_count(input.baseline),
         &hint,
         sticky,
     );
@@ -9418,6 +9419,7 @@ struct Channel2DirectiveInput<'a> {
 struct Channel2Pressure {
     due: bool,
     reclaimable_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: Vec<(i64, String)>,
 }
 
@@ -9448,7 +9450,7 @@ fn channel2_directives(
                     channel2_nudge: Some(Channel2NudgeDirective {
                         text: build_channel2_host_reminder(
                             pressure.reclaimable_tokens,
-                            input.usable_window_tokens,
+                            pressure.reclaimable_tool_outputs,
                             &pressure.hint,
                         ),
                     }),
@@ -9496,6 +9498,7 @@ fn channel2_pressure(
     Some(Channel2Pressure {
         due,
         reclaimable_tokens,
+        reclaimable_tool_outputs: reclaimable_tool_output_count(input.baseline),
         hint,
     })
 }
@@ -9585,7 +9588,7 @@ fn claude_code_channel2_directive(
     let pending = PendingChannel2Directive {
         text: build_channel2_reminder_text(
             pressure.reclaimable_tokens,
-            input.usable_window_tokens,
+            pressure.reclaimable_tool_outputs,
             &pressure.hint,
         ),
         directive_id: channel2_directive_id(session_id, arming_watermark),
@@ -9650,23 +9653,22 @@ fn oldest_channel2_hint(
 
 fn build_channel2_reminder_text(
     reclaimable_tokens: i64,
-    usable_window_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: &[(i64, String)],
 ) -> String {
-    let amount = approx_thousands(reclaimable_tokens);
-    let usable_window = approx_thousands(usable_window_tokens);
+    let summary = format_reclaimable_output_summary(reclaimable_tool_outputs, reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
     format!(
-        "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~{amount} of ~{usable_window} reclaimable).{hint_text}"
+        "Routine housekeeping: {summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.{hint_text}"
     )
 }
 
 fn build_channel2_host_reminder(
     reclaimable_tokens: i64,
-    usable_window_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: &[(i64, String)],
 ) -> String {
-    let text = build_channel2_reminder_text(reclaimable_tokens, usable_window_tokens, hint);
+    let text = build_channel2_reminder_text(reclaimable_tokens, reclaimable_tool_outputs, hint);
     format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
@@ -9739,6 +9741,7 @@ fn channel1_refire_tokens(tail_tokens: i64) -> i64 {
 #[cfg(test)]
 mod nudge_formula_tests {
     use super::*;
+    use serde::Deserialize;
 
     fn baseline(u: i64, t: i64) -> TailHygieneBaseline {
         TailHygieneBaseline {
@@ -9877,19 +9880,94 @@ mod nudge_formula_tests {
         assert!(format_reclaimable_hint(&hint).is_empty());
     }
 
+    #[derive(Debug, Deserialize)]
+    struct ReminderCopyGolden {
+        schema: u32,
+        cases: Vec<ReminderCopyGoldenCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ReminderCopyGoldenCase {
+        id: String,
+        channel: String,
+        level: Option<String>,
+        reclaimable_tool_outputs: usize,
+        reclaimable_tokens: i64,
+        #[serde(default)]
+        sticky: bool,
+        hint: Vec<ReminderCopyGoldenHint>,
+        expected: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ReminderCopyGoldenHint {
+        tag_number: i64,
+        tool_name: String,
+    }
+
     #[test]
-    fn reminder_wording_uses_the_usable_window_and_keeps_gentle_number_free() {
-        let gentle = build_channel1_reminder(Channel1Level::Gentle, 42_000, 128_000, &[], false);
-        assert!(gentle.contains("Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope."));
-        assert!(!gentle.chars().any(|character| character.is_ascii_digit()));
+    fn reminder_copy_matches_the_typescript_golden_without_capacity_gauges() {
+        let golden: ReminderCopyGolden = serde_json::from_str(include_str!(
+            "../testdata/ctx-reduce-nudge-copy-golden.json"
+        ))
+        .expect("parse ctx_reduce nudge copy golden");
+        assert_eq!(golden.schema, 1);
 
-        let firm = build_channel1_reminder(Channel1Level::Firm, 42_000, 128_000, &[], false);
-        assert!(firm.contains("Housekeeping: ~42k of this session's ~128k window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."));
-        let urgent = build_channel1_reminder(Channel1Level::Urgent, 61_000, 128_000, &[], false);
-        assert!(urgent.contains("Housekeeping backlog: ~61k of this session's ~128k window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."));
-
-        let channel2 = build_channel2_reminder_text(55_000, 128_000, &[]);
-        assert_eq!(channel2, "Routine housekeeping: an older span of this session folds into compact history automatically — nothing is lost and nothing pauses. Drop spent tool outputs with ctx_reduce first so the archive keeps only what matters (~55k of ~128k reclaimable).");
+        for reminder in golden.cases {
+            let hint = reminder
+                .hint
+                .iter()
+                .map(|hint| (hint.tag_number, hint.tool_name.clone()))
+                .collect::<Vec<_>>();
+            let rendered = match reminder.channel.as_str() {
+                "channel1" => build_channel1_reminder(
+                    Channel1Level::parse(reminder.level.as_deref().unwrap_or_default())
+                        .expect("channel1 golden must name a known level"),
+                    reminder.reclaimable_tokens,
+                    reminder.reclaimable_tool_outputs,
+                    &hint,
+                    reminder.sticky,
+                ),
+                "channel2" => build_channel2_host_reminder(
+                    reminder.reclaimable_tokens,
+                    reminder.reclaimable_tool_outputs,
+                    &hint,
+                ),
+                unknown => panic!("unknown reminder golden channel: {unknown}"),
+            };
+            assert_eq!(rendered, reminder.expected, "{} copy drifted", reminder.id);
+            assert!(
+                !rendered.contains("of ~"),
+                "{} exposed a denominator",
+                reminder.id
+            );
+            assert!(
+                !rendered.contains("of this session"),
+                "{} exposed session capacity",
+                reminder.id
+            );
+            assert_eq!(
+                Regex::new(r"~\d+(?:\.\d+)?k\b")
+                    .unwrap()
+                    .find_iter(&rendered)
+                    .count(),
+                1,
+                "{} exposed more than the reclaimable token mass",
+                reminder.id
+            );
+            assert!(
+                !Regex::new(r"\b\d+(?:\.\d+)?\s*%")
+                    .unwrap()
+                    .is_match(&rendered),
+                "{} exposed a percentage",
+                reminder.id
+            );
+            assert!(
+                !Regex::new(r"(?i)\bwindow\b").unwrap().is_match(&rendered),
+                "{} exposed context capacity",
+                reminder.id
+            );
+        }
     }
 
     #[test]
@@ -9927,11 +10005,11 @@ mod nudge_formula_tests {
             Channel1Level::Urgent,
             1,
         ));
-        let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 128_000, &[], true);
-        assert!(sticky.contains("Reminder: ctx_reduce housekeeping still pending —"));
-        assert!(!sticky.contains("Not a limit"));
-        let escalation =
-            build_channel1_reminder(Channel1Level::Urgent, 80_000, 128_000, &[], false);
+        let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 16, &[], true);
+        assert!(
+            sticky.contains("Reminder: 16 spent tool outputs (~70k tokens) are still reclaimable")
+        );
+        let escalation = build_channel1_reminder(Channel1Level::Urgent, 80_000, 16, &[], false);
         assert!(escalation.contains("Housekeeping backlog:"));
     }
 
@@ -10118,33 +10196,50 @@ fn should_use_sticky_channel1_reminder(
         && current_real_user_turn_count - last_ordinal < CHANNEL1_STICKY_REAL_USER_TURN_GAP
 }
 
+fn reclaimable_tool_output_count(baseline: Option<&TailHygieneBaseline>) -> usize {
+    baseline
+        .into_iter()
+        .flat_map(|baseline| baseline.baseline_parts.iter())
+        .filter(|part| part.kind == TailHygienePartKind::ToolOutput && part.u_tokens > 0)
+        .count()
+}
+
 fn build_channel1_reminder(
     level: Channel1Level,
     reclaimable_tokens: i64,
-    usable_window_tokens: i64,
+    reclaimable_tool_outputs: usize,
     hint: &[(i64, String)],
     sticky: bool,
 ) -> String {
+    let summary = format_reclaimable_output_summary(reclaimable_tool_outputs, reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
     if sticky {
         return format!(
-            "\n\n<system-reminder>\nReminder: ctx_reduce housekeeping still pending —{hint_text}\n</system-reminder>"
+            "\n\n<system-reminder>\nReminder: {summary} are still reclaimable — ctx_reduce them at a natural stopping point.{hint_text}\n</system-reminder>"
         );
     }
 
-    let amount = approx_thousands(reclaimable_tokens);
-    let usable_window = approx_thousands(usable_window_tokens);
     let body = match level {
-        Channel1Level::Gentle =>
-            "Housekeeping: some earlier tool outputs are spent and can be dropped with ctx_reduce when you are done with them. Context is managed automatically — this is tidiness, never a reason to rush or narrow scope.".to_string(),
+        Channel1Level::Gentle => format!(
+            "Housekeeping: {summary} are reclaimable — drop the ones you have already processed with ctx_reduce at a natural stopping point."
+        ),
         Channel1Level::Firm => format!(
-            "Housekeeping: ~{amount} of this session's ~{usable_window} window is spent tool output. Drop what you have already processed with ctx_reduce at a natural stopping point. Not a limit — nothing is lost either way."
+            "Housekeeping: {summary} are reclaimable — make a ctx_reduce pass at a natural stopping point."
         ),
         Channel1Level::Urgent => format!(
-            "Housekeeping backlog: ~{amount} of this session's ~{usable_window} window is spent tool output — worth a ctx_reduce pass now. This is routine and lossless; it is never a reason to change scope."
+            "Housekeeping backlog: {summary} are reclaimable — a ctx_reduce pass is due."
         ),
     };
     format!("\n\n<system-reminder>\n{body}{hint_text}\n</system-reminder>")
+}
+
+fn format_reclaimable_output_summary(reclaimable_tool_outputs: usize, tokens: i64) -> String {
+    let outputs = match reclaimable_tool_outputs {
+        0 => "spent tool outputs".to_string(),
+        1 => "1 spent tool output".to_string(),
+        count => format!("{count} spent tool outputs"),
+    };
+    format!("{outputs} (~{} tokens)", approx_thousands(tokens))
 }
 
 fn approx_thousands(tokens: i64) -> String {
@@ -26218,8 +26313,13 @@ pub(crate) mod tests {
             let refire_request = with_usage(refire_request, 900, 1024);
             let sticky = run(&s, &refire_request, &spine());
             let sticky_result = tail_bytes(&sticky, "result3").to_string();
+            assert_eq!(
+                tail_bytes(&sticky, "result2"),
+                first_result,
+                "the first reminder span is frozen while the new cache-busting tail appends its own span"
+            );
             assert!(
-                sticky_result.contains("Reminder: ctx_reduce housekeeping still pending —"),
+                sticky_result.contains("Reminder: "),
                 "expected sticky refire, got {sticky_result}"
             );
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
@@ -26299,7 +26399,7 @@ pub(crate) mod tests {
             let resumed_result = tail_bytes(&resumed, "result5");
             assert!(resumed_result.contains("<system-reminder>"));
             assert!(resumed_result.contains("Housekeeping"));
-            assert!(!resumed_result.contains("Reminder: ctx_reduce housekeeping still pending"));
+            assert!(!resumed_result.contains("Reminder: "));
             assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 2);
         });
     }
