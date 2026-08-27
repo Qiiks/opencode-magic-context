@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize structural evidence from anthropic-auth request wire dumps.
+"""Summarize TS/Rust parity evidence from served wire dumps and durable rows.
 
-The audit intentionally compares serialized request bodies rather than trying to
-reconstruct them from transform state. Rust-mode sessions are explicit because
-that lane assignment is not encoded in the dump filename.
+Serialized provider requests remain ground truth. Lane assignment is accepted
+only after reading each live project's magic-context.jsonc; transform telemetry
+then reports any disagreement between configured and observed authority.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from typing import Any, Iterable
 RUST_SESSIONS = {
     "ses_0ad83017cffexe0g5N8UG0y3LZ",  # ENGRAM Rust transform session
     "ses_08df2045bffeBcWcqw60elghER",  # ASTROCYTE Rust transform session
-    "ses_12a4fa38dffe81Fz7Y2AsWb5Cg",  # SUBCONSCIOUS configured Rust session
 }
 SESSION_PATTERN = re.compile(r"-(ses_[^-]+)-")
 TAG_PATTERN = re.compile(r"^§(\d+)§(?P<separator> |$)")
@@ -83,6 +82,8 @@ TRUNCATION_SENTINEL = "...[truncated]"
 EDIT_TOOL_NAMES = {"edit", "write", "mcp_edit", "mcp_write"}
 EDIT_DIFF_KEYS = {"content", "newstring", "oldstring", "patch", "diff"}
 WORKING_DIRECTORY_PATTERN = re.compile(r"^Working directory: (?P<path>.+)$", re.MULTILINE)
+TRANSFORM_MODE_PATTERN = re.compile(r'"transform_mode"\s*:\s*"(?P<mode>ts|rust)"')
+CTX_FACADE_NAMES = {"ctx_expand", "ctx_note", "ctx_search"}
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,14 @@ def parse_args() -> argparse.Namespace:
         "--rust-session",
         action="append",
         dest="rust_sessions",
-        help="override the configured Rust session set (repeatable)",
+        help="assert an expected Rust session (repeatable; config still decides its lane)",
+    )
+    parser.add_argument(
+        "--project-config",
+        action="append",
+        default=[],
+        metavar="PROJECT_ROOT=CONFIG_PATH",
+        help="override <root>/.cortexkit/magic-context.jsonc for lane verification",
     )
     parser.add_argument(
         "--context-db",
@@ -392,6 +400,129 @@ def project_root(body: dict[str, Any]) -> str | None:
     return None
 
 
+def strip_jsonc_comments(value: str) -> str:
+    output: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(value):
+        char = value[index]
+        next_char = value[index + 1] if index + 1 < len(value) else ""
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            index += 2
+            while index < len(value) and value[index] not in "\r\n":
+                index += 1
+            continue
+        if char == "/" and next_char == "*":
+            index += 2
+            while index + 1 < len(value) and value[index : index + 2] != "*/":
+                index += 1
+            index = min(len(value), index + 2)
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def project_config_overrides(values: Iterable[str]) -> dict[str, Path]:
+    overrides: dict[str, Path] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"project config override must be ROOT=PATH: {value}")
+        root, path = value.split("=", 1)
+        if not root or not path:
+            raise ValueError(f"project config override must be ROOT=PATH: {value}")
+        overrides[str(Path(root).expanduser())] = Path(path).expanduser()
+    return overrides
+
+
+def configured_transform_mode(path: Path) -> tuple[str | None, str | None]:
+    try:
+        text = path.read_text()
+    except OSError as error:
+        return None, str(error)
+    match = TRANSFORM_MODE_PATTERN.search(strip_jsonc_comments(text))
+    return (match.group("mode") if match else "ts"), None
+
+
+def verify_dump_lanes(
+    dumps: list[Dump],
+    expected_rust_sessions: set[str],
+    overrides: dict[str, Path],
+) -> tuple[list[Dump], dict[str, Any]]:
+    verified: list[Dump] = []
+    rows: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for dump in dumps:
+        root = project_root(dump.body)
+        config_path = (
+            overrides.get(str(Path(root).expanduser()))
+            if root is not None
+            else None
+        )
+        if config_path is None and root is not None:
+            config_path = Path(root).expanduser() / ".cortexkit" / "magic-context.jsonc"
+        mode, error = (
+            configured_transform_mode(config_path)
+            if config_path is not None
+            else (None, "project root unavailable in served system bytes")
+        )
+        configured_lane = mode if mode in ("rust", "ts") else "unverified"
+        claimed_lane = "rust" if dump.session in expected_rust_sessions else "ts"
+        status = (
+            "verified"
+            if configured_lane == claimed_lane
+            else "label_corrected_from_live_config"
+            if configured_lane != "unverified"
+            else "unverified"
+        )
+        verified.append(
+            Dump(
+                path=dump.path,
+                session=dump.session,
+                lane=configured_lane,
+                body=dump.body,
+                response=dump.response,
+            )
+        )
+        key = (dump.session, root)
+        row = rows.setdefault(
+            key,
+            {
+                "session": dump.session,
+                "project_root": root,
+                "config_path": str(config_path) if config_path is not None else None,
+                "claimed_lane": claimed_lane,
+                "configured_lane": configured_lane,
+                "status": status,
+                "error": error,
+                "dump_count": 0,
+            },
+        )
+        row["dump_count"] += 1
+    return verified, {
+        "sessions": sorted(rows.values(), key=lambda row: (row["session"], row["project_root"] or "")),
+        "denominator_dump_counts": dict(
+            sorted(collections.Counter(dump.lane for dump in verified).items())
+        ),
+        "rule": "only dumps whose live project config was readable enter rust/ts denominators",
+    }
+
+
 def media_shape(message_index: int, role: Any, block: dict[str, Any]) -> tuple[Any, ...] | None:
     block_type = block.get("type")
     if block_type not in ("image", "document", "file", "attachment"):
@@ -437,11 +568,357 @@ def parse_bound(value: str | None, date: str, end: bool = False) -> int:
     return int(day.timestamp() * 1000)
 
 
+def table_columns(db: sqlite3.Connection, table: str) -> list[str]:
+    exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    if exists is None:
+        return []
+    quoted = table.replace('"', '""')
+    return [str(row[1]) for row in db.execute(f'PRAGMA table_info("{quoted}")')]
+
+
+def fetch_dicts(
+    db: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    cursor = db.execute(sql, parameters)
+    names = [str(column[0]) for column in cursor.description or ()]
+    return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+
+def session_table_inventory(db: sqlite3.Connection) -> list[str]:
+    tables = [
+        str(row[0])
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    ]
+    return sorted(table for table in tables if "session_id" in table_columns(db, table))
+
+
+def scoped_table_rows(
+    db: sqlite3.Connection,
+    table: str,
+    columns: Iterable[str],
+    sessions: set[str],
+    start_ms: int,
+    end_ms: int,
+    created_column: str | None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    available = table_columns(db, table)
+    selected = [column for column in columns if column in available]
+    if not available or "session_id" not in available or not sessions:
+        return available, []
+    placeholders = ",".join("?" for _ in sessions)
+    predicates = [f"session_id IN ({placeholders})"]
+    parameters: list[Any] = list(sorted(sessions))
+    if created_column is not None and created_column in available:
+        predicates.append(f"{created_column} >= ? AND {created_column} < ?")
+        parameters.extend((start_ms, end_ms))
+    quoted = table.replace('"', '""')
+    projection = ", ".join(f'"{column}"' for column in selected)
+    return available, fetch_dicts(
+        db,
+        f'SELECT {projection} FROM "{quoted}" WHERE {" AND ".join(predicates)} ORDER BY session_id',
+        tuple(parameters),
+    )
+
+
+def summarize_historian_rows(
+    db: sqlite3.Connection,
+    lane: str,
+    sessions: set[str],
+    start_ms: int,
+    end_ms: int,
+) -> dict[str, Any]:
+    compartment_table = "mc_compartments" if lane == "rust" else "compartments"
+    compartment_columns, compartments = scoped_table_rows(
+        db,
+        compartment_table,
+        (
+            "session_id",
+            "sequence",
+            "start_message",
+            "end_message",
+            "start_date",
+            "end_date",
+            "p1",
+            "p2",
+            "p3",
+            "p4",
+            "importance",
+            "legacy",
+            "created_at",
+        ),
+        sessions,
+        start_ms,
+        end_ms,
+        "created_at",
+    )
+    tier_columns = [column for column in ("p1", "p2", "p3", "p4") if column in compartment_columns]
+    importance = [
+        int(row["importance"])
+        for row in compartments
+        if isinstance(row.get("importance"), int)
+    ]
+    date_columns = [
+        column for column in ("start_date", "end_date") if column in compartment_columns
+    ]
+    compartment_summary = {
+        "table": compartment_table,
+        "columns": compartment_columns,
+        "rows_born_in_window": len(compartments),
+        "sessions": counter_dict(
+            collections.Counter(row.get("session_id") for row in compartments)
+        ),
+        "tier_complete_rows": sum(
+            all(isinstance(row.get(column), str) and bool(row[column]) for column in tier_columns)
+            for row in compartments
+        )
+        if len(tier_columns) == 4
+        else None,
+        "legacy_rows": sum(row.get("legacy") == 1 for row in compartments),
+        "importance": {
+            "min": min(importance) if importance else None,
+            "max": max(importance) if importance else None,
+            "average": round(sum(importance) / len(importance), 3) if importance else None,
+        },
+        "date_columns": date_columns,
+        "complete_date_rows": sum(
+            all(isinstance(row.get(column), str) and bool(row[column]) for column in date_columns)
+            for row in compartments
+        )
+        if len(date_columns) == 2
+        else None,
+        "samples": [
+            {
+                "session": row.get("session_id"),
+                "sequence": row.get("sequence"),
+                "range": [row.get("start_message"), row.get("end_message")],
+                "tier_presence": [bool(row.get(column)) for column in tier_columns],
+                "importance": row.get("importance"),
+                "legacy": row.get("legacy"),
+                "dates": [row.get("start_date"), row.get("end_date")]
+                if date_columns
+                else "derived_from_raw_messages_at_ts_render_time",
+                "created_at": row.get("created_at"),
+            }
+            for row in compartments[:12]
+        ],
+    }
+
+    memory_table = "mc_memories" if lane == "rust" else "memories"
+    memory_columns, facts = scoped_table_rows(
+        db,
+        memory_table,
+        (
+            "session_id",
+            "source_session_id",
+            "category",
+            "content",
+            "importance",
+            "source_type",
+            "created_at",
+        ),
+        sessions,
+        start_ms,
+        end_ms,
+        "created_at",
+    )
+    if "source_session_id" in memory_columns and sessions:
+        placeholders = ",".join("?" for _ in sessions)
+        projection = ", ".join(
+            f'"{column}"'
+            for column in (
+                "source_session_id",
+                "category",
+                "content",
+                "importance",
+                "source_type",
+                "created_at",
+            )
+            if column in memory_columns
+        )
+        predicates = [f"source_session_id IN ({placeholders})"]
+        parameters: list[Any] = list(sorted(sessions))
+        if "created_at" in memory_columns:
+            predicates.append("created_at >= ? AND created_at < ?")
+            parameters.extend((start_ms, end_ms))
+        facts = fetch_dicts(
+            db,
+            f'SELECT {projection} FROM "{memory_table}" WHERE {" AND ".join(predicates)} ORDER BY source_session_id, created_at',
+            tuple(parameters),
+        )
+    else:
+        facts = []
+    fact_summary = {
+        "table": memory_table,
+        "rows_promoted_in_window": len(facts),
+        "sessions": counter_dict(
+            collections.Counter(row.get("source_session_id") for row in facts)
+        ),
+        "categories": counter_dict(collections.Counter(row.get("category") for row in facts)),
+        "samples": [
+            {
+                "session": row.get("source_session_id"),
+                "category": row.get("category"),
+                "content_sha256_12": hashlib.sha256(
+                    str(row.get("content", "")).encode()
+                ).hexdigest()[:12],
+                "content_bytes": len(str(row.get("content", "")).encode()),
+                "importance": row.get("importance"),
+                "source_type": row.get("source_type"),
+                "created_at": row.get("created_at"),
+            }
+            for row in facts[:12]
+        ],
+    }
+
+    side_table = (
+        "mc_historian_side_channel_outbox" if lane == "rust" else "compartment_events"
+    )
+    side_columns, side_rows = scoped_table_rows(
+        db,
+        side_table,
+        (
+            "session_id",
+            "kind",
+            "firing_seq",
+            "source_start",
+            "source_end",
+            "at_compartment",
+            "attempt_count",
+            "delivered_at_ms",
+            "last_error",
+            "created_at",
+            "created_at_ms",
+        ),
+        sessions,
+        start_ms,
+        end_ms,
+        "created_at_ms" if lane == "rust" else "created_at",
+    )
+    side_summary = {
+        "table": side_table,
+        "columns": side_columns,
+        "rows_born_in_window": len(side_rows),
+        "kinds": counter_dict(collections.Counter(row.get("kind") for row in side_rows)),
+        "pending_delivery_rows": sum(
+            "delivered_at_ms" in row and row.get("delivered_at_ms") is None for row in side_rows
+        ),
+        "failed_delivery_rows": sum(bool(row.get("last_error")) for row in side_rows),
+    }
+    return {
+        "compartments": compartment_summary,
+        "promoted_facts": fact_summary,
+        "historian_side_effects": side_summary,
+        "session_id_tables": session_table_inventory(db),
+        "session_delete_coverage": (
+            "dynamic: session.delete deletes every live table with an exact session_id column"
+            if lane == "rust"
+            else "static shared table list; storage-db lockstep test compares it to this schema inventory"
+        ),
+    }
+
+
+def observed_authority_lanes(
+    context_db: Path | None,
+    store_db: Path | None,
+    sessions: set[str],
+    start_ms: int,
+    end_ms: int,
+) -> dict[str, str]:
+    operand_rows: collections.Counter[str] = collections.Counter()
+    if context_db is not None and sessions:
+        placeholders = ",".join("?" for _ in sessions)
+        with sqlite3.connect(f"file:{context_db}?mode=ro", uri=True) as db:
+            rows = db.execute(
+                f"""SELECT session_id, system_hash_prev, system_hash_new,
+                           m0_model_key_prev, m0_model_key_new,
+                           m0_tool_set_hash_prev, m0_tool_set_hash_new
+                      FROM transform_decisions
+                     WHERE session_id IN ({placeholders}) AND ts_ms >= ? AND ts_ms < ?""",
+                (*sorted(sessions), start_ms, end_ms),
+            ).fetchall()
+        for session, *operands in rows:
+            if any(value is not None for value in operands):
+                operand_rows[str(session)] += 1
+    module_active: set[str] = set()
+    if store_db is not None and sessions:
+        placeholders = ",".join("?" for _ in sessions)
+        with sqlite3.connect(f"file:{store_db}?mode=ro", uri=True) as db:
+            rows = db.execute(
+                f"SELECT session_id, last_activity_at FROM mc_cache_state WHERE session_id IN ({placeholders})",
+                tuple(sorted(sessions)),
+            ).fetchall()
+        module_active = {
+            str(session)
+            for session, last_activity in rows
+            if isinstance(last_activity, int) and start_ms <= last_activity < end_ms
+        }
+    return {
+        session: (
+            "ts"
+            if operand_rows[session] > 0
+            else "rust"
+            if session in module_active
+            else "unknown"
+        )
+        for session in sessions
+    }
+
+
+def apply_observed_lanes(
+    dumps: list[Dump],
+    verification: dict[str, Any],
+    observed: dict[str, str],
+) -> list[Dump]:
+    effective: list[Dump] = []
+    for dump in dumps:
+        observed_lane = observed.get(dump.session, "unknown")
+        lane = (
+            observed_lane
+            if dump.lane in ("rust", "ts") and observed_lane in ("rust", "ts")
+            else dump.lane
+        )
+        effective.append(
+            Dump(
+                path=dump.path,
+                session=dump.session,
+                lane=lane,
+                body=dump.body,
+                response=dump.response,
+            )
+        )
+    for row in verification["sessions"]:
+        observed_lane = observed.get(row["session"], "unknown")
+        row["observed_lane"] = observed_lane
+        row["effective_lane"] = (
+            observed_lane
+            if row["configured_lane"] in ("rust", "ts")
+            and observed_lane in ("rust", "ts")
+            else row["configured_lane"]
+        )
+        if (
+            row["configured_lane"] in ("rust", "ts")
+            and observed_lane in ("rust", "ts")
+            and observed_lane != row["configured_lane"]
+        ):
+            row["status"] = "config_and_durable_authority_disagree"
+    verification["denominator_dump_counts"] = dict(
+        sorted(collections.Counter(dump.lane for dump in effective).items())
+    )
+    verification["rule"] = (
+        "read live project config first; decisive in-window durable authority then selects the effective denominator"
+    )
+    return effective
+
+
 def summarize_telemetry(
     context_db: Path | None,
     store_db: Path | None,
     sessions: set[str],
-    configured_rust_sessions: set[str],
+    lane_by_session: dict[str, str],
     start_ms: int,
     end_ms: int,
 ) -> dict[str, Any]:
@@ -469,6 +946,13 @@ def summarize_telemetry(
                        FROM tags WHERE caveman_depth > 0
                       GROUP BY session_id, caveman_depth ORDER BY session_id, caveman_depth"""
             ).fetchall()
+            report["ts_historian_rows"] = summarize_historian_rows(
+                db,
+                "ts",
+                {session for session in sessions if lane_by_session.get(session) == "ts"},
+                start_ms,
+                end_ms,
+            )
         report["caveman_depth_state"] = [
             {
                 "session": row[0],
@@ -503,6 +987,13 @@ def summarize_telemetry(
                 ).fetchall()
             else:
                 scheduler_rows = []
+            report["rust_historian_rows"] = summarize_historian_rows(
+                db,
+                "rust",
+                {session for session in sessions if lane_by_session.get(session) == "rust"},
+                start_ms,
+                end_ms,
+            )
         scheduler_report: dict[str, Any] = {}
         for session, history_json, interesting_json in scheduler_rows:
             history = [
@@ -548,7 +1039,7 @@ def summarize_telemetry(
         rows = transform_rows.get(session, [])
         operand_rows = sum(any(value is not None for value in row[6:]) for row in rows)
         module_active = module_activity.get(session, {}).get(
-            "active_since_window_start", False
+            "last_activity_in_window", False
         )
         observed_lane = (
             "rust"
@@ -560,7 +1051,7 @@ def summarize_telemetry(
         decisions = collections.Counter(row[1] for row in rows)
         reasons = collections.Counter(row[2] for row in rows)
         decision_report[session] = {
-            "configured_lane": "rust" if session in configured_rust_sessions else "ts",
+            "configured_lane": lane_by_session.get(session, "unverified"),
             "observed_lane": observed_lane,
             "rows": len(rows),
             "rows_with_ts_only_operands": operand_rows,
@@ -1193,37 +1684,196 @@ def summarize_lane(dumps: list[Dump]) -> dict[str, Any]:
     }
 
 
+def tool_result_text(block: dict[str, Any]) -> str | None:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        values = [
+            item.get("text")
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        return "\n".join(values) if values else None
+    return None
+
+
+def normalize_facade_output(value: str) -> str:
+    normalized = TAG_PATTERN.sub("", value, count=1)
+    return TEMPORAL_PATTERN.sub("", normalized, count=1)
+
+
+def facade_output_shape(value: str) -> str:
+    if DROP_PATTERN.fullmatch(value) or SEARCH_HINT_DROP_PATTERN.fullmatch(value):
+        return "dropped"
+    first = value.splitlines()[0] if value else "empty"
+    if first.startswith("Messages ") and "(verbose)" in first:
+        return "expand_verbose"
+    if first.startswith("Messages "):
+        return "expand_range"
+    if "full recovery:" in first:
+        return "expand_full"
+    if first.startswith("No message") or "no longer recoverable" in first:
+        return "expand_missing"
+    if first.startswith("Error:"):
+        return "error"
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return "json_array"
+        except json.JSONDecodeError:
+            pass
+    return first[:80]
+
+
+def compare_ctx_facades(dumps: list[Dump]) -> dict[str, Any]:
+    observations: dict[
+        tuple[str, str], dict[str, dict[tuple[str, str], dict[str, Any]]]
+    ] = collections.defaultdict(lambda: collections.defaultdict(dict))
+    for dump in dumps:
+        if dump.lane not in ("rust", "ts"):
+            continue
+        messages = dump.body.get("messages")
+        if not isinstance(messages, list):
+            continue
+        calls: dict[str, tuple[str, str]] = {}
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            for block_index, block in enumerate(blocks(message)):
+                if block.get("type") == "tool_use":
+                    call_id = block.get("id")
+                    name = block.get("name")
+                    tool_input = block.get("input")
+                    if (
+                        isinstance(call_id, str)
+                        and isinstance(name, str)
+                        and name in CTX_FACADE_NAMES
+                        and isinstance(tool_input, dict)
+                    ):
+                        calls[call_id] = (name, raw_hash(tool_input))
+                    continue
+                if block.get("type") != "tool_result":
+                    continue
+                call_id = block.get("tool_use_id")
+                if not isinstance(call_id, str) or call_id not in calls:
+                    continue
+                output = tool_result_text(block)
+                if output is None:
+                    continue
+                normalized = normalize_facade_output(output)
+                name, input_hash = calls[call_id]
+                identity = (dump.session, call_id)
+                observations[(name, input_hash)][dump.lane].setdefault(
+                    identity,
+                    {
+                        "output_sha256": text_hash(normalized),
+                        "output_bytes": len(normalized.encode()),
+                        "shape": facade_output_shape(normalized),
+                        "evidence": evidence(
+                            dump, message_index, block_index, short(normalized, 240)
+                        ),
+                    },
+                )
+    matched: list[dict[str, Any]] = []
+    only: dict[str, list[dict[str, Any]]] = {"rust": [], "ts": []}
+    divergences: list[dict[str, Any]] = []
+    for (name, input_hash), lanes in sorted(observations.items()):
+        lane_outputs = {
+            lane: sorted(
+                {
+                    (row["output_sha256"], row["output_bytes"], row["shape"])
+                    for row in lane_rows.values()
+                }
+            )
+            for lane, lane_rows in lanes.items()
+        }
+        row = {
+            "tool": name,
+            "input_sha256": input_hash,
+            "outputs": lane_outputs,
+            "evidence": {
+                lane: next(iter(lane_rows.values()))["evidence"]
+                for lane, lane_rows in lanes.items()
+                if lane_rows
+            },
+        }
+        if "rust" in lanes and "ts" in lanes:
+            row["verdict"] = "byte_equal" if lane_outputs["rust"] == lane_outputs["ts"] else "divergent"
+            matched.append(row)
+            if row["verdict"] == "divergent":
+                divergences.append(row)
+        else:
+            lane = next(iter(lanes))
+            only[lane].append(row)
+    return {
+        "matched_input_classes": matched,
+        "lane_only_input_classes": only,
+        "unexplained_byte_classes": divergences,
+        "note": "leading transform tags and temporal carriers are removed before output hashing",
+    }
+
+
 def main() -> None:
     args = parse_args()
-    rust_sessions = set(args.rust_sessions or RUST_SESSIONS)
+    expected_rust_sessions = set(args.rust_sessions or RUST_SESSIONS)
+    try:
+        config_overrides = project_config_overrides(args.project_config)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     dumps = load_dumps(
         choose_paths(args.dump_dir, args.date, args.per_session, args.after, args.before),
-        rust_sessions,
+        expected_rust_sessions,
+    )
+    dumps, lane_verification = verify_dump_lanes(
+        dumps, expected_rust_sessions, config_overrides
     )
     sessions = {dump.session for dump in dumps}
+    start_ms = parse_bound(args.after, args.date)
+    end_ms = parse_bound(args.before, args.date, end=True)
+    dumps = apply_observed_lanes(
+        dumps,
+        lane_verification,
+        observed_authority_lanes(
+            args.context_db, args.store_db, sessions, start_ms, end_ms
+        ),
+    )
+    lane_by_session: dict[str, str] = {}
+    for session in sessions:
+        observed = {dump.lane for dump in dumps if dump.session == session}
+        lane_by_session[session] = next(iter(observed)) if len(observed) == 1 else "unverified"
     report = {
         "method": {
             "date": args.date,
             "per_session": args.per_session,
             "after": args.after,
             "before": args.before,
-            "rust_sessions": sorted(rust_sessions),
+            "expected_rust_sessions": sorted(expected_rust_sessions),
+            "project_config_overrides": {
+                root: str(path) for root, path in sorted(config_overrides.items())
+            },
             "context_db": str(args.context_db) if args.context_db else None,
             "store_db": str(args.store_db) if args.store_db else None,
         },
+        "lane_verification": lane_verification,
         "lanes": {
             lane: summarize_lane([dump for dump in dumps if dump.lane == lane])
             for lane in ("rust", "ts")
         },
+        "excluded_unverified_dumps": [
+            dump.path.name for dump in dumps if dump.lane == "unverified"
+        ],
+        "ctx_facade_parity": compare_ctx_facades(dumps),
     }
     if args.context_db is not None or args.store_db is not None:
         report["telemetry"] = summarize_telemetry(
             args.context_db,
             args.store_db,
             sessions,
-            rust_sessions,
-            parse_bound(args.after, args.date),
-            parse_bound(args.before, args.date, end=True),
+            lane_by_session,
+            start_ms,
+            end_ms,
         )
     print(json.dumps(report, ensure_ascii=False, indent=args.indent, sort_keys=True))
 
