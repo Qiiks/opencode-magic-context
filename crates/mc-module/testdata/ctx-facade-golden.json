@@ -36,7 +36,10 @@
                 "input": {
                   "filePath": "src/config.ts"
                 },
-                "output": "line one\nline two\nline three"
+                "output": "line one\nline two\nline three",
+                "metadata": {
+                  "title": "Read the runtime configuration"
+                }
               }
             },
             {
@@ -101,6 +104,13 @@
                 }
               }
             ],
+            "provider_extras": {
+              "opencode": {
+                "ctx_expand_tool_titles": {
+                  "read:7": "Read the runtime configuration"
+                }
+              }
+            },
             "meta": {
               "harness_id": "m7",
               "ordinal": 7,
@@ -115,7 +125,7 @@
         "full": [
           {
             "ordinal": 7,
-            "text": "[7] A (assistant) — full recovery:\n\n  [text]\nReading it now.\n  [tool: read #read:7]\n  input: {\"filePath\":\"src/config.ts\"}\n  output:\nline one\nline two\nline three"
+            "text": "[7] A (assistant) — full recovery:\n\n  [text]\nReading it now.\n  [tool: read #read:7]\n  description: Read the runtime configuration\n  input: {\"filePath\":\"src/config.ts\"}\n  output:\nline one\nline two\nline three"
           }
         ],
         "verbose": {

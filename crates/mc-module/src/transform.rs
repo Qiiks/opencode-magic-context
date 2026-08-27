@@ -8917,6 +8917,13 @@ fn run_user_hint_lexical_search(
                     title: None,
                     note_status: None,
                     surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
                 },
             });
         }
@@ -8947,6 +8954,13 @@ fn run_user_hint_lexical_search(
                 title: Some(compartment.title),
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
         });
     }
@@ -24815,6 +24829,13 @@ pub(crate) mod tests {
             title: None,
             note_status: None,
             surface_condition: None,
+            score_hundredths: 100,
+            start_ordinal: None,
+            end_ordinal: None,
+            note_created_at_ms: None,
+            note_anchor_ordinal: None,
+            note_session_id: None,
+            source_project_path: None,
         }];
         let singular = render_user_hint(&single).unwrap();
         assert!(singular.contains("Your memory may contain 1 related fragment:"));
@@ -24829,6 +24850,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             })
             .collect::<Vec<_>>();
         let hint = render_user_hint(&results).unwrap();
@@ -24852,6 +24880,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
             crate::memory_tool::MemorySearchResult {
                 source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
@@ -24862,6 +24897,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
             crate::memory_tool::MemorySearchResult {
                 source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
@@ -24872,6 +24914,13 @@ pub(crate) mod tests {
                 title: None,
                 note_status: None,
                 surface_condition: None,
+                score_hundredths: 100,
+                start_ordinal: None,
+                end_ordinal: None,
+                note_created_at_ms: None,
+                note_anchor_ordinal: None,
+                note_session_id: None,
+                source_project_path: None,
             },
         ])
         .unwrap();

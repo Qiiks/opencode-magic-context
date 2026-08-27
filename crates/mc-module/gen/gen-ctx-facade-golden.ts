@@ -38,6 +38,7 @@ const cases = [
                             status: "completed",
                             input: { filePath: "src/config.ts" },
                             output: "line one\nline two\nline three",
+                            metadata: { title: "Read the runtime configuration" },
                         },
                     },
                     { type: "step-finish", tokens: { total: 1234 } },

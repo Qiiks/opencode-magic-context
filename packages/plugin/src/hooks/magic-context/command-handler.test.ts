@@ -1057,6 +1057,80 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
 
+        it("maps every shared wrapup state cell to the TypeScript outcome contract", async () => {
+            const matrix = [
+                {
+                    cell: "empty",
+                    disposition: "nothing_to_compact",
+                    expectedHeading: "## Magic Wrapup",
+                    forbiddenHeading: "— Partial",
+                },
+                {
+                    cell: "active",
+                    disposition: "already_in_progress",
+                    expectedHeading: "## Magic Wrapup — Skipped",
+                },
+                ...[
+                    "lease_timeout",
+                    "zero_progress",
+                    "partial_progress",
+                    "producer_failure",
+                    "ownership_loss",
+                ].map((cell) => ({
+                    cell,
+                    disposition: "retryable",
+                    expectedHeading: "## Magic Wrapup — Partial",
+                })),
+                {
+                    cell: "success",
+                    disposition: "completed",
+                    expectedHeading: "## Magic Wrapup",
+                    forbiddenHeading: "— Partial",
+                },
+            ];
+
+            for (const row of matrix) {
+                const sendNotification = mock(async () => {});
+                const moduleCall = mock(async () => ({
+                    ok: true,
+                    disposition: row.disposition,
+                    rounds: row.cell === "success" ? 2 : 0,
+                    summary: `matrix:${row.cell}`,
+                }));
+                const handler = createMagicContextCommandHandler({
+                    db,
+                    protectedTags: 3,
+                    transformMode: "rust",
+                    rustModeModuleClient: { call: moduleCall },
+                    sendNotification,
+                });
+                const sessionId = `ses-rust-wrapup-matrix-${row.cell}`;
+
+                await expectSentinel(
+                    handler["command.execute.before"](
+                        { command: "ctx-wrapup", sessionID: sessionId, arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-WRAPUP_HANDLED__",
+                );
+
+                const text = (sendNotification.mock.calls as unknown as Array<[string, string]>)
+                    .filter(([notifiedSession]) => notifiedSession === sessionId)
+                    .map(([, notification]) => notification)
+                    .join("\n");
+                expect(text, row.cell).toContain(row.expectedHeading);
+                if (row.disposition !== "already_in_progress") {
+                    expect(text, row.cell).toContain(`matrix:${row.cell}`);
+                }
+                if (row.forbiddenHeading) expect(text, row.cell).not.toContain(row.forbiddenHeading);
+                if (row.disposition === "retryable") {
+                    expect(text, row.cell).toContain("Run /ctx-wrapup again to continue.");
+                    expect(text, row.cell).not.toContain("— Failed");
+                }
+            }
+        });
+
         it("presents a retryable Rust wrapup as Partial with a continuation, not Failed", async () => {
             const sendNotification = mock(async () => {});
             const moduleCall = mock(async () => ({

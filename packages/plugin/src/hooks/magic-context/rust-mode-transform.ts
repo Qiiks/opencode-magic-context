@@ -1872,12 +1872,17 @@ export function createRustModeTransform(
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);
         const todoAvailability = resolveTodowriteAvailability(sessionId);
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
-        const todoToolPresent = await resolveCombinedTodowriteVerdict(
-            deps,
-            sessionId,
-            messages,
-            todoAvailability,
-        );
+        let todoToolPresent = false;
+        try {
+            todoToolPresent = await resolveCombinedTodowriteVerdict(
+                deps,
+                sessionId,
+                messages,
+                todoAvailability,
+            );
+        } catch (error) {
+            preflightError ??= error;
+        }
         try {
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
