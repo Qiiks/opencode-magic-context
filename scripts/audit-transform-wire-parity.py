@@ -15,6 +15,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -97,9 +99,18 @@ class Dump:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("dump_dir", type=Path)
+    parser.add_argument("dump_dir", type=Path, nargs="?")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="run the privacy-preserving consolidation probe against live host state",
+    )
     parser.add_argument("--date", default=dt.datetime.now(dt.timezone.utc).date().isoformat())
     parser.add_argument("--per-session", type=int, default=6)
+    parser.add_argument(
+        "--engine-after",
+        help="UTC/offset ISO lower bound for hunt-6 engine evidence in --live mode",
+    )
     parser.add_argument(
         "--after",
         help="include dump filenames at or after this UTC timestamp prefix",
@@ -130,6 +141,31 @@ def parse_args() -> argparse.Namespace:
         "--store-db",
         type=Path,
         help="read-only Rust store.db for module activity and scheduler evidence",
+    )
+    parser.add_argument(
+        "--store-root",
+        type=Path,
+        help="root containing live mc-store databases used by --live",
+    )
+    parser.add_argument(
+        "--opencode-db",
+        type=Path,
+        help="read-only OpenCode database used by --live",
+    )
+    parser.add_argument(
+        "--rpc-root",
+        type=Path,
+        help="Magic Context RPC discovery root used by --live",
+    )
+    parser.add_argument(
+        "--skip-live-rpc",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--skip-live-rust-oracle",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pi-session-dir",
@@ -655,6 +691,8 @@ def tool_reduction_shape(name: Any, tool_input: dict[str, Any]) -> str:
 
 
 def provider_wire_family(body: dict[str, Any]) -> str:
+    if isinstance(body.get("input"), list) and isinstance(body.get("instructions"), str):
+        return "openai_responses"
     if isinstance(body.get("contents"), list):
         return "gemini"
     messages = body.get("messages")
@@ -680,6 +718,9 @@ def provider_system_entries(body: dict[str, Any], family: str) -> list[Any]:
     if family == "anthropic":
         system = body.get("system")
         return list(system) if isinstance(system, list) else []
+    if family == "openai_responses":
+        instructions = body.get("instructions")
+        return [{"text": instructions}] if isinstance(instructions, str) else []
     if family == "openai_compatible":
         messages = body.get("messages")
         if not isinstance(messages, list):
@@ -733,7 +774,7 @@ def provider_label(dump: Dump, family: str) -> str:
 
 
 def provider_wire_messages(body: dict[str, Any], family: str) -> list[dict[str, Any]]:
-    key = "contents" if family == "gemini" else "messages"
+    key = "contents" if family == "gemini" else "input" if family == "openai_responses" else "messages"
     messages = body.get(key)
     if not isinstance(messages, list):
         return []
@@ -748,6 +789,12 @@ def provider_wire_messages(body: dict[str, Any], family: str) -> list[dict[str, 
 
 def provider_message_role(message: dict[str, Any], family: str) -> str:
     role = message.get("role")
+    if family == "openai_responses" and not isinstance(role, str):
+        item_type = message.get("type")
+        if item_type in ("function_call", "reasoning"):
+            return "assistant"
+        if item_type == "function_call_output":
+            return "tool"
     if family == "gemini" and role == "model":
         return "assistant"
     return str(role) if isinstance(role, str) else "unknown"
@@ -755,6 +802,8 @@ def provider_message_role(message: dict[str, Any], family: str) -> str:
 
 def provider_message_texts(message: dict[str, Any], family: str) -> list[str]:
     values = list(nested_text_values(message))
+    if family == "openai_responses" and isinstance(message.get("output"), str):
+        values.append(message["output"])
     if family == "openai_compatible":
         reasoning = message.get("reasoning_content")
         if isinstance(reasoning, str):
@@ -767,6 +816,14 @@ def provider_tool_ids(
 ) -> tuple[list[str], list[str]]:
     calls: list[str] = []
     results: list[str] = []
+    if family == "openai_responses":
+        item_type = message.get("type")
+        call_id = message.get("call_id")
+        if item_type == "function_call" and isinstance(call_id, str) and call_id:
+            calls.append(call_id)
+        if item_type == "function_call_output" and isinstance(call_id, str) and call_id:
+            results.append(call_id)
+        return calls, results
     if family == "openai_compatible":
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -810,7 +867,17 @@ def provider_tool_ids(
 
 def provider_reasoning_shapes(message: dict[str, Any], family: str) -> list[str]:
     shapes: list[str] = []
+    if family == "openai_responses" and message.get("type") == "reasoning":
+        signed = isinstance(message.get("encrypted_content"), str) and bool(
+            message.get("encrypted_content")
+        )
+        summary = message.get("summary")
+        summary_count = len(summary) if isinstance(summary, list) else 0
+        return [
+            f"reasoning_item:signed={str(signed).lower()};summary_parts={summary_count}"
+        ]
     if family == "openai_compatible":
+
         reasoning = message.get("reasoning_content")
         if isinstance(reasoning, str):
             signed = any(
@@ -856,9 +923,61 @@ def provider_reasoning_shapes(message: dict[str, Any], family: str) -> list[str]
     return shapes
 
 
-def provider_tool_adjacency(
-    messages: list[dict[str, Any]], family: str
+def openai_responses_tool_adjacency(
+    messages: list[dict[str, Any]], allow_external_result_owner: bool
 ) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        calls, results = provider_tool_ids(messages[index], "openai_responses")
+        if calls:
+            owner_index = index
+            expected: list[str] = []
+            while index < len(messages):
+                current_calls, _ = provider_tool_ids(messages[index], "openai_responses")
+                if not current_calls:
+                    break
+                expected.extend(current_calls)
+                index += 1
+            actual: list[str] = []
+            while index < len(messages):
+                _, current_results = provider_tool_ids(messages[index], "openai_responses")
+                if not current_results:
+                    break
+                actual.extend(current_results)
+                index += 1
+            missing = sorted(set(expected) - set(actual))
+            unexpected = sorted(set(actual) - set(expected))
+            if missing or unexpected:
+                violations.append(
+                    {
+                        "message_index": owner_index,
+                        "missing_result_ids": missing,
+                        "unexpected_result_ids": unexpected,
+                        "orphan_result_ids": [],
+                    }
+                )
+            continue
+        if results and not allow_external_result_owner:
+            violations.append(
+                {
+                    "message_index": index,
+                    "missing_result_ids": [],
+                    "unexpected_result_ids": [],
+                    "orphan_result_ids": sorted(set(results)),
+                }
+            )
+        index += 1
+    return violations
+
+
+def provider_tool_adjacency(
+    messages: list[dict[str, Any]],
+    family: str,
+    allow_external_result_owner: bool = False,
+) -> list[dict[str, Any]]:
+    if family == "openai_responses":
+        return openai_responses_tool_adjacency(messages, allow_external_result_owner)
     violations: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
         calls, _ = provider_tool_ids(message, family)
@@ -897,6 +1016,8 @@ def provider_tool_adjacency(
             provider_tool_ids(messages[cursor], family)[0] if cursor >= 0 else []
         )
         orphaned = [result_id for result_id in results if result_id not in owner_calls]
+        if orphaned and allow_external_result_owner and not owner_calls:
+            continue
         if orphaned:
             violations.append(
                 {
@@ -929,7 +1050,11 @@ def summarize_provider_dump(dump: Dump) -> dict[str, Any]:
         texts = provider_message_texts(message, family)
         has_empty_text = any(value == "" for value in texts)
         content = message.get("parts" if family == "gemini" else "content")
-        content_empty = content in (None, "", []) and not call_ids and not result_ids
+        content_empty = (
+            content in (None, "", []) and not call_ids and not result_ids
+            if family != "openai_responses" or message.get("type") in (None, "message")
+            else False
+        )
         if has_empty_text or content_empty:
             empty_shapes.add(
                 f"role={role};empty_text={str(has_empty_text).lower()};empty_message={str(content_empty).lower()}"
@@ -956,10 +1081,18 @@ def summarize_provider_dump(dump: Dump) -> dict[str, Any]:
             dropped_shapes.add(f"role={role};position={position}")
         for shape in provider_reasoning_shapes(message, family):
             reasoning_shapes.add(f"role={role};{shape}")
-    adjacency = provider_tool_adjacency(messages, family)
+    adjacency = provider_tool_adjacency(
+        messages,
+        family,
+        allow_external_result_owner=(
+            family == "openai_responses"
+            and isinstance(dump.body.get("previous_response_id"), str)
+            and bool(dump.body.get("previous_response_id"))
+        ),
+    )
     system_message_count = 1 if family == "anthropic" and systems else len(systems)
     invariants: list[str] = []
-    if family in ("openai_compatible", "gemini") and system_message_count > 1:
+    if family in ("openai_compatible", "openai_responses", "gemini") and system_message_count > 1:
         invariants.append("multiple_system_messages_for_strict_template")
     canonical_anthropic = provider == "anthropic" and family == "anthropic"
     if not canonical_anthropic and empty_shapes:
@@ -3183,8 +3316,341 @@ def compare_ctx_facades(dumps: list[Dump]) -> dict[str, Any]:
     }
 
 
+LIVE_PROVIDER_FAMILIES = (
+    "anthropic:anthropic",
+    "bedrock:anthropic",
+    "github-copilot:openai_compatible",
+    "qwen:openai_compatible",
+    "openai:openai_compatible",
+    "openai:openai_responses",
+    "google:gemini",
+    "moonshot:openai_compatible",
+)
+
+
+def live_dump_directories(explicit: Path | None) -> list[Path]:
+    roots: set[Path] = set()
+    if explicit is not None:
+        roots.add(explicit)
+        parent = explicit.parent
+    else:
+        parent = Path(tempfile.gettempdir())
+    roots.update(path for path in parent.glob("opencode-*-auth-dumps") if path.is_dir())
+    return sorted(roots)
+
+
+def live_provider_report(dumps: list[Dump]) -> dict[str, Any]:
+    matrix = compare_provider_matrix(dumps)
+    matrix.pop("evidence", None)
+    evidence_rows = [summarize_provider_dump(dump) for dump in dumps]
+    sanitized_evidence: list[dict[str, Any]] = []
+    for row in evidence_rows:
+        dump = next(
+            (
+                candidate
+                for candidate in dumps
+                if candidate.path.name == row["file"] and candidate.session == row["session"]
+            ),
+            None,
+        )
+        if dump is None:
+            continue
+        raw = dump.path.read_bytes()
+        sanitized_evidence.append(
+            {
+                "capture_sha256": hashlib.sha256(raw).hexdigest(),
+                "capture_bytes": len(raw),
+                "session_prefix": dump.session[:8],
+                "lane": row["lane"],
+                "provider_family": row["provider_family"],
+                "message_count": row["message_count"],
+                "system_message_count": row["system_message_count"],
+                "system_block_count": row["system_block_count"],
+                "empty_content_shapes": row["empty_content_shapes"],
+                "dropped_placeholder_shapes": row["dropped_placeholder_shapes"],
+                "tool_pairing_shapes": row["tool_pairing_shapes"],
+                "reasoning_signature_shapes": row["reasoning_signature_shapes"],
+                "unexplained_invariants": row["unexplained_invariants"],
+                "adjacency_violations": [
+                    {
+                        "message_ordinal": violation.get("message_index"),
+                        "missing_results": len(violation.get("missing_result_ids", [])),
+                        "unexpected_results": len(
+                            violation.get("unexpected_result_ids", [])
+                        ),
+                        "orphan_results": len(violation.get("orphan_result_ids", [])),
+                    }
+                    for violation in row["adjacency_violations"]
+                ],
+            }
+        )
+    counts = collections.Counter(row["provider_family"] for row in sanitized_evidence)
+    matrix["inventory_by_lane"] = {
+        lane: counter_dict(
+            collections.Counter(
+                row["provider_family"]
+                for row in sanitized_evidence
+                if row["lane"] == lane
+            )
+        )
+        for lane in ("rust", "ts", "unverified")
+    }
+    matrix["unexplained_wire_invariants"] = [
+        {
+            "capture_sha256": row["capture_sha256"],
+            "capture_bytes": row["capture_bytes"],
+            "session_prefix": row["session_prefix"],
+            "lane": row["lane"],
+            "provider_family": row["provider_family"],
+            "classes": row["unexplained_invariants"],
+            "adjacency_violations": row["adjacency_violations"],
+        }
+        for row in sanitized_evidence
+        if row["unexplained_invariants"]
+    ]
+    matrix["live_family_counts"] = {
+        family: counts.get(family, 0) for family in LIVE_PROVIDER_FAMILIES
+    }
+    matrix["zero_live_coverage_families"] = [
+        family for family in LIVE_PROVIDER_FAMILIES if counts.get(family, 0) == 0
+    ]
+    matrix["non_anthropic_capture_count"] = sum(
+        count for family, count in counts.items() if family != "anthropic:anthropic"
+    )
+    matrix["non_anthropic_unverified_lane_count"] = sum(
+        1
+        for row in sanitized_evidence
+        if row["provider_family"] != "anthropic:anthropic"
+        and row["lane"] == "unverified"
+    )
+    matrix["evidence"] = sanitized_evidence
+    return matrix
+
+
+def invoke_live_probe(
+    args: argparse.Namespace, after_ms: int, engine_after_ms: int
+) -> dict[str, Any]:
+    home = Path.home()
+    context_db = args.context_db or home / ".local/share/cortexkit/magic-context/context.db"
+    store_db = args.store_db or home / ".local/share/cortexkit/magic-context/store.db"
+    store_root = args.store_root or home / ".local/share/cortexkit"
+    opencode_db = args.opencode_db or home / ".local/share/opencode/opencode.db"
+    pi_session_dir = args.pi_session_dir or home / ".pi/agent/sessions"
+    rpc_root = args.rpc_root or home / ".local/share/cortexkit/magic-context/rpc"
+    command = [
+        "bun",
+        str(Path(__file__).with_name("audit-transform-wire-parity-live.ts")),
+        "--context-db",
+        str(context_db),
+        "--store-db",
+        str(store_db),
+        "--store-root",
+        str(store_root),
+        "--opencode-db",
+        str(opencode_db),
+        "--pi-session-dir",
+        str(pi_session_dir),
+        "--rpc-root",
+        str(rpc_root),
+        "--after-ms",
+        str(after_ms),
+        "--engine-after-ms",
+        str(engine_after_ms),
+    ]
+    if args.skip_live_rpc:
+        command.append("--skip-rpc")
+    if args.skip_live_rust_oracle:
+        command.append("--skip-rust-oracle")
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parent.parent,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return {
+            "status": "failed",
+            "exit_code": completed.returncode,
+            "stderr_sha256": hashlib.sha256(completed.stderr.encode()).hexdigest(),
+            "stderr_bytes": len(completed.stderr.encode()),
+        }
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {
+            "status": "failed",
+            "exit_code": completed.returncode,
+            "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+            "stdout_bytes": len(completed.stdout.encode()),
+        }
+
+
+def live_ledger_report(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {"present": False, "rows": 0, "parse_error_count": 0}
+    summary = summarize_window_report_ledger(path)
+    return {
+        "present": summary.get("status") == "ok",
+        "rows": summary.get("rows", 0),
+        "key_shape_count": len(summary.get("key_shapes", {})),
+        "geometry_count": sum(summary.get("geometries", {}).values()),
+        "status_count": sum(summary.get("statuses", {}).values()),
+        "parse_error_count": len(summary.get("parse_errors", [])),
+    }
+
+
+def live_leg_verdicts(provider: dict[str, Any], probe: dict[str, Any]) -> list[dict[str, Any]]:
+    if probe.get("status") == "failed":
+        return [
+            {
+                "leg": leg,
+                "origin_hunt": origin,
+                "verdict": "FINDING",
+                "classes": ["live_probe_failed"],
+            }
+            for leg, origin in (
+                (1, 6),
+                (2, 8),
+                (3, 8),
+                (4, 5),
+                (5, 7),
+                (6, "1-4"),
+            )
+        ]
+
+    engine = probe.get("engine_truth", {})
+    engine_classes = [
+        row.get("class") for row in engine.get("unexplained_invariants", [])
+    ]
+    engine_sessions = engine.get("sessions", [])
+    if not any(
+        row.get("compartments", {}).get("mirror_since_cutoff", 0) > 0
+        for row in engine_sessions
+    ):
+        engine_classes.append("zero_post_cutoff_rust_compartment_publish_rows")
+    if not any(
+        row.get("memories", {}).get("mirror_since_cutoff", 0) > 0
+        for row in engine_sessions
+    ):
+        engine_classes.append("zero_post_cutoff_rust_memory_publish_rows")
+
+    caveman = probe.get("caveman", {})
+    caveman_classes = [
+        row.get("class") for row in caveman.get("unexplained_invariants", [])
+    ]
+    if {row.get("lane") for row in caveman.get("sessions", [])} != {"rust", "ts"}:
+        caveman_classes.append("missing_live_aged_lane")
+    if caveman.get("rust_oracle_status") != "ok":
+        caveman_classes.append("rust_live_oracle_not_ok")
+
+    provider_classes = [
+        "provider_value_space_divergence"
+        for _ in provider.get("unexplained_byte_classes", [])
+    ] + [
+        class_name
+        for row in provider.get("unexplained_wire_invariants", [])
+        for class_name in row.get("classes", [])
+    ]
+    if provider.get("non_anthropic_unverified_lane_count", 0) > 0:
+        provider_classes.append("non_anthropic_lane_unverified")
+
+    pi = probe.get("pi_real_jsonl", {})
+    pi_classes = [row.get("class") for row in pi.get("unexplained_invariants", [])]
+    if pi.get("coverage", {}).get("observed_sessions", 0) < 2:
+        pi_classes.append("fewer_than_two_real_pi_sessions")
+    for row in pi.get("sessions", []):
+        if not row.get("m0", {}).get("present") or not row.get("m1", {}).get("present"):
+            pi_classes.append("pi_cached_m0_or_m1_absent")
+
+    operator = probe.get("operator_reads", {})
+    operator_classes = [
+        str(row.get("field", row.get("class")))
+        for row in operator.get("unexplained_invariants", [])
+    ]
+    if operator.get("coverage", {}).get("observed_lanes", 0) < 2:
+        operator_classes.append("missing_live_operator_lane")
+
+    decisions = probe.get("decision_window", {})
+    decision_classes = [
+        str(row.get("class")) for row in decisions.get("unexplained_invariants", [])
+    ]
+    distributions = decisions.get("transform_decisions", {})
+    for lane in ("rust", "ts"):
+        if distributions.get(lane, {}).get("rows", 0) == 0:
+            decision_classes.append(f"zero_{lane}_transform_decision_rows")
+    if decisions.get("scheduler_history", {}).get("rows", 0) == 0:
+        decision_classes.append("zero_scheduler_history_rows")
+
+    return [
+        {
+            "leg": leg,
+            "origin_hunt": origin,
+            "verdict": "CLOSED" if not classes else "FINDING",
+            "classes": sorted(set(filter(None, classes))),
+        }
+        for leg, origin, classes in (
+            (1, 6, engine_classes),
+            (2, 8, caveman_classes),
+            (3, 8, provider_classes),
+            (4, 5, pi_classes),
+            (5, 7, operator_classes),
+            (6, "1-4", decision_classes),
+        )
+    ]
+
+
+def run_live(args: argparse.Namespace) -> None:
+    expected_rust_sessions = set(args.rust_sessions or RUST_SESSIONS)
+    paths: list[Path] = []
+    directories = live_dump_directories(args.dump_dir)
+    for directory in directories:
+        paths.extend(
+            choose_paths(directory, args.date, args.per_session, args.after, args.before)
+        )
+    dumps = load_dumps(paths, expected_rust_sessions)
+    try:
+        config_overrides = project_config_overrides(args.project_config)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    dumps, _lane_verification = verify_dump_lanes(
+        dumps, expected_rust_sessions, config_overrides
+    )
+    provider = live_provider_report(dumps)
+    after_ms = parse_bound(args.after, args.date)
+    engine_after_ms = parse_bound(args.engine_after or args.after, args.date)
+    probe = invoke_live_probe(args, after_ms, engine_after_ms)
+    report = {
+        "method": {
+            "mode": "live",
+            "date": args.date,
+            "after": args.after,
+            "before": args.before,
+            "engine_after": args.engine_after,
+            "per_session": args.per_session,
+            "capture_directories": len(directories),
+            "capture_files": len(dumps),
+            "expected_rust_session_prefixes": sorted(
+                session[:8] for session in expected_rust_sessions
+            ),
+            "privacy_contract": "hashes, counts, ordinals, eight-character session prefixes, and byte lengths only",
+            "sqlite_contract": {"readonly": True},
+        },
+        "provider_live": provider,
+        "window_report_ledger_live": live_ledger_report(args.window_report_ledger),
+        "live_probe": probe,
+        "leg_verdicts": live_leg_verdicts(provider, probe),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=args.indent, sort_keys=True))
+
+
 def main() -> None:
     args = parse_args()
+    if args.live:
+        run_live(args)
+        return
+    if args.dump_dir is None:
+        raise SystemExit("dump_dir is required unless --live is used")
     expected_rust_sessions = set(args.rust_sessions or RUST_SESSIONS)
     try:
         config_overrides = project_config_overrides(args.project_config)
