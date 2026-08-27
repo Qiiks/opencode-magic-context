@@ -32,8 +32,32 @@ class AuditTransformWireParityTest(unittest.TestCase):
             (ts_root / ".cortexkit" / "magic-context.jsonc").write_text(
                 "{ // Empty means the TypeScript default.\n}\n"
             )
-            self._write_dump(dump_dir, "ses_rust", rust_root, "rust-call")
-            self._write_dump(dump_dir, "ses_ts", ts_root, "ts-call")
+            providers = (
+                "anthropic",
+                "github-copilot",
+                "bedrock",
+                "qwen",
+                "openai",
+                "google",
+                "moonshot",
+            )
+            for minute, provider in enumerate(providers):
+                self._write_dump(
+                    dump_dir,
+                    "ses_rust",
+                    rust_root,
+                    f"rust-{provider}-call",
+                    provider,
+                    minute,
+                )
+                self._write_dump(
+                    dump_dir,
+                    "ses_ts",
+                    ts_root,
+                    f"ts-{provider}-call",
+                    provider,
+                    minute,
+                )
             pi_session_dir = temp / "pi-sessions"
             pi_render_dir = temp / "pi-renders"
             omp_session_dir = temp / "omp-sessions"
@@ -93,7 +117,7 @@ class AuditTransformWireParityTest(unittest.TestCase):
             report = json.loads(completed.stdout)
             self.assertEqual(
                 report["lane_verification"]["denominator_dump_counts"],
-                {"rust": 1, "ts": 1},
+                {"rust": 7, "ts": 7},
             )
             rows = report["lane_verification"]["sessions"]
             rust = next(row for row in rows if row["session"] == "ses_rust")
@@ -102,6 +126,27 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self.assertEqual(rust["status"], "label_corrected_from_live_config")
             self.assertEqual(ts["configured_lane"], "ts")
             self.assertEqual(report["excluded_unverified_dumps"], [])
+            provider_matrix = report["provider_matrix_parity"]
+            self.assertEqual(provider_matrix["unexplained_byte_classes"], [])
+            self.assertEqual(provider_matrix["unexplained_wire_invariants"], [])
+            self.assertEqual(
+                set(provider_matrix["inventory_by_lane"]["rust"]),
+                {
+                    "anthropic:anthropic",
+                    "bedrock:anthropic",
+                    "github-copilot:openai_compatible",
+                    "google:gemini",
+                    "moonshot:openai_compatible",
+                    "openai:openai_compatible",
+                    "qwen:openai_compatible",
+                },
+            )
+            self.assertTrue(
+                all(
+                    axis["verdict"] == "matched_value_space"
+                    for axis in provider_matrix["axes"]
+                )
+            )
             self.assertEqual(
                 report["pi_lane_verification"]["denominator_dump_counts"], {"pi": 1}
             )
@@ -201,40 +246,172 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 "context_read_model",
             )
 
+    def test_provider_matrix_reports_non_anthropic_empty_and_adjacency_breaks(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            temp = Path(temporary)
+            dump_dir = temp / "dumps"
+            dump_dir.mkdir()
+            rust_root = temp / "rust-project"
+            ts_root = temp / "ts-project"
+            for project, mode in ((rust_root, "rust"), (ts_root, "ts")):
+                (project / ".cortexkit").mkdir(parents=True)
+                (project / ".cortexkit" / "magic-context.jsonc").write_text(
+                    json.dumps({"transform_mode": mode})
+                )
+            self._write_dump(
+                dump_dir, "ses_rust", rust_root, "rust-call", "github-copilot", 0
+            )
+            self._write_dump(dump_dir, "ses_ts", ts_root, "ts-call", "github-copilot", 0)
+            ts_path = next(dump_dir.glob("*ses_ts*.body.json"))
+            broken = json.loads(ts_path.read_text())
+            broken["model"] = "claude-copilot-fixture"
+            broken["messages"][1]["content"] = ""
+            broken["messages"].insert(4, {"role": "assistant", "content": "[dropped]"})
+            ts_path.write_text(json.dumps(broken))
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--date",
+                    DATE,
+                    "--rust-session",
+                    "ses_rust",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            matrix = json.loads(completed.stdout)["provider_matrix_parity"]
+            self.assertTrue(matrix["unexplained_byte_classes"])
+            self.assertEqual(
+                matrix["unexplained_wire_invariants"][0]["classes"],
+                ["non_anthropic_empty_content", "tool_result_adjacency_violation"],
+            )
+            self.assertEqual(matrix["unexplained_wire_invariants"][0]["lane"], "ts")
+
     def _write_dump(
-        self, dump_dir: Path, session: str, project: Path, call_id: str
+        self,
+        dump_dir: Path,
+        session: str,
+        project: Path,
+        call_id: str,
+        provider: str,
+        minute: int,
     ) -> None:
-        name = f"{DATE}T12-00-00-000Z-000001-{session}-direct.body.json"
-        body = {
-            "system": [{"type": "text", "text": f"Working directory: {project}"}],
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": call_id,
-                            "name": "ctx_expand",
-                            "input": {"message": 7},
-                        }
-                    ],
+        name = f"{DATE}T12-{minute:02d}-00-000Z-000001-{session}-direct.body.json"
+        recovery = "§42§ [7] A (assistant) — full recovery:\n\n  [text]\nhello"
+        if provider in ("anthropic", "bedrock"):
+            body = {
+                "model": "claude-fixture",
+                "system": [{"type": "text", "text": f"Working directory: {project}"}],
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "redacted_thinking",
+                                "data": "opaque-plan",
+                                "signature": f"sig-{provider}",
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": "ctx_expand",
+                                "input": {"message": 7},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": recovery,
+                            }
+                        ],
+                    },
+                ],
+            }
+        elif provider == "google":
+            body = {
+                "model": "gemini-fixture",
+                "systemInstruction": {
+                    "parts": [{"text": f"Working directory: {project}"}]
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": "§42§ [7] A (assistant) — full recovery:\n\n  [text]\nhello",
-                        }
-                    ],
-                },
-            ],
-        }
+                "contents": [
+                    {"role": "model", "parts": [{"text": "[dropped]"}]},
+                    {"role": "user", "parts": [{"text": "continue"}]},
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "plan",
+                                "thought": True,
+                                "thoughtSignature": "gemini-signature",
+                            },
+                            {
+                                "functionCall": {
+                                    "id": call_id,
+                                    "name": "ctx_expand",
+                                    "args": {"message": 7},
+                                }
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": call_id,
+                                    "name": "ctx_expand",
+                                    "response": {"content": recovery},
+                                }
+                            }
+                        ],
+                    },
+                ],
+            }
+        else:
+            body = {
+                "model": f"{provider}-fixture",
+                "messages": [
+                    {"role": "system", "content": f"Working directory: {project}"},
+                    {"role": "assistant", "content": "[dropped]"},
+                    {"role": "user", "content": "continue"},
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "reasoning_content": "plan",
+                        "reasoning_signature": f"sig-{provider}",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "ctx_expand",
+                                    "arguments": json.dumps({"message": 7}),
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": call_id, "content": recovery},
+                ],
+            }
         path = dump_dir / name
         path.write_text(json.dumps(body))
         path.with_name(name.replace(".body.json", ".response.json")).write_text(
-            json.dumps({"status": 200, "usage": {"input_tokens": 100}})
+            json.dumps(
+                {
+                    "status": 200,
+                    "provider_id": provider,
+                    "usage": {"input_tokens": 100},
+                }
+            )
         )
 
     def _write_pi_session(self, directory: Path) -> None:
