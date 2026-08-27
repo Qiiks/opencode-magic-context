@@ -12,9 +12,13 @@ import {
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    resolveProjectIdentityForSession,
+} from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
@@ -281,6 +285,7 @@ interface RustSessionState extends ModuleStateSyncState {
     memoryAuthorityProject: string | null;
     memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
+    recordedSessionProjectIdentity: string | null;
     authorityMemorySyncSkipLogged?: boolean;
     lkgCaptureSequence: number;
     lkgLastCapturedRowVersion: number;
@@ -744,6 +749,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityProject: null,
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
+            recordedSessionProjectIdentity: null,
             authorityMemorySyncSkipLogged: false,
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
@@ -1886,7 +1892,22 @@ export function createRustModeTransform(
         try {
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
-            const { directory } = await getSessionDirectory(deps, sessionId);
+            const { directory, resolvedFromHost } = await getSessionDirectory(deps, sessionId);
+            if (resolvedFromHost) {
+                const sessionProjectIdentity = resolveProjectIdentityForSession(
+                    directory,
+                    deps.allowHomeProject,
+                );
+                if (
+                    sessionProjectIdentity &&
+                    state.recordedSessionProjectIdentity !== sessionProjectIdentity
+                ) {
+                    // Missing chunk embeddings are restored through the session's
+                    // host-owned project binding, not through Rust module state.
+                    recordSessionProjectIdentity(deps.db, sessionId, sessionProjectIdentity);
+                    state.recordedSessionProjectIdentity = sessionProjectIdentity;
+                }
+            }
             if (model) deps.liveModelBySession?.set(sessionId, model);
             const usage = passUsageSnapshot;
             requestInputTokens = Math.max(0, Math.floor(usage.inputTokens));

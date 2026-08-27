@@ -41,6 +41,7 @@ import {
 } from "../../features/magic-context/memory/project-identity";
 import {
     embedSessionCompartmentChunks,
+    embedUnembeddedMemoriesForProject,
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
@@ -971,6 +972,27 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       // Auto-search and local RPC/dashboard reads consume the mirror,
                       // so publish the module mutation to that read model before return.
                       await syncModuleMemories();
+                      if (
+                          !moduleNoteResponseIsError(response) &&
+                          (action === "write" || action === "update" || action === "merge")
+                      ) {
+                          // TypeScript memory writes queue embedding work immediately.
+                          // The Rust path must do the same after publishing its memory.
+                          void (async () => {
+                              await ensureProjectRegisteredFromOpenCodeDirectory(projectRoot, db);
+                              const embedded = await embedUnembeddedMemoriesForProject(
+                                  db,
+                                  memoryProject,
+                              );
+                              if (embedded > 0) {
+                                  log(
+                                      `[magic-context] proactively embedded ${embedded} mirrored ${embedded === 1 ? "memory" : "memories"} for project ${memoryProject}`,
+                                  );
+                              }
+                          })().catch((error) => {
+                              log("[magic-context] mirrored memory embedding failed:", error);
+                          });
+                      }
                       return response;
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>

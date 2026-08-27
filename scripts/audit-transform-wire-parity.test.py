@@ -116,6 +116,39 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self.assertIn("mc_historian_side_channel_outbox", rust_rows["session_id_tables"])
             self.assertIn("compartment_events", ts_rows["session_id_tables"])
 
+            adjacent = report["engine_adjacent_state"]
+            self.assertEqual(adjacent["unexplained_invariants"], [])
+            self.assertTrue(
+                adjacent["coverage_by_lane"]["rust"][0]["message_index_present"]
+            )
+            self.assertTrue(
+                adjacent["coverage_by_lane"]["ts"][0]["message_index_present"]
+            )
+            self.assertTrue(
+                adjacent["coverage_by_lane"]["rust"][0]["chunk_vectors_present"]
+            )
+            self.assertTrue(
+                adjacent["coverage_by_lane"]["ts"][0]["memory_vectors_present"]
+            )
+            self.assertEqual(
+                adjacent["per_session"]["ses_rust"]["rust_engine_truth"][
+                    "mc_cache_state"
+                ][0]["last_activity_at"],
+                int(dt.datetime(2026, 8, 27, 12, tzinfo=dt.timezone.utc).timestamp() * 1000),
+            )
+            self.assertEqual(
+                adjacent["per_session"]["ses_rust"]["rust_engine_truth"][
+                    "mc_pass_trace"
+                ][0]["receive_count"],
+                3,
+            )
+            self.assertEqual(
+                adjacent["per_session"]["ses_ts"]["rust_engine_truth"][
+                    "mc_cache_state"
+                ],
+                [],
+            )
+
     def _write_dump(
         self, dump_dir: Path, session: str, project: Path, call_id: str
     ) -> None:
@@ -224,14 +257,34 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 );
                 CREATE TABLE tags (session_id TEXT, caveman_depth INTEGER, tag_number INTEGER);
                 CREATE TABLE compartments (
-                    session_id TEXT, sequence INTEGER, start_message INTEGER, end_message INTEGER,
-                    p1 TEXT, p2 TEXT, p3 TEXT, p4 TEXT, importance INTEGER, legacy INTEGER,
-                    created_at INTEGER
+                    id INTEGER PRIMARY KEY, session_id TEXT, harness TEXT, sequence INTEGER,
+                    start_message INTEGER, end_message INTEGER, p1 TEXT, p2 TEXT, p3 TEXT,
+                    p4 TEXT, importance INTEGER, legacy INTEGER, created_at INTEGER
                 );
                 CREATE TABLE memories (
-                    source_session_id TEXT, category TEXT, content TEXT, importance INTEGER,
+                    id INTEGER PRIMARY KEY, project_path TEXT, source_session_id TEXT,
+                    category TEXT, content TEXT, normalized_hash TEXT, importance INTEGER,
                     source_type TEXT, created_at INTEGER
                 );
+                CREATE TABLE message_history_index (
+                    session_id TEXT PRIMARY KEY, last_indexed_ordinal INTEGER,
+                    dirty_floor_ordinal INTEGER, harness TEXT
+                );
+                CREATE TABLE message_history_fts (
+                    session_id TEXT, message_ordinal INTEGER, message_id TEXT, role TEXT,
+                    content TEXT
+                );
+                CREATE TABLE session_projects (
+                    session_id TEXT, harness TEXT, project_path TEXT
+                );
+                CREATE TABLE compartment_chunk_embeddings (
+                    compartment_id INTEGER, session_id TEXT, project_path TEXT, harness TEXT
+                );
+                CREATE TABLE memory_embeddings (memory_id INTEGER, model_id TEXT);
+                CREATE TABLE notes (
+                    session_id TEXT, type TEXT, status TEXT, check_status TEXT
+                );
+                CREATE TABLE git_commits (project_path TEXT, sha TEXT);
                 CREATE TABLE compartment_events (
                     session_id TEXT, kind TEXT, at_compartment INTEGER, created_at INTEGER
                 );
@@ -245,12 +298,40 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 ("ses_ts", now, "defer", None, 100, 0, 0, "a", "a", "m", "m", "t", "t"),
             )
             db.execute(
-                "INSERT INTO compartments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("ses_ts", 1, 1, 4, "p1", "p2", "p3", "p4", 61, 0, now),
+                "INSERT INTO compartments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, "ses_ts", "opencode", 1, 1, 4, "p1", "p2", "p3", "p4", 61, 0, now),
             )
             db.execute(
-                "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?)",
-                ("ses_ts", "workflow", "ts fact", 50, "historian", now),
+                "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, "git:ts", "ses_ts", "workflow", "ts fact", "ts-hash", 50, "historian", now),
+            )
+            db.executemany(
+                "INSERT INTO message_history_index VALUES (?, 1, NULL, 'opencode')",
+                [("ses_ts",), ("ses_rust",)],
+            )
+            db.executemany(
+                "INSERT INTO message_history_fts VALUES (?, 1, ?, 'user', ?)",
+                [
+                    ("ses_ts", "ts-message", "identical searchable bytes"),
+                    ("ses_rust", "rust-message", "identical searchable bytes"),
+                ],
+            )
+            db.executemany(
+                "INSERT INTO session_projects VALUES (?, 'opencode', ?)",
+                [("ses_ts", "git:ts"), ("ses_rust", "git:rust")],
+            )
+            db.executemany(
+                "INSERT INTO compartment_chunk_embeddings VALUES (?, ?, ?, 'opencode')",
+                [(1, "ses_ts", "git:ts"), (2, "ses_rust", "git:rust")],
+            )
+            db.execute("INSERT INTO memory_embeddings VALUES (1, 'fixture-model')")
+            db.executemany(
+                "INSERT INTO notes VALUES (?, 'smart', 'active', 'compiled')",
+                [("ses_ts",), ("ses_rust",)],
+            )
+            db.executemany(
+                "INSERT INTO git_commits VALUES (?, ?)",
+                [("git:ts", "abcdef1"), ("git:rust", "abcdef2")],
             )
             db.execute(
                 "INSERT INTO compartment_events VALUES (?, ?, ?, ?)",
@@ -266,7 +347,10 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 );
                 CREATE TABLE mc_pass_trace (
                     session_id TEXT, scheduler_history TEXT,
-                    scheduler_interesting_history TEXT
+                    scheduler_interesting_history TEXT, last_received_at_ms INTEGER,
+                    last_completed_at_ms INTEGER, last_reject_error TEXT,
+                    last_reject_at_ms INTEGER, receive_count INTEGER, reject_count INTEGER,
+                    first_divergence TEXT
                 );
                 CREATE TABLE mc_compartments (
                     session_id TEXT, sequence INTEGER, start_message INTEGER, end_message INTEGER,
@@ -292,8 +376,8 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 ("ses_rust", now, json.dumps({"caveman_age_basis_tag": 9})),
             )
             db.execute(
-                "INSERT INTO mc_pass_trace VALUES (?, ?, ?)",
-                ("ses_rust", "[]", "[]"),
+                "INSERT INTO mc_pass_trace VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("ses_rust", "[]", "[]", now, now, None, None, 3, 0, None),
             )
             db.execute(
                 "INSERT INTO mc_compartments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

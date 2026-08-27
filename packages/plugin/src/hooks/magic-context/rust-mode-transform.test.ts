@@ -10,6 +10,7 @@ import {
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
 import { insertMemory } from "../../features/magic-context/memory";
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
@@ -353,6 +354,15 @@ describe("Rust mode authority adapter", () => {
 
         expect(authorityRoots.length).toBeGreaterThan(0);
         expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
+        expect(
+            db
+                .prepare(
+                    "SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode'",
+                )
+                .get(sessionId),
+        ).toEqual({
+            project_path: resolveProjectIdentityForSession("/session/root-b", false),
+        });
     });
 
     it("transports the host-resolved output_reserve as Rust usable_soft", () => {
