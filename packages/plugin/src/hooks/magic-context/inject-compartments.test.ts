@@ -2065,7 +2065,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(m1).not.toContain("profile delta must not leak");
     });
 
-    it("uses the system-hash HARD path for a memory-on to memory-off transition", () => {
+    it("uses an immediate render-config HARD path for a memory-on to memory-off transition", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
         createUserMemoryTable();
@@ -2100,8 +2100,12 @@ describe("m[0]/m[1] materialization", () => {
             projectPath: undefined,
             projectDirectory,
             memoryEnabled: false,
-            hardSignals: { systemHash: "memory-guidance-off", modelKey: "test/model" },
+            // The system hook publishes its changed hash after message transform.
+            // Keep the old hash here to prove the memory gate itself prevents a
+            // one-request replay of the memory-bearing cache.
+            hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
         });
+        expect(transition.decision.reason).toBe("render_config");
         expect(transition.m0RematerializedThisPass).toBe(true);
         expect(renderedText(off[0])).not.toContain("transition profile fact");
         const suppressedBytes = transition.m0Bytes?.toString("utf8");
@@ -2116,7 +2120,7 @@ describe("m[0]/m[1] materialization", () => {
             projectPath: undefined,
             projectDirectory,
             memoryEnabled: false,
-            hardSignals: { systemHash: "memory-guidance-off", modelKey: "test/model" },
+            hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
         });
         expect(replay.m0RematerializedThisPass).toBe(false);
         expect(replay.m0Bytes?.toString("utf8")).toBe(suppressedBytes);

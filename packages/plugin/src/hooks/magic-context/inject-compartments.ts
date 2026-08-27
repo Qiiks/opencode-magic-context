@@ -1526,6 +1526,15 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
  * whole point of the m[0]=frozen-prefix / m[1]=volatile-delta split: a routine
  * historian publish must keep the Anthropic prompt-cache prefix intact.
  */
+const MEMORY_DERIVED_BLOCK_PATTERN =
+    /<(?:project-memory|user-profile|new-user-profile|memory-updates|memory-mural)(?:>|\s)/;
+
+function cachedMemoryDerivedSurfacePresent(state: M0M1State): boolean {
+    return [state.cachedM0Bytes, state.cachedM1Bytes].some(
+        (bytes) => bytes !== null && MEMORY_DERIVED_BLOCK_PATTERN.test(bytes.toString("utf8")),
+    );
+}
+
 export function mustMaterialize(args: {
     db: Database;
     sessionId: string;
@@ -1545,10 +1554,19 @@ export function mustMaterialize(args: {
     if (!args.state.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
     const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
     // `current.workspaceFingerprint` is resolved inside readCurrentM0SnapshotMarkers
-    // (it resolves its own workspace context); the HARD memory gate below keys on
-    // that vs the cached fingerprint, so no local workspace context is needed here.
+    // (it resolves its own workspace context); the later workspace-identity HARD
+    // gate compares it with the cached fingerprint, so no local context is needed.
     const current = readCurrentM0SnapshotMarkers(args);
     const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(args.state.cachedM0UpgradeState);
+
+    // The system-prompt hook runs after the message transform, so its changed hash
+    // reaches this decision one pass late. A memory-off process must not replay one
+    // request of the old memory-bearing m[0]/m[1] while waiting for that signal.
+    // The rendered bytes make this transition self-consuming without another
+    // durable flag: once suppressed, the next pass finds no memory-derived block.
+    if (args.memoryEnabled === false && cachedMemoryDerivedSurfacePresent(args.state)) {
+        return { value: true, reason: "render_config" };
+    }
 
     // Renderer-format changes must fold cached m[0] once before sanitized bytes can
     // mix with a stale baseline. Persisting the new component consumes this trigger.
