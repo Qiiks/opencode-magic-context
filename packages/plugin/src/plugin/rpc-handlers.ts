@@ -72,7 +72,6 @@ import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 // the next poll cold-starts from the persisted session_meta value's session by
 // re-folding once, which is the acceptable one-time cost design A accepts.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
-const RUST_STATUS_CACHE_TTL_MS = 2_000;
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
     tail_hygiene?: WireTailHygieneBaseline | null;
@@ -87,7 +86,7 @@ export interface RustSessionStatus {
     wrapup_active?: boolean;
     wrapup_rounds?: number | null;
 }
-const rustStatusCache = new Map<string, { status: RustSessionStatus; cachedAt: number }>();
+const rustStatusInFlight = new Map<string, Promise<RustSessionStatus | undefined>>();
 
 /**
  * Lazily compute work-metrics for the sidebar. Returns the persisted fallback
@@ -129,36 +128,50 @@ function getDb(): Database | null {
     }
 }
 
-async function loadRustSessionStatus(
+/**
+ * Coalesce only overlapping reads. Reusing a completed response would let a burst of module
+ * writes leave status fields behind the durable store while still appearing authoritative.
+ */
+export async function loadRustSessionStatus(
     client: RustModeModuleClient | undefined,
     sessionId: string,
     directory: string,
 ): Promise<RustSessionStatus | undefined> {
     if (!client) return undefined;
-    const cached = rustStatusCache.get(sessionId);
-    if (cached && Date.now() - cached.cachedAt < RUST_STATUS_CACHE_TTL_MS) {
-        return cached.status;
-    }
+    const requestKey = `${directory}\0${sessionId}`;
+    const existing = rustStatusInFlight.get(requestKey);
+    if (existing) return existing;
+
+    const request = (async () => {
+        try {
+            const response = await client.call({
+                sessionId,
+                projectRoot: directory,
+                method: "session.status",
+                body: { method: "session.status", v: 1, session_id: sessionId },
+            });
+            const raw =
+                response && typeof response === "object"
+                    ? (response as Record<string, unknown>)
+                    : {};
+            const value =
+                raw.result && typeof raw.result === "object"
+                    ? (raw.result as Record<string, unknown>)
+                    : raw;
+            if (value.error || value.ok === false) return undefined;
+            return value as RustSessionStatus;
+        } catch (error) {
+            log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
+            return undefined;
+        }
+    })();
+    rustStatusInFlight.set(requestKey, request);
     try {
-        const response = await client.call({
-            sessionId,
-            projectRoot: directory,
-            method: "session.status",
-            body: { method: "session.status", v: 1, session_id: sessionId },
-        });
-        const raw =
-            response && typeof response === "object" ? (response as Record<string, unknown>) : {};
-        const value =
-            raw.result && typeof raw.result === "object"
-                ? (raw.result as Record<string, unknown>)
-                : raw;
-        if (value.error || value.ok === false) return undefined;
-        const status = value as RustSessionStatus;
-        rustStatusCache.set(sessionId, { status, cachedAt: Date.now() });
-        return status;
-    } catch (error) {
-        log(`[rpc] Rust session.status unavailable for ${sessionId}:`, error);
-        return undefined;
+        return await request;
+    } finally {
+        if (rustStatusInFlight.get(requestKey) === request) {
+            rustStatusInFlight.delete(requestKey);
+        }
     }
 }
 

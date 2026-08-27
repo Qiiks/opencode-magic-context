@@ -3565,7 +3565,7 @@ def live_leg_verdicts(provider: dict[str, Any], probe: dict[str, Any]) -> list[d
 
     operator = probe.get("operator_reads", {})
     operator_classes = [
-        str(row.get("field", row.get("class")))
+        str(row.get("class", row.get("field")))
         for row in operator.get("unexplained_invariants", [])
     ]
     if operator.get("coverage", {}).get("observed_lanes", 0) < 2:

@@ -26364,6 +26364,12 @@ mod tests {
                         token_count: 2,
                         source_bytes: b"nine".to_vec(),
                     },
+                    TagMintInput {
+                        block_id: "m11#0".to_string(),
+                        kind: "message".to_string(),
+                        token_count: 2,
+                        source_bytes: b"eleven".to_vec(),
+                    },
                 ],
                 2,
             )
@@ -26380,10 +26386,10 @@ mod tests {
         assert!(summary.contains("coverage ordinal 10"));
         assert!(summary.contains("boundary present"));
         assert!(summary.contains("1 pending drop"));
-        assert!(summary.contains("2 tags"));
+        assert!(summary.contains("3 tags"));
         assert!(summary.contains("pending m1 delta true age_ms=0"));
         assert!(summary.contains("last historian: published seq 3"));
-        assert_eq!(body["tag_count"], json!(2));
+        assert_eq!(body["tag_count"], json!(3));
         assert_eq!(body["pending_m1_delta"], json!(true));
         assert_eq!(body["pending_m1_age_ms"], json!(0));
         assert_eq!(body["tail_identity_re_adopt_count"], json!(0));

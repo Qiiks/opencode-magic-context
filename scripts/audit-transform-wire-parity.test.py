@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import runpy
 import sqlite3
 import subprocess
 import tempfile
@@ -17,6 +18,27 @@ DATE = "2026-08-27"
 
 
 class AuditTransformWireParityTest(unittest.TestCase):
+    def test_live_leg_5_preserves_the_specific_tag_total_failure_class(self) -> None:
+        module = runpy.run_path(str(SCRIPT))
+        verdicts = module["live_leg_verdicts"](
+            {},
+            {
+                "operator_reads": {
+                    "coverage": {"observed_lanes": 2},
+                    "unexplained_invariants": [
+                        {
+                            "class": "rust_status_tag_total_mismatch",
+                            "field": "totalTags",
+                        }
+                    ],
+                }
+            },
+        )
+        leg_5 = next(row for row in verdicts if row["leg"] == 5)
+
+        self.assertEqual(leg_5["verdict"], "FINDING")
+        self.assertEqual(leg_5["classes"], ["rust_status_tag_total_mismatch"])
+
     def test_config_verified_lanes_facades_and_historian_rows(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             temp = Path(temporary)
