@@ -172,63 +172,26 @@ export async function loadSidebarSnapshot(
     }
 }
 
-/** Fetch full status detail from the server via RPC. */
+export type StatusDetailResult = { ok: true; detail: StatusDetail } | { ok: false; error: string };
+
+/** Fetch full status detail without presenting transport failure as an empty session. */
 export async function loadStatusDetail(
     sessionId: string,
     directory: string,
     modelKey?: string,
-): Promise<StatusDetail> {
-    const emptyDetail: StatusDetail = {
-        ...EMPTY_SNAPSHOT,
-        sessionId,
-        activeProfile: null,
-        tagCounter: 0,
-        activeTags: 0,
-        droppedTags: 0,
-        totalTags: 0,
-        activeBytes: 0,
-        lastResponseTime: 0,
-        lastNudgeTokens: 0,
-        lastTransformError: null,
-        isSubagent: false,
-        pendingOps: [],
-        contextLimit: 0,
-        cacheTtlMs: 0,
-        cacheRemainingMs: 0,
-        cacheExpired: false,
-        cacheNeverExpires: false,
-        executeThreshold: 65,
-        executeThresholdMode: "percentage",
-        protectedTagCount: 20,
-        historyBudgetPercentage: 0.15,
-        historyBlockTokens: 0,
-        compressionBudget: null,
-        compressionUsage: null,
-        toastDurationMs: 5000,
-        loggerDiagnostics: {
-            swallowedWriteCount: 0,
-            lastErrorMessage: null,
-            lastErrorTime: null,
-        },
-        storage_versions: {
-            context_db_schema_version: null,
-            plugin_supported_version: 0,
-        },
-    };
-
-    if (!rpcClient) return emptyDetail;
+): Promise<StatusDetailResult> {
+    if (!rpcClient) return { ok: false, error: "RPC client is not initialized" };
     try {
         const result = await rpcClient.call<StatusDetail>("status-detail", {
             sessionId,
             directory,
             modelKey,
         });
-        if ((result as unknown as Record<string, unknown>).error) {
-            return emptyDetail;
-        }
-        return result;
-    } catch {
-        return emptyDetail;
+        const error = (result as unknown as Record<string, unknown>).error;
+        if (typeof error === "string") return { ok: false, error };
+        return { ok: true, detail: result };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
 }
 
@@ -262,12 +225,15 @@ export async function loadEmbedDetail(sessionId: string, directory: string): Pro
 export type CompartmentCountResult = { ok: true; count: number } | { ok: false; error: string };
 
 /** Get compartment count without making transport failure look like a real zero. */
-export async function getCompartmentCount(sessionId: string): Promise<CompartmentCountResult> {
+export async function getCompartmentCount(
+    sessionId: string,
+    directory?: string,
+): Promise<CompartmentCountResult> {
     if (!rpcClient) return { ok: false, error: "RPC client is not initialized" };
     try {
         const result = await rpcClient.call<{ count?: number; error?: string }>(
             "compartment-count",
-            { sessionId },
+            { sessionId, directory },
         );
         if (typeof result.error === "string") return { ok: false, error: result.error };
         if (typeof result.count !== "number" || !Number.isFinite(result.count)) {

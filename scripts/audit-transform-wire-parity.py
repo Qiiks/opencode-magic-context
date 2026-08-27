@@ -141,6 +141,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="directory of YYYY-MM-DD*.pi-render.json context-output captures",
     )
+    parser.add_argument(
+        "--omp-session-dir",
+        type=Path,
+        help="read-only OMP JSONL session root for shared-listing evidence",
+    )
+    parser.add_argument(
+        "--window-report-ledger",
+        type=Path,
+        help="read-only window-reports.jsonl overflow ledger",
+    )
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args()
 
@@ -426,6 +436,18 @@ def summarize_pi_session_sources(root: Path | None) -> dict[str, Any]:
         },
         "rule": "JSONL is source evidence; only .pi-render.json captures enter served-output comparisons",
     }
+
+
+def summarize_omp_session_sources(root: Path | None) -> dict[str, Any]:
+    summary = summarize_pi_session_sources(root)
+    if root is None:
+        summary["note"] = "pass --omp-session-dir to inspect real OMP JSONL source entries"
+    else:
+        summary["rule"] = (
+            "OMP uses the Pi-compatible JSONL reader; source rows prove listing coverage, "
+            "not served output"
+        )
+    return summary
 
 
 def blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1439,6 +1461,334 @@ def summarize_engine_adjacent_state(
         "coverage_by_lane": dict(sorted(coverage_by_lane.items())),
         "unexplained_invariants": unexplained_invariants,
         "note": "counts inventory durable coverage only; parity verdicts require identical histories and per-leg value-space adjudication",
+    }
+
+
+def summarize_operator_read_state(
+    context_db: Path | None,
+    store_db: Path | None,
+    sessions: set[str],
+    lane_by_session: dict[str, str],
+) -> dict[str, Any]:
+    """Inventory the exact durable fields consumed by doctor, RPC, and sidebar reads."""
+
+    per_session: dict[str, dict[str, Any]] = {
+        session: {"configured_lane": lane_by_session.get(session, "unverified")}
+        for session in sorted(sessions)
+    }
+    storage_versions: dict[str, int | None] = {
+        "context_db_schema_version": None,
+        "module_store_schema_version": None,
+    }
+
+    def scalar(db: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> int:
+        row = db.execute(sql, parameters).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else 0
+
+    def json_object(value: Any) -> dict[str, Any]:
+        if not isinstance(value, str):
+            return {}
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    project_paths_by_session: dict[str, list[str]] = collections.defaultdict(list)
+    if context_db is not None:
+        with sqlite3.connect(f"file:{context_db}?mode=ro", uri=True) as db:
+            if table_exists(db, "schema_migrations"):
+                storage_versions["context_db_schema_version"] = scalar(
+                    db,
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations WHERE version < 10000",
+                )
+            for session in sorted(sessions):
+                row = per_session[session]
+                context: dict[str, Any] = {}
+                if table_exists(db, "session_meta"):
+                    available = table_columns(db, "session_meta")
+                    selected = [
+                        column
+                        for column in (
+                            "last_context_percentage",
+                            "last_input_tokens",
+                            "last_usage_context_limit",
+                            "cache_ttl",
+                            "last_response_time",
+                            "counter",
+                            "cached_m0_mural_hash",
+                        )
+                        if column in available
+                    ]
+                    context["session_meta"] = (
+                        fetch_dicts(
+                            db,
+                            f"SELECT {', '.join(selected)} FROM session_meta WHERE session_id = ?",
+                            (session,),
+                        )
+                        if selected
+                        else []
+                    )
+                if table_exists(db, "tags"):
+                    available = table_columns(db, "tags")
+                    tag_counts: dict[str, Any] = {
+                        "total": scalar(
+                            db, "SELECT COUNT(*) FROM tags WHERE session_id = ?", (session,)
+                        )
+                    }
+                    if "status" in available:
+                        tag_counts["by_status"] = fetch_dicts(
+                            db,
+                            "SELECT status, COUNT(*) AS count FROM tags WHERE session_id = ? GROUP BY status ORDER BY status",
+                            (session,),
+                        )
+                    if "byte_size" in available and "status" in available:
+                        tag_counts["active_bytes"] = scalar(
+                            db,
+                            "SELECT COALESCE(SUM(byte_size), 0) FROM tags WHERE session_id = ? AND status = 'active'",
+                            (session,),
+                        )
+                    context["tags"] = tag_counts
+                if table_exists(db, "compartments"):
+                    context["compartment_count"] = scalar(
+                        db, "SELECT COUNT(*) FROM compartments WHERE session_id = ?", (session,)
+                    )
+                if table_exists(db, "session_projects"):
+                    project_paths = [
+                        str(binding["project_path"])
+                        for binding in fetch_dicts(
+                            db,
+                            "SELECT project_path FROM session_projects WHERE session_id = ? ORDER BY project_path",
+                            (session,),
+                        )
+                        if binding.get("project_path") is not None
+                    ]
+                    project_paths_by_session[session] = project_paths
+                    context["project_paths"] = project_paths
+                if table_exists(db, "mural_manifest"):
+                    murals: list[dict[str, Any]] = []
+                    available = table_columns(db, "mural_manifest")
+                    selected = [
+                        column
+                        for column in (
+                            "project_path",
+                            "content_hash",
+                            "rendered_at",
+                            "width",
+                            "height",
+                            "memory_ids_json",
+                        )
+                        if column in available
+                    ]
+                    for project_path in project_paths_by_session[session]:
+                        murals.extend(
+                            fetch_dicts(
+                                db,
+                                f"SELECT {', '.join(selected)} FROM mural_manifest WHERE project_path = ?",
+                                (project_path,),
+                            )
+                            if selected
+                            else []
+                        )
+                    context["mural_manifest"] = murals
+                row["context_read_model"] = context
+
+    mural_invariants: list[dict[str, Any]] = []
+    if store_db is not None:
+        with sqlite3.connect(f"file:{store_db}?mode=ro", uri=True) as db:
+            if table_exists(db, "cortexkit_schema_version"):
+                storage_versions["module_store_schema_version"] = scalar(
+                    db,
+                    "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = 'mc_cache'",
+                )
+            for session in sorted(sessions):
+                row = per_session[session]
+                module: dict[str, Any] = {}
+                if table_exists(db, "mc_cache_state"):
+                    available = table_columns(db, "mc_cache_state")
+                    selected = [
+                        column
+                        for column in ("row_version", "last_activity_at", "meta")
+                        if column in available
+                    ]
+                    states = (
+                        fetch_dicts(
+                            db,
+                            f"SELECT {', '.join(selected)} FROM mc_cache_state WHERE session_id = ?",
+                            (session,),
+                        )
+                        if selected
+                        else []
+                    )
+                    module["cache_state"] = [
+                        {
+                            **{
+                                key: value
+                                for key, value in state.items()
+                                if key != "meta"
+                            },
+                            "last_usage": json_object(state.get("meta")).get("last_usage"),
+                            "initialized": json_object(state.get("meta")).get("initialized"),
+                        }
+                        for state in states
+                    ]
+                for table, field in (
+                    ("mc_compartments", "compartment_count"),
+                    ("mc_tags", "tag_count"),
+                    ("pending_agent_drops", "pending_drop_count"),
+                ):
+                    module[field] = (
+                        scalar(db, f"SELECT COUNT(*) FROM {table} WHERE session_id = ?", (session,))
+                        if table_exists(db, table)
+                        else None
+                    )
+                if table_exists(db, "mc_pass_trace"):
+                    available = table_columns(db, "mc_pass_trace")
+                    selected = [
+                        column
+                        for column in (
+                            "last_received_at_ms",
+                            "last_completed_at_ms",
+                            "last_reject_error",
+                            "last_reject_at_ms",
+                            "receive_count",
+                            "reject_count",
+                        )
+                        if column in available
+                    ]
+                    traces = (
+                        fetch_dicts(
+                            db,
+                            f"SELECT {', '.join(selected)} FROM mc_pass_trace WHERE session_id = ?",
+                            (session,),
+                        )
+                        if selected
+                        else []
+                    )
+                    module["pass_trace"] = [
+                        {
+                            **{
+                                key: value
+                                for key, value in trace.items()
+                                if key != "last_reject_error"
+                            },
+                            "last_reject_error": (
+                                {
+                                    "present": True,
+                                    "bytes": len(str(trace["last_reject_error"]).encode()),
+                                    "sha256": text_hash(str(trace["last_reject_error"])),
+                                }
+                                if trace.get("last_reject_error")
+                                else {"present": False}
+                            ),
+                        }
+                        for trace in traces
+                    ]
+                if table_exists(db, "mc_project_mural_artifacts"):
+                    artifacts: list[dict[str, Any]] = []
+                    for project_path in project_paths_by_session[session]:
+                        values = fetch_dicts(
+                            db,
+                            "SELECT project_path, content_hash, length(data_url) AS data_url_bytes, updated_at FROM mc_project_mural_artifacts WHERE project_path = ?",
+                            (project_path,),
+                        )
+                        artifacts.extend(values)
+                    module["mural_artifacts"] = artifacts
+                    host_hashes = {
+                        str(value["content_hash"])
+                        for value in row.get("context_read_model", {}).get(
+                            "mural_manifest", []
+                        )
+                        if value.get("content_hash") is not None
+                    }
+                    module_hashes = {
+                        str(value["content_hash"])
+                        for value in artifacts
+                        if value.get("content_hash") is not None
+                    }
+                    if host_hashes and module_hashes and host_hashes != module_hashes:
+                        mural_invariants.append(
+                            {
+                                "session": session,
+                                "class": "mural_artifact_hash_mismatch",
+                                "host_hashes": sorted(host_hashes),
+                                "module_hashes": sorted(module_hashes),
+                            }
+                        )
+                row["module_read_model"] = module
+
+    for row in per_session.values():
+        lane = row["configured_lane"]
+        row["operator_truth_sources"] = (
+            {
+                "usage": "module_read_model",
+                "compartment_count": "module_read_model",
+                "tag_count": "module_read_model",
+                "pending_drop_count": "module_read_model",
+                "mural": "module_read_model",
+                "cache_ttl": "context_read_model",
+            }
+            if lane == "rust"
+            else {
+                "usage": "context_read_model",
+                "compartment_count": "context_read_model",
+                "tag_count": "context_read_model",
+                "pending_drop_count": "context_read_model",
+                "mural": "context_read_model",
+                "cache_ttl": "context_read_model",
+            }
+        )
+    return {
+        "storage_versions": storage_versions,
+        "per_session": per_session,
+        "unexplained_invariants": mural_invariants,
+        "field_contract": {
+            "rust": "usage, compartment totals, tag totals, pending drops, and mural inclusion come from mc-store; cache TTL timing remains host-owned",
+            "ts": "usage, compartment/tag totals, cache TTL timing, and mural manifest come from context.db",
+            "doctor": "context.db and mc-store have independent storage-version and repair domains",
+        },
+        "note": "rows are an inventory; compare values only for the same session/history and preserve unavailable Rust active/dropped tag breakdowns as unavailable",
+    }
+
+
+def summarize_window_report_ledger(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {
+            "status": "not_requested",
+            "note": "pass --window-report-ledger to inspect overflow report row shapes",
+        }
+    key_shapes: collections.Counter[tuple[str, ...]] = collections.Counter()
+    geometries: collections.Counter[str] = collections.Counter()
+    statuses: collections.Counter[str] = collections.Counter()
+    errors: list[str] = []
+    rows = 0
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as error:
+        return {"status": "unreadable", "error": str(error)}
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as error:
+            errors.append(f"line {line_number}: {error.msg}")
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"line {line_number}: row is not an object")
+            continue
+        rows += 1
+        key_shapes[tuple(sorted(str(key) for key in value))] += 1
+        geometries[str(value.get("geometry", "missing"))] += 1
+        statuses[str(value.get("status", "missing"))] += 1
+    return {
+        "status": "ok",
+        "rows": rows,
+        "key_shapes": counter_dict(key_shapes),
+        "geometries": counter_dict(geometries),
+        "statuses": counter_dict(statuses),
+        "parse_errors": errors[:20],
+        "note": "the event handler owns this ledger before transform authority branches, so lane parity is row-shape parity for the same provider event",
     }
 
 
@@ -2488,11 +2838,19 @@ def main() -> None:
             "store_db": str(args.store_db) if args.store_db else None,
             "pi_session_dir": str(args.pi_session_dir) if args.pi_session_dir else None,
             "pi_render_dir": str(args.pi_render_dir) if args.pi_render_dir else None,
+            "omp_session_dir": str(args.omp_session_dir) if args.omp_session_dir else None,
+            "window_report_ledger": (
+                str(args.window_report_ledger) if args.window_report_ledger else None
+            ),
         },
         "lane_verification": lane_verification,
         "pi_lane_verification": pi_lane_verification,
         "lanes": lane_summaries,
         "pi_session_sources": summarize_pi_session_sources(args.pi_session_dir),
+        "omp_session_sources": summarize_omp_session_sources(args.omp_session_dir),
+        "overflow_report_ledger": summarize_window_report_ledger(
+            args.window_report_ledger
+        ),
         "ts_pi_cross_harness_parity": compare_ts_pi_axes(
             lane_summaries["ts"], lane_summaries["pi"]
         ),
@@ -2503,6 +2861,12 @@ def main() -> None:
     }
     if args.context_db is not None or args.store_db is not None:
         report["engine_adjacent_state"] = summarize_engine_adjacent_state(
+            args.context_db,
+            args.store_db,
+            sessions,
+            lane_by_session,
+        )
+        report["operator_read_state"] = summarize_operator_read_state(
             args.context_db,
             args.store_db,
             sessions,

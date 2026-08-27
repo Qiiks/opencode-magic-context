@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
 import type { SidebarSnapshot } from "../../shared/rpc-types";
-import { closeRpc, getCompartmentCount, initRpcClient, loadSidebarSnapshot } from "./context-db";
+import {
+    closeRpc,
+    getCompartmentCount,
+    initRpcClient,
+    loadSidebarSnapshot,
+    loadStatusDetail,
+} from "./context-db";
 
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const tempDirs: string[] = [];
@@ -94,6 +100,21 @@ describe("TUI context RPC data", () => {
         expect((await loadSidebarSnapshot(sessionId, directory)).inputTokens).toBe(0);
         response = { error: "database busy again" };
         expect((await loadSidebarSnapshot(sessionId, directory)).inputTokens).toBe(0);
+    });
+
+    test("does not turn a status authority failure into an empty session", async () => {
+        const dataHome = makeDataHome();
+        const directory = "/repo-status-error";
+        const server = await startServer(dataHome, directory, () => ({}));
+        server.handle("status-detail", async () => ({
+            error: "Rust module status unavailable; canonical session state was not read",
+        }));
+        initRpcClient(directory);
+
+        expect(await loadStatusDetail("ses_rust", directory)).toEqual({
+            ok: false,
+            error: "Rust module status unavailable; canonical session state was not read",
+        });
     });
 
     test("distinguishes a real zero compartment count from an RPC failure", async () => {

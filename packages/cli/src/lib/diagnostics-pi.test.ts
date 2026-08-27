@@ -46,7 +46,23 @@ describe("sanitizeValue Pi diagnostics redaction", () => {
             }),
         ).toEqual({
             execute_threshold_tokens: 200000,
-            api_key: "<REDACTED>",
+            api_key: "<REDACTED:api_key>",
+        });
+    });
+
+    it("uses the shared key classifier for token budgets and secret classes", () => {
+        expect(
+            sanitizeValue({
+                execute_threshold_tokens: { default: 200000 },
+                injection_budget_tokens: 4000,
+                access_token: "high-entropy-access-token",
+                hasUsageTokens: true,
+            }),
+        ).toEqual({
+            execute_threshold_tokens: { default: 200000 },
+            injection_budget_tokens: 4000,
+            access_token: "<REDACTED:access_token>",
+            hasUsageTokens: true,
         });
     });
 });

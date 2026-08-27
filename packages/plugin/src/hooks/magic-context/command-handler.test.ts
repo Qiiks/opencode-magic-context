@@ -958,6 +958,48 @@ describe("createMagicContextCommandHandler", () => {
     });
 
     describe("Rust-mode command operations", () => {
+        it("omits context.db mirrors when canonical status is unavailable", async () => {
+            insertTag(db, "ses-rust-status-unavailable", 1, 1024);
+            const sendNotification = mock(async () => {});
+            const getStatusDetail = mock(() => {
+                throw new Error("host mirror must not be formatted");
+            });
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: {
+                    call: async () => {
+                        throw new Error("module offline");
+                    },
+                },
+                getStatusDetail,
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    {
+                        command: "ctx-status",
+                        sessionID: "ses-rust-status-unavailable",
+                        arguments: "",
+                    },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+            );
+
+            expect(getStatusDetail).not.toHaveBeenCalled();
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-rust-status-unavailable",
+                expect.stringContaining("Rust module status could not be read"),
+                {},
+            );
+            const text = String(sendNotification.mock.calls[0]?.[1]);
+            expect(text).not.toContain("- Active: 1");
+        });
+
         it("routes flush to the module while retaining flush wording", async () => {
             const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
             const sendNotification = mock(async () => {});
