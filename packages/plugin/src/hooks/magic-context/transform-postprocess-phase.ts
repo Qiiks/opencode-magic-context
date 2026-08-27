@@ -1673,7 +1673,7 @@ export async function runPostTransformPhase(
         // Step 1: Replay — re-apply sentinel to messages whose IDs were neutralized
         // on a prior bust pass. Preserves array length — no splice.
         if (persistedIds.size > 0) {
-            const { replayed, missingIds } = replaySentinelByMessageIds(
+            const { replayed } = replaySentinelByMessageIds(
                 args.messages,
                 persistedIds,
                 args.resolvedProviderID,
@@ -1684,15 +1684,12 @@ export async function runPostTransformPhase(
                     `sentinel replay: neutralized ${replayed} previously-stripped messages`,
                 );
             }
-            // Prune IDs that no longer appear in the live message set (e.g., after
-            // compaction trimmed them out entirely). Don't prune if they're present
-            // but already sentinel — those are working as intended.
-            if (missingIds.length > 0) {
-                for (const id of missingIds) persistedIds.delete(id);
-                // CAS delta (remove) so a sibling process discovering new IDs in
-                // parallel isn't clobbered by this prune's whole-set overwrite.
-                applyStrippedPlaceholderDelta(args.db, args.sessionId, { remove: missingIds });
-            }
+            // Absence from one transform array is not deletion. Advancing the
+            // compaction marker can temporarily hide source rows on the fold pass
+            // and project them again on the next pass. Their frozen sentinel IDs
+            // must survive that gap so the reappearing rows keep the bytes already
+            // served at the seam. The message.deleted handler removes IDs only
+            // after OpenCode confirms that the durable source row was deleted.
         }
 
         // Step 2: Detect — only on cache-busting passes, find NEW eligible messages
