@@ -9,11 +9,13 @@ import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     advanceToolReclaimWatermark,
+    applyStrippedPlaceholderDelta,
     getActiveTagsBySession,
     getChannel2NudgeState,
     getOrCreateSessionMeta,
     getPendingCompactionMarkerState,
     getProcessedImageStrippedIds,
+    getStrippedPlaceholderIds,
     getTagsBySession,
     insertTag,
     queueM0Mutation,
@@ -427,6 +429,82 @@ function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[
     }
     return serializeAnthropicWirePrefix(merged);
 }
+
+function serializeAnthropicVisibleRoleGroups(messages: MessageLike[]): string {
+    const merged: Array<{ role: string | undefined; parts: MessageLike["parts"] }> = [];
+    for (const message of messages) {
+        const parts = message.parts.filter((part) => {
+            if (part === null || typeof part !== "object") return true;
+            const candidate = part as { type?: unknown; text?: unknown };
+            return candidate.type !== "text" || candidate.text !== "";
+        });
+        if (parts.length === 0) continue;
+        const previous = merged.at(-1);
+        if (previous?.role === message.info.role) previous.parts.push(...structuredClone(parts));
+        else merged.push({ role: message.info.role, parts: structuredClone(parts) });
+    }
+    return JSON.stringify(merged);
+}
+
+describe("stripped placeholder replay across temporary marker windows", () => {
+    for (const [missingPassDecision, replayPassDecision] of [
+        ["execute", "defer"],
+        ["defer", "execute"],
+    ] as const) {
+        it(`keeps frozen assistant bytes across ${missingPassDecision}→${replayPassDecision} passes`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `ses-placeholder-marker-${missingPassDecision}`;
+            const assistantId = "assistant-at-marker-seam";
+            applyStrippedPlaceholderDelta(db, sessionId, { add: [assistantId] });
+
+            // A marker-applying pass can temporarily omit an older assistant even
+            // though adjacent retained user rows remain in the provider projection.
+            const missingAssistantPass = [
+                {
+                    info: { id: "user-before", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained-before" }],
+                },
+                {
+                    info: { id: "user-after", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained-after" }],
+                },
+            ] as unknown as MessageLike[];
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, missingAssistantPass, {
+                    schedulerDecision: missingPassDecision,
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+            const foldWire = serializeAnthropicVisibleRoleGroups(missingAssistantPass);
+            expect(getStrippedPlaceholderIds(db, sessionId).has(assistantId)).toBe(true);
+
+            const replayPass = [
+                {
+                    info: { id: "user-before", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained-before" }],
+                },
+                {
+                    info: { id: assistantId, role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "[dropped §70730§]" }],
+                },
+                {
+                    info: { id: "user-after", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained-after" }],
+                },
+            ] as unknown as MessageLike[];
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, replayPass, {
+                    schedulerDecision: replayPassDecision,
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+
+            expect(replayPass[1]?.parts).toEqual([{ type: "text", text: "" }]);
+            expect(serializeAnthropicVisibleRoleGroups(replayPass)).toBe(foldWire);
+        });
+    }
+});
 
 describe("deferred compaction marker representation", () => {
     it("ignores a persisted message that carries a forged syntheticHead flag", () => {
