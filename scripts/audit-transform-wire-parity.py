@@ -868,6 +868,15 @@ def fetch_dicts(
     return [dict(zip(names, row)) for row in cursor.fetchall()]
 
 
+def table_exists(db: sqlite3.Connection, table: str) -> bool:
+    return (
+        db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
 def session_table_inventory(db: sqlite3.Connection) -> list[str]:
     tables = [
         str(row[0])
@@ -1194,6 +1203,243 @@ def apply_observed_lanes(
         "read live project config first; decisive in-window durable authority then selects the effective denominator"
     )
     return effective
+
+
+def summarize_engine_adjacent_state(
+    context_db: Path | None,
+    store_db: Path | None,
+    sessions: set[str],
+    lane_by_session: dict[str, str],
+) -> dict[str, Any]:
+    """Inventory lane-neutral read models and Rust engine truth without dumping content."""
+
+    per_session: dict[str, dict[str, Any]] = {
+        session: {"configured_lane": lane_by_session.get(session, "unverified")}
+        for session in sorted(sessions)
+    }
+
+    def count(
+        db: sqlite3.Connection, sql: str, parameters: tuple[Any, ...]
+    ) -> int:
+        row = db.execute(sql, parameters).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    if context_db is not None:
+        with sqlite3.connect(f"file:{context_db}?mode=ro", uri=True) as db:
+            for session in sorted(sessions):
+                row = per_session[session]
+                if table_exists(db, "message_history_index"):
+                    columns = table_columns(db, "message_history_index")
+                    selected = [
+                        column
+                        for column in (
+                            "last_indexed_ordinal",
+                            "dirty_floor_ordinal",
+                            "harness",
+                        )
+                        if column in columns
+                    ]
+                    projection = ", ".join(selected)
+                    state = (
+                        fetch_dicts(
+                            db,
+                            f"SELECT {projection} FROM message_history_index WHERE session_id = ?",
+                            (session,),
+                        )
+                        if selected
+                        else []
+                    )
+                else:
+                    state = []
+                if table_exists(db, "message_history_fts"):
+                    fts = {
+                        "rows": count(
+                            db,
+                            "SELECT COUNT(*) FROM message_history_fts WHERE session_id = ?",
+                            (session,),
+                        ),
+                        "distinct_message_ids": count(
+                            db,
+                            "SELECT COUNT(DISTINCT message_id) FROM message_history_fts WHERE session_id = ?",
+                            (session,),
+                        ),
+                        "empty_content_rows": count(
+                            db,
+                            "SELECT COUNT(*) FROM message_history_fts WHERE session_id = ? AND content = ''",
+                            (session,),
+                        ),
+                    }
+                else:
+                    fts = None
+                row["message_index"] = {"state": state, "fts": fts}
+
+                bindings = (
+                    fetch_dicts(
+                        db,
+                        "SELECT harness, project_path FROM session_projects WHERE session_id = ? ORDER BY harness, project_path",
+                        (session,),
+                    )
+                    if table_exists(db, "session_projects")
+                    else []
+                )
+                row["session_project_bindings"] = bindings
+
+                embedding: dict[str, Any] = {}
+                if table_exists(db, "compartments"):
+                    embedding["compartments"] = count(
+                        db, "SELECT COUNT(*) FROM compartments WHERE session_id = ?", (session,)
+                    )
+                if table_exists(db, "compartment_chunk_embeddings"):
+                    embedding["chunk_vectors"] = count(
+                        db,
+                        "SELECT COUNT(*) FROM compartment_chunk_embeddings WHERE session_id = ?",
+                        (session,),
+                    )
+                    if table_exists(db, "session_projects"):
+                        embedding["mis_scoped_chunk_vectors"] = count(
+                            db,
+                            """SELECT COUNT(*)
+                                 FROM compartment_chunk_embeddings e
+                                 JOIN session_projects sp
+                                   ON sp.session_id = e.session_id AND sp.harness = e.harness
+                                WHERE e.session_id = ? AND e.project_path <> sp.project_path""",
+                            (session,),
+                        )
+                if table_exists(db, "memories") and "source_session_id" in table_columns(
+                    db, "memories"
+                ):
+                    embedding["memories"] = count(
+                        db, "SELECT COUNT(*) FROM memories WHERE source_session_id = ?", (session,)
+                    )
+                    if table_exists(db, "memory_embeddings"):
+                        embedding["memory_vectors"] = count(
+                            db,
+                            """SELECT COUNT(*) FROM memory_embeddings e
+                                 JOIN memories m ON m.id = e.memory_id
+                                WHERE m.source_session_id = ?""",
+                            (session,),
+                        )
+                row["embeddings"] = embedding
+
+                if table_exists(db, "notes"):
+                    note_columns = table_columns(db, "notes")
+                    predicates = ["session_id = ?"]
+                    if "type" in note_columns:
+                        predicates.append("type = 'smart'")
+                    projection = ["status"]
+                    if "check_status" in note_columns:
+                        projection.append("check_status")
+                    note_rows = fetch_dicts(
+                        db,
+                        f"SELECT {', '.join(projection)}, COUNT(*) AS count FROM notes WHERE {' AND '.join(predicates)} GROUP BY {', '.join(projection)} ORDER BY {', '.join(projection)}",
+                        (session,),
+                    )
+                else:
+                    note_rows = []
+                row["smart_notes"] = note_rows
+
+                if table_exists(db, "git_commits") and bindings:
+                    projects = sorted(
+                        {
+                            str(binding["project_path"])
+                            for binding in bindings
+                            if binding.get("project_path") is not None
+                        }
+                    )
+                    placeholders = ",".join("?" for _ in projects)
+                    row["git_commits"] = (
+                        count(
+                            db,
+                            f"SELECT COUNT(*) FROM git_commits WHERE project_path IN ({placeholders})",
+                            tuple(projects),
+                        )
+                        if projects
+                        else 0
+                    )
+
+    if store_db is not None:
+        with sqlite3.connect(f"file:{store_db}?mode=ro", uri=True) as db:
+            for session in sorted(sessions):
+                truth: dict[str, Any] = {}
+                for table, preferred in (
+                    (
+                        "mc_cache_state",
+                        (
+                            "row_version",
+                            "last_activity_at",
+                        ),
+                    ),
+                    (
+                        "mc_pass_trace",
+                        (
+                            "last_received_at_ms",
+                            "last_completed_at_ms",
+                            "last_reject_error",
+                            "last_reject_at_ms",
+                            "receive_count",
+                            "reject_count",
+                            "first_divergence",
+                        ),
+                    ),
+                ):
+                    if not table_exists(db, table):
+                        truth[table] = None
+                        continue
+                    available = table_columns(db, table)
+                    selected = [column for column in preferred if column in available]
+                    projection = ", ".join(selected) if selected else "session_id"
+                    values = fetch_dicts(
+                        db,
+                        f"SELECT {projection} FROM {table} WHERE session_id = ?",
+                        (session,),
+                    )
+                    truth[table] = values
+                row = per_session[session]
+                row["rust_engine_truth"] = truth
+
+    coverage_by_lane: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for session, row in per_session.items():
+        message_state = row.get("message_index", {}).get("state", [])
+        embedding = row.get("embeddings", {})
+        coverage_by_lane[str(row["configured_lane"])].append(
+            {
+                "session": session,
+                "message_index_present": bool(message_state),
+                "message_index_dirty": any(
+                    state.get("dirty_floor_ordinal") not in (None, 0) for state in message_state
+                ),
+                "session_project_bound": bool(row.get("session_project_bindings")),
+                "chunk_vectors_present": embedding.get("chunk_vectors", 0) > 0,
+                "memory_vectors_present": embedding.get("memory_vectors", 0) > 0,
+                "smart_notes_present": bool(row.get("smart_notes")),
+                "git_commits_present": row.get("git_commits", 0) > 0,
+            }
+        )
+    unexplained_invariants = [
+        {
+            "session": session,
+            "class": "duplicate_message_fts_rows",
+            "rows": fts["rows"],
+            "distinct_message_ids": fts["distinct_message_ids"],
+        }
+        for session, row in per_session.items()
+        if (fts := row.get("message_index", {}).get("fts"))
+        and fts["rows"] != fts["distinct_message_ids"]
+    ] + [
+        {
+            "session": session,
+            "class": "mis_scoped_chunk_vectors",
+            "count": row.get("embeddings", {}).get("mis_scoped_chunk_vectors"),
+        }
+        for session, row in per_session.items()
+        if row.get("embeddings", {}).get("mis_scoped_chunk_vectors", 0) > 0
+    ]
+    return {
+        "per_session": per_session,
+        "coverage_by_lane": dict(sorted(coverage_by_lane.items())),
+        "unexplained_invariants": unexplained_invariants,
+        "note": "counts inventory durable coverage only; parity verdicts require identical histories and per-leg value-space adjudication",
+    }
 
 
 def summarize_telemetry(
@@ -2256,6 +2502,12 @@ def main() -> None:
         "ctx_facade_parity": compare_ctx_facades(dumps),
     }
     if args.context_db is not None or args.store_db is not None:
+        report["engine_adjacent_state"] = summarize_engine_adjacent_state(
+            args.context_db,
+            args.store_db,
+            sessions,
+            lane_by_session,
+        )
         report["telemetry"] = summarize_telemetry(
             args.context_db,
             args.store_db,
