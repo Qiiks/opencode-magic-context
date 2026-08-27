@@ -16,12 +16,16 @@ export interface CtxExpandToolDeps {
 const ctxExpandArgsShape = {
     start: tool.schema
         .number()
+        .int()
+        .min(1)
         .optional()
         .describe(
             'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
         ),
     end: tool.schema
         .number()
+        .int()
+        .min(1)
         .optional()
         .describe(
             'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
@@ -34,6 +38,8 @@ const ctxExpandArgsShape = {
         ),
     message: tool.schema
         .number()
+        .int()
+        .min(1)
         .optional()
         .describe(
             "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
@@ -60,11 +66,25 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             const sessionId = toolContext.sessionID;
 
             // By-ordinal mode: full recovery of a single message from stored history.
-            if (typeof args.message === "number" && args.message >= 1) {
+            if (args.message !== undefined) {
+                if (
+                    typeof args.message !== "number" ||
+                    !Number.isInteger(args.message) ||
+                    args.message < 1
+                ) {
+                    return "Error: message must be a positive integer.";
+                }
                 return renderMessageByOrdinal(sessionId, args.message);
             }
 
-            if (!args.start || !args.end || args.start < 1 || args.end < args.start) {
+            if (
+                !args.start ||
+                !args.end ||
+                !Number.isInteger(args.start) ||
+                !Number.isInteger(args.end) ||
+                args.start < 1 ||
+                args.end < args.start
+            ) {
                 return "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).";
             }
 

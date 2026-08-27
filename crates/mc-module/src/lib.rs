@@ -10688,7 +10688,10 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         let session_id = facade_scope.conversation_key.as_str();
-        if let Some(message) = i64_arg(args, "message").filter(|value| *value >= 0) {
+        if args.get("message").is_some() {
+            let Some(message) = i64_arg(args, "message").filter(|value| *value > 0) else {
+                return tool_error_result("Error: message must be a positive integer.");
+            };
             if let Some(raw_message) =
                 self.cached_expand_messages(session_id)
                     .and_then(|messages| {
@@ -10721,17 +10724,17 @@ impl McHandler {
         }
         let Some(start) = i64_arg(args, "start") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
             );
         };
         let Some(end) = i64_arg(args, "end") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
             );
         };
-        if start < 0 || end < start {
+        if start <= 0 || end < start {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
             );
         }
         let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
@@ -13167,12 +13170,24 @@ fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
         "user" => "U (user)",
         role => role,
     };
-    let parts = message
-        .ck
-        .content
-        .iter()
-        .filter_map(render_cached_expand_part)
-        .collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while let Some(part) = message.ck.content.get(index) {
+        if let Some((name, id, input, output)) =
+            paired_expand_tool(part, message.ck.content.get(index + 1))
+        {
+            parts.push(format!(
+                "  [tool: {name} #{id}]\n  input: {input}\n  output:\n{}",
+                expand_tool_output_text(output)
+            ));
+            index += 2;
+            continue;
+        }
+        if let Some(rendered) = render_cached_expand_part(part) {
+            parts.push(rendered);
+        }
+        index += 1;
+    }
     let mut lines = vec![
         format!("[{}] {role} — full recovery:", message.ordinal),
         String::new(),
@@ -13185,6 +13200,31 @@ fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
         lines.extend(parts);
     }
     lines.join("\n")
+}
+
+fn paired_expand_tool<'a>(
+    call: &'a ck_wire::CkWireBlock,
+    result: Option<&'a ck_wire::CkWireBlock>,
+) -> Option<(&'a str, &'a str, &'a Value, &'a ck_wire::CkToolOutput)> {
+    let ck_wire::CkKind::ToolCall {
+        id, name, input, ..
+    } = &call.kind
+    else {
+        return None;
+    };
+    let ck_wire::CkKind::ToolResult {
+        id: result_id,
+        output,
+        ..
+    } = &result?.kind
+    else {
+        return None;
+    };
+    (id == result_id).then_some((name.as_str(), id.as_str(), input, output))
+}
+
+fn expand_file_label(filename: Option<&str>) -> String {
+    filename.map_or_else(|| "  [file]".to_string(), |name| format!("  [file] {name}"))
 }
 
 fn render_cached_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
@@ -13204,7 +13244,14 @@ fn render_cached_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
             "  [tool: {tool_name} #{id}]\n  output:\n{}",
             expand_tool_output_text(output)
         )),
-        ck_wire::CkKind::Media(_) => Some("  [media]".to_string()),
+        ck_wire::CkKind::Media(media) => Some(expand_file_label(media.filename.as_deref())),
+        ck_wire::CkKind::Opaque(opaque) if opaque.kind == "file" => Some(expand_file_label(
+            opaque
+                .raw
+                .get("filename")
+                .or_else(|| opaque.raw.get("url"))
+                .and_then(Value::as_str),
+        )),
         ck_wire::CkKind::Text { .. }
         | ck_wire::CkKind::Reasoning { .. }
         | ck_wire::CkKind::RedactedReasoning { .. }
@@ -13500,12 +13547,30 @@ fn render_verbose_expand_message(message: &ck_wire::CkIngressMessage) -> String 
         "user" => "U (user)",
         role => role,
     };
-    let previews = message
-        .ck
-        .content
-        .iter()
-        .filter_map(render_verbose_expand_part)
-        .collect::<Vec<_>>();
+    let mut previews = Vec::new();
+    let mut index = 0;
+    while let Some(part) = message.ck.content.get(index) {
+        if let Some((name, _id, input, output)) =
+            paired_expand_tool(part, message.ck.content.get(index + 1))
+        {
+            let argument = verbose_expand_key_argument(input);
+            let head = if argument.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}({argument})")
+            };
+            previews.push(format!(
+                "    • tool {head} → output ~{} tok",
+                mc_tokenizer::estimate_tokens(&expand_tool_output_text(output))
+            ));
+            index += 2;
+            continue;
+        }
+        if let Some(rendered) = render_verbose_expand_part(part) {
+            previews.push(rendered);
+        }
+        index += 1;
+    }
     if previews.is_empty() {
         format!("[{}] {role}", message.ordinal)
     } else {
@@ -13538,8 +13603,13 @@ fn render_verbose_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
             "    • [reasoning] {}",
             truncate_expand_preview(text, CTX_EXPAND_VERBOSE_REASONING_PREVIEW_CHARS)
         )),
-        ck_wire::CkKind::Media(_) => Some("    • [media]".to_string()),
+        ck_wire::CkKind::Media(_) => Some("    • [file]".to_string()),
         ck_wire::CkKind::RedactedReasoning { .. } => Some("    • [redacted_reasoning]".to_string()),
+        ck_wire::CkKind::Opaque(opaque)
+            if opaque.kind == "step-start" || opaque.kind == "step-finish" =>
+        {
+            None
+        }
         ck_wire::CkKind::Opaque(opaque) => Some(format!("    • [{}]", opaque.kind)),
     }
 }
@@ -14658,10 +14728,10 @@ fn ctx_expand_schema() -> Value {
         "type": "object",
         "additionalProperties": true,
         "properties": {
-            "start": { "type": "integer", "minimum": 0, "description": "First message ordinal to expand." },
-            "end": { "type": "integer", "minimum": 0, "description": "Last message ordinal to expand, inclusive." },
+            "start": { "type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991_i64, "description": "First message ordinal to expand." },
+            "end": { "type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991_i64, "description": "Last message ordinal to expand, inclusive." },
             "verbose": { "type": "boolean", "description": "With start/end: list each message separately with its ordinal [N] and per-part preview, including each tool call's output size, so one message can be recovered by ordinal." },
-            "message": { "type": "integer", "minimum": 0, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
+            "message": { "type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991_i64, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
         }
     })
 }
@@ -30703,33 +30773,74 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn ctx_expand_renderers_match_typescript_facade_golden() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/ctx-facade-golden.json")).unwrap();
+        assert_eq!(golden["schema"], json!(1));
+        let cases = golden["cases"].as_array().expect("golden cases");
+        assert!(!cases.is_empty(), "ctx facade golden must not be empty");
+        for case in cases {
+            let name = case["name"].as_str().expect("case name");
+            let messages: Vec<ck_wire::CkIngressMessage> =
+                serde_json::from_value(case["ck_messages"].clone()).expect("CK messages");
+            for expected in case["expected"]["full"]
+                .as_array()
+                .expect("full render cases")
+            {
+                let ordinal = expected["ordinal"].as_u64().expect("full ordinal");
+                let message = messages
+                    .iter()
+                    .find(|message| message.ordinal == ordinal)
+                    .expect("golden message ordinal");
+                assert_eq!(
+                    render_cached_message_expand(message),
+                    expected["text"].as_str().expect("full text"),
+                    "full renderer drifted for {name} ordinal {ordinal}"
+                );
+            }
+            let start = i64::try_from(messages.first().expect("messages").ordinal).unwrap();
+            let end = i64::try_from(messages.last().expect("messages").ordinal).unwrap();
+            let rendered = render_verbose_range_expand_with_budget(&messages, start, end, 15_000);
+            let expected = &case["expected"]["verbose"];
+            assert_eq!(
+                rendered.text,
+                expected["text"].as_str().expect("verbose text"),
+                "verbose renderer drifted for {name}"
+            );
+            assert_eq!(
+                rendered.last_ordinal,
+                expected["lastOrdinal"].as_i64().expect("last ordinal"),
+                "verbose last ordinal drifted for {name}"
+            );
+            assert_eq!(
+                rendered.truncated,
+                expected["truncated"].as_bool().expect("truncated"),
+                "verbose truncation drifted for {name}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn ctx_expand_accepts_native_ordinal_zero_in_message_and_range_forms() {
+    async fn ctx_expand_rejects_ordinal_zero_like_the_typescript_facade() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
             default_test_config(),
             resolver,
         );
-        publish_ctx_expand_fixture(
-            &store,
-            "ses",
-            project.to_str().unwrap(),
-            &[ck_with_role("m0", 0, "user", "ordinal zero")],
-        );
 
-        // R5-11: the shape published by a zero-based native history round-trips exactly.
-        let by_message =
-            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 0})).await);
-        assert!(by_message.contains("[0] U (user) — full recovery:"));
-        assert!(by_message.contains("ordinal zero"));
-        let by_range =
-            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 0})).await);
-        assert!(by_range.contains("Messages 0-0"));
-        assert!(by_range.contains("[0] U: ordinal zero"));
+        let by_message = call_facade(&handler, "ctx_expand", json!({"message": 0})).await;
+        assert!(tool_is_error(by_message));
+        let by_range = call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 0})).await;
+        assert!(tool_is_error(by_range));
         let schema = ctx_expand_schema();
-        assert_eq!(schema["properties"]["message"]["minimum"], json!(0));
-        assert_eq!(schema["properties"]["start"]["minimum"], json!(0));
-        assert_eq!(schema["properties"]["end"]["minimum"], json!(0));
+        for property in ["message", "start", "end"] {
+            assert_eq!(schema["properties"][property]["minimum"], json!(1));
+            assert_eq!(
+                schema["properties"][property]["maximum"],
+                json!(9_007_199_254_740_991_i64)
+            );
+        }
     }
 }
