@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize TS/Rust parity evidence from served wire dumps and durable rows.
+"""Summarize TS/Rust/Pi parity evidence from served captures and durable rows.
 
-Serialized provider requests remain ground truth. Lane assignment is accepted
-only after reading each live project's magic-context.jsonc; transform telemetry
-then reports any disagreement between configured and observed authority.
+Serialized provider requests remain OpenCode ground truth. Pi JSONL is source
+history only; dated .pi-render.json context outputs are its served-transform
+evidence. Every lane is admitted only after reading the live project config.
 """
 
 from __future__ import annotations
@@ -131,6 +131,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="read-only Rust store.db for module activity and scheduler evidence",
     )
+    parser.add_argument(
+        "--pi-session-dir",
+        type=Path,
+        help="read-only Pi JSONL session root (normally ~/.pi/agent/sessions)",
+    )
+    parser.add_argument(
+        "--pi-render-dir",
+        type=Path,
+        help="directory of YYYY-MM-DD*.pi-render.json context-output captures",
+    )
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args()
 
@@ -181,6 +191,241 @@ def load_dumps(paths: Iterable[Path], rust_sessions: set[str]) -> list[Dump]:
             )
         )
     return dumps
+
+
+def choose_pi_render_paths(root: Path, date: str, per_session: int) -> list[Path]:
+    grouped: dict[str, list[Path]] = collections.defaultdict(list)
+    for path in root.glob(f"{date}*.pi-render.json"):
+        try:
+            capture = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        session = capture.get("session_id") if isinstance(capture, dict) else None
+        if isinstance(session, str) and session:
+            grouped[session].append(path)
+    return [
+        path
+        for session in sorted(grouped)
+        for path in sorted(grouped[session])[-per_session:]
+    ]
+
+
+def pi_content_blocks(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return []
+    output: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "toolCall":
+            output.append(
+                {
+                    "type": "tool_use",
+                    "id": part.get("id"),
+                    "name": part.get("name"),
+                    "input": part.get("arguments", {}),
+                }
+            )
+        elif part_type == "image":
+            output.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": part.get("mimeType"),
+                        "data": part.get("data"),
+                    },
+                }
+            )
+        elif part_type == "thinking":
+            output.append(
+                {
+                    "type": "thinking",
+                    "thinking": part.get("thinking", ""),
+                    **(
+                        {"signature": part["thinkingSignature"]}
+                        if isinstance(part.get("thinkingSignature"), str)
+                        else {}
+                    ),
+                }
+            )
+        else:
+            output.append(dict(part))
+    return output
+
+
+def normalize_pi_render_messages(messages: Any) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    output: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "toolResult":
+            output.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": message.get("toolCallId"),
+                            "content": pi_content_blocks(message.get("content")),
+                        }
+                    ],
+                }
+            )
+        elif role in ("user", "assistant", "custom"):
+            output.append(
+                {
+                    "role": "user" if role == "custom" else role,
+                    "content": pi_content_blocks(message.get("content")),
+                }
+            )
+    return output
+
+
+def load_pi_render_dumps(paths: Iterable[Path]) -> list[Dump]:
+    dumps: list[Dump] = []
+    for path in paths:
+        try:
+            capture = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(capture, dict):
+            continue
+        session = capture.get("session_id")
+        project = capture.get("project_root")
+        messages = capture.get("messages", capture.get("output_messages"))
+        if not isinstance(session, str) or not session:
+            continue
+        system = (
+            [{"type": "text", "text": f"Working directory: {project}"}]
+            if isinstance(project, str) and project
+            else []
+        )
+        dumps.append(
+            Dump(
+                path=path,
+                session=session,
+                lane="pi",
+                body={"system": system, "messages": normalize_pi_render_messages(messages)},
+                response=capture.get("response") if isinstance(capture.get("response"), dict) else None,
+            )
+        )
+    return dumps
+
+
+def nested_text_values(value: Any) -> Iterable[str]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in ("text", "thinking", "content") and isinstance(child, str):
+                yield child
+            else:
+                yield from nested_text_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from nested_text_values(child)
+
+
+def summarize_pi_session_sources(root: Path | None) -> dict[str, Any]:
+    if root is None:
+        return {
+            "status": "not_requested",
+            "sessions": [],
+            "note": "pass --pi-session-dir to inspect real Pi JSONL source entries",
+        }
+    sessions: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*.jsonl")):
+        entry_types: collections.Counter[str] = collections.Counter()
+        tag_placements: collections.Counter[str] = collections.Counter()
+        message_entries = 0
+        missing_entry_ids = 0
+        channel_nudges = 0
+        session_id: str | None = None
+        project_root: str | None = None
+        clone_parent: str | None = None
+        errors: list[str] = []
+        try:
+            lines = path.read_text().splitlines()
+        except OSError as error:
+            sessions.append({"file": str(path), "error": str(error)})
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as error:
+                errors.append(f"line {line_number}: {error.msg}")
+                continue
+            if not isinstance(entry, dict):
+                continue
+            entry_type = str(entry.get("type", "unknown"))
+            entry_types[entry_type] += 1
+            if entry_type == "session":
+                session_id = next(
+                    (
+                        value
+                        for key in ("id", "sessionId", "session_id")
+                        if isinstance((value := entry.get(key)), str) and value
+                    ),
+                    session_id,
+                )
+                project_root = next(
+                    (
+                        value
+                        for key in ("cwd", "projectRoot", "project_root")
+                        if isinstance((value := entry.get(key)), str) and value
+                    ),
+                    project_root,
+                )
+                clone_parent = next(
+                    (
+                        value
+                        for key in ("parentSession", "parentSessionId", "parent_session_id")
+                        if isinstance((value := entry.get(key)), str) and value
+                    ),
+                    clone_parent,
+                )
+            if entry_type == "message":
+                message_entries += 1
+                if not isinstance(entry.get("id"), str) or not entry.get("id"):
+                    missing_entry_ids += 1
+            for text in nested_text_values(entry):
+                placement, _ = tag_placement(text)
+                tag_placements[placement] += 1
+                reminder = reminder_shape(text)
+                if reminder is not None:
+                    channel_nudges += 1
+        sessions.append(
+            {
+                "file": str(path),
+                "session_id": session_id,
+                "project_root": project_root,
+                "clone_parent": clone_parent,
+                "entry_types": counter_dict(entry_types),
+                "message_entries": message_entries,
+                "missing_entry_ids": missing_entry_ids,
+                "tag_placements": counter_dict(tag_placements),
+                "channel_nudges": channel_nudges,
+                "errors": errors[:10],
+            }
+        )
+    return {
+        "status": "ok",
+        "sessions": sessions,
+        "totals": {
+            "files": len(sessions),
+            "message_entries": sum(row.get("message_entries", 0) for row in sessions),
+            "missing_entry_ids": sum(row.get("missing_entry_ids", 0) for row in sessions),
+            "clones": sum(bool(row.get("clone_parent")) for row in sessions),
+        },
+        "rule": "JSONL is source evidence; only .pi-render.json captures enter served-output comparisons",
+    }
 
 
 def blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -520,6 +765,43 @@ def verify_dump_lanes(
             sorted(collections.Counter(dump.lane for dump in verified).items())
         ),
         "rule": "only dumps whose live project config was readable enter rust/ts denominators",
+    }
+
+
+def verify_pi_render_configs(
+    dumps: list[Dump], overrides: dict[str, Path]
+) -> tuple[list[Dump], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    verified: list[Dump] = []
+    for dump in dumps:
+        root = project_root(dump.body)
+        config_path = overrides.get(str(Path(root).expanduser())) if root is not None else None
+        if config_path is None and root is not None:
+            config_path = Path(root).expanduser() / ".cortexkit" / "magic-context.jsonc"
+        configured_lane, error = (
+            configured_transform_mode(config_path)
+            if config_path is not None
+            else (None, "project root unavailable in Pi render capture")
+        )
+        status = "verified" if configured_lane in ("rust", "ts") else "unverified"
+        if status == "verified":
+            verified.append(dump)
+        rows.append(
+            {
+                "session": dump.session,
+                "project_root": root,
+                "config_path": str(config_path) if config_path is not None else None,
+                "opencode_transform_mode": configured_lane,
+                "effective_lane": "pi" if status == "verified" else "unverified",
+                "status": status,
+                "error": error,
+                "dump_count": 1,
+            }
+        )
+    return verified, {
+        "sessions": rows,
+        "denominator_dump_counts": {"pi": len(verified)} if verified else {},
+        "rule": "Pi remains its own TS harness lane; a readable live project config is required, while transform_mode describes only OpenCode authority",
     }
 
 
@@ -1684,6 +1966,95 @@ def summarize_lane(dumps: list[Dump]) -> dict[str, Any]:
     }
 
 
+def compare_ts_pi_axes(ts: dict[str, Any], pi: dict[str, Any]) -> dict[str, Any]:
+    def key_space(summary: dict[str, Any], fields: tuple[str, ...]) -> set[str]:
+        return {
+            f"{field}:{key}"
+            for field in fields
+            for key in summary.get(field, {})
+        }
+
+    def compare(
+        name: str,
+        fields: tuple[str, ...],
+        ledger: str | None,
+        expectation: str = "same_effective_shape",
+    ) -> dict[str, Any]:
+        ts_keys = key_space(ts, fields)
+        pi_keys = key_space(pi, fields)
+        if not ts_keys or not pi_keys:
+            verdict = "evidence_gap"
+        elif ts_keys == pi_keys:
+            verdict = "matched_shape_space"
+        else:
+            verdict = "divergent_shape_space"
+        return {
+            "axis": name,
+            "verdict": verdict,
+            "expectation": expectation,
+            "intentional_divergence_ledger": ledger,
+            "opencode_only": sorted(ts_keys - pi_keys),
+            "pi_only": sorted(pi_keys - ts_keys),
+            "shared": sorted(ts_keys & pi_keys),
+        }
+
+    axes = [
+        compare(
+            "tagging_and_fallback_adoption",
+            ("tag_placements", "tag_prefix_formats"),
+            None,
+        ),
+        compare(
+            "m0_m1_render",
+            (
+                "m0_section_orders",
+                "m0_section_separators",
+                "m1_section_orders",
+                "m1_section_separators",
+                "m1_placeholders",
+            ),
+            "PARITY.md §9 (date attributes) and §26 (mural envelope) are the only allowed envelope differences",
+        ),
+        compare(
+            "rendered_compaction_marker",
+            ("compaction_marker_shapes",),
+            "PARITY.md §4 allows marker-drain mechanism differences, not rendered marker bytes",
+        ),
+        compare(
+            "nudge_template",
+            ("channel1_template_shapes",),
+            "PARITY.md §9 requires shared copy and metrics",
+        ),
+        compare(
+            "nudge_carrier",
+            ("nudge_assembly_shapes",),
+            "PARITY.md §9 allows tool-output and hidden-delivery carrier differences",
+            "intentional_carrier_difference",
+        ),
+        compare(
+            "caveman_and_strip",
+            (
+                "tool_reduction_arc_shapes_top40",
+                "tool_reduction_vocabulary_top100",
+                "drop_shapes",
+            ),
+            "PARITY.md §2 allows Pi splice versus OpenCode sentinel only after equivalent content removal",
+        ),
+    ]
+    unexplained = [
+        row
+        for row in axes
+        if row["verdict"] == "divergent_shape_space"
+        and row["expectation"] == "same_effective_shape"
+    ]
+    return {
+        "axes": axes,
+        "unexplained_byte_classes": unexplained,
+        "ledger_baseline": "packages/pi-plugin/PARITY.md",
+        "note": "counts are never compared; each axis compares observed shape key spaces and retains lane-only evidence for adjudication",
+    }
+
+
 def tool_result_text(block: dict[str, Any]) -> str | None:
     content = block.get("content")
     if isinstance(content, str):
@@ -1843,6 +2214,20 @@ def main() -> None:
     for session in sessions:
         observed = {dump.lane for dump in dumps if dump.session == session}
         lane_by_session[session] = next(iter(observed)) if len(observed) == 1 else "unverified"
+
+    pi_dumps = (
+        load_pi_render_dumps(
+            choose_pi_render_paths(args.pi_render_dir, args.date, args.per_session)
+        )
+        if args.pi_render_dir is not None
+        else []
+    )
+    pi_dumps, pi_lane_verification = verify_pi_render_configs(pi_dumps, config_overrides)
+    dumps.extend(pi_dumps)
+    lane_summaries = {
+        lane: summarize_lane([dump for dump in dumps if dump.lane == lane])
+        for lane in ("rust", "ts", "pi")
+    }
     report = {
         "method": {
             "date": args.date,
@@ -1855,12 +2240,16 @@ def main() -> None:
             },
             "context_db": str(args.context_db) if args.context_db else None,
             "store_db": str(args.store_db) if args.store_db else None,
+            "pi_session_dir": str(args.pi_session_dir) if args.pi_session_dir else None,
+            "pi_render_dir": str(args.pi_render_dir) if args.pi_render_dir else None,
         },
         "lane_verification": lane_verification,
-        "lanes": {
-            lane: summarize_lane([dump for dump in dumps if dump.lane == lane])
-            for lane in ("rust", "ts")
-        },
+        "pi_lane_verification": pi_lane_verification,
+        "lanes": lane_summaries,
+        "pi_session_sources": summarize_pi_session_sources(args.pi_session_dir),
+        "ts_pi_cross_harness_parity": compare_ts_pi_axes(
+            lane_summaries["ts"], lane_summaries["pi"]
+        ),
         "excluded_unverified_dumps": [
             dump.path.name for dump in dumps if dump.lane == "unverified"
         ],

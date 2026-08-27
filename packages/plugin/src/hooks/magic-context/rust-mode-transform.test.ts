@@ -439,6 +439,31 @@ describe("Rust mode authority adapter", () => {
         expect(body.history_budget_tokens).toBe(42_000);
     });
 
+    it("copies the profile-resolved historian chain onto the authority wire", () => {
+        const historianModelChain = __rustModeTransformTest.resolvedHistorianModelChain({
+            historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
+            fallbackModels: [
+                { model: "openai/profile-fallback", qualifier: "low" },
+                "anthropic/profile-historian",
+            ],
+        });
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "profile-model-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: { historian_model_chain: historianModelChain },
+            usage: {},
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+
+        expect(body.historian_model_chain).toEqual([
+            "anthropic/profile-historian",
+            "openai/profile-fallback",
+        ]);
+    });
+
     it("gates and copies a mural payload onto the transform wire", () => {
         const resolved = {
             enabled: true,

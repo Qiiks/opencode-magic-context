@@ -1195,6 +1195,15 @@ export function applyNativeMessagesVerbatim(
     ]);
 }
 
+function resolvedHistorianModelChain(
+    deps: Pick<TransformDeps, "historianModel" | "fallbackModels">,
+): string[] {
+    const models = [deps.historianModel, ...(deps.fallbackModels ?? [])]
+        .map((entry) => (typeof entry === "string" ? entry : entry?.model))
+        .filter((model): model is string => typeof model === "string" && model.length > 0);
+    return [...new Set(models)];
+}
+
 function muralInputForWire(
     mural: ReturnType<typeof resolveMuralWire> | undefined,
 ): Record<string, unknown> | undefined {
@@ -1300,6 +1309,7 @@ function buildTransformBody(args: {
         auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
         auto_search_min_prompt_chars: args.passInputs.auto_search_min_prompt_chars,
         history_budget_tokens: args.passInputs.history_budget_tokens,
+        historian_model_chain: args.passInputs.historian_model_chain,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
         caveman_enabled: args.passInputs.caveman_enabled === true,
         caveman_min_chars: args.passInputs.caveman_min_chars ?? 500,
@@ -1930,6 +1940,7 @@ export function createRustModeTransform(
                 auto_search_score_threshold: deps.autoSearch?.scoreThreshold ?? 0.6,
                 auto_search_min_prompt_chars: deps.autoSearch?.minPromptChars ?? 20,
                 history_budget_tokens: historyBudgetTokens,
+                historian_model_chain: resolvedHistorianModelChain(deps),
                 clear_reasoning_age: deps.clearReasoningAge,
                 caveman_enabled:
                     !sessionMeta.isSubagent && deps.cavemanTextCompression?.enabled === true,
@@ -2947,6 +2958,7 @@ export const __rustModeTransformTest = {
     transformGeometryForWire,
     hardWallUsagePercentage,
     muralInputForWire,
+    resolvedHistorianModelChain,
     formatRustPassLog,
     shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,

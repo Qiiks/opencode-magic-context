@@ -248,7 +248,7 @@ describe("module-backed classification", () => {
         );
     }
 
-    test("translates mirrored context ids to module ids and uses the stored module hash", async () => {
+    test("sends profile-resolved models with translated module ids and hashes", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:module-classify";
@@ -260,33 +260,34 @@ describe("module-backed classification", () => {
             installAuthorityManagedMarker(db, projectIdentity, "store");
 
             const calls: ClassifyModuleCallArgs[] = [];
-            const result = await runClassify(
-                moduleArgs(db, projectIdentity, (call) => {
-                    calls.push(call);
-                    if (call.method === "dreamer.run_task") {
-                        const items = (
-                            call.body as {
-                                payload: {
-                                    items: Array<{ memory_id: number; content_hash: string }>;
-                                };
-                            }
-                        ).payload.items;
-                        const manifest = items
-                            .map(
-                                (item) =>
-                                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
-                            )
-                            .join("\n");
-                        return { result: { manifest_text: `<classify>${manifest}</classify>` } };
-                    }
-                    const rows = (
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                if (call.method === "dreamer.run_task") {
+                    const items = (
                         call.body as {
-                            arguments: { rows: Array<{ memory_id: number }> };
+                            payload: {
+                                items: Array<{ memory_id: number; content_hash: string }>;
+                            };
                         }
-                    ).arguments.rows;
-                    return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
-                }),
-            );
+                    ).payload.items;
+                    const manifest = items
+                        .map(
+                            (item) =>
+                                `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
+                        )
+                        .join("\n");
+                    return { result: { manifest_text: `<classify>${manifest}</classify>` } };
+                }
+                const rows = (
+                    call.body as {
+                        arguments: { rows: Array<{ memory_id: number }> };
+                    }
+                ).arguments.rows;
+                return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
+            });
+            args.model = "anthropic/profile-dreamer";
+            args.fallbackModels = ["openai/profile-fallback"];
+            const result = await runClassify(args);
 
             expect(result).toEqual({
                 classified: 10,
@@ -298,6 +299,10 @@ describe("module-backed classification", () => {
             });
             const taskCall = calls.find((call) => call.method === "dreamer.run_task");
             const applyCall = calls.find((call) => call.method === "memory.set_classification");
+            expect((taskCall?.body as { model_chain: string[] }).model_chain).toEqual([
+                "anthropic/profile-dreamer",
+                "openai/profile-fallback",
+            ]);
             expect(
                 (
                     taskCall?.body as {

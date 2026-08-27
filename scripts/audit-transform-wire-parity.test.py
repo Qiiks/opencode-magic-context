@@ -34,6 +34,12 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             self._write_dump(dump_dir, "ses_rust", rust_root, "rust-call")
             self._write_dump(dump_dir, "ses_ts", ts_root, "ts-call")
+            pi_session_dir = temp / "pi-sessions"
+            pi_render_dir = temp / "pi-renders"
+            pi_session_dir.mkdir()
+            pi_render_dir.mkdir()
+            self._write_pi_session(pi_session_dir)
+            self._write_pi_render(pi_render_dir, ts_root)
 
             context_db = temp / "context.db"
             store_db = temp / "store.db"
@@ -53,6 +59,10 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     str(context_db),
                     "--store-db",
                     str(store_db),
+                    "--pi-session-dir",
+                    str(pi_session_dir),
+                    "--pi-render-dir",
+                    str(pi_render_dir),
                 ],
                 cwd=ROOT,
                 check=True,
@@ -71,6 +81,23 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self.assertEqual(rust["status"], "label_corrected_from_live_config")
             self.assertEqual(ts["configured_lane"], "ts")
             self.assertEqual(report["excluded_unverified_dumps"], [])
+            self.assertEqual(
+                report["pi_lane_verification"]["denominator_dump_counts"], {"pi": 1}
+            )
+            self.assertEqual(report["lanes"]["pi"]["dump_count"], 1)
+            self.assertEqual(report["pi_session_sources"]["totals"]["files"], 1)
+            self.assertEqual(
+                report["pi_session_sources"]["totals"]["missing_entry_ids"], 0
+            )
+            tagging = next(
+                axis
+                for axis in report["ts_pi_cross_harness_parity"]["axes"]
+                if axis["axis"] == "tagging_and_fallback_adoption"
+            )
+            self.assertEqual(tagging["verdict"], "matched_shape_space")
+            self.assertEqual(
+                report["ts_pi_cross_harness_parity"]["unexplained_byte_classes"], []
+            )
 
             facades = report["ctx_facade_parity"]
             self.assertEqual(len(facades["matched_input_classes"]), 1)
@@ -124,6 +151,66 @@ class AuditTransformWireParityTest(unittest.TestCase):
         path.with_name(name.replace(".body.json", ".response.json")).write_text(
             json.dumps({"status": 200, "usage": {"input_tokens": 100}})
         )
+
+    def _write_pi_session(self, directory: Path) -> None:
+        entries = [
+            {
+                "type": "session",
+                "id": "pi_session",
+                "cwd": "/fixture/project",
+                "timestamp": "2026-08-27T12:00:00Z",
+            },
+            {
+                "type": "message",
+                "id": "pi-user-1",
+                "message": {"role": "user", "content": "§1§ hello", "timestamp": 1},
+            },
+            {
+                "type": "message",
+                "id": "pi-tool-1",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "pi-call",
+                    "toolName": "ctx_expand",
+                    "content": [{"type": "text", "text": "§42§ recovered"}],
+                    "timestamp": 2,
+                },
+            },
+        ]
+        (directory / "pi-session.jsonl").write_text(
+            "".join(json.dumps(entry) + "\n" for entry in entries)
+        )
+
+    def _write_pi_render(self, directory: Path, project: Path) -> None:
+        capture = {
+            "session_id": "pi_session",
+            "project_root": str(project),
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "toolCall",
+                            "id": "pi-call",
+                            "name": "ctx_expand",
+                            "arguments": {"message": 7},
+                        }
+                    ],
+                },
+                {
+                    "role": "toolResult",
+                    "toolCallId": "pi-call",
+                    "toolName": "ctx_expand",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "§42§ [7] A (assistant) — full recovery:\n\n  [text]\nhello",
+                        }
+                    ],
+                },
+            ],
+        }
+        (directory / f"{DATE}T12-00-00.pi-render.json").write_text(json.dumps(capture))
 
     def _write_context_db(self, path: Path) -> None:
         with sqlite3.connect(path) as db:
