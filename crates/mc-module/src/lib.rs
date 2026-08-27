@@ -10623,6 +10623,7 @@ impl McHandler {
             return tool_error_result(format!("Error: {error}."));
         }
         let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
+        let sources = facade_search_sources(args);
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories", false)
             .await
@@ -10636,37 +10637,68 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        match memory_tool::search_memories_and_compartments_for_session(
+        let visible_memory_ids = match store.load(conversation_key) {
+            Ok(state) => state
+                .meta
+                .rendered_memory_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let include_memories = facade_scope.memory_enabled && sources.memory;
+        let workspace_membership = match store.resolve_workspace_membership(memory_project) {
+            Ok(membership) => membership,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+
+        if include_memories {
+            if let Some(ids) = parse_search_memory_ids(query) {
+                match memory_tool::resolve_memory_ids_for_search(
+                    store,
+                    memory_project,
+                    &ids,
+                    limit.max(ids.len()),
+                    &visible_memory_ids,
+                ) {
+                    Ok(Some(results)) => {
+                        return mcp_text_result(
+                            render_facade_search_results(
+                                query,
+                                &results,
+                                conversation_key,
+                                workspace_membership.as_ref(),
+                            ),
+                            false,
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(error) => return tool_error_result(format!("Error: {error}")),
+                }
+            }
+        }
+
+        match memory_tool::search_available_corpora_for_session(
             store,
             memory_project,
             conversation_key,
             query,
-            limit,
-            facade_scope.memory_enabled,
+            memory_tool::MemorySearchOptions {
+                limit,
+                include_memories,
+                include_messages: sources.message,
+                include_notes: sources.note,
+                excluded_memory_ids: &visible_memory_ids,
+            },
         ) {
-            Ok(results) => {
-                let rendered = results
-                    .into_iter()
-                    .map(|result| {
-                        json!({
-                            "source": match result.source_kind {
-                                memory_tool::MemorySearchSourceKind::Memory => "memory",
-                                memory_tool::MemorySearchSourceKind::CompartmentTitle => "compartment_title",
-                                memory_tool::MemorySearchSourceKind::CompartmentBody => "compartment_body",
-                                memory_tool::MemorySearchSourceKind::Note => "note",
-                            },
-                            "id": result.id,
-                            "snippet": result.snippet,
-                            "category": result.category,
-                            "sequence": result.sequence,
-                            "title": result.title,
-                            "status": result.note_status,
-                            "surface_condition": result.surface_condition,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                mcp_text_result(Value::Array(rendered).to_string(), false)
-            }
+            Ok(results) => mcp_text_result(
+                render_facade_search_results(
+                    query,
+                    &results,
+                    conversation_key,
+                    workspace_membership.as_ref(),
+                ),
+                false,
+            ),
             Err(error) => tool_error_result(format!("Error: {error}")),
         }
     }
@@ -13108,6 +13140,179 @@ fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FacadeSearchSources {
+    memory: bool,
+    message: bool,
+    note: bool,
+}
+
+fn facade_search_sources(args: &Map<String, Value>) -> FacadeSearchSources {
+    let Some(values) = args.get("sources") else {
+        return FacadeSearchSources {
+            memory: true,
+            message: true,
+            note: true,
+        };
+    };
+    let Some(values) = values.as_array() else {
+        return FacadeSearchSources {
+            memory: true,
+            message: true,
+            note: true,
+        };
+    };
+    FacadeSearchSources {
+        memory: values.iter().any(|value| value.as_str() == Some("memory")),
+        message: values.iter().any(|value| value.as_str() == Some("message")),
+        note: values.iter().any(|value| value.as_str() == Some("note")),
+    }
+}
+
+fn parse_search_memory_ids(query: &str) -> Option<Vec<i64>> {
+    const MAX_IDS: usize = 5;
+    let tokens = query.trim().split(',').map(str::trim).collect::<Vec<_>>();
+    if tokens.is_empty() || tokens.len() > MAX_IDS {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let digits = token.strip_prefix('#').unwrap_or(token);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let id = digits.parse::<i64>().ok().filter(|id| *id > 0)?;
+        ids.push(id);
+    }
+    Some(ids)
+}
+
+fn format_search_age(created_at_ms: i64) -> String {
+    let now_ms = now_ms();
+    if created_at_ms > now_ms {
+        return "future".to_string();
+    }
+    let age_ms = now_ms - created_at_ms;
+    let days = age_ms / (24 * 60 * 60 * 1_000);
+    if days <= 0 {
+        return "today".to_string();
+    }
+    if days == 1 {
+        return "1d ago".to_string();
+    }
+    if days < 30 {
+        return format!("{days}d ago");
+    }
+    let months = days / 30;
+    if months == 1 {
+        return "1mo ago".to_string();
+    }
+    if months < 12 {
+        return format!("{months}mo ago");
+    }
+    let years = days / 365;
+    if years == 1 {
+        "1y ago".to_string()
+    } else {
+        format!("{years}y ago")
+    }
+}
+
+fn render_facade_search_results(
+    query: &str,
+    results: &[memory_tool::MemorySearchResult],
+    current_session_id: &str,
+    workspace_membership: Option<&mc_store::WorkspaceMembership>,
+) -> String {
+    if results.is_empty() {
+        return format!(
+            "No results found for \"{query}\" across notes, memories, primers, git commits, or message history."
+        );
+    }
+
+    let mut body = Vec::with_capacity(results.len() + 2);
+    for (index, result) in results.iter().enumerate() {
+        let score = result.score_hundredths as f64 / 100.0;
+        let rendered = match result.source_kind {
+            memory_tool::MemorySearchSourceKind::Memory => {
+                let source = workspace_membership
+                    .and_then(|membership| {
+                        result
+                            .source_project_path
+                            .as_deref()
+                            .filter(|path| *path != membership.own_identity)
+                            .and_then(|path| membership.display_name_by_path.get(path))
+                    })
+                    .map(|name| format!(" source={name}"))
+                    .unwrap_or_default();
+                format!(
+                    "[{}] [memory] score={score:.2} id={} category={}{} match=fts\n{}",
+                    index + 1,
+                    result.id,
+                    result.category.as_deref().unwrap_or("uncategorized"),
+                    source,
+                    result.snippet,
+                )
+            }
+            memory_tool::MemorySearchSourceKind::CompartmentTitle
+            | memory_tool::MemorySearchSourceKind::CompartmentBody => format!(
+                "[{}] [message] score={score:.2} compartment_id={} range={}-{} match=fts title={}\nSnippet: {}",
+                index + 1,
+                result.id,
+                result.start_ordinal.unwrap_or_default(),
+                result.end_ordinal.unwrap_or_default(),
+                result.title.as_deref().unwrap_or(""),
+                result.snippet,
+            ),
+            memory_tool::MemorySearchSourceKind::Note => {
+                let anchor = match (result.note_anchor_ordinal, result.note_session_id.as_deref()) {
+                    (Some(ordinal), Some(session_id)) if session_id == current_session_id => {
+                        format!(" @msg {ordinal}")
+                    }
+                    _ => String::new(),
+                };
+                format!(
+                    "[{}] [note] score={score:.2} id=#{} status={} {}{anchor}\n{}",
+                    index + 1,
+                    result.id,
+                    result.note_status.as_deref().unwrap_or("active"),
+                    format_search_age(result.note_created_at_ms.unwrap_or_default()),
+                    result.snippet,
+                )
+            }
+        };
+        body.push(rendered);
+    }
+    if results.iter().any(|result| {
+        matches!(
+            result.source_kind,
+            memory_tool::MemorySearchSourceKind::CompartmentTitle
+                | memory_tool::MemorySearchSourceKind::CompartmentBody
+        )
+    }) {
+        body.push(
+            "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context."
+                .to_string(),
+        );
+    }
+    if results.iter().any(|result| {
+        result.source_kind == memory_tool::MemorySearchSourceKind::Note
+            && result.note_anchor_ordinal.is_some()
+            && result.note_session_id.as_deref() == Some(current_session_id)
+    }) {
+        body.push(
+            "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context."
+                .to_string(),
+        );
+    }
+    format!(
+        "Found {} result{} for \"{query}\":\n\n{}",
+        results.len(),
+        if results.len() == 1 { "" } else { "s" },
+        body.join("\n\n")
+    )
+}
+
 fn truncate_expand_output(mut output: String) -> String {
     if output.len() <= CTX_EXPAND_BYTE_BUDGET {
         return output;
@@ -13178,10 +13383,15 @@ fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
         if let Some((name, id, input, output)) =
             paired_expand_tool(part, message.ck.content.get(index + 1))
         {
-            parts.push(format!(
-                "  [tool: {name} #{id}]\n  input: {input}\n  output:\n{}",
+            let mut rendered = format!("  [tool: {name} #{id}]");
+            if let Some(title) = expand_recovery_tool_title(message, id) {
+                rendered.push_str(&format!("\n  description: {title}"));
+            }
+            rendered.push_str(&format!(
+                "\n  input: {input}\n  output:\n{}",
                 expand_tool_output_text(output)
             ));
+            parts.push(rendered);
             index += 2;
             continue;
         }
@@ -13202,6 +13412,22 @@ fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
         lines.extend(parts);
     }
     lines.join("\n")
+}
+
+fn expand_recovery_tool_title<'a>(
+    message: &'a ck_wire::CkIngressMessage,
+    call_id: &str,
+) -> Option<&'a str> {
+    message
+        .ck
+        .provider_extras
+        .get("opencode")?
+        .get("ctx_expand_tool_titles")?
+        .as_object()?
+        .get(call_id)?
+        .as_str()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
 }
 
 fn paired_expand_tool<'a>(
@@ -16787,14 +17013,6 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
-    }
-
-    fn tool_json_array(outcome: HandlerOutcome) -> Vec<Value> {
-        let body = tool_body(outcome);
-        let text = body["content"][0]["text"]
-            .as_str()
-            .unwrap_or_else(|| panic!("tool response missing text: {body}"));
-        serde_json::from_str(text).unwrap_or_else(|error| panic!("tool text was not JSON: {error}"))
     }
 
     fn insert_memory(
@@ -21808,8 +22026,8 @@ mod tests {
         let read = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(read.contains("remember the lattice"));
         let hits =
-            tool_json_array(call_facade(&handler, "ctx_search", json!({"query": "lattice"})).await);
-        assert!(hits.iter().any(|hit| hit["source"] == "note"));
+            tool_text(call_facade(&handler, "ctx_search", json!({"query": "lattice"})).await);
+        assert!(hits.contains("[note]"));
 
         let note_id = store
             .search_notes_like(project.to_str().unwrap(), "ses", "lattice")
@@ -22654,7 +22872,7 @@ mod tests {
         )
         .await;
         assert!(!tool_is_error(a));
-        let b_search = tool_json_array(
+        let b_search = tool_text(
             call_facade_on_channel(
                 &handler,
                 8,
@@ -22663,7 +22881,7 @@ mod tests {
             )
             .await,
         );
-        assert!(b_search.iter().any(|row| row["source"] == "memory"));
+        assert!(b_search.contains("[memory]"), "{b_search}");
 
         let b = call_facade_on_channel(
             &handler,
@@ -22693,7 +22911,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let a_comp = tool_json_array(
+        let a_comp = tool_text(
             call_facade_on_channel(
                 &handler,
                 7,
@@ -22702,8 +22920,8 @@ mod tests {
             )
             .await,
         );
-        assert!(a_comp.iter().any(|row| row["source"] == "compartment_body"));
-        let a_cannot_see_b = tool_json_array(
+        assert!(a_comp.contains("[message]"), "{a_comp}");
+        let a_cannot_see_b = tool_text(
             call_facade_on_channel(
                 &handler,
                 7,
@@ -22712,8 +22930,11 @@ mod tests {
             )
             .await,
         );
-        assert!(a_cannot_see_b.is_empty());
-        let b_comp = tool_json_array(
+        assert_eq!(
+            a_cannot_see_b,
+            "No results found for \"beta-compartment-only\" across notes, memories, primers, git commits, or message history."
+        );
+        let b_comp = tool_text(
             call_facade_on_channel(
                 &handler,
                 8,
@@ -22722,7 +22943,7 @@ mod tests {
             )
             .await,
         );
-        assert!(b_comp.iter().any(|row| row["source"] == "compartment_body"));
+        assert!(b_comp.contains("[message]"), "{b_comp}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -24286,6 +24507,116 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ctx_search_matches_typescript_shape_for_available_module_corpora() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding(project, "token"));
+
+        let visible_id = insert_memory(&store, project, "CONSTRAINTS", "needle visible", 10);
+        let first_id = insert_memory(&store, project, "CONSTRAINTS", "needle memory first", 20);
+        let second_id = insert_memory(&store, project, "CONSTRAINTS", "needle memory second", 20);
+        assert_eq!(
+            parse_search_memory_ids(&format!("#{first_id}, {second_id}")),
+            Some(vec![first_id, second_id])
+        );
+        assert_eq!(
+            parse_search_memory_ids(&format!("{first_id} {second_id}")),
+            None,
+            "direct memory ids require TypeScript's comma-separated query shape"
+        );
+        store
+            .replace_compartments("ses", &[stored_comp(1, 10, 20, "m20", "needle history")])
+            .unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id: Some("ses"),
+                content: "needle note",
+                surface_condition: None,
+                anchor_block_id: Some("m18#0"),
+                anchor_ordinal: Some(18),
+                now_ms: now_ms(),
+            })
+            .unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &ModuleMeta {
+                    rendered_memory_ids: vec![visible_id],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let all = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": "needle", "limit": 10}),
+            )
+            .await,
+        );
+        assert!(all.starts_with("Found 4 results for \"needle\":"), "{all}");
+        assert!(!all.lines().any(|line| {
+            line.contains("[memory]") && line.contains(&format!("id={visible_id} "))
+        }));
+        assert!(all.contains(&format!("[memory] score=1.00 id={first_id}")));
+        assert!(all.contains(&format!("[memory] score=1.00 id={second_id}")));
+        assert!(
+            all.find(&format!("id={first_id}")) < all.find(&format!("id={second_id}")),
+            "equal-score/equal-recency memory ties must use ascending ids: {all}"
+        );
+        assert!(
+            all.contains("[message] score=0.90 compartment_id=1 range=10-20 match=fts title=C1")
+        );
+        assert!(all.contains(&format!("[note] score=0.95 id=#{}", note.id)));
+        assert!(all.contains("@msg 18"));
+        assert!(all.contains("Use ctx_expand(start, end)"));
+
+        let message_only = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": "needle", "sources": ["message"]}),
+            )
+            .await,
+        );
+        assert!(message_only.contains("[message]"));
+        assert!(!message_only.contains("[memory]"));
+        assert!(!message_only.contains("[note]"));
+
+        let id_lookup = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": format!("#{second_id}"), "sources": ["memory"]}),
+            )
+            .await,
+        );
+        assert!(id_lookup.contains(&format!("id={second_id}")));
+        assert!(id_lookup.contains("match=fts"));
+
+        let unsupported_corpus = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": "needle", "sources": ["primer", "git_commit"]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            unsupported_corpus,
+            "No results found for \"needle\" across notes, memories, primers, git commits, or message history."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn memory_disabled_rejects_mutation_and_excludes_memory_search() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
@@ -24307,8 +24638,8 @@ mod tests {
             .await
         ));
         let results =
-            tool_json_array(call_facade(&handler, "ctx_search", json!({"query": "needle"})).await);
-        assert!(results.iter().all(|result| result["source"] != "memory"));
+            tool_text(call_facade(&handler, "ctx_search", json!({"query": "needle"})).await);
+        assert!(!results.contains("[memory]"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -28629,7 +28960,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn status_diagnostics_surface_pending_historian_side_channel_failure() {
+    async fn status_diagnostics_do_not_advertise_lossy_historian_side_channels_as_pending() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         seed_historian_phase(&store, HistorianPhase::Publishing);
@@ -28667,25 +28998,12 @@ mod tests {
 
         let status =
             call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
-        assert_eq!(status["historian"]["side_channel_pending_count"], 1);
-        assert!(status["historian"]["side_channel_last_failure"]
-            .as_str()
-            .is_some_and(|error| error.contains("event")));
-
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        let _ = call_transform(
-            &handler,
-            vec![ck("m21", 21, "follow up"), ck("m22", 22, "small reply")],
-        )
-        .await;
-        assert_eq!(store.load_compartment_events("ses").unwrap().len(), 1);
-        let recovered =
-            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
-        assert_eq!(recovered["historian"]["side_channel_pending_count"], 0);
+        assert_eq!(status["historian"]["side_channel_pending_count"], 0);
         assert_eq!(
-            recovered["historian"]["side_channel_last_failure"],
+            status["historian"]["side_channel_last_failure"],
             Value::Null
         );
+        assert!(store.load_compartment_events("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30773,6 +31091,45 @@ mod tests {
             "output ~{} tok",
             mc_tokenizer::estimate_tokens(&full_tool_output)
         )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_preserves_typescript_tool_titles_immediately_and_after_snapshot_loss() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/ctx-facade-golden.json")).unwrap();
+        let case = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "merged-completed-tool-and-structural-noise")
+            .unwrap();
+        let messages: Vec<ck_wire::CkIngressMessage> =
+            serde_json::from_value(case["ck_messages"].clone()).unwrap();
+        let expected = case["expected"]["full"][0]["text"].as_str().unwrap();
+        assert!(expected.contains("description: Read the runtime configuration"));
+
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        publish_ctx_expand_fixture(&store, "ses", project.to_str().unwrap(), &messages);
+
+        let request = Arc::new(transform_request(messages.clone(), 1_000, 128_000));
+        let retained_bytes = request.retained_bytes();
+        {
+            let mut snapshots = handler.transform_snapshots.lock().unwrap();
+            let generation = snapshots.begin("ses");
+            snapshots.finish_ready("ses", generation, Arc::clone(&request), 0, retained_bytes);
+        }
+        let immediate = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 7})).await);
+        assert_eq!(immediate, expected);
+
+        handler.transform_snapshots.lock().unwrap().remove("ses");
+        let after_snapshot_loss =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 7})).await);
+        assert_eq!(after_snapshot_loss, expected);
     }
 
     #[test]

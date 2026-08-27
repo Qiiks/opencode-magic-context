@@ -142,6 +142,36 @@ function toolOutput(message: TestMessage, index: number): string {
 }
 
 describe("createTransform", () => {
+    it("keeps the raw array untouched when session metadata is unreadable", async () => {
+        useTempDataHome("context-transform-meta-fault-");
+        const db = openDatabase();
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => "execute" as const) },
+            contextUsageMap: new Map<string, { usage: ContextUsage; updatedAt: number }>(),
+            db,
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTags: 0,
+        });
+        const messages: TestMessage[] = [
+            {
+                info: { id: "meta-fault-user", role: "user", sessionID: "ses-meta-fault" },
+                parts: [{ type: "text", text: "raw must survive" }],
+            },
+        ];
+        const original = structuredClone(messages);
+        const output = { messages };
+        db.exec("DROP TABLE session_meta");
+
+        await transform({}, output);
+
+        expect(output.messages).toBe(messages);
+        expect(messages).toEqual(original);
+    });
+
     it("persists distinct TypeScript transform decision reasons from ordinary passes", async () => {
         useTempDataHome("context-transform-decision-fence-");
         const sessionId = "ses-transform-decision-fence";

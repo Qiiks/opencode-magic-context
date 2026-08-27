@@ -2394,6 +2394,37 @@ describe("Rust mode authority adapter", () => {
         expect(getSlot(sessionId)?.jsonPrefix).toContain("recovered synchronously");
     });
 
+    it("keeps the raw array untouched when overflow-state storage is unreadable", async () => {
+        const sessionId = `rust-overflow-state-fault-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const moduleCall = mock(async () => {
+            throw new Error("module must not run after the preflight storage fault");
+        });
+        const moduleClient: RustModeModuleClient = { call: moduleCall };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "raw must survive" }],
+            },
+        ] as MessageLike[];
+        const meta = makeMeta(db, sessionId);
+        db.exec("DROP TABLE session_meta");
+        const output = { messages: [] as unknown[] };
+
+        await transform.run(sessionId, input, output, meta);
+
+        expect(output.messages).toEqual(input);
+        expect(moduleCall).not.toHaveBeenCalled();
+    });
+
     it("throws locally instead of serving raw above a known context limit", async () => {
         const sessionId = `rust-raw-limit-${Date.now()}`;
         sessions.push(sessionId);
