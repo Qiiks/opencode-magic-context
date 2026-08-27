@@ -290,6 +290,9 @@ interface RustSessionState extends ModuleStateSyncState {
     lkgCaptureSequence: number;
     lkgLastCapturedRowVersion: number;
     lkgSyncCaptureRequired: boolean;
+    /** A fallback replay is provider-visible output. Keep that exact representation until the
+     * module authorizes a cache-busting pass instead of replacing it during a later defer. */
+    lkgRepresentationFrozen: boolean;
 }
 
 export interface RustModeTransformOptions {
@@ -754,6 +757,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
+            lkgRepresentationFrozen: false,
         };
         states.set(sessionId, state);
     }
@@ -2603,7 +2607,7 @@ export function createRustModeTransform(
                 // Validate and postprocess the module result before touching the caller-owned
                 // array. This keeps failure recovery O(1) on the steady path: no defensive
                 // full-array clone is needed just in case boundary validation rejects it.
-                appliedMessages = applyNativeMessagesVerbatim(
+                const moduleMessages = applyNativeMessagesVerbatim(
                     { messages: [] },
                     response,
                     previousWireCache?.nativeOutput
@@ -2613,17 +2617,42 @@ export function createRustModeTransform(
                           }
                         : undefined,
                 );
+                let replayedFrozenRepresentation = false;
+                if (state.lkgRepresentationFrozen && !cacheBustingPass) {
+                    const keys = resolveLkgModelKeys(messages);
+                    const frozen = replayLkg({
+                        sessionId,
+                        messages,
+                        modelKey: keys.modelKey,
+                        providerKey: keys.providerKey,
+                    });
+                    if (!frozen.ok) {
+                        throw new Error(
+                            `frozen LKG representation cannot replay on a defer pass: ${frozen.reason}`,
+                        );
+                    }
+                    appliedMessages = frozen.messages;
+                    replayedFrozenRepresentation = true;
+                    servedFrom = "lkg_frozen";
+                    sessionLog(sessionId, "lkg_frozen_replay_served");
+                } else {
+                    appliedMessages = moduleMessages;
+                }
                 pendingWireCache.nativeOutput = appliedMessages;
-                runRustModePostprocess({
-                    db: deps.db,
-                    sessionId,
-                    messages: appliedMessages as MessageLike[],
-                    projectPath: memoryProjectPath,
-                    fullFeatureMode: !sessionMeta.isSubagent,
-                    compactionOff: deps.compactionOff,
-                    tagger: deps.tagger,
-                    ctxReduceAvailability: reduceAvailability,
-                });
+                // LKG captures postprocessed output, so running postprocess again would stop the
+                // fallback artifact from being an exact replay.
+                if (!replayedFrozenRepresentation) {
+                    runRustModePostprocess({
+                        db: deps.db,
+                        sessionId,
+                        messages: appliedMessages as MessageLike[],
+                        projectPath: memoryProjectPath,
+                        fullFeatureMode: !sessionMeta.isSubagent,
+                        compactionOff: deps.compactionOff,
+                        tagger: deps.tagger,
+                        ctxReduceAvailability: reduceAvailability,
+                    });
+                }
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
@@ -2729,6 +2758,9 @@ export function createRustModeTransform(
                 }
                 throw error;
             }
+            if (cacheBustingPass) {
+                state.lkgRepresentationFrozen = false;
+            }
             try {
                 mirrorRustRenderedMemoryIds({ db: deps.db, sessionId, response });
             } catch (error) {
@@ -2765,9 +2797,10 @@ export function createRustModeTransform(
             state.parked = false;
             state.passesSincePark = 0;
             state.warningSent = false;
-            // An applied pass proves the module reconstructed the wire; delta
-            // transport may resume on the next pass.
-            state.forceFullWire = false;
+            // A frozen LKG representation is not the module's acknowledged native prefix, so
+            // output deltas cannot safely splice against it. Full transport resumes deltas only
+            // after a cache-busting pass adopts the module representation.
+            state.forceFullWire = state.lkgRepresentationFrozen;
 
             const directiveText = directiveTextOf(response);
             if (syntheticTurn) {
@@ -2908,6 +2941,8 @@ export function createRustModeTransform(
                 output,
                 sessionMeta.systemPromptTokens,
             );
+            state.lkgRepresentationFrozen = replayed;
+            if (replayed) state.forceFullWire = true;
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
             materializeReason = "none";

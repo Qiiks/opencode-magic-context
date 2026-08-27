@@ -3844,6 +3844,61 @@ describe("LKG durability across restarts", () => {
         }
     });
 
+    it("freezes a replayed representation across defers and converts it on a bust", async () => {
+        const sessionId = `rust-lkg-frozen-transition-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeRestartInput(sessionId);
+        const representationA = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "representation A" }],
+            },
+        ];
+        const representationB = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "representation B" }],
+            },
+        ];
+        let pass = 0;
+        const transformBodies: Record<string, unknown>[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBodies.push(body as Record<string, unknown>);
+                pass += 1;
+                if (pass === 2) throw new Error("daemon unavailable");
+                return {
+                    decision: pass === 4 ? "HARD" : pass === 1 ? "HARD" : "SOFT+",
+                    native_messages: structuredClone(
+                        pass === 1 ? representationA : representationB,
+                    ),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+
+        const initial = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, initial, makeMeta(db, sessionId));
+        expect(initial.messages).toEqual(representationA);
+
+        const fallback = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, fallback, makeMeta(db, sessionId));
+        expect(fallback.messages).toEqual(representationA);
+
+        const deferred = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, deferred, makeMeta(db, sessionId));
+        expect(deferred.messages).toEqual(representationA);
+
+        const busted = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, busted, makeMeta(db, sessionId));
+        expect(busted.messages).toEqual(representationB);
+        expect(transformBodies[2]?.tail_delta).toBeUndefined();
+        expect(transformBodies[3]?.tail_delta).toBeUndefined();
+    });
+
     it("still refuses a model change on a hydrated slot", async () => {
         const sessionId = `rust-lkg-restart-model-${Date.now()}`;
         sessions.push(sessionId);
