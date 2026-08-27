@@ -36,10 +36,27 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self._write_dump(dump_dir, "ses_ts", ts_root, "ts-call")
             pi_session_dir = temp / "pi-sessions"
             pi_render_dir = temp / "pi-renders"
+            omp_session_dir = temp / "omp-sessions"
             pi_session_dir.mkdir()
             pi_render_dir.mkdir()
+            omp_session_dir.mkdir()
             self._write_pi_session(pi_session_dir)
+            self._write_pi_session(omp_session_dir)
             self._write_pi_render(pi_render_dir, ts_root)
+            window_report_ledger = temp / "window-reports.jsonl"
+            window_report_ledger.write_text(
+                json.dumps(
+                    {
+                        "provider_id": "anthropic",
+                        "model_id": "claude",
+                        "access_path": "api",
+                        "status": 400,
+                        "geometry": "combined",
+                        "observed_at_ms": 1,
+                    }
+                )
+                + "\n"
+            )
 
             context_db = temp / "context.db"
             store_db = temp / "store.db"
@@ -63,6 +80,10 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     str(pi_session_dir),
                     "--pi-render-dir",
                     str(pi_render_dir),
+                    "--omp-session-dir",
+                    str(omp_session_dir),
+                    "--window-report-ledger",
+                    str(window_report_ledger),
                 ],
                 cwd=ROOT,
                 check=True,
@@ -89,6 +110,9 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self.assertEqual(
                 report["pi_session_sources"]["totals"]["missing_entry_ids"], 0
             )
+            self.assertEqual(report["omp_session_sources"]["totals"]["files"], 1)
+            self.assertEqual(report["overflow_report_ledger"]["rows"], 1)
+            self.assertEqual(report["overflow_report_ledger"]["parse_errors"], [])
             tagging = next(
                 axis
                 for axis in report["ts_pi_cross_harness_parity"]["axes"]
@@ -147,6 +171,34 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     "mc_cache_state"
                 ],
                 [],
+            )
+
+            operator = report["operator_read_state"]
+            self.assertEqual(operator["unexplained_invariants"], [])
+            self.assertEqual(
+                operator["storage_versions"],
+                {"context_db_schema_version": 99, "module_store_schema_version": 50},
+            )
+            rust_read = operator["per_session"]["ses_rust"]
+            self.assertEqual(
+                rust_read["operator_truth_sources"]["usage"], "module_read_model"
+            )
+            self.assertEqual(
+                rust_read["operator_truth_sources"]["cache_ttl"], "context_read_model"
+            )
+            self.assertEqual(rust_read["module_read_model"]["compartment_count"], 1)
+            self.assertEqual(rust_read["module_read_model"]["tag_count"], 2)
+            self.assertEqual(
+                rust_read["module_read_model"]["cache_state"][0]["last_usage"],
+                {"current_total_input_tokens": 100, "context_limit_tokens": 200},
+            )
+            self.assertEqual(
+                rust_read["module_read_model"]["mural_artifacts"][0]["content_hash"],
+                "mural-hash",
+            )
+            self.assertEqual(
+                operator["per_session"]["ses_ts"]["operator_truth_sources"]["usage"],
+                "context_read_model",
             )
 
     def _write_dump(
@@ -249,13 +301,24 @@ class AuditTransformWireParityTest(unittest.TestCase):
         with sqlite3.connect(path) as db:
             db.executescript(
                 """
+                CREATE TABLE schema_migrations (version INTEGER);
+                INSERT INTO schema_migrations VALUES (99);
                 CREATE TABLE transform_decisions (
                     session_id TEXT, ts_ms INTEGER, decision TEXT, materialize_reason TEXT,
                     input_tokens INTEGER, emergency INTEGER, dropped_count INTEGER,
                     system_hash_prev TEXT, system_hash_new TEXT, m0_model_key_prev TEXT,
                     m0_model_key_new TEXT, m0_tool_set_hash_prev TEXT, m0_tool_set_hash_new TEXT
                 );
-                CREATE TABLE tags (session_id TEXT, caveman_depth INTEGER, tag_number INTEGER);
+                CREATE TABLE tags (
+                    session_id TEXT, caveman_depth INTEGER, tag_number INTEGER,
+                    status TEXT, byte_size INTEGER
+                );
+                CREATE TABLE session_meta (
+                    session_id TEXT PRIMARY KEY, last_context_percentage REAL,
+                    last_input_tokens INTEGER, last_usage_context_limit INTEGER,
+                    cache_ttl TEXT, last_response_time INTEGER, counter INTEGER,
+                    cached_m0_mural_hash TEXT
+                );
                 CREATE TABLE compartments (
                     id INTEGER PRIMARY KEY, session_id TEXT, harness TEXT, sequence INTEGER,
                     start_message INTEGER, end_message INTEGER, p1 TEXT, p2 TEXT, p3 TEXT,
@@ -285,6 +348,10 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     session_id TEXT, type TEXT, status TEXT, check_status TEXT
                 );
                 CREATE TABLE git_commits (project_path TEXT, sha TEXT);
+                CREATE TABLE mural_manifest (
+                    project_path TEXT PRIMARY KEY, content_hash TEXT, rendered_at INTEGER,
+                    width INTEGER, height INTEGER, memory_ids_json TEXT
+                );
                 CREATE TABLE compartment_events (
                     session_id TEXT, kind TEXT, at_compartment INTEGER, created_at INTEGER
                 );
@@ -292,6 +359,21 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             now = int(
                 dt.datetime(2026, 8, 27, 12, tzinfo=dt.timezone.utc).timestamp() * 1000
+            )
+            db.executemany(
+                "INSERT INTO session_meta VALUES (?, ?, ?, ?, 'never', ?, ?, ?)",
+                [
+                    ("ses_ts", 50.0, 100, 200, now, 2, "mural-hash"),
+                    ("ses_rust", 50.0, 100, 200, now, 2, "mural-hash"),
+                ],
+            )
+            db.executemany(
+                "INSERT INTO tags VALUES (?, 0, ?, ?, ?)",
+                [
+                    ("ses_ts", 1, "active", 10),
+                    ("ses_ts", 2, "dropped", 20),
+                    ("ses_rust", 1, "active", 10),
+                ],
             )
             db.execute(
                 "INSERT INTO transform_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -333,6 +415,10 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 "INSERT INTO git_commits VALUES (?, ?)",
                 [("git:ts", "abcdef1"), ("git:rust", "abcdef2")],
             )
+            db.executemany(
+                "INSERT INTO mural_manifest VALUES (?, 'mural-hash', ?, 16, 8, '[1]')",
+                [("git:ts", now), ("git:rust", now)],
+            )
             db.execute(
                 "INSERT INTO compartment_events VALUES (?, ?, ?, ?)",
                 ("ses_ts", "decision", 1, now),
@@ -342,6 +428,7 @@ class AuditTransformWireParityTest(unittest.TestCase):
         with sqlite3.connect(path) as db:
             db.executescript(
                 """
+                CREATE TABLE cortexkit_schema_version (namespace TEXT, version INTEGER);
                 CREATE TABLE mc_cache_state (
                     session_id TEXT, last_activity_at INTEGER, meta TEXT
                 );
@@ -351,6 +438,11 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     last_completed_at_ms INTEGER, last_reject_error TEXT,
                     last_reject_at_ms INTEGER, receive_count INTEGER, reject_count INTEGER,
                     first_divergence TEXT
+                );
+                CREATE TABLE mc_tags (session_id TEXT, tag_number INTEGER);
+                CREATE TABLE pending_agent_drops (session_id TEXT, id INTEGER);
+                CREATE TABLE mc_project_mural_artifacts (
+                    project_path TEXT, data_url BLOB, content_hash TEXT, updated_at INTEGER
                 );
                 CREATE TABLE mc_compartments (
                     session_id TEXT, sequence INTEGER, start_message INTEGER, end_message INTEGER,
@@ -371,9 +463,32 @@ class AuditTransformWireParityTest(unittest.TestCase):
             now = int(
                 dt.datetime(2026, 8, 27, 12, tzinfo=dt.timezone.utc).timestamp() * 1000
             )
+            db.execute("INSERT INTO cortexkit_schema_version VALUES ('mc_cache', 50)")
             db.execute(
                 "INSERT INTO mc_cache_state VALUES (?, ?, ?)",
-                ("ses_rust", now, json.dumps({"caveman_age_basis_tag": 9})),
+                (
+                    "ses_rust",
+                    now,
+                    json.dumps(
+                        {
+                            "initialized": True,
+                            "caveman_age_basis_tag": 9,
+                            "last_usage": {
+                                "current_total_input_tokens": 100,
+                                "context_limit_tokens": 200,
+                            },
+                        }
+                    ),
+                ),
+            )
+            db.executemany(
+                "INSERT INTO mc_tags VALUES (?, ?)",
+                [("ses_rust", 1), ("ses_rust", 2)],
+            )
+            db.execute("INSERT INTO pending_agent_drops VALUES ('ses_rust', 1)")
+            db.execute(
+                "INSERT INTO mc_project_mural_artifacts VALUES (?, ?, 'mural-hash', ?)",
+                ("git:rust", b"data:image/png;base64,cG5n", now),
             )
             db.execute(
                 "INSERT INTO mc_pass_trace VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

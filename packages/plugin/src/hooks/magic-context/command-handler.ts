@@ -783,11 +783,17 @@ export function createMagicContextCommandHandler(deps: {
                 }
                 let combinedStatus: string;
                 try {
-                    const detail = deps.getStatusDetail?.(
-                        sessionId,
-                        rustStatus as RustSessionStatus | undefined,
-                    );
-                    if (detail) {
+                    const detail =
+                        rustMode && !rustStatus
+                            ? undefined
+                            : deps.getStatusDetail?.(
+                                  sessionId,
+                                  rustStatus as RustSessionStatus | undefined,
+                              );
+                    if (rustMode && !rustStatus) {
+                        combinedStatus =
+                            "## Magic Status — Unavailable\n\nRust module status could not be read. Canonical session usage, tags, and compartments live in mc-store, so context.db mirror values are intentionally omitted.";
+                    } else if (detail) {
                         combinedStatus = formatStatusDetailMarkdown(detail);
                     } else {
                         // Compatibility for isolated handler consumers that have not yet
@@ -847,7 +853,9 @@ export function createMagicContextCommandHandler(deps: {
                         "shared ctx-status detail failed; using compatibility text:",
                         error,
                     );
-                    combinedStatus = executeStatus(deps.db, sessionId, deps.protectedTags);
+                    combinedStatus = rustMode
+                        ? "## Magic Status — Unavailable\n\nRust module status failed while formatting. Canonical session usage, tags, and compartments live in mc-store, so context.db mirror values are intentionally omitted."
+                        : executeStatus(deps.db, sessionId, deps.protectedTags);
                 }
                 result += result ? `\n\n${combinedStatus}` : combinedStatus;
             }

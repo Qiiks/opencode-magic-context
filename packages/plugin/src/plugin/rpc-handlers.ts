@@ -622,6 +622,7 @@ export function buildStatusDetail(
         activeTags: 0,
         droppedTags: 0,
         totalTags: 0,
+        tagCountsAuthoritative: true,
         activeBytes: 0,
         lastResponseTime: 0,
         lastNudgeTokens: 0,
@@ -663,8 +664,7 @@ export function buildStatusDetail(
             context_db_schema_version: getPersistedSchemaVersion(db),
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
         };
-        const muralConfig = (config?.experimental as { mural?: { enabled?: boolean } } | undefined)
-            ?.mural;
+        const muralConfig = config?.mural as { enabled?: boolean } | undefined;
         if (muralConfig?.enabled && base.projectIdentity) {
             const row = getMural(db, base.projectIdentity);
             detail.mural = {
@@ -705,6 +705,13 @@ export function buildStatusDetail(
             detail.totalTags = detail.activeTags + detail.droppedTags;
         } catch {
             // tags table might have different schema
+        }
+        if (typeof moduleStatus?.tag_count === "number") {
+            // mc-store retains exact minted-tag totals but does not classify its rows with
+            // context.db's active/dropped status vocabulary. Use the module total while
+            // telling the TUI not to present host-mirror breakdowns as Rust authority truth.
+            detail.totalTags = moduleStatus.tag_count;
+            detail.tagCountsAuthoritative = false;
         }
 
         // Pending ops. The dialog only displays pendingOpsCount (computed
@@ -858,6 +865,26 @@ function buildEmbedDetail(
     };
 }
 
+export function buildCompartmentCount(
+    db: Database,
+    sessionId: string,
+    moduleStatus?: RustSessionStatus,
+): number {
+    if (typeof moduleStatus?.compartment_count === "number") {
+        return moduleStatus.compartment_count;
+    }
+    try {
+        const row = db
+            .prepare<[string], { count: number }>(
+                "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
+            )
+            .get(sessionId);
+        return row?.count ?? 0;
+    } catch {
+        return 0;
+    }
+}
+
 /**
  * Register all RPC handlers on the server.
  */
@@ -894,10 +921,15 @@ export function registerRpcHandlers(
         const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
-            config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+        const rustMode = config.transform_mode === "rust";
+        const moduleStatus = rustMode
+            ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+            : undefined;
+        if (rustMode && !moduleStatus) {
+            return {
+                error: "Rust module status unavailable; canonical session state was not read",
+            };
+        }
         return buildSidebarSnapshotRpcResponse(
             db,
             sessionId,
@@ -916,10 +948,15 @@ export function registerRpcHandlers(
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
-        const moduleStatus =
-            config.transform_mode === "rust"
-                ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
-                : undefined;
+        const rustMode = config.transform_mode === "rust";
+        const moduleStatus = rustMode
+            ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+            : undefined;
+        if (rustMode && !moduleStatus) {
+            return {
+                error: "Rust module status unavailable; canonical session state was not read",
+            };
+        }
         return buildStatusDetail(
             db,
             sessionId,
@@ -951,18 +988,20 @@ export function registerRpcHandlers(
 
     rpcServer.handle("compartment-count", async (params) => {
         const sessionId = String(params.sessionId ?? "");
+        const dir = String(params.directory ?? directory);
         const db = getDb();
         if (!db || !sessionId) return { count: 0 };
-        try {
-            const row = db
-                .prepare<[string], { count: number }>(
-                    "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
-                )
-                .get(sessionId);
-            return { count: row?.count ?? 0 };
-        } catch {
-            return { count: 0 };
+        const rustMode = config.transform_mode === "rust";
+        const moduleStatus = rustMode
+            ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
+            : undefined;
+        if (rustMode && !moduleStatus) {
+            return {
+                count: 0,
+                error: "Rust module status unavailable; canonical compartment count was not read",
+            };
         }
+        return { count: buildCompartmentCount(db, sessionId, moduleStatus) };
     });
 
     // ── Recomp / session-upgrade: delegate to the shared orchestrator ───────

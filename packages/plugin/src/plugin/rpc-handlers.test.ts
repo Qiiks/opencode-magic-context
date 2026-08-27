@@ -1,10 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
+
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
+import { upsertMural } from "../features/magic-context/mural/storage-mural";
 import {
     getPersistedSchemaVersion,
     initializeDatabase,
@@ -16,6 +18,7 @@ import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import {
+    buildCompartmentCount,
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
@@ -432,6 +435,18 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
                 ) VALUES (?, 1, 1, 5000, '', 0)`,
             ).run(sessionId);
 
+            const moduleStatus = {
+                usage: {
+                    current_total_input_tokens: 42_000,
+                    context_limit_tokens: 100_000,
+                },
+                boundary_present: true,
+                coverage_ordinal: 17,
+                compartment_count: 4,
+                compartment_tokens: 23,
+                pending_drop_count: 2,
+                tag_count: 9,
+            };
             const snapshot = buildSidebarSnapshot(
                 db,
                 sessionId,
@@ -439,17 +454,17 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
                 undefined,
                 4000,
                 undefined,
-                {
-                    usage: {
-                        current_total_input_tokens: 42_000,
-                        context_limit_tokens: 100_000,
-                    },
-                    boundary_present: true,
-                    coverage_ordinal: 17,
-                    compartment_count: 4,
-                    compartment_tokens: 23,
-                    pending_drop_count: 2,
-                },
+                moduleStatus,
+            );
+            const detail = buildStatusDetail(
+                db,
+                sessionId,
+                process.cwd(),
+                undefined,
+                undefined,
+                undefined,
+                4000,
+                moduleStatus,
             );
 
             expect(snapshot.inputTokens).toBe(42_000);
@@ -460,6 +475,11 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
             expect(snapshot.pendingOpsCount).toBe(2);
             expect(snapshot.boundaryPresent).toBe(true);
             expect(snapshot.coverageOrdinal).toBe(17);
+            expect(buildCompartmentCount(db, sessionId, moduleStatus)).toBe(4);
+            expect(detail.totalTags).toBe(9);
+            expect(detail.activeTags).toBe(0);
+            expect(detail.droppedTags).toBe(0);
+            expect(detail.tagCountsAuthoritative).toBe(false);
         } finally {
             closeQuietly(db);
         }
@@ -632,6 +652,35 @@ describe("buildStatusDetail — storage versions probe", () => {
 
             expect(detail.storage_versions.context_db_schema_version).toBe(50);
             expect(detail.storage_versions.plugin_supported_version).toBe(LATEST_SUPPORTED_VERSION);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — mural read surface", () => {
+    test("reads the graduated top-level mural config", () => {
+        const db = createTestDb();
+        try {
+            const directory = process.cwd();
+            const projectIdentity = resolveProjectIdentity(directory);
+            upsertMural(db, {
+                projectPath: projectIdentity,
+                image: Buffer.from("png"),
+                contentHash: "mural-content-hash",
+                renderedAt: Date.now() - 1000,
+                model: "deterministic",
+                memoryIds: [1],
+                width: 16,
+                height: 8,
+            });
+
+            const detail = buildStatusDetail(db, "ses-mural-status", directory, undefined, {
+                mural: { enabled: true },
+            });
+
+            expect(detail.mural?.present).toBe(true);
+            expect(detail.mural?.ageMs).toBeGreaterThanOrEqual(1000);
         } finally {
             closeQuietly(db);
         }
