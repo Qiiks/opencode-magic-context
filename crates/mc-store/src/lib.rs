@@ -3922,6 +3922,7 @@ pub struct SessionStatusSnapshot {
     pub loaded: LoadedState,
     pub compartment_count: usize,
     pub pending_drop_count: usize,
+    /// Every durable `mc_tags` row for the session, regardless of coverage, compartment, or drop state.
     pub tag_count: usize,
     pub pass_trace: Option<PassTrace>,
     pub compartment_page: Option<CompartmentPage>,
@@ -7113,6 +7114,13 @@ impl McStore {
                 )
                 .map(|value| value.max(0) as usize)
             };
+            let tag_count = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM mc_tags WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .max(0) as usize;
             let compartment_page = compartment_page
                 .map(|(after_sequence, limit)| {
                     let max_sequence = transaction
@@ -7177,7 +7185,7 @@ impl McStore {
                 loaded,
                 compartment_count: count("mc_compartments")?,
                 pending_drop_count: count("pending_agent_drops")?,
-                tag_count: count("mc_tags")?,
+                tag_count,
                 pass_trace,
                 compartment_page,
             };
@@ -18308,6 +18316,76 @@ mod tests {
                 ("cmd-zero".to_string(), Some("no_targets".to_string())),
                 ("cmd-normal".to_string(), None),
             ]
+        );
+    }
+
+    #[test]
+    fn session_status_tag_count_includes_all_operational_tag_states_and_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let session_id = "status-tag-total";
+        let tags = (1..=6)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: ordinal,
+                source_bytes: format!("message {ordinal}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.mint_or_get_tags(session_id, &tags, 100).unwrap();
+        store
+            .mint_or_get_tags(
+                "another-session",
+                &[TagMintInput {
+                    block_id: "m1#0".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: b"other".to_vec(),
+                }],
+                100,
+            )
+            .unwrap();
+        store
+            .replace_compartments(
+                session_id,
+                &[StoredCompartment {
+                    sequence: 1,
+                    start_message: 1,
+                    end_message: 2,
+                    end_message_id: "m2#0".to_string(),
+                    title: "frozen prefix".to_string(),
+                    content: "prefix".to_string(),
+                    importance: 50,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        store
+            .append_pending_agent_drops(session_id, &["m3#0".to_string(), "m4#0".to_string()], 200)
+            .unwrap();
+        let core = CoreState {
+            boundary_id: "m2#0".to_string(),
+            ..Default::default()
+        };
+        let meta = ModuleMeta {
+            coverage_ordinal: Some(4),
+            ..Default::default()
+        };
+        store.commit(session_id, None, &core, &meta).unwrap();
+
+        // The compartment covers m1-m2, queued drops cover m3-m4, and m5-m6 remain active.
+        // The status total must cross both the durable coverage boundary and the requested page.
+        let snapshot = store
+            .load_session_status_snapshot(session_id, Some((0, 1)))
+            .unwrap();
+        assert_eq!(snapshot.loaded.meta.coverage_ordinal, Some(4));
+        assert_eq!(snapshot.compartment_count, 1);
+        assert_eq!(snapshot.pending_drop_count, 2);
+        assert_eq!(snapshot.compartment_page.unwrap().compartments.len(), 1);
+        assert_eq!(snapshot.tag_count, 6);
+        assert_eq!(
+            snapshot.tag_count,
+            store.load_tags_for_session(session_id).unwrap().len()
         );
     }
 

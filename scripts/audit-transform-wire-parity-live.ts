@@ -1127,7 +1127,7 @@ function directOperatorFields(
 	};
 }
 
-function compareOperatorFields(
+export function compareOperatorFields(
 	before: Row,
 	after: Row,
 	sidebar: Row,
@@ -1169,6 +1169,55 @@ function compareOperatorFields(
 			].filter(Boolean),
 		};
 	});
+}
+
+export function evaluateOperatorTagTotalContract(
+	lane: Lane,
+	before: Row,
+	after: Row,
+	status: Row,
+): Row {
+	const beforeTotal =
+		typeof before.totalTags === "number" ? Number(before.totalTags) : null;
+	const afterTotal =
+		typeof after.totalTags === "number" ? Number(after.totalTags) : null;
+	const statusTotal =
+		typeof status.totalTags === "number" ? Number(status.totalTags) : null;
+	const directStable = beforeTotal !== null && beforeTotal === afterTotal;
+	const sourceMatchesLane =
+		lane === "rust"
+			? status.tagCountsAuthoritative === false
+			: status.tagCountsAuthoritative !== false;
+	return {
+		direct_before: beforeTotal,
+		direct_after: afterTotal,
+		direct_stable: directStable,
+		status: statusTotal,
+		status_matches_direct_total:
+			directStable && statusTotal !== null && statusTotal === beforeTotal,
+		authority_source:
+			lane === "rust"
+				? status.tagCountsAuthoritative === false
+					? "module"
+					: "host_or_unknown"
+				: status.tagCountsAuthoritative === false
+					? "module"
+					: "host",
+		source_matches_lane: sourceMatchesLane,
+	};
+}
+
+export function operatorTagTotalFailureClasses(lane: Lane, contract: Row): string[] {
+	const failures: string[] = [];
+	if (contract.direct_stable !== true) {
+		failures.push(`${lane}_tag_total_bracket_not_quiescent`);
+	} else if (contract.status_matches_direct_total !== true) {
+		failures.push(`${lane}_status_tag_total_mismatch`);
+	}
+	if (contract.source_matches_lane !== true) {
+		failures.push(`${lane}_status_tag_total_wrong_authority`);
+	}
+	return failures;
 }
 
 function sessionDirectory(
@@ -1252,12 +1301,13 @@ async function operatorEvidence(
 					context,
 					candidate.db,
 				);
+				// Route the store using independent fields so the tag value under test cannot select
+				// a convenient database and make its own contract check pass.
 				const score = [
 					"inputTokens",
 					"contextLimit",
 					"compartmentCount",
 					"pendingOpsCount",
-					"totalTags",
 				].filter(
 					(field) =>
 						typeof rpcValues[field] === "number" &&
@@ -1293,6 +1343,12 @@ async function operatorEvidence(
 				context,
 				sessionStore.db,
 			);
+			const tagTotalContract = evaluateOperatorTagTotalContract(
+				lane,
+				directBefore,
+				directAfter,
+				status,
+			);
 			selected.push({
 				lane,
 				session_prefix: sessionPrefix(binding.sessionId),
@@ -1307,6 +1363,7 @@ async function operatorEvidence(
 					sidebar,
 					status,
 				),
+				tag_total_contract: tagTotalContract,
 				context_schema_version_direct: tableExists(context, "schema_migrations")
 					? count(
 							context,
@@ -1333,10 +1390,11 @@ async function operatorEvidence(
 			break;
 		}
 	}
-	const mismatches = selected.flatMap((session) =>
-		(session.fields as Row[])
+	const mismatches = selected.flatMap((session) => {
+		const fieldMismatches = (session.fields as Row[])
 			.filter(
 				(field) =>
+					field.field !== "totalTags" &&
 					field.matched_snapshot === false &&
 					(field.exposed_by as unknown[]).length > 0,
 			)
@@ -1344,8 +1402,19 @@ async function operatorEvidence(
 				lane: session.lane,
 				session_prefix: session.session_prefix,
 				field: field.field,
+			}));
+		const contract = session.tag_total_contract as Row;
+		const tagFailures = operatorTagTotalFailureClasses(session.lane as Lane, contract);
+		return [
+			...fieldMismatches,
+			...tagFailures.map((className) => ({
+				class: className,
+				lane: session.lane,
+				session_prefix: session.session_prefix,
+				field: "totalTags",
 			})),
-	);
+		];
+	});
 	return {
 		sessions: selected,
 		coverage: {
@@ -1511,4 +1580,4 @@ async function main(): Promise<void> {
 	}
 }
 
-await main();
+if (import.meta.main) await main();

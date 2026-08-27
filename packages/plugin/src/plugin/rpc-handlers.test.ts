@@ -14,6 +14,7 @@ import {
 } from "../features/magic-context/storage-db";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
+import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
@@ -22,6 +23,7 @@ import {
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
+    loadRustSessionStatus,
 } from "./rpc-handlers";
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
 
@@ -35,6 +37,35 @@ function createTestDb(): Database {
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+});
+
+describe("Rust session status reads", () => {
+    test("coalesces overlapping reads without reusing a completed store snapshot", async () => {
+        let callCount = 0;
+        let releaseFirst!: (value: Record<string, unknown>) => void;
+        const firstResponse = new Promise<Record<string, unknown>>((resolve) => {
+            releaseFirst = resolve;
+        });
+        const client = {
+            call: () => {
+                callCount += 1;
+                return callCount === 1
+                    ? firstResponse
+                    : Promise.resolve({ ok: true, tag_count: 8_842 });
+            },
+        } as unknown as RustModeModuleClient;
+
+        const first = loadRustSessionStatus(client, "ses-status-fresh", "/project");
+        const overlapping = loadRustSessionStatus(client, "ses-status-fresh", "/project");
+        expect(callCount).toBe(1);
+        releaseFirst({ ok: true, tag_count: 1_666 });
+        expect((await first)?.tag_count).toBe(1_666);
+        expect((await overlapping)?.tag_count).toBe(1_666);
+
+        const refreshed = await loadRustSessionStatus(client, "ses-status-fresh", "/project");
+        expect(callCount).toBe(2);
+        expect(refreshed?.tag_count).toBe(8_842);
+    });
 });
 
 describe("sidebar snapshot RPC failures", () => {
