@@ -292,6 +292,182 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             self.assertEqual(matrix["unexplained_wire_invariants"][0]["lane"], "ts")
 
+    def test_provider_matrix_supports_openai_responses_wire(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            temp = Path(temporary)
+            dump_dir = temp / "dumps"
+            dump_dir.mkdir()
+            roots = {"rust": temp / "rust-project", "ts": temp / "ts-project"}
+            for lane, project in roots.items():
+                (project / ".cortexkit").mkdir(parents=True)
+                (project / ".cortexkit" / "magic-context.jsonc").write_text(
+                    json.dumps({"transform_mode": lane})
+                )
+                session = f"ses_response_{lane}"
+                path = (
+                    dump_dir
+                    / f"{DATE}T12-20-00-000Z-000100-{session}-direct-sticky-main.body.json"
+                )
+                body = {
+                    "model": "gpt-5-responses-fixture",
+                    "previous_response_id": "response-before-fixture",
+                    "instructions": f"Identity\nWorking directory: {project}\n\n## Magic Context",
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "external-call-fixture",
+                            "output": "prior response result",
+                        },
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hello"}],
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call-fixture",
+                            "name": "ctx_expand",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call-fixture-2",
+                            "name": "ctx_search",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call-fixture",
+                            "output": "§1§ recovered",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call-fixture-2",
+                            "output": "§2§ recovered",
+                        },
+                        {
+                            "type": "reasoning",
+                            "encrypted_content": "signed-fixture",
+                            "summary": [{"type": "summary_text", "text": "summary"}],
+                        },
+                    ],
+                }
+                path.write_text(json.dumps(body))
+                Path(str(path).replace(".body.json", ".meta.json")).write_text(
+                    json.dumps({"status": 200, "provider_id": "openai"})
+                )
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--date",
+                    DATE,
+                    "--rust-session",
+                    "ses_response_rust",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            matrix = json.loads(completed.stdout)["provider_matrix_parity"]
+            self.assertEqual(
+                matrix["inventory_by_lane"],
+                {
+                    "rust": {"openai:openai_responses": 1},
+                    "ts": {"openai:openai_responses": 1},
+                },
+            )
+            self.assertTrue(
+                all(axis["verdict"] == "matched_value_space" for axis in matrix["axes"])
+            )
+            self.assertEqual(matrix["unexplained_wire_invariants"], [])
+
+    def test_live_mode_uses_read_only_coordinate_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            temp = Path(temporary)
+            dump_dir = temp / "dumps"
+            dump_dir.mkdir()
+            rust_root = temp / "rust-project"
+            ts_root = temp / "ts-project"
+            for project, mode in ((rust_root, "rust"), (ts_root, "ts")):
+                (project / ".cortexkit").mkdir(parents=True)
+                (project / ".cortexkit" / "magic-context.jsonc").write_text(
+                    json.dumps({"transform_mode": mode})
+                )
+            self._write_dump(dump_dir, "ses_rust", rust_root, "rust-call", "anthropic", 0)
+            self._write_dump(dump_dir, "ses_ts", ts_root, "ts-call", "anthropic", 0)
+
+            context_db = temp / "context.db"
+            store_db = temp / "store.db"
+            opencode_db = temp / "opencode.db"
+            self._write_context_db(context_db)
+            self._write_store_db(store_db)
+            with sqlite3.connect(context_db) as db:
+                db.execute("ALTER TABLE session_projects ADD COLUMN updated_at INTEGER DEFAULT 0")
+                db.execute("ALTER TABLE tags ADD COLUMN id INTEGER")
+                db.execute("ALTER TABLE tags ADD COLUMN type TEXT DEFAULT 'message'")
+                db.execute("ALTER TABLE tags ADD COLUMN message_id TEXT DEFAULT ''")
+                db.execute("ALTER TABLE tags ADD COLUMN harness TEXT DEFAULT 'opencode'")
+            with sqlite3.connect(opencode_db) as db:
+                db.executescript("CREATE TABLE session (id TEXT); CREATE TABLE message (id TEXT);")
+            pi_session_dir = temp / "pi-sessions"
+            rpc_root = temp / "rpc"
+            pi_session_dir.mkdir()
+            rpc_root.mkdir()
+            self._write_pi_session(pi_session_dir)
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--live",
+                    "--date",
+                    DATE,
+                    "--after",
+                    f"{DATE}T00-00-00",
+                    "--context-db",
+                    str(context_db),
+                    "--store-db",
+                    str(store_db),
+                    "--store-root",
+                    str(temp),
+                    "--opencode-db",
+                    str(opencode_db),
+                    "--pi-session-dir",
+                    str(pi_session_dir),
+                    "--rpc-root",
+                    str(rpc_root),
+                    "--skip-live-rpc",
+                    "--skip-live-rust-oracle",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            report = json.loads(completed.stdout)
+            self.assertEqual(report["method"]["mode"], "live")
+            self.assertEqual(report["method"]["sqlite_contract"], {"readonly": True})
+            live_helper = (ROOT / "scripts" / "audit-transform-wire-parity-live.ts").read_text()
+            self.assertEqual(live_helper.count("new Database("), 1)
+            self.assertIn("new Database(path, { readonly: true })", live_helper)
+            self.assertTrue(
+                report["live_probe"]["method"]["sqlite_query_only_verified"]
+            )
+            evidence = report["provider_live"]["evidence"]
+            self.assertEqual(len(evidence), 2)
+            self.assertTrue(all(len(row["session_prefix"]) <= 8 for row in evidence))
+            self.assertTrue(all(len(row["capture_sha256"]) == 64 for row in evidence))
+            self.assertNotIn(str(temp), completed.stdout)
+            self.assertEqual(
+                {row["session_prefix"] for row in evidence},
+                {"ses_rust"[:8], "ses_ts"[:8]},
+            )
+
     def _write_dump(
         self,
         dump_dir: Path,
