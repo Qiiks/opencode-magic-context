@@ -654,17 +654,418 @@ def tool_reduction_shape(name: Any, tool_input: dict[str, Any]) -> str:
     return "full_or_small"
 
 
-def project_root(body: dict[str, Any]) -> str | None:
-    system = body.get("system")
-    if not isinstance(system, list):
-        return None
-    for item in system:
-        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+def provider_wire_family(body: dict[str, Any]) -> str:
+    if isinstance(body.get("contents"), list):
+        return "gemini"
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return "unknown"
+    if isinstance(body.get("system"), list):
+        return "anthropic"
+    for message in messages:
+        if not isinstance(message, dict):
             continue
-        match = WORKING_DIRECTORY_PATTERN.search(item["text"])
-        if match:
-            return match.group("path")
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict)
+            and block.get("type")
+            in ("tool_use", "tool_result", "thinking", "redacted_thinking")
+            for block in content
+        ):
+            return "anthropic"
+    return "openai_compatible"
+
+
+def provider_system_entries(body: dict[str, Any], family: str) -> list[Any]:
+    if family == "anthropic":
+        system = body.get("system")
+        return list(system) if isinstance(system, list) else []
+    if family == "openai_compatible":
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return []
+        return [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "system"
+        ]
+    if family == "gemini":
+        system = body.get("systemInstruction", body.get("system_instruction"))
+        return [system] if isinstance(system, dict) else []
+    return []
+
+
+def project_root(body: dict[str, Any]) -> str | None:
+    family = provider_wire_family(body)
+    for item in provider_system_entries(body, family):
+        for text in nested_text_values(item):
+            match = WORKING_DIRECTORY_PATTERN.search(text)
+            if match:
+                return match.group("path")
     return None
+
+
+def provider_label(dump: Dump, family: str) -> str:
+    for source in (dump.response, dump.body):
+        if not isinstance(source, dict):
+            continue
+        for key in ("provider_id", "providerID", "provider"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    if family == "anthropic" and "anthropic_version" in dump.body:
+        return "bedrock"
+    model = dump.body.get("model")
+    if isinstance(model, str):
+        lowered = model.lower()
+        for marker, label in (
+            ("moonshot", "moonshot"),
+            ("kimi", "moonshot"),
+            ("qwen", "qwen"),
+            ("gemini", "google"),
+            ("gpt", "openai"),
+        ):
+            if marker in lowered:
+                return label
+        if family == "anthropic" and "claude" in lowered:
+            return "anthropic"
+    return f"{family}_unknown_provider"
+
+
+def provider_wire_messages(body: dict[str, Any], family: str) -> list[dict[str, Any]]:
+    key = "contents" if family == "gemini" else "messages"
+    messages = body.get(key)
+    if not isinstance(messages, list):
+        return []
+    if family == "openai_compatible":
+        return [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") != "system"
+        ]
+    return [message for message in messages if isinstance(message, dict)]
+
+
+def provider_message_role(message: dict[str, Any], family: str) -> str:
+    role = message.get("role")
+    if family == "gemini" and role == "model":
+        return "assistant"
+    return str(role) if isinstance(role, str) else "unknown"
+
+
+def provider_message_texts(message: dict[str, Any], family: str) -> list[str]:
+    values = list(nested_text_values(message))
+    if family == "openai_compatible":
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str):
+            values.append(reasoning)
+    return values
+
+
+def provider_tool_ids(
+    message: dict[str, Any], family: str
+) -> tuple[list[str], list[str]]:
+    calls: list[str] = []
+    results: list[str] = []
+    if family == "openai_compatible":
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id")
+                if isinstance(call_id, str) and call_id:
+                    calls.append(call_id)
+        if message.get("role") == "tool":
+            result_id = message.get("tool_call_id")
+            if isinstance(result_id, str) and result_id:
+                results.append(result_id)
+        return calls, results
+
+    parts_key = "parts" if family == "gemini" else "content"
+    parts = message.get(parts_key)
+    if not isinstance(parts, list):
+        return calls, results
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if family == "anthropic":
+            if part.get("type") == "tool_use" and isinstance(part.get("id"), str):
+                calls.append(part["id"])
+            if part.get("type") == "tool_result" and isinstance(part.get("tool_use_id"), str):
+                results.append(part["tool_use_id"])
+            continue
+        function_call = part.get("functionCall")
+        if isinstance(function_call, dict):
+            call_id = function_call.get("id", function_call.get("name"))
+            if isinstance(call_id, str) and call_id:
+                calls.append(call_id)
+        function_response = part.get("functionResponse")
+        if isinstance(function_response, dict):
+            result_id = function_response.get("id", function_response.get("name"))
+            if isinstance(result_id, str) and result_id:
+                results.append(result_id)
+    return calls, results
+
+
+def provider_reasoning_shapes(message: dict[str, Any], family: str) -> list[str]:
+    shapes: list[str] = []
+    if family == "openai_compatible":
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str):
+            signed = any(
+                isinstance(message.get(key), str) and bool(message.get(key))
+                for key in ("reasoning_signature", "thinking_signature", "signature")
+            )
+            shapes.append(f"reasoning_content:signed={str(signed).lower()}")
+        content = message.get("content")
+        parts = content if isinstance(content, list) else []
+    else:
+        parts_key = "parts" if family == "gemini" else "content"
+        raw_parts = message.get(parts_key)
+        parts = raw_parts if isinstance(raw_parts, list) else []
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        if family == "gemini":
+            if part.get("thought") is not True and "thoughtSignature" not in part:
+                continue
+            signed = isinstance(part.get("thoughtSignature"), str) and bool(
+                part.get("thoughtSignature")
+            )
+            shapes.append(f"thought@{index}:signed={str(signed).lower()}")
+            continue
+        block_type = part.get("type")
+        if block_type not in (
+            "thinking",
+            "reasoning",
+            "redacted_thinking",
+            "redacted_reasoning",
+        ):
+            continue
+        metadata = part.get("metadata")
+        metadata_signed = isinstance(metadata, dict) and any(
+            "signature" in path.lower() and isinstance(value, str) and bool(value)
+            for path, value in json_paths(metadata, "metadata")
+        )
+        signed = any(
+            isinstance(part.get(key), str) and bool(part.get(key))
+            for key in ("signature", "thinkingSignature", "thoughtSignature")
+        ) or metadata_signed
+        shapes.append(f"{block_type}@{index}:signed={str(signed).lower()}")
+    return shapes
+
+
+def provider_tool_adjacency(
+    messages: list[dict[str, Any]], family: str
+) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        calls, _ = provider_tool_ids(message, family)
+        if not calls:
+            continue
+        collected: list[str] = []
+        cursor = index + 1
+        while cursor < len(messages):
+            _, results = provider_tool_ids(messages[cursor], family)
+            if not results:
+                break
+            collected.extend(results)
+            cursor += 1
+        missing = [call_id for call_id in calls if call_id not in collected]
+        unexpected = [result_id for result_id in collected if result_id not in calls]
+        if missing or unexpected:
+            violations.append(
+                {
+                    "message_index": index,
+                    "missing_result_ids": missing,
+                    "unexpected_result_ids": unexpected,
+                    "following_roles": [
+                        provider_message_role(candidate, family)
+                        for candidate in messages[index + 1 : index + 4]
+                    ],
+                }
+            )
+    for index, message in enumerate(messages):
+        _, results = provider_tool_ids(message, family)
+        if not results:
+            continue
+        cursor = index - 1
+        while cursor >= 0 and provider_tool_ids(messages[cursor], family)[1]:
+            cursor -= 1
+        owner_calls = (
+            provider_tool_ids(messages[cursor], family)[0] if cursor >= 0 else []
+        )
+        orphaned = [result_id for result_id in results if result_id not in owner_calls]
+        if orphaned:
+            violations.append(
+                {
+                    "message_index": index,
+                    "orphan_result_ids": orphaned,
+                    "preceding_roles": [
+                        provider_message_role(candidate, family)
+                        for candidate in messages[max(0, index - 3) : index]
+                    ],
+                }
+            )
+    return violations
+
+
+def summarize_provider_dump(dump: Dump) -> dict[str, Any]:
+    family = provider_wire_family(dump.body)
+    provider = provider_label(dump, family)
+    messages = provider_wire_messages(dump.body, family)
+    systems = provider_system_entries(dump.body, family)
+    empty_shapes: set[str] = set()
+    dropped_shapes: set[str] = set()
+    reasoning_shapes: set[str] = set()
+    calls = 0
+    results = 0
+    for index, message in enumerate(messages):
+        role = provider_message_role(message, family)
+        call_ids, result_ids = provider_tool_ids(message, family)
+        calls += len(call_ids)
+        results += len(result_ids)
+        texts = provider_message_texts(message, family)
+        has_empty_text = any(value == "" for value in texts)
+        content = message.get("parts" if family == "gemini" else "content")
+        content_empty = content in (None, "", []) and not call_ids and not result_ids
+        if has_empty_text or content_empty:
+            empty_shapes.add(
+                f"role={role};empty_text={str(has_empty_text).lower()};empty_message={str(content_empty).lower()}"
+            )
+        if any(DROP_PATTERN.fullmatch(value.strip()) for value in texts):
+            previous_calls = (
+                provider_tool_ids(messages[index - 1], family)[0] if index > 0 else []
+            )
+            next_results = (
+                provider_tool_ids(messages[index + 1], family)[1]
+                if index + 1 < len(messages)
+                else []
+            )
+            if previous_calls and next_results:
+                position = "between_call_and_result"
+            elif index + 1 < len(messages) and provider_tool_ids(
+                messages[index + 1], family
+            )[0]:
+                position = "before_tool_call"
+            elif index > 0 and provider_tool_ids(messages[index - 1], family)[1]:
+                position = "after_tool_result"
+            else:
+                position = "isolated"
+            dropped_shapes.add(f"role={role};position={position}")
+        for shape in provider_reasoning_shapes(message, family):
+            reasoning_shapes.add(f"role={role};{shape}")
+    adjacency = provider_tool_adjacency(messages, family)
+    system_message_count = 1 if family == "anthropic" and systems else len(systems)
+    invariants: list[str] = []
+    if family in ("openai_compatible", "gemini") and system_message_count > 1:
+        invariants.append("multiple_system_messages_for_strict_template")
+    canonical_anthropic = provider == "anthropic" and family == "anthropic"
+    if not canonical_anthropic and empty_shapes:
+        invariants.append("non_anthropic_empty_content")
+    if adjacency:
+        invariants.append("tool_result_adjacency_violation")
+    return {
+        "file": dump.path.name,
+        "session": dump.session,
+        "lane": dump.lane,
+        "provider": provider,
+        "wire_family": family,
+        "provider_family": f"{provider}:{family}",
+        "message_count": len(messages),
+        "system_message_count": system_message_count,
+        "system_block_count": len(systems),
+        "empty_content_shapes": sorted(empty_shapes) or ["none"],
+        "dropped_placeholder_shapes": sorted(dropped_shapes) or ["none"],
+        "tool_pairing_shapes": [
+            f"calls={calls};results={results};adjacency={'invalid' if adjacency else 'valid'}"
+        ],
+        "reasoning_signature_shapes": sorted(reasoning_shapes) or ["none"],
+        "adjacency_violations": adjacency,
+        "unexplained_invariants": invariants,
+    }
+
+
+def compare_provider_matrix(dumps: list[Dump]) -> dict[str, Any]:
+    rows = [
+        summarize_provider_dump(dump)
+        for dump in dumps
+        if dump.lane in ("ts", "rust")
+    ]
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
+    for row in rows:
+        grouped[row["provider_family"]][row["lane"]].append(row)
+    fields = (
+        "empty_content_shapes",
+        "dropped_placeholder_shapes",
+        "system_message_count",
+        "system_block_count",
+        "tool_pairing_shapes",
+        "reasoning_signature_shapes",
+    )
+    axes: list[dict[str, Any]] = []
+    for provider_family, lanes in sorted(grouped.items()):
+        for field in fields:
+            def value_space(lane: str) -> set[str]:
+                space: set[str] = set()
+                for row in lanes.get(lane, []):
+                    value = row[field]
+                    if isinstance(value, list):
+                        space.update(str(item) for item in value)
+                    else:
+                        space.add(str(value))
+                return space
+
+            ts_space = value_space("ts")
+            rust_space = value_space("rust")
+            if not ts_space or not rust_space:
+                verdict = "evidence_gap"
+            elif ts_space == rust_space:
+                verdict = "matched_value_space"
+            else:
+                verdict = "divergent_value_space"
+            axes.append(
+                {
+                    "provider_family": provider_family,
+                    "axis": field,
+                    "verdict": verdict,
+                    "ts_only": sorted(ts_space - rust_space),
+                    "rust_only": sorted(rust_space - ts_space),
+                    "shared": sorted(ts_space & rust_space),
+                }
+            )
+    unexplained_invariants = [
+        {
+            "file": row["file"],
+            "session": row["session"],
+            "lane": row["lane"],
+            "provider_family": row["provider_family"],
+            "classes": row["unexplained_invariants"],
+            "adjacency_violations": row["adjacency_violations"],
+        }
+        for row in rows
+        if row["unexplained_invariants"]
+    ]
+    return {
+        "inventory_by_lane": {
+            lane: counter_dict(
+                collections.Counter(
+                    row["provider_family"] for row in rows if row["lane"] == lane
+                )
+            )
+            for lane in ("ts", "rust")
+        },
+        "axes": axes,
+        "unexplained_byte_classes": [
+            axis for axis in axes if axis["verdict"] == "divergent_value_space"
+        ],
+        "unexplained_wire_invariants": unexplained_invariants,
+        "evidence": rows,
+        "note": "provider families compare observed per-leg value spaces; counts from unlike sessions are inventory only",
+    }
 
 
 def strip_jsonc_comments(value: str) -> str:
@@ -2854,6 +3255,7 @@ def main() -> None:
         "ts_pi_cross_harness_parity": compare_ts_pi_axes(
             lane_summaries["ts"], lane_summaries["pi"]
         ),
+        "provider_matrix_parity": compare_provider_matrix(dumps),
         "excluded_unverified_dumps": [
             dump.path.name for dump in dumps if dump.lane == "unverified"
         ],
