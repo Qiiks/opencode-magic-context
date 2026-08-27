@@ -14,7 +14,7 @@ import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { hasShareabilitySensitiveText } from "../../../shared/redaction";
-import { modelBodyField } from "../../../shared/resolve-fallbacks";
+import { modelBodyField, toModelEntry } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
     getMemoriesByProject,
@@ -461,6 +461,11 @@ async function runClassifyThroughModule(
         memories: chunk.map(toPromptMemory),
         anchors,
     });
+    const modelChain = [args.model, ...(args.fallbackModels ?? [])]
+        .map(toModelEntry)
+        .filter((entry) => entry !== undefined)
+        .map((entry) => entry.model);
+    const resolvedModelChain = [...new Set(modelChain)];
     const response = await args.moduleClient?.call({
         sessionId: args.moduleSessionId as string,
         projectRoot: args.moduleProjectRoot as string,
@@ -478,6 +483,7 @@ async function runClassifyThroughModule(
                 .digest("hex")
                 .slice(0, 24)}`,
             authority_generation: args.moduleAuthorityGeneration,
+            ...(resolvedModelChain.length > 0 ? { model_chain: resolvedModelChain } : {}),
             payload: {
                 prompt_body: prompt,
                 items: chunk.map((candidate) => ({

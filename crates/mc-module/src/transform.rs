@@ -817,6 +817,12 @@ pub struct TransformRequest {
     /// route can outlive a config reload; absent values use the bind-time fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_budget_tokens: Option<f64>,
+    /// When set, this is the host-approved model order for OpenCode historian requests. Before
+    /// building the request, the host applies the user's profile and removes model choices from
+    /// repository config. An absent value lets Claude Code choose models from module config;
+    /// a present but empty list disables historian dispatch for this OpenCode route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historian_model_chain: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
     /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
@@ -970,6 +976,8 @@ struct TransformRequestWire {
     #[serde(default)]
     history_budget_tokens: Option<f64>,
     #[serde(default)]
+    historian_model_chain: Option<Vec<String>>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
     #[serde(default)]
     lineage_switched: bool,
@@ -1044,6 +1052,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             detected_context_limit: wire.detected_context_limit,
             detected_context_limit_model_key: wire.detected_context_limit_model_key,
             history_budget_tokens: wire.history_budget_tokens,
+            historian_model_chain: wire.historian_model_chain,
             declared_trim: wire.declared_trim,
             lineage_switched: wire.lineage_switched,
             descent_edge_id: wire.descent_edge_id,
@@ -14485,6 +14494,7 @@ pub(crate) mod tests {
             detected_context_limit: 0,
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
+            historian_model_chain: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,

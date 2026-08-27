@@ -4854,7 +4854,11 @@ impl McHandler {
             });
         }
         let trigger_reason = trigger.reason.map(|r| r.as_str().to_string());
-        if cfg.model_chain.is_empty() {
+        let model_chain = parsed
+            .historian_model_chain
+            .as_deref()
+            .unwrap_or(&cfg.model_chain);
+        if model_chain.is_empty() {
             self.record_no_fire(&store, &parsed.session_id, &loaded, "no_models");
             return PreparedHistorianAction::Complete(HistorianDiagnostics {
                 fired: false,
@@ -4920,7 +4924,7 @@ impl McHandler {
                 session_id: parsed.session_id.clone(),
                 project_path: project_path.to_string(),
                 project_slug: project_slug.clone(),
-                model_chain: cfg.model_chain.clone(),
+                model_chain: model_chain.to_vec(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary,
                 memory_enabled: cfg.memory_enabled,
@@ -9543,12 +9547,45 @@ impl McHandler {
             return replay_dream_task_response(&recorded.response_json);
         }
 
+        let requested_model_chain = match request.get("model_chain") {
+            None => None,
+            Some(Value::Array(entries)) if entries.len() <= 16 => {
+                let mut models = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let Some(model) = entry.as_str() else {
+                        return invalid_params_error(
+                            "dreamer.run_task model_chain entries must be strings",
+                        );
+                    };
+                    if model.trim().is_empty() || model.len() > 256 {
+                        return invalid_params_error(
+                            "dreamer.run_task model_chain entries must be 1-256 bytes",
+                        );
+                    }
+                    if !models.iter().any(|existing| existing == model) {
+                        models.push(model.to_string());
+                    }
+                }
+                Some(models)
+            }
+            Some(Value::Array(_)) => {
+                return invalid_params_error(
+                    "dreamer.run_task model_chain supports at most 16 entries",
+                );
+            }
+            Some(_) => {
+                return invalid_params_error("dreamer.run_task model_chain must be an array");
+            }
+        };
+        let model_chain = requested_model_chain
+            .as_deref()
+            .unwrap_or(&binding.config.model_chain);
         let child_session = child_session_id(&authority_project, command_id);
         let _dreamer_run_guard = self.register_dreamer_run(&child_session);
         let mut attempts = 0usize;
         let mut last_error = String::new();
         let mut output = None;
-        for model in &binding.config.model_chain {
+        for model in model_chain {
             attempts += 1;
             let mut producer = match self.producer_factory.connect(&binding.project_root).await {
                 Ok(producer) => producer,
@@ -16207,6 +16244,7 @@ mod tests {
         outputs: Mutex<VecDeque<String>>,
         next_fact: Mutex<Option<String>>,
         prompts: Mutex<Vec<String>>,
+        models: Mutex<Vec<String>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
@@ -16252,7 +16290,7 @@ mod tests {
             _session_id: &str,
             _system: &str,
             prompt: &str,
-            _model: &str,
+            model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
             let n = self.state.starts.fetch_add(1, Ordering::SeqCst) + 1;
             self.state
@@ -16260,6 +16298,11 @@ mod tests {
                 .lock()
                 .expect("prompts mutex")
                 .push(prompt.to_string());
+            self.state
+                .models
+                .lock()
+                .expect("models mutex")
+                .push(model.to_string());
             if let Some(result) = self
                 .state
                 .start_errors
@@ -23901,7 +23944,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_advances_model_chain_after_outage_text() {
+    async fn dreamer_run_task_uses_profile_resolved_chain_and_advances_after_outage_text() {
         let producer = Arc::new(ProducerState::default());
         producer
             .await_results
@@ -23921,8 +23964,7 @@ mod tests {
             handler_with_store(Arc::clone(&producer), default_test_config());
         let route_root = project.to_str().unwrap();
         let mut route_binding = binding(route_root, "ses");
-        route_binding.config.model_chain =
-            vec!["test/bad-model".to_string(), "test/good-model".to_string()];
+        route_binding.config.model_chain = vec!["test/base-dreamer".to_string()];
         handler.bind_route(7, route_binding);
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
@@ -23940,6 +23982,7 @@ mod tests {
                     "task": CLASSIFY_TASK,
                     "command_id": "model-chain-command",
                     "authority_generation": generation,
+                    "model_chain": ["test/profile-bad-model", "test/profile-good-model"],
                     "payload": { "prompt_body": "classify", "items": [] },
                 }),
             )
@@ -23951,7 +23994,14 @@ mod tests {
 
         assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
         assert_eq!(response["manifest_text"], json!("<classify></classify>"));
-        assert_eq!(response["diagnostics"]["model"], json!("test/good-model"));
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["test/profile-bad-model", "test/profile-good-model"]
+        );
+        assert_eq!(
+            response["diagnostics"]["model"],
+            json!("test/profile-good-model")
+        );
         assert_eq!(response["diagnostics"]["attempts"], json!(2));
     }
 
@@ -28685,6 +28735,28 @@ mod tests {
         assert_eq!(
             recovered["historian"]["side_channel_last_failure"],
             Value::Null
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_resolved_transform_models_override_base_config_for_broca_dispatch() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.model_chain = vec!["anthropic/base-historian".to_string()];
+        let (handler, store, _dir, _project) = handler_with_store(Arc::clone(&producer), config);
+        let mut transform = request(big_messages());
+        transform["serializer_profile"] = json!("opencode-aisdk");
+        transform["historian_model_chain"] =
+            json!(["anthropic/profile-historian", "openai/profile-fallback"]);
+
+        let response = call_transform_request(&handler, transform).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["anthropic/profile-historian"],
+            "the Broca dispatch must use the host's profile-resolved primary instead of module-local base config"
         );
     }
 

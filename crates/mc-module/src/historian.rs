@@ -1827,6 +1827,7 @@ mod tests {
             detected_context_limit: 0,
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
+            historian_model_chain: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,
