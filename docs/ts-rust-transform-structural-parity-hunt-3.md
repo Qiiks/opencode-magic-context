@@ -45,6 +45,8 @@ A new hermetic differential fixture starts memory-off, sends a real TS request, 
 
 **Fix brief:** inspect SUBCONSCIOUS's effective project `transform_mode`, user-tier subc connection, module status/provenance, and route binding; restart that host after restoring the Rust route. Acceptance is one fresh served request whose decision row has all six TypeScript-only operands null plus current `mc_cache_state`/`mc_pass_trace` activity. Then re-run this audit with all three sessions genuinely observed as Rust.
 
+**Post-delivery correction (review):** the "configured as Rust" premise came from the hunt brief, not from configuration — the live project config at `subconscious/.cortexkit/magic-context.jsonc` is empty, with a comment documenting the deliberate escape-hatch-off state (the July flip-back decision stands). Config = TS, wires = TS: consistent, no activation gap, no fix owed. What stands from F2: the differ must not count `subconscious` in Rust denominators (landed), and the stale July `mc_cache_state` rows for that project explain the module-side silence. The audit's wire-evidence discipline caught the contradiction the brief planted — the denominators were protected by refusing to trust the label over the bytes.
+
 ## Per-axis verdicts
 
 ### 1. Fresh de-gauged nudge assembly
