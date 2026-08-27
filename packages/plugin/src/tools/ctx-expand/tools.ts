@@ -16,16 +16,12 @@ export interface CtxExpandToolDeps {
 const ctxExpandArgsShape = {
     start: tool.schema
         .number()
-        .int()
-        .min(1)
         .optional()
         .describe(
             'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
         ),
     end: tool.schema
         .number()
-        .int()
-        .min(1)
         .optional()
         .describe(
             'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
@@ -38,8 +34,6 @@ const ctxExpandArgsShape = {
         ),
     message: tool.schema
         .number()
-        .int()
-        .min(1)
         .optional()
         .describe(
             "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",

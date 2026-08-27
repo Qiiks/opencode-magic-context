@@ -10689,8 +10689,10 @@ impl McHandler {
         };
         let session_id = facade_scope.conversation_key.as_str();
         if args.get("message").is_some() {
-            let Some(message) = i64_arg(args, "message").filter(|value| *value > 0) else {
-                return tool_error_result("Error: message must be a positive integer.");
+            // Ordinal 0 is a real message on the Claude Code leg (its chunk
+            // transcripts store 0-based ordinals), so the domain is non-negative.
+            let Some(message) = i64_arg(args, "message").filter(|value| *value >= 0) else {
+                return tool_error_result("Error: message must be a non-negative integer.");
             };
             if let Some(raw_message) =
                 self.cached_expand_messages(session_id)
@@ -10724,17 +10726,17 @@ impl McHandler {
         }
         let Some(start) = i64_arg(args, "start") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
         let Some(end) = i64_arg(args, "end") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
-        if start <= 0 || end < start {
+        if start < 0 || end < start {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         }
         let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
@@ -14728,10 +14730,10 @@ fn ctx_expand_schema() -> Value {
         "type": "object",
         "additionalProperties": true,
         "properties": {
-            "start": { "type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991_i64, "description": "First message ordinal to expand." },
-            "end": { "type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991_i64, "description": "Last message ordinal to expand, inclusive." },
+            "start": { "type": "integer", "minimum": 0, "description": "First message ordinal to expand." },
+            "end": { "type": "integer", "minimum": 0, "description": "Last message ordinal to expand, inclusive." },
             "verbose": { "type": "boolean", "description": "With start/end: list each message separately with its ordinal [N] and per-part preview, including each tool call's output size, so one message can be recovered by ordinal." },
-            "message": { "type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991_i64, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
+            "message": { "type": "integer", "minimum": 0, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
         }
     })
 }
@@ -30822,7 +30824,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ctx_expand_rejects_ordinal_zero_like_the_typescript_facade() {
+    async fn ctx_expand_accepts_ordinal_zero_because_cc_transcripts_are_zero_based() {
+        // The ordinal DOMAINS deliberately differ across legs: OpenCode/Pi
+        // transcripts are 1-based (the TypeScript facade rejects 0), while
+        // Claude Code chunk transcripts store 0-based ordinals — so the module
+        // facade must accept ordinal 0 or a CC session's first message becomes
+        // permanently unexpandable. Same-schema-everywhere is false parity here.
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
         let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
@@ -30830,17 +30837,17 @@ mod tests {
             resolver,
         );
 
+        // Ordinal 0 passes domain validation (the miss is a not-found, not a
+        // domain rejection), and negatives still refuse.
         let by_message = call_facade(&handler, "ctx_expand", json!({"message": 0})).await;
-        assert!(tool_is_error(by_message));
+        assert!(!tool_text(by_message).contains("must be a"));
         let by_range = call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 0})).await;
-        assert!(tool_is_error(by_range));
+        assert!(!tool_text(by_range).contains("non-negative integers"));
+        let negative = call_facade(&handler, "ctx_expand", json!({"message": -1})).await;
+        assert!(tool_is_error(negative));
         let schema = ctx_expand_schema();
         for property in ["message", "start", "end"] {
-            assert_eq!(schema["properties"][property]["minimum"], json!(1));
-            assert_eq!(
-                schema["properties"][property]["maximum"],
-                json!(9_007_199_254_740_991_i64)
-            );
+            assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
     }
 }

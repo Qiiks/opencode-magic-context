@@ -103,3 +103,18 @@ The differ now hashes actual served outputs for matched facade inputs after remo
 ## Honest-empty declaration
 
 Hunt #4 is **not empty**: it lands two `ctx_expand` behavior corrections and exact Channel-1 math enforcement, and records three concrete structural follow-ups (`ctx_search`, tool-title recovery, and historian event durability). No master push is part of this work.
+
+## Post-delivery correction (review): ctx_expand ordinal domains deliberately differ
+
+The delivered unification of the ctx_expand ordinal domain to positive integers
+(schema minimum 1 + runtime <=0 rejects, both legs) was reverted at merge. The
+missing evidence: Claude Code chunk transcripts store 0-BASED ordinals (the D5
+drive sessions pinned `ordinals 0..17` in the module store), so a minimum of 1
+makes a CC session's first message permanently unexpandable. The correct
+contract, now pinned by `ctx_expand_accepts_ordinal_zero_because_cc_transcripts_are_zero_based`:
+the module facade accepts ordinal 0 (CC's space), the TypeScript facade keeps
+rejecting it (OpenCode/Pi transcripts are 1-based) — same-schema-everywhere is
+false parity when the underlying ordinal spaces differ. The advertised-schema
+byte changes were additionally release-window material (cache surface on both
+legs) and are dropped rather than deferred: the runtime integer tightening on
+the TS side (Number.isInteger checks, no wire bytes) is kept.
