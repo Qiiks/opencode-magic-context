@@ -182,10 +182,15 @@ describe("dreamer lease (serialized acquisition)", () => {
             const logIndex = events.findIndex((event) => event.startsWith("log:"));
             expect(commitIndex).toBeGreaterThanOrEqual(0);
             expect(logIndex).toBeGreaterThan(commitIndex);
-            expect(logSpy).toHaveBeenCalledWith(
-                expect.stringContaining("site=lease-guarded-write:memory:proj"),
-            );
-            expect(logSpy.mock.calls[0]?.[0]).toMatch(/held=\d+\.\dms/);
+            // Filter for this instrument's own line: the spy wraps the shared
+            // module logger, so unrelated subsystems (e.g. background embedding
+            // retries) can interleave calls in the same worker process. Positional
+            // assertions on calls[0] were the real source of this file's flakes.
+            const timingLines = logSpy.mock.calls
+                .map((call) => String(call[0]))
+                .filter((line) => line.includes("site=lease-guarded-write:memory:proj"));
+            expect(timingLines.length).toBe(1);
+            expect(timingLines[0]).toMatch(/held=\d+\.\dms/);
         } finally {
             logSpy.mockRestore();
             execSpy.mockRestore();
@@ -199,7 +204,12 @@ describe("dreamer lease (serialized acquisition)", () => {
         try {
             expect(acquireLease(db, "holder-a", "memory:proj")).toBe(true);
             runLeaseGuardedWrite(db, "holder-a", "memory:proj", () => {}, Number.MAX_SAFE_INTEGER);
-            expect(logSpy).not.toHaveBeenCalled();
+            // Assert no WRITE-TIMING line specifically — unrelated logger traffic
+            // from the shared worker process must not fail this test.
+            const timingLines = logSpy.mock.calls
+                .map((call) => String(call[0]))
+                .filter((line) => line.includes("site=lease-guarded-write"));
+            expect(timingLines).toEqual([]);
         } finally {
             logSpy.mockRestore();
             closeQuietly(db);
