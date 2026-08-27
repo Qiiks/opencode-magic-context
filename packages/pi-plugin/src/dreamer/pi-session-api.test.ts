@@ -246,7 +246,7 @@ describe("loadDefaultPiSessionApi", () => {
 			const dir = mkdtempSync(join(tmpdir(), "pi-traversal-"));
 			const pkgRoot = join(dir, "pi-coding-agent");
 			writeFixturePackage(pkgRoot, {
-				entry: "../../outside.js",
+				entry: "./../../outside.js",
 				files: { "cli.js": "// entry\n" },
 			});
 			await withArgv1(join(pkgRoot, "cli.js"), async () => {
