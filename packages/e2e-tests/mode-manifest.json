@@ -478,6 +478,19 @@
             ]
         },
         {
+            "path": "tests/rust-memory-off-parity.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "one hermetic persistent-data fixture runs memory-on/off transitions through both TS and Rust served-wire lanes",
+            "contract_refs": [
+                "RUST-E2E",
+                "MEMORY-OFF-TRANSFORM-PARITY"
+            ]
+        },
+        {
             "path": "tests/rust-multi-frame-delta-perf.test.ts",
             "tier": "rust-only",
             "invocation": {
