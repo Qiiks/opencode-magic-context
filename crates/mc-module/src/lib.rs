@@ -10605,9 +10605,9 @@ impl McHandler {
                 )
             }
             "merge" => {
-                let Some((target_id, source_ids)) = merge_ids(args) else {
+                let Some(ids) = merge_ids(args) else {
                     return tool_error_result(
-                        "Error: provide target_id plus source_ids, or ids with the target first, when action is 'merge'.",
+                        "Error: provide target_id plus source_ids, or at least two ids when action is 'merge'.",
                     );
                 };
                 let Some(content) = non_empty_string_arg(args, "content") else {
@@ -10625,22 +10625,23 @@ impl McHandler {
                         action,
                         command_id.as_deref(),
                         |tx| {
-                            let memory = tx
-                                .merge_memories(
+                            let (memory, superseded_ids) = tx
+                                .merge_memories_canonical(
                                     memory_project,
-                                    target_id,
-                                    &source_ids,
+                                    &ids,
                                     content,
+                                    Some(conversation_key),
                                     now_ms(),
                                 )
                                 .map_err(|error| error.to_string())?
-                                .ok_or_else(|| format!("memory {target_id} was not found"))?;
+                                .ok_or_else(|| "memories could not be merged".to_string())?;
                             facade_text_response(
                                 format!(
-                                    "Merged memories into [ID: {}] in {}; superseded [{}].",
+                                    "Merged memories [{}] into canonical memory [ID: {}] in {}; superseded [{}].",
+                                    join_i64s(&ids),
                                     memory.id,
                                     memory.category,
-                                    join_i64s(&source_ids)
+                                    join_i64s(&superseded_ids)
                                 ),
                                 false,
                             )
@@ -11038,6 +11039,9 @@ impl McHandler {
         let args = &args;
         if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
             .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
+            .and_then(|_| validate_string_cap(args, "compiled_provider", MAX_SHORT_FIELD_BYTES))
+            .and_then(|_| validate_string_cap(args, "compiled_config", MAX_NOTE_CONTENT_BYTES))
+            .and_then(|_| validate_string_cap(args, "compile_status", MAX_SHORT_FIELD_BYTES))
         {
             return tool_error_result(format!("Error: {error}."));
         }
@@ -11122,6 +11126,10 @@ impl McHandler {
                                         session_id: Some(session),
                                         content,
                                         surface_condition: Some(condition),
+                                        compiled_provider: string_arg(args, "compiled_provider"),
+                                        compiled_config: string_arg(args, "compiled_config"),
+                                        compiled_at: i64_arg(args, "compiled_at"),
+                                        compile_status: string_arg(args, "compile_status"),
                                         anchor_block_id: anchor.as_deref(),
                                         anchor_ordinal: None,
                                         now_ms: now,
@@ -11251,7 +11259,7 @@ impl McHandler {
                         "Error: 'note_id' is required when action is 'update'.",
                     );
                 };
-                let content = non_empty_string_arg(args, "content");
+                let content = string_arg(args, "content");
                 let condition = string_arg(args, "surface_condition")
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
@@ -12582,7 +12590,7 @@ fn respond_transform(
     };
     let response_meta_encode_ms = response_encode_started_at.elapsed().as_secs_f64() * 1_000.0;
     let Some(messages) = messages else {
-        let outcome = HandlerOutcome::Response(encoded);
+        let outcome = HandlerOutcome::Response(transform::encode_js_surrogate_markers(encoded));
         emit_pass_timing(
             session_id,
             pass_timings.as_ref(),
@@ -12626,7 +12634,7 @@ fn respond_transform(
     output.push(b']');
     output.extend_from_slice(&encoded[null_start + 4..]);
     let response_splice_ms = response_splice_started_at.elapsed().as_secs_f64() * 1_000.0;
-    let outcome = HandlerOutcome::Response(output);
+    let outcome = HandlerOutcome::Response(transform::encode_js_surrogate_markers(output));
     emit_pass_timing(
         session_id,
         pass_timings.as_ref(),
@@ -14143,24 +14151,20 @@ fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
     ids
 }
 
-fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
-    if let Some(target_id) = i64_arg(args, "target_id") {
-        let source_ids = args
-            .get("source_ids")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(Value::as_i64)
-            .collect::<Vec<_>>();
-        if source_ids.is_empty() {
-            return None;
-        }
-        return Some((target_id, dedup_i64s(source_ids)));
-    }
-    let ids = memory_ids(args, "merge");
-    if ids.len() < 2 {
-        return None;
-    }
-    Some((ids[0], ids[1..].to_vec()))
+fn merge_ids(args: &Map<String, Value>) -> Option<Vec<i64>> {
+    let ids = if let Some(target_id) = i64_arg(args, "target_id") {
+        let mut ids = vec![target_id];
+        ids.extend(
+            args.get("source_ids")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_i64),
+        );
+        dedup_i64s(ids)
+    } else {
+        memory_ids(args, "merge")
+    };
+    (ids.len() >= 2).then_some(ids)
 }
 
 fn dedup_i64s(ids: Vec<i64>) -> Vec<i64> {
@@ -15089,7 +15093,12 @@ mod tests {
             final_wire_trusted: false,
         };
         let (limit, _, pct) = usage_numbers(Some(&tiny), None);
-        assert_eq!(limit, 200_000.0);
+        let boundary_golden: Value =
+            serde_json::from_str(include_str!("../testdata/boundary-golden.json")).unwrap();
+        assert_eq!(
+            limit,
+            boundary_golden["default_context_limit"].as_f64().unwrap()
+        );
         assert!((pct - 25.0).abs() < 0.01, "pct={pct}");
 
         let ok = ModuleUsage {
@@ -19159,7 +19168,12 @@ mod tests {
         let first_ingress = vec![ck_reasoning("reasoning-1", 1, "signed-1")];
         let first_native = vec![json!({
             "info": { "id": "reasoning-1", "role": "assistant" },
-            "parts": [{ "type": "reasoning", "text": "signed-1", "metadata": { "signature": "sig-1" } }]
+            "parts": [{
+                "type": "reasoning",
+                "text": "signed-1",
+                "metadata": { "signature": "sig-1" },
+                "cache_control": { "type": "ephemeral" }
+            }]
         })];
         let mut first_request = native_cache_request(
             "native-reasoning-movement",
@@ -19224,7 +19238,11 @@ mod tests {
         let native = second.native_messages.unwrap();
         assert_eq!(
             native[0]["parts"][0],
-            json!({ "type": "reasoning", "text": "" })
+            json!({
+                "type": "text",
+                "text": "",
+                "cache_control": { "type": "ephemeral" }
+            })
         );
         assert_eq!(native[1]["parts"][0]["text"], "signed-2");
     }
@@ -22464,6 +22482,10 @@ mod tests {
                 session_id: Some("session"),
                 content: "surface after evaluation",
                 surface_condition: Some("when ready"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -22504,6 +22526,10 @@ mod tests {
                 session_id: Some("ses"),
                 content: "identity note lifecycle",
                 surface_condition: Some("when ready"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -22608,6 +22634,10 @@ mod tests {
                     session_id: Some("session"),
                     content: &format!("ready note {index}"),
                     surface_condition: Some("condition"),
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     anchor_block_id: None,
                     anchor_ordinal: None,
                     now_ms: index,
@@ -23571,21 +23601,34 @@ mod tests {
             json!({"action": "update", "ids": [1], "content": "first updated"}),
             json!({"action": "write", "category": "CONSTRAINTS", "content": "second"}),
             json!({"action": "merge", "ids": [1, 2], "content": "merged"}),
-            json!({"action": "get", "ids": [1]}),
-            json!({"action": "archive", "ids": [1]}),
         ] {
             let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
             assert!(!tool_is_error(outcome), "action failed: {arguments}");
         }
-        let memory = store.get_memory_full(1).unwrap().unwrap();
-        assert_eq!(memory.content, "merged");
-        assert_eq!(memory.status, "archived");
-        assert!(store
-            .get_memory_full(2)
+        let canonical = store
+            .get_memory_full(1)
             .unwrap()
             .unwrap()
             .superseded_by_memory_id
-            .is_some());
+            .expect("new merged content creates a canonical row");
+        for arguments in [
+            json!({"action": "get", "ids": [canonical]}),
+            json!({"action": "archive", "ids": [canonical]}),
+        ] {
+            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
+            assert!(!tool_is_error(outcome), "action failed: {arguments}");
+        }
+        let memory = store.get_memory_full(canonical).unwrap().unwrap();
+        assert_eq!(memory.content, "merged");
+        assert_eq!(memory.status, "archived");
+        assert_eq!(
+            store
+                .get_memory_full(2)
+                .unwrap()
+                .unwrap()
+                .superseded_by_memory_id,
+            Some(canonical)
+        );
         let feed = store.pull_changefeed("memories", 0, 100).unwrap();
         assert!(
             feed.rows.len() >= 6,
@@ -24372,6 +24415,13 @@ mod tests {
         )
         .await;
         assert!(!tool_is_error(merge));
+        let canonical = store
+            .get_memory_full(source)
+            .unwrap()
+            .unwrap()
+            .superseded_by_memory_id
+            .expect("merge created a canonical replacement");
+        assert_ne!(canonical, target);
         let revision_after = crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
         assert_ne!(revision_before, revision_after);
         assert_eq!(
@@ -24395,7 +24445,7 @@ mod tests {
             "{transition_m1}"
         );
         assert!(
-            transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
+            transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{canonical}\"/>")),
             "{transition_m1}"
         );
         let stable = call_transform_request(&handler, request).await;
@@ -24616,6 +24666,10 @@ mod tests {
                 session_id: Some("ses"),
                 content: "needle note",
                 surface_condition: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: Some("m18#0"),
                 anchor_ordinal: Some(18),
                 now_ms: now_ms(),

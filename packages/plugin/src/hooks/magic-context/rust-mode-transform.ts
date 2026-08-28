@@ -1237,10 +1237,41 @@ function muralInputForWire(
     };
 }
 
+function toolInputKeyOrders(input: unknown[]): Record<string, string[]> {
+    const orders: Record<string, string[]> = {};
+    for (const entry of input) {
+        if (!entry || typeof entry !== "object") continue;
+        const record = entry as Record<string, unknown>;
+        const mid = typeof record.mid === "string" ? record.mid : null;
+        const ck = record.ck;
+        if (!mid || !ck || typeof ck !== "object") continue;
+        const content = (ck as Record<string, unknown>).content;
+        if (!Array.isArray(content)) continue;
+        for (let index = 0; index < content.length; index += 1) {
+            const block = content[index];
+            if (!block || typeof block !== "object") continue;
+            const kind = (block as Record<string, unknown>).kind;
+            if (!kind || typeof kind !== "object") continue;
+            const kindRecord = kind as Record<string, unknown>;
+            const toolInput = kindRecord.input;
+            if (
+                kindRecord.type === "tool_call" &&
+                toolInput !== null &&
+                typeof toolInput === "object" &&
+                !Array.isArray(toolInput)
+            ) {
+                orders[`${mid}#${index}`] = Object.keys(toolInput as Record<string, unknown>);
+            }
+        }
+    }
+    return orders;
+}
+
 function buildTransformBody(args: {
     sessionId: string;
     input: unknown[];
     nativeMessages: unknown[];
+    toolInputKeyOrders?: Record<string, string[]>;
     passInputs: Record<string, unknown>;
     usage: Record<string, number | boolean>;
     geometry?: TransformGeometryWire;
@@ -1284,6 +1315,7 @@ function buildTransformBody(args: {
         protected_tags: args.passInputs.protected_tags ?? DEFAULT_PROTECTED_TAGS,
         messages: args.input,
         native_messages: args.nativeMessages,
+        tool_input_key_orders: args.toolInputKeyOrders ?? toolInputKeyOrders(args.input),
         ...(args.fullArrayFingerprint ? { full_array_fingerprint: args.fullArrayFingerprint } : {}),
         ...(args.tailDelta
             ? {
@@ -2292,6 +2324,7 @@ export function createRustModeTransform(
                 sessionId,
                 input: encodedInput,
                 nativeMessages: wireDelta ? messages.slice(wireDelta.rawStart) : messages,
+                toolInputKeyOrders: toolInputKeyOrders(encodedInput),
                 fullArrayFingerprint: pendingWireCache.fingerprint,
                 tailDelta: wireDelta
                     ? {
@@ -2529,6 +2562,7 @@ export function createRustModeTransform(
                         sessionId,
                         input: retryEncodedInput,
                         nativeMessages: messages,
+                        toolInputKeyOrders: toolInputKeyOrders(retryEncodedInput),
                         fullArrayFingerprint: pendingWireCache.fingerprint,
                         passInputs,
                         usage: {

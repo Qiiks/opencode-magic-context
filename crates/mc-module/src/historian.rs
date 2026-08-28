@@ -1817,6 +1817,7 @@ mod tests {
             clear_reasoning_age: 50,
             caveman_enabled: false,
             caveman_min_chars: 500,
+            tool_input_key_orders: Default::default(),
             tool_present: false,
             todo_tool_present: None,
             prompt_surface_preset: crate::prompt_surface::PromptSurfacePreset::Full,

@@ -715,6 +715,10 @@ pub struct TransformRequest {
     /// Minimum source byte length for an eligible caveman text block.
     #[serde(default = "default_caveman_min_chars")]
     pub caveman_min_chars: usize,
+    /// Top-level tool-input key order captured by the TypeScript wire adapter. The
+    /// map is used only for edit-marker payload bytes and never reaches provider input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_input_key_orders: BTreeMap<String, Vec<String>>,
     /// Whether this request advertises the canonical reduction tool. Missing input is
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
@@ -922,6 +926,8 @@ struct TransformRequestWire {
     #[serde(default = "default_caveman_min_chars")]
     caveman_min_chars: usize,
     #[serde(default)]
+    tool_input_key_orders: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     tool_present: bool,
     #[serde(default)]
     todo_tool_present: Option<bool>,
@@ -1026,6 +1032,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             auto_search_min_prompt_chars: wire.auto_search_min_prompt_chars,
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
+            tool_input_key_orders: wire.tool_input_key_orders,
             tool_present: wire.tool_present,
             todo_tool_present: wire.todo_tool_present,
             prompt_surface_preset: wire.prompt_surface_preset,
@@ -4008,8 +4015,9 @@ fn apply_once(
                 .map(|tokens| (row.block_id.as_str(), tokens))
         })
         .collect();
-    let tail_for_selection =
+    let mut tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
+    attach_edit_input_key_orders(&mut tail_for_selection, &req.tool_input_key_orders);
     // Todo state is deferred work just like an m1 or reduction delta: it may ride an
     // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
     // Compute only the call-id transition here; the complete pair is built after classification.
@@ -6989,6 +6997,27 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
     }
 }
 
+fn attach_edit_input_key_orders(items: &mut [SelItem], key_orders: &BTreeMap<String, Vec<String>>) {
+    for item in items {
+        let Some(key_order) = key_orders.get(&item.id) else {
+            continue;
+        };
+        let SelKind::ToolCall { name, input } = &mut item.kind else {
+            continue;
+        };
+        if !crate::selection::is_edit_tool(name) {
+            continue;
+        }
+        let Some(object) = input.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            crate::selection::EDIT_INPUT_KEY_ORDER_MARKER.to_string(),
+            serde_json::to_value(key_order).unwrap_or(Value::Null),
+        );
+    }
+}
+
 fn tail_sel_items(
     live: &[&FlatBlock],
     coverage: Option<u64>,
@@ -9138,6 +9167,86 @@ fn strip_mc_tag_notation(text: &str) -> String {
 
 pub(crate) fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
+}
+
+// Rust strings cannot contain JavaScript's lone UTF-16 surrogates. These Unicode
+// noncharacters reserve an internal representation until the JSON response is encoded.
+const JS_SURROGATE_MARKER_OPEN: char = '\u{FDD0}';
+const JS_SURROGATE_MARKER_CLOSE: char = '\u{FDD1}';
+
+pub(crate) fn string_from_js_utf16_prefix(units: &[u16], requested: usize) -> String {
+    let end = requested.min(units.len());
+    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
+        let mut prefix = String::from_utf16(&units[..end - 1])
+            .expect("a prefix before a leading surrogate remains valid UTF-16");
+        let _ = write!(
+            prefix,
+            "{JS_SURROGATE_MARKER_OPEN}{:04x}{JS_SURROGATE_MARKER_CLOSE}",
+            units[end - 1]
+        );
+        prefix
+    } else {
+        String::from_utf16(&units[..end]).expect("a complete JavaScript prefix is valid UTF-16")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn js_utf16_units_from_internal(text: &str) -> Vec<u16> {
+    let mut units = Vec::new();
+    let mut rest = text;
+    while let Some(marker_start) = rest.find(JS_SURROGATE_MARKER_OPEN) {
+        units.extend(rest[..marker_start].encode_utf16());
+        let marker = &rest[marker_start + JS_SURROGATE_MARKER_OPEN.len_utf8()..];
+        let bytes = marker.as_bytes();
+        let encoded_marker = bytes.len() >= 4
+            && bytes[..4].iter().all(u8::is_ascii_hexdigit)
+            && marker[4..].starts_with(JS_SURROGATE_MARKER_CLOSE);
+        if encoded_marker {
+            if let Ok(unit) = u16::from_str_radix(&marker[..4], 16) {
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    units.push(unit);
+                    rest = &marker[4 + JS_SURROGATE_MARKER_CLOSE.len_utf8()..];
+                    continue;
+                }
+            }
+        }
+        units.extend(JS_SURROGATE_MARKER_OPEN.to_string().encode_utf16());
+        rest = marker;
+    }
+    units.extend(rest.encode_utf16());
+    units
+}
+
+pub(crate) fn encode_js_surrogate_markers(encoded: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = String::from_utf8(encoded) else {
+        unreachable!("serde_json always emits UTF-8")
+    };
+    if !text.contains(JS_SURROGATE_MARKER_OPEN) {
+        return text.into_bytes();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(marker_start) = rest.find(JS_SURROGATE_MARKER_OPEN) {
+        output.push_str(&rest[..marker_start]);
+        let marker = &rest[marker_start + JS_SURROGATE_MARKER_OPEN.len_utf8()..];
+        let bytes = marker.as_bytes();
+        let encoded_marker = bytes.len() >= 4
+            && bytes[..4].iter().all(u8::is_ascii_hexdigit)
+            && marker[4..].starts_with(JS_SURROGATE_MARKER_CLOSE)
+            && u16::from_str_radix(&marker[..4], 16)
+                .is_ok_and(|unit| (0xD800..=0xDBFF).contains(&unit));
+        if encoded_marker {
+            output.push_str("\\u");
+            output.push_str(&marker[..4]);
+            rest = &marker[4 + JS_SURROGATE_MARKER_CLOSE.len_utf8()..];
+        } else {
+            output.push(JS_SURROGATE_MARKER_OPEN);
+            rest = marker;
+        }
+    }
+    output.push_str(rest);
+    output.into_bytes()
 }
 
 /// Keep whole Unicode scalars while measuring the prefix in UTF-16 code units, matching the
@@ -13039,15 +13148,12 @@ fn empty_reasoning_sentinel(part: &Value) -> Value {
     let Some(object) = part.as_object() else {
         return Value::Object(sentinel);
     };
-    let part_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("reasoning");
-    sentinel.insert("type".to_string(), Value::String(part_type.to_string()));
-    if object.contains_key("thinking") && !object.contains_key("text") {
-        sentinel.insert("thinking".to_string(), Value::String(String::new()));
-    } else {
-        sentinel.insert("text".to_string(), Value::String(String::new()));
+    sentinel.insert("type".to_string(), Value::String("text".to_string()));
+    sentinel.insert("text".to_string(), Value::String(String::new()));
+    for key in ["cache_control", "cacheControl"] {
+        if let Some(value) = object.get(key) {
+            sentinel.insert(key.to_string(), value.clone());
+        }
     }
     Value::Object(sentinel)
 }
@@ -13056,13 +13162,14 @@ fn is_empty_reasoning_sentinel(part: &Value) -> bool {
     let Some(object) = part.as_object() else {
         return false;
     };
-    if object.len() != 2 || !object.contains_key("type") {
-        return false;
-    }
-    object
-        .get("text")
-        .or_else(|| object.get("thinking"))
-        .is_some_and(|value| value.as_str() == Some(""))
+    object.get("type").and_then(Value::as_str) == Some("text")
+        && object.get("text").and_then(Value::as_str) == Some("")
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "type" | "text" | "cache_control" | "cacheControl"
+            )
+        })
 }
 
 fn is_sentinel_invisible_text_block(block: &CkWireBlock) -> bool {
@@ -14482,6 +14589,7 @@ pub(crate) mod tests {
             clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
+            tool_input_key_orders: BTreeMap::new(),
             tool_present: false,
             todo_tool_present: Some(true),
             prompt_surface_preset: PromptSurfacePreset::Full,
@@ -20539,10 +20647,7 @@ pub(crate) mod tests {
             1,
             "the newest assistant is exempt even after completion"
         );
-        assert_eq!(
-            native[0]["parts"][0],
-            json!({ "type": "reasoning", "text": "" })
-        );
+        assert_eq!(native[0]["parts"][0], json!({ "type": "text", "text": "" }));
         assert_eq!(native[1]["parts"][0]["text"], "thinking-latest");
         let first_pass = native.clone();
         assert_eq!(
@@ -24951,6 +25056,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reasoning_sentinel_matches_typescript_cache_metadata_golden() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        let fixture = golden["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "reasoning_cache_control")
+            .unwrap();
+        let original = &fixture["raw_messages"][1]["parts"][0];
+        assert_eq!(
+            empty_reasoning_sentinel(original),
+            fixture["expected_sentinel"]
+        );
+    }
+
+    #[test]
+    fn response_encoder_emits_javascript_lone_surrogate_escape() {
+        let units = "a😀b".encode_utf16().collect::<Vec<_>>();
+        let internal = string_from_js_utf16_prefix(&units, 2);
+        assert_eq!(js_utf16_units_from_internal(&internal), units[..2]);
+        let encoded = serde_json::to_vec(&internal).unwrap();
+        assert_eq!(
+            encode_js_surrogate_markers(encoded),
+            br#""a\ud83d""#.to_vec()
+        );
+    }
+
+    #[test]
     fn auto_search_respects_enabled_min_length_and_threshold_controls() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -27972,6 +28108,10 @@ pub(crate) mod tests {
                 session_id: Some("writer"),
                 content: "ready note survives pressure refold",
                 surface_condition: Some("condition true"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -28795,6 +28935,16 @@ pub(crate) mod tests {
         request.caveman_enabled = true;
         request.caveman_min_chars = 1;
         request.protected_tags = 0;
+        request.messages[0].ck.role = "assistant".to_string();
+        request.messages[0]
+            .ck
+            .content
+            .push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "mixed-call".to_string(),
+                name: "read".to_string(),
+                input: json!({ "filePath": "src/lib.rs" }),
+                provider_executed: false,
+            }));
         let projection = project_messages(&request.messages).unwrap();
         let live = projection
             .blocks

@@ -2415,6 +2415,101 @@ const MIGRATIONS: &[Migration] = &[
             ADD COLUMN mapping_origin TEXT NOT NULL DEFAULT 'mapper';
         ",
     },
+    Migration {
+        version: 52,
+        // Smart-note authoring compilation is part of the authoritative note row. Without
+        // these fields a MODULE write becomes uncompiled when the host mirror is rebuilt.
+        statements: r#"
+        ALTER TABLE mc_notes ADD COLUMN compiled_provider TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_config TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_at INTEGER;
+        ALTER TABLE mc_notes ADD COLUMN compile_status TEXT;
+
+        DROP TRIGGER IF EXISTS mc_notes_feed_insert;
+        DROP TRIGGER IF EXISTS mc_notes_feed_update;
+        CREATE TRIGGER mc_notes_feed_insert AFTER INSERT ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition,
+                    'compiled_provider', NEW.compiled_provider, 'compiled_config', NEW.compiled_config,
+                    'compiled_at', NEW.compiled_at, 'compile_status', NEW.compile_status,
+                    'ready_at', NEW.ready_at, 'ready_reason', NEW.ready_reason,
+                    'manifest_json', NEW.manifest_json, 'compiled_check', NEW.compiled_check,
+                    'check_hash', NEW.check_hash, 'check_cron', NEW.check_cron,
+                    'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_update AFTER UPDATE ON mc_notes
+        WHEN NEW.id IS NOT OLD.id OR NEW.type IS NOT OLD.type
+          OR NEW.project_path IS NOT OLD.project_path OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.content IS NOT OLD.content OR NEW.status IS NOT OLD.status
+          OR NEW.surface_condition IS NOT OLD.surface_condition
+          OR NEW.compiled_provider IS NOT OLD.compiled_provider
+          OR NEW.compiled_config IS NOT OLD.compiled_config OR NEW.compiled_at IS NOT OLD.compiled_at
+          OR NEW.compile_status IS NOT OLD.compile_status OR NEW.ready_at IS NOT OLD.ready_at
+          OR NEW.ready_reason IS NOT OLD.ready_reason OR NEW.manifest_json IS NOT OLD.manifest_json
+          OR NEW.compiled_check IS NOT OLD.compiled_check OR NEW.check_hash IS NOT OLD.check_hash
+          OR NEW.check_cron IS NOT OLD.check_cron
+          OR NEW.check_failure_count IS NOT OLD.check_failure_count
+          OR NEW.check_network_failure_count IS NOT OLD.check_network_failure_count
+          OR NEW.check_quarantined_until IS NOT OLD.check_quarantined_until
+          OR NEW.check_next_due_at IS NOT OLD.check_next_due_at
+          OR NEW.check_compiled_at IS NOT OLD.check_compiled_at
+          OR NEW.check_false_since_at IS NOT OLD.check_false_since_at
+          OR NEW.check_last_liveness_at IS NOT OLD.check_last_liveness_at
+          OR NEW.last_checked_at IS NOT OLD.last_checked_at OR NEW.check_status IS NOT OLD.check_status
+          OR NEW.check_version IS NOT OLD.check_version OR NEW.policy_version IS NOT OLD.policy_version
+          OR NEW.harness IS NOT OLD.harness OR NEW.anchor_block_id IS NOT OLD.anchor_block_id
+          OR NEW.anchor_ordinal IS NOT OLD.anchor_ordinal OR NEW.dismissed_at IS NOT OLD.dismissed_at
+          OR NEW.dismissal_resolution IS NOT OLD.dismissal_resolution
+          OR NEW.status_version IS NOT OLD.status_version
+          OR NEW.created_at_ms IS NOT OLD.created_at_ms OR NEW.updated_at_ms IS NOT OLD.updated_at_ms
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition,
+                    'compiled_provider', NEW.compiled_provider, 'compiled_config', NEW.compiled_config,
+                    'compiled_at', NEW.compiled_at, 'compile_status', NEW.compile_status,
+                    'ready_at', NEW.ready_at, 'ready_reason', NEW.ready_reason,
+                    'manifest_json', NEW.manifest_json, 'compiled_check', NEW.compiled_check,
+                    'check_hash', NEW.check_hash, 'check_cron', NEW.check_cron,
+                    'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id), NULL);
+        END;
+        "#,
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4203,6 +4298,10 @@ pub struct NoteWriteInput<'a> {
     pub session_id: Option<&'a str>,
     pub content: &'a str,
     pub surface_condition: Option<&'a str>,
+    pub compiled_provider: Option<&'a str>,
+    pub compiled_config: Option<&'a str>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<&'a str>,
     pub anchor_block_id: Option<&'a str>,
     pub anchor_ordinal: Option<i64>,
     pub now_ms: i64,
@@ -4217,6 +4316,10 @@ pub struct StoredNote {
     pub content: String,
     pub status: String,
     pub surface_condition: Option<String>,
+    pub compiled_provider: Option<String>,
+    pub compiled_config: Option<String>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<String>,
     pub ready_at: Option<i64>,
     pub ready_reason: Option<String>,
     pub manifest_json: Option<String>,
@@ -5444,7 +5547,11 @@ impl<'a> FacadeMutationTxn<'a> {
                         normalized_hash = ?2,
                         updated_at = ?3,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        mural_cue = NULL,
+                        mural_cue_hash = NULL,
+                        mural_cue_at = NULL,
+                        mural_cue_rejection_count = 0
                   WHERE id = ?4",
                 params![content, normalized_hash, now_ms, id],
             )
@@ -5527,6 +5634,116 @@ impl<'a> FacadeMutationTxn<'a> {
             archived.push(memory.id);
         }
         Ok(Some(archived))
+    }
+
+    pub fn merge_memories_canonical(
+        &self,
+        project_path: &str,
+        ids: &[i64],
+        merged_content: &str,
+        source_session_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<(StoredMemoryFull, Vec<i64>)>, String> {
+        if ids.len() < 2 {
+            return Ok(None);
+        }
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(row) = load_memory_full_tx(self.tx, *id).map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            if row.project_path != project_path
+                || row.superseded_by_memory_id.is_some()
+                || !matches!(row.status.as_str(), "active" | "permanent")
+                || rows
+                    .first()
+                    .is_some_and(|first: &StoredMemoryFull| first.category != row.category)
+            {
+                return Ok(None);
+            }
+            rows.push(row);
+        }
+
+        let category = rows[0].category.clone();
+        let normalized_hash = compute_normalized_memory_hash(merged_content);
+        let matching_id = self
+            .tx
+            .query_row(
+                "SELECT id FROM mc_memories
+                  WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                  LIMIT 1",
+                params![project_path, category, normalized_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(id) = matching_id.filter(|id| !ids.contains(id)) {
+            return Err(format!("memory content already exists as ID {id}"));
+        }
+
+        let created_canonical = matching_id.is_none();
+        let target_id = if let Some(id) = matching_id {
+            id
+        } else {
+            self.insert_memory(InsertMemoryInput {
+                project_path,
+                route_project_root: None,
+                category: &category,
+                content: merged_content,
+                source_session_id,
+                source_type: Some("agent"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms,
+            })?
+        };
+        let source_ids = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != target_id)
+            .collect::<Vec<_>>();
+        let Some(mut merged) =
+            self.merge_memories(project_path, target_id, &source_ids, merged_content, now_ms)?
+        else {
+            return Ok(None);
+        };
+
+        if created_canonical {
+            // The TypeScript-compatible merge path inserts the new canonical row with
+            // lineage and counters computed only from the source rows. Because this block
+            // writes those final aggregates, no separate target-update delta is required.
+            let merged_from = merged_from_json(&rows);
+            let seen_count = rows.iter().map(|row| row.seen_count.max(0)).sum::<i64>();
+            let retrieval_count = rows
+                .iter()
+                .map(|row| row.retrieval_count.max(0))
+                .sum::<i64>();
+            self.tx
+                .execute(
+                    "UPDATE mc_memories
+                        SET seen_count = ?1, retrieval_count = ?2, merged_from = ?3
+                      WHERE id = ?4",
+                    params![seen_count, retrieval_count, merged_from, target_id],
+                )
+                .map_err(|error| error.to_string())?;
+            self.tx
+                .execute(
+                    "DELETE FROM mc_memory_mutation_log
+                      WHERE id = (
+                          SELECT MAX(id) FROM mc_memory_mutation_log
+                           WHERE project_path = ?1 AND mutation_type = 'update'
+                             AND target_memory_id = ?2 AND queued_at = ?3
+                      )",
+                    params![project_path, target_id, now_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            merged = load_memory_full_tx(self.tx, target_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "canonical memory disappeared during merge".to_string())?;
+        }
+        Ok(Some((merged, source_ids)))
     }
 
     pub fn merge_memories(
@@ -5804,8 +6021,9 @@ impl<'a> FacadeMutationTxn<'a> {
             .execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
+                  compiled_provider, compiled_config, compiled_at, compile_status,
                   anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'module', ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -5815,6 +6033,10 @@ impl<'a> FacadeMutationTxn<'a> {
                         .surface_condition
                         .map(str::trim)
                         .filter(|value| !value.is_empty()),
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.anchor_block_id,
                     input.anchor_ordinal,
                     input.now_ms,
@@ -5849,17 +6071,13 @@ impl<'a> FacadeMutationTxn<'a> {
                 current: Some(current),
             });
         }
-        let next_content = content.map(str::trim).unwrap_or(&current.content);
-        if next_content.is_empty() {
-            return Ok(NoteCasOutcome::Conflict {
-                current: Some(current),
-            });
-        }
-        let condition_changed = surface_condition.is_some();
+        let next_content = content.unwrap_or(&current.content);
         let next_condition = surface_condition
             .flatten()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let condition_changed =
+            surface_condition.is_some() && next_condition != current.surface_condition.as_deref();
         let next_status = if condition_changed && next_condition.is_some() {
             "pending"
         } else {
@@ -11169,7 +11387,11 @@ impl McStore {
                         normalized_hash = ?2,
                         updated_at = ?3,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        mural_cue = NULL,
+                        mural_cue_hash = NULL,
+                        mural_cue_at = NULL,
+                        mural_cue_rejection_count = 0
                   WHERE id = ?4",
                 params![content, normalized_hash, now_ms, id],
             )?;
@@ -13163,15 +13385,13 @@ impl McStore {
             if current.status != expected_status || current.status_version != expected_version {
                 return Ok(NoteCasOutcome::Conflict { current: Some(current) });
             }
-            let next_content = content.map(str::trim).unwrap_or(&current.content);
-            if next_content.is_empty() {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
-            }
-            let condition_changed = surface_condition.is_some();
+            let next_content = content.unwrap_or(&current.content);
             let next_condition = surface_condition
                 .flatten()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            let condition_changed = surface_condition.is_some()
+                && next_condition != current.surface_condition.as_deref();
             let next_status = if condition_changed && next_condition.is_some() {
                 "pending"
             } else {
@@ -16048,7 +16268,7 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
     })
 }
 
-const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
 const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
@@ -16060,33 +16280,37 @@ fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
         content: r.get(4)?,
         status: r.get(5)?,
         surface_condition: r.get(6)?,
-        ready_at: r.get(7)?,
-        ready_reason: r.get(8)?,
-        manifest_json: r.get(9)?,
-        compiled_check: r.get(10)?,
-        check_hash: r.get(11)?,
-        check_cron: r.get(12)?,
-        check_failure_count: r.get(13)?,
-        check_network_failure_count: r.get(14)?,
-        check_quarantined_until: r.get(15)?,
-        check_next_due_at: r.get(16)?,
-        check_compiled_at: r.get(17)?,
-        check_false_since_at: r.get(18)?,
-        check_last_liveness_at: r.get(19)?,
-        last_checked_at: r.get(20)?,
-        check_status: r.get(21)?,
-        check_version: r.get(22)?,
-        policy_version: r.get(23)?,
-        harness: r.get(24)?,
-        anchor_block_id: r.get(25)?,
-        anchor_ordinal: r.get(26)?,
-        dismissed_at: r.get(27)?,
-        dismissal_resolution: r.get(28)?,
-        status_version: r.get(29)?,
-        created_at_ms: r.get(30)?,
-        updated_at_ms: r.get(31)?,
-        context_store_uuid: r.get(32)?,
-        context_row_id: r.get(33)?,
+        compiled_provider: r.get(7)?,
+        compiled_config: r.get(8)?,
+        compiled_at: r.get(9)?,
+        compile_status: r.get(10)?,
+        ready_at: r.get(11)?,
+        ready_reason: r.get(12)?,
+        manifest_json: r.get(13)?,
+        compiled_check: r.get(14)?,
+        check_hash: r.get(15)?,
+        check_cron: r.get(16)?,
+        check_failure_count: r.get(17)?,
+        check_network_failure_count: r.get(18)?,
+        check_quarantined_until: r.get(19)?,
+        check_next_due_at: r.get(20)?,
+        check_compiled_at: r.get(21)?,
+        check_false_since_at: r.get(22)?,
+        check_last_liveness_at: r.get(23)?,
+        last_checked_at: r.get(24)?,
+        check_status: r.get(25)?,
+        check_version: r.get(26)?,
+        policy_version: r.get(27)?,
+        harness: r.get(28)?,
+        anchor_block_id: r.get(29)?,
+        anchor_ordinal: r.get(30)?,
+        dismissed_at: r.get(31)?,
+        dismissal_resolution: r.get(32)?,
+        status_version: r.get(33)?,
+        created_at_ms: r.get(34)?,
+        updated_at_ms: r.get(35)?,
+        context_store_uuid: r.get(36)?,
+        context_row_id: r.get(37)?,
     })
 }
 
@@ -17195,6 +17419,10 @@ mod tests {
                 session_id: Some("ses_delete"),
                 content: "smart note",
                 surface_condition: Some("later"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -20618,6 +20846,10 @@ mod tests {
                 session_id: Some("m1-session"),
                 content: "m1 note",
                 surface_condition: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -22451,6 +22683,10 @@ mod tests {
                 session_id: Some(session_a),
                 content: "shared project guidance",
                 surface_condition: Some("shared condition"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 3,
@@ -22574,6 +22810,10 @@ mod tests {
                 session_id: Some("writer-session"),
                 content: "wait for the release",
                 surface_condition: Some("release exists"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 10,
@@ -22687,6 +22927,10 @@ mod tests {
                 session_id: Some("writer"),
                 content: "evaluate me",
                 surface_condition: Some("condition"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
                 now_ms: 1,
@@ -22746,6 +22990,10 @@ mod tests {
                     session_id: Some("writer"),
                     content: "scoped note",
                     surface_condition: Some("condition"),
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     anchor_block_id: None,
                     anchor_ordinal: None,
                     now_ms: 1,
@@ -22803,6 +23051,10 @@ mod tests {
                     session_id: Some("writer"),
                     content: &format!("note {index}"),
                     surface_condition: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     anchor_block_id: None,
                     anchor_ordinal: None,
                     now_ms: 1,
@@ -25705,6 +25957,264 @@ mod shadow_tests {
                 .unwrap()
                 .next_cursor,
             applied_feed_head
+        );
+    }
+
+    #[test]
+    fn memory_content_update_invalidates_all_derived_mural_cues() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:mural-cue-update";
+        let memory_id = store
+            .insert_memory(InsertMemoryInput {
+                project_path: project,
+                route_project_root: None,
+                category: "CONSTRAINTS",
+                content: "old content",
+                source_session_id: None,
+                source_type: None,
+                importance: None,
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET mural_cue = 'cue', mural_cue_hash = 'hash',
+                            mural_cue_at = 9, mural_cue_rejection_count = 3
+                      WHERE id = ?1",
+                    params![memory_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        store
+            .update_memory_content(project, memory_id, "new content", 10)
+            .unwrap()
+            .unwrap();
+        let cues = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mural_cue, mural_cue_hash, mural_cue_at,
+                            mural_cue_rejection_count
+                       FROM mc_memories WHERE id = ?1",
+                    params![memory_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(cues, (None, None, None, 0));
+    }
+
+    #[test]
+    fn facade_note_write_persists_compilation_and_update_matches_ts_content_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:compiled-note";
+        let session = "compiled-note-session";
+        let written = store
+            .with_facade_command(
+                "/route/compiled-note",
+                project,
+                "notes",
+                session,
+                "note",
+                "write",
+                Some("write-compiled-note"),
+                |tx| {
+                    let note = tx.insert_project_note(NoteWriteInput {
+                        project_path: project,
+                        route_project_root: Some("/route/compiled-note"),
+                        session_id: Some(session),
+                        content: "original",
+                        surface_condition: Some("same condition"),
+                        compiled_provider: Some("anthropic"),
+                        compiled_config: Some("{\"model\":\"claude\"}"),
+                        compiled_at: Some(123),
+                        compile_status: Some("compiled"),
+                        anchor_block_id: None,
+                        anchor_ordinal: None,
+                        now_ms: 1,
+                    })?;
+                    Ok(note.id.to_string().into_bytes())
+                },
+            )
+            .unwrap();
+        let note_id = match written {
+            FacadeMutationOutcome::Applied(bytes) => {
+                String::from_utf8(bytes).unwrap().parse::<i64>().unwrap()
+            }
+            FacadeMutationOutcome::Duplicate(_) => unreachable!(),
+        };
+        let initial = store
+            .get_note_by_id(project, session, note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.compiled_provider.as_deref(), Some("anthropic"));
+        assert_eq!(initial.compile_status.as_deref(), Some("compiled"));
+        assert_eq!(initial.compiled_at, Some(123));
+
+        store
+            .with_facade_command(
+                "/route/compiled-note",
+                project,
+                "notes",
+                session,
+                "note",
+                "update",
+                Some("update-note-verbatim"),
+                |tx| {
+                    tx.update_note_cas(
+                        project,
+                        note_id,
+                        &initial.status,
+                        initial.status_version,
+                        Some("  keep surrounding whitespace  "),
+                        Some(Some("same condition")),
+                        2,
+                    )?;
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let updated = store
+            .get_note_by_id(project, session, note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content, "  keep surrounding whitespace  ");
+        assert_eq!(updated.compiled_provider.as_deref(), Some("anthropic"));
+        assert_eq!(updated.compile_status.as_deref(), Some("compiled"));
+
+        store
+            .with_facade_command(
+                "/route/compiled-note",
+                project,
+                "notes",
+                session,
+                "note",
+                "update",
+                Some("update-note-empty"),
+                |tx| {
+                    tx.update_note_cas(
+                        project,
+                        note_id,
+                        &updated.status,
+                        updated.status_version,
+                        Some(""),
+                        None,
+                        3,
+                    )?;
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let emptied = store
+            .get_note_by_id(project, session, note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(emptied.content, "");
+        let feed = store.pull_changefeed("notes", 0, 100).unwrap();
+        assert!(feed.rows.iter().any(|row| {
+            row.full_row_snapshot["compiled_provider"].as_str() == Some("anthropic")
+                && row.full_row_snapshot["compile_status"].as_str() == Some("compiled")
+        }));
+    }
+
+    #[test]
+    fn facade_merge_creates_content_hash_canonical_row_and_supersedes_all_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:canonical-merge";
+        let first = store
+            .insert_memory(InsertMemoryInput {
+                project_path: project,
+                route_project_root: None,
+                category: "CONSTRAINTS",
+                content: "first source",
+                source_session_id: None,
+                source_type: None,
+                importance: None,
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        let second = store
+            .insert_memory(InsertMemoryInput {
+                project_path: project,
+                route_project_root: None,
+                category: "CONSTRAINTS",
+                content: "second source",
+                source_session_id: None,
+                source_type: None,
+                importance: None,
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap();
+
+        let merged = store
+            .with_facade_command(
+                "/route/canonical-merge",
+                project,
+                "memories",
+                "canonical-session",
+                "memory",
+                "merge",
+                Some("canonical-merge"),
+                |tx| {
+                    let (canonical, superseded) = tx
+                        .merge_memories_canonical(
+                            project,
+                            &[first, second],
+                            "new canonical content",
+                            Some("canonical-session"),
+                            2,
+                        )?
+                        .expect("valid same-category merge");
+                    Ok(serde_json::to_vec(&(canonical.id, superseded)).unwrap())
+                },
+            )
+            .unwrap();
+        let bytes = match merged {
+            FacadeMutationOutcome::Applied(bytes) => bytes,
+            FacadeMutationOutcome::Duplicate(_) => unreachable!(),
+        };
+        let (canonical_id, superseded): (i64, Vec<i64>) = serde_json::from_slice(&bytes).unwrap();
+        assert!(canonical_id > second);
+        assert_eq!(superseded, vec![first, second]);
+        let canonical = store.get_memory_full(canonical_id).unwrap().unwrap();
+        assert_eq!(canonical.content, "new canonical content");
+        assert_eq!(canonical.merged_from, Some(format!("[{first},{second}]")));
+        assert_eq!(
+            store
+                .get_memory_full(first)
+                .unwrap()
+                .unwrap()
+                .superseded_by_memory_id,
+            Some(canonical_id)
+        );
+        assert_eq!(
+            store
+                .get_memory_full(second)
+                .unwrap()
+                .unwrap()
+                .superseded_by_memory_id,
+            Some(canonical_id)
         );
     }
 }
