@@ -504,6 +504,45 @@ describe("stripped placeholder replay across temporary marker windows", () => {
             expect(serializeAnthropicVisibleRoleGroups(replayPass)).toBe(foldWire);
         });
     }
+
+    it("retains frozen ids while compaction is off and replays them when it resumes", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-placeholder-compaction-off";
+        const assistantId = "assistant-across-compaction-toggle";
+        applyStrippedPlaceholderDelta(db, sessionId, { add: [assistantId] });
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: assistantId, role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "[dropped §70731§]" }],
+                },
+            ] as unknown as MessageLike[];
+
+        const compactionOffMessages = buildMessages();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, compactionOffMessages, {
+                compactionOff: true,
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(compactionOffMessages[0]?.parts).toEqual([
+            { type: "text", text: "[dropped §70731§]" },
+        ]);
+        expect(getStrippedPlaceholderIds(db, sessionId).has(assistantId)).toBe(true);
+
+        const resumedMessages = buildMessages();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, resumedMessages, {
+                compactionOff: false,
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(resumedMessages[0]?.parts).toEqual([{ type: "text", text: "" }]);
+        expect(getStrippedPlaceholderIds(db, sessionId).has(assistantId)).toBe(true);
+    });
 });
 
 describe("deferred compaction marker representation", () => {

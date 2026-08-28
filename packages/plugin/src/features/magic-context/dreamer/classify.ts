@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
+import { withContentLanguageDirective } from '../../../agents/language-directive';
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
@@ -109,6 +110,7 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    language?: string;
     /** Present only for rust-mode projects whose memories authority is MODULE. */
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
@@ -367,7 +369,7 @@ async function classifyOneChunk(
                 query: { directory: args.sessionDirectory },
                 body: {
                     agent: DREAMER_CLASSIFIER_AGENT,
-                    system: CLASSIFY_SYSTEM_PROMPT,
+                    system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
                     ...modelBodyField(args.model),
                     parts: [{ type: "text", text: prompt, synthetic: true }],
                 },

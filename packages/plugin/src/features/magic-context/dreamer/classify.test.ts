@@ -25,13 +25,16 @@ function assistantMessages(text: string) {
     ];
 }
 
-function successfulClassifyClient(onPrompt?: () => void) {
+function successfulClassifyClient(onPrompt?: () => void, onSystem?: (system: string) => void) {
     let manifest = "";
     return {
         session: {
             create: async () => ({ data: { id: "classify-child" } }),
-            prompt: async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+            prompt: async (args: {
+                body?: { system?: string; parts?: Array<{ text?: string }> };
+            }) => {
                 const prompt = args.body?.parts?.[0]?.text ?? "";
+                onSystem?.(args.body?.system ?? "");
                 const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
                 manifest = `<classify>${ids.map((id) => `<memory id="${id}" importance="80" scope="project" shareable="true"/>`).join("")}</classify>`;
                 onPrompt?.();
@@ -67,6 +70,29 @@ function classifyArgs(db: Database, projectIdentity: string): ClassifyArgs {
 }
 
 describe("runClassify disposition", () => {
+    test("localizes the TypeScript classifier system prompt", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-language";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            args.language = "tr";
+            let system = "";
+            args.client = successfulClassifyClient(undefined, (value) => {
+                system = value;
+            }) as never;
+
+            const result = await runClassify(args);
+
+            expect(result.classified).toBe(10);
+            expect(system).toContain(
+                "Write human-readable prose you author in: Turkish (Türkçe).",
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("banks a completed chunk and reports the deadline remainder", async () => {
         const db = freshDb();
         try {

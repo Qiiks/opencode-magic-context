@@ -41,6 +41,18 @@ class AuditTransformWireParityTest(unittest.TestCase):
         self.assertEqual(
             module["summarize_wrapup_contract"](ROOT)["unexplained_invariants"], []
         )
+        hunt12 = module["summarize_hunt12_source_contract"](ROOT)
+        self.assertEqual(hunt12["unexplained_invariants"], [])
+        self.assertTrue(hunt12["cache_seams"]["delta_resumes_after_bust_adoption"])
+        self.assertTrue(hunt12["language_directives"]["rust_classifier_localized"])
+        self.assertTrue(hunt12["mapping_origin"]["cross_lane_regressions_present"])
+        self.assertTrue(hunt12["provider_lane_coordinates"]["readonly_binding_projection"])
+        broken_hunt12 = json.loads(json.dumps(hunt12))
+        broken_hunt12["mapping_origin"]["module_payload_preserves_origin"] = False
+        self.assertEqual(
+            module["hunt12_source_invariants"](broken_hunt12),
+            ["hunt12_mapping_origin_module_payload_preserves_origin_missing"],
+        )
 
         broken = json.loads(json.dumps(contract))
         broken["calibration"]["ts"]["temperature"] = 1.0
@@ -454,6 +466,53 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             self.assertEqual(matrix["unexplained_wire_invariants"], [])
 
+    def test_provider_matrix_does_not_compare_unlike_session_tool_counts(self) -> None:
+        module = runpy.run_path(str(SCRIPT))
+        dump_type = module["Dump"]
+
+        def body(call_ids: list[str]) -> dict[str, object]:
+            return {
+                "model": "openai-fixture",
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {
+                        "role": "assistant",
+                        "content": "calling",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "ctx_search", "arguments": "{}"},
+                            }
+                            for call_id in call_ids
+                        ],
+                    },
+                    *[
+                        {"role": "tool", "tool_call_id": call_id, "content": "result"}
+                        for call_id in call_ids
+                    ],
+                ],
+            }
+
+        dumps = [
+            dump_type(Path("ts.body.json"), "ses_ts", "ts", body(["call-1"]), None),
+            dump_type(
+                Path("rust.body.json"),
+                "ses_rust",
+                "rust",
+                body(["call-1", "call-2"]),
+                None,
+            ),
+        ]
+        matrix = module["compare_provider_matrix"](dumps)
+        tool_axis = next(
+            axis for axis in matrix["axes"] if axis["axis"] == "tool_pairing_shapes"
+        )
+        self.assertEqual(tool_axis["verdict"], "matched_value_space")
+        self.assertEqual(
+            tool_axis["shared"], ["cardinality=balanced;adjacency=valid"]
+        )
+
     def test_live_mode_uses_read_only_coordinate_evidence(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             temp = Path(temporary)
@@ -468,6 +527,28 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 )
             self._write_dump(dump_dir, "ses_rust", rust_root, "rust-call", "anthropic", 0)
             self._write_dump(dump_dir, "ses_ts", ts_root, "ts-call", "anthropic", 0)
+            response_path = (
+                dump_dir
+                / f"{DATE}T12-01-00-000Z-000100-ses_ts-direct-sticky-main.body.json"
+            )
+            response_path.write_text(
+                json.dumps(
+                    {
+                        "model": "gpt-5-responses-fixture",
+                        "instructions": "Identity\n\n## Magic Context",
+                        "input": [
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "hello"}],
+                            }
+                        ],
+                    }
+                )
+            )
+            response_path.with_name(
+                response_path.name.replace(".body.json", ".response.json")
+            ).write_text(json.dumps({"status": 200, "provider_id": "openai"}))
 
             context_db = temp / "context.db"
             store_db = temp / "store.db"
@@ -476,6 +557,14 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self._write_store_db(store_db)
             with sqlite3.connect(context_db) as db:
                 db.execute("ALTER TABLE session_projects ADD COLUMN updated_at INTEGER DEFAULT 0")
+                db.execute(
+                    "UPDATE session_projects SET project_path = ? WHERE session_id = 'ses_ts'",
+                    (str(ts_root),),
+                )
+                db.execute(
+                    "UPDATE session_projects SET project_path = ? WHERE session_id = 'ses_rust'",
+                    (str(rust_root),),
+                )
                 db.execute("ALTER TABLE tags ADD COLUMN id INTEGER")
                 db.execute("ALTER TABLE tags ADD COLUMN type TEXT DEFAULT 'message'")
                 db.execute("ALTER TABLE tags ADD COLUMN message_id TEXT DEFAULT ''")
@@ -528,13 +617,30 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 report["live_probe"]["method"]["sqlite_query_only_verified"]
             )
             evidence = report["provider_live"]["evidence"]
-            self.assertEqual(len(evidence), 2)
+            self.assertEqual(len(evidence), 3)
             self.assertTrue(all(len(row["session_prefix"]) <= 8 for row in evidence))
             self.assertTrue(all(len(row["capture_sha256"]) == 64 for row in evidence))
             self.assertNotIn(str(temp), completed.stdout)
             self.assertEqual(
                 {row["session_prefix"] for row in evidence},
                 {"ses_rust"[:8], "ses_ts"[:8]},
+            )
+            responses = [
+                row
+                for row in evidence
+                if row["provider_family"] == "openai:openai_responses"
+            ]
+            self.assertEqual([row["lane"] for row in responses], ["ts"])
+            self.assertEqual(
+                report["provider_live"]["lane_coordinate_coverage"],
+                {
+                    "resolved_dumps": 1,
+                    "remaining_unverified_dumps": 0,
+                    "ambiguous_capture_hashes": [],
+                    "coordinate_requested_hashes": 2,
+                    "coordinate_resolved_hashes": 2,
+                    "rule": "served project roots win; otherwise only a collision-free twelve-character session hash joined to a readable live project config enters a lane denominator",
+                },
             )
 
     def _write_dump(

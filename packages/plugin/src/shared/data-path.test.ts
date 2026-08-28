@@ -9,6 +9,7 @@ import {
     getLegacyOpenCodeMagicContextStorageDir,
     getMagicContextLogPath,
     getMagicContextStorageDir,
+    getMagicContextStorageResolution,
     getOpenCodeCacheDir,
     getOpenCodeStorageDir,
     getProjectMagicContextDir,
@@ -152,12 +153,14 @@ describe("data-path", () => {
         );
     });
 
-    test("test storage isolation takes precedence over XDG_DATA_HOME", () => {
+    test("a per-test XDG_DATA_HOME overrides the preload root without escaping test isolation", () => {
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "/tmp/mc-test-isolation";
-        process.env.XDG_DATA_HOME = "/tmp/custom-data";
-        expect(getMagicContextStorageDir()).toBe(
-            path.join("/tmp/mc-test-isolation", "cortexkit", "magic-context"),
-        );
+        process.env.XDG_DATA_HOME = "/tmp/custom-test-data";
+        process.env.MAGIC_CONTEXT_STORAGE_DIR = "/tmp/production-shared-data";
+        expect(getMagicContextStorageResolution()).toEqual({
+            path: path.join("/tmp/custom-test-data", "cortexkit", "magic-context"),
+            source: "test isolation",
+        });
     });
 
     test("getMagicContextStorageDir honors XDG_DATA_HOME", () => {
