@@ -23,6 +23,7 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+mod content_language;
 pub mod decay_render;
 pub mod divergence;
 pub mod healing;
@@ -3384,6 +3385,7 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
 struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
+    language: Option<String>,
     project_path: String,
     project_root: PathBuf,
     project_slug: String,
@@ -3654,6 +3656,7 @@ impl McHandler {
             McModuleConfig {
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 model_chain: vec!["test/model".to_string()],
+                language: None,
                 execute_threshold_percentage: 65.0,
                 compaction_enabled: true,
                 memory_enabled: true,
@@ -5003,6 +5006,7 @@ impl McHandler {
             task: HistorianFiringTask {
                 store,
                 session_id: parsed.session_id.clone(),
+                language: cfg.language.clone(),
                 project_path: project_path.to_string(),
                 project_root: binding.project_root.clone(),
                 project_slug,
@@ -5071,6 +5075,7 @@ impl McHandler {
             .cloned()
             .collect::<Vec<_>>();
         let project_slug = project_slug(&binding.project_root);
+        let language = cfg.language.clone();
         let assemble = assemble_historian_firing(
             &store,
             &parsed.messages,
@@ -5119,6 +5124,7 @@ impl McHandler {
         PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
             store,
             session_id: parsed.session_id.clone(),
+            language,
             project_path,
             project_root: binding.project_root.clone(),
             project_slug,
@@ -5169,6 +5175,7 @@ impl McHandler {
         let HistorianFiringTask {
             store,
             session_id,
+            language,
             project_path,
             project_root,
             project_slug,
@@ -5182,8 +5189,13 @@ impl McHandler {
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory.connect(&project_root).await {
             Ok(mut producer) => {
-                let mut request =
-                    firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                let mut request = firing.as_fire_request(
+                    &store,
+                    &session_id,
+                    &project_path,
+                    &project_slug,
+                    language.as_deref(),
+                );
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing(&mut *producer, request).await
             }
@@ -12660,41 +12672,7 @@ fn guidance_bytes_for(text: &str, date_line: &str) -> String {
 }
 
 fn primary_language_directive(language: &str) -> Option<String> {
-    if language.len() != 2 || !language.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        return None;
-    }
-    let name = match language.to_ascii_lowercase().as_str() {
-        "ar" => "Arabic (العربية)",
-        "cs" => "Czech (Čeština)",
-        "da" => "Danish (Dansk)",
-        "de" => "German (Deutsch)",
-        "el" => "Greek (Ελληνικά)",
-        "en" => "English",
-        "es" => "Spanish (Español)",
-        "fi" => "Finnish (Suomi)",
-        "fr" => "French (Français)",
-        "he" => "Hebrew (עברית)",
-        "hi" => "Hindi (हिन्दी)",
-        "hu" => "Hungarian (Magyar)",
-        "id" => "Indonesian",
-        "it" => "Italian (Italiano)",
-        "ja" => "Japanese (日本語)",
-        "ko" => "Korean (한국어)",
-        "nl" => "Dutch (Nederlands)",
-        "no" => "Norwegian (Norsk)",
-        "pl" => "Polish (Polski)",
-        "pt" => "Portuguese (Português)",
-        "ro" => "Romanian (Română)",
-        "ru" => "Russian (Русский)",
-        "sk" => "Slovak (Slovenčina)",
-        "sv" => "Swedish (Svenska)",
-        "th" => "Thai (ไทย)",
-        "tr" => "Turkish (Türkçe)",
-        "uk" => "Ukrainian (Українська)",
-        "vi" => "Vietnamese (Tiếng Việt)",
-        "zh" => "Chinese (中文)",
-        _ => return None,
-    };
+    let name = crate::content_language::resolve_language_name(Some(language))?;
     Some(format!(
         "Use {name} for your natural-language replies to the user unless the user explicitly asks for another language. Keep code, identifiers, file paths, commands, logs, and quoted text verbatim."
     ))
@@ -16484,6 +16462,7 @@ mod tests {
         outputs: Mutex<VecDeque<String>>,
         next_fact: Mutex<Option<String>>,
         prompts: Mutex<Vec<String>>,
+        systems: Mutex<Vec<String>>,
         models: Mutex<Vec<String>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
@@ -16528,7 +16507,7 @@ mod tests {
         async fn start(
             &mut self,
             _session_id: &str,
-            _system: &str,
+            system: &str,
             prompt: &str,
             model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
@@ -16538,6 +16517,11 @@ mod tests {
                 .lock()
                 .expect("prompts mutex")
                 .push(prompt.to_string());
+            self.state
+                .systems
+                .lock()
+                .expect("systems mutex")
+                .push(system.to_string());
             self.state
                 .models
                 .lock()
@@ -16768,6 +16752,7 @@ mod tests {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
+            language: None,
             execute_threshold_percentage: 65.0,
             compaction_enabled: true,
             memory_enabled: true,
@@ -25574,6 +25559,74 @@ mod tests {
         ));
         assert_eq!(recovered["historian"]["consecutive_publish_failures"], 0);
         assert_eq!(recovered["historian"]["publish_health_degraded"], false);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_language_changes_only_the_historian_producer_system_prompt() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.language = Some("tr".to_string());
+        let (handler, store, _dir, _project) = handler_with_store(Arc::clone(&producer), config);
+
+        let response = call_transform(&handler, big_messages()).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+
+        let expected = crate::historian_prompt::with_content_language_directive(
+            crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT,
+            Some("tr"),
+            crate::historian_prompt::ContentLanguageDirectiveOptions::default(),
+        );
+        assert_eq!(
+            producer.systems.lock().unwrap().as_slice(),
+            [expected.as_ref()],
+            "language guidance belongs to the producer system role"
+        );
+        wait_for_idle(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_language_is_byte_invisible_to_transform_output() {
+        let plain_producer = Arc::new(ProducerState::default());
+        let (plain_handler, _plain_store, _plain_dir, _plain_project) =
+            handler_with_store(plain_producer, default_test_config());
+
+        let localized_producer = Arc::new(ProducerState::default());
+        let mut localized_config = default_test_config();
+        localized_config.language = Some("tr".to_string());
+        let (localized_handler, _localized_store, _localized_dir, _localized_project) =
+            handler_with_store(localized_producer, localized_config);
+
+        let fixture = request(vec![ck("language-wire", 1, "same rust-mode fixture")]);
+        let HandlerOutcome::Response(plain) = plain_handler
+            .handle_transform_for_test(7, fixture.clone())
+            .await
+        else {
+            panic!("plain transform fixture did not return bytes");
+        };
+        let HandlerOutcome::Response(localized) = localized_handler
+            .handle_transform_for_test(7, fixture)
+            .await
+        else {
+            panic!("localized transform fixture did not return bytes");
+        };
+
+        let mut plain: Value = serde_json::from_slice(&plain).expect("plain transform JSON");
+        let mut localized: Value =
+            serde_json::from_slice(&localized).expect("localized transform JSON");
+        assert_eq!(
+            serde_json::to_vec(&plain["ck_messages"]).unwrap(),
+            serde_json::to_vec(&localized["ck_messages"]).unwrap(),
+            "language must not change transform-served wire bytes, including m0/m1"
+        );
+        // Timings are measured per invocation and intentionally cannot be byte-stable.
+        // Every provider-visible response field, including the primary system hash, must match.
+        plain.as_object_mut().unwrap().remove("timings");
+        localized.as_object_mut().unwrap().remove("timings");
+        assert_eq!(
+            localized, plain,
+            "language must not change any deterministic transform output or primary system hash"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
