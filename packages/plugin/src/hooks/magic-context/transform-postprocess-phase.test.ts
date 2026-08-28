@@ -26,6 +26,8 @@ import {
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
+    addMergedReasoningStrippedIds,
+    addTrailingBlankDecisions,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
@@ -44,6 +46,8 @@ import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
+import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
+import { stripStructuralNoise } from "./strip-structural-noise";
 import {
     type MessageLike,
     type TagTarget,
@@ -3092,6 +3096,211 @@ describe("final message representation", () => {
             type: "text",
             text: "",
         });
+    });
+
+    it("mints from the raw store shape instead of a composed trailing sentinel", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-blank-artifact-observation";
+        const rawStoreMessages = [
+            {
+                info: { id: "assistant-sibling", role: "assistant" },
+                parts: [{ type: "text", text: "leading sibling text" }],
+            },
+            {
+                info: { id: "assistant-target", role: "assistant" },
+                parts: [
+                    { type: "step-start", snapshot: "raw-store-step" },
+                    { type: "reasoning", text: "merged reasoning", signature: "sig" },
+                    { type: "tool", callID: "call-1", state: { status: "completed" } },
+                    { type: "step-finish", reason: "tool-calls" },
+                ],
+            },
+            {
+                info: { id: "assistant-newest", role: "assistant" },
+                parts: [{ type: "text", text: "newest" }],
+            },
+        ] as unknown as MessageLike[];
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(rawStoreMessages);
+        const messages = cloneMessages(rawStoreMessages);
+        stripStructuralNoise(messages);
+        expect(findMessage(messages, "assistant-target").parts.at(-1)).toEqual({
+            type: "text",
+            text: "",
+        });
+        addMergedReasoningStrippedIds(db, sessionId, ["assistant-target"]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions,
+            }),
+        );
+
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set(["assistant-target"]));
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-target")).toBe("strip");
+        expect(findMessage(messages, "assistant-target").parts.at(-1)).toMatchObject({
+            type: "tool",
+            callID: "call-1",
+        });
+    });
+
+    it("heals poisoned keeps only on a bust and replays the healed strip byte-stably", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-blank-poison-heal";
+        const buildPass = () => {
+            const rawStoreMessages = [
+                {
+                    info: { id: "assistant-sibling", role: "assistant" },
+                    parts: [{ type: "text", text: "leading sibling text" }],
+                },
+                {
+                    info: { id: "assistant-poisoned", role: "assistant" },
+                    parts: [
+                        { type: "step-start", snapshot: "raw-store-step" },
+                        { type: "reasoning", text: "merged reasoning", signature: "sig" },
+                        { type: "tool", callID: "call-poisoned", state: { status: "completed" } },
+                        { type: "step-finish", reason: "tool-calls" },
+                    ],
+                },
+                {
+                    info: { id: "assistant-newest", role: "assistant" },
+                    parts: [{ type: "text", text: "newest" }],
+                },
+            ] as unknown as MessageLike[];
+            const trailingBlankSourceDecisions =
+                snapshotTrailingBlankSourceDecisions(rawStoreMessages);
+            const messages = cloneMessages(rawStoreMessages);
+            stripStructuralNoise(messages);
+            return { messages, trailingBlankSourceDecisions };
+        };
+        addMergedReasoningStrippedIds(db, sessionId, ["assistant-poisoned"]);
+        addTrailingBlankDecisions(db, sessionId, [["assistant-poisoned", "keep"]]);
+
+        const preBustDefer = buildPass();
+        const expectedPreBustTargetParts = structuredClone(
+            findMessage(preBustDefer.messages, "assistant-poisoned").parts,
+        );
+        expectedPreBustTargetParts[1] = { type: "text", text: "" };
+        const expectedPreBustBytes = JSON.stringify(expectedPreBustTargetParts);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, preBustDefer.messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: preBustDefer.trailingBlankSourceDecisions,
+            }),
+        );
+        expect(JSON.stringify(findMessage(preBustDefer.messages, "assistant-poisoned").parts)).toBe(
+            expectedPreBustBytes,
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-poisoned")).toBe("keep");
+
+        const sessionLog = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        let bustBytes = "";
+        try {
+            const bust = buildPass();
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, bust.messages, {
+                    schedulerDecision: "execute",
+                    resolvedProviderID: "anthropic",
+                    trailingBlankSourceDecisions: bust.trailingBlankSourceDecisions,
+                }),
+            );
+            const bustTarget = findMessage(bust.messages, "assistant-poisoned");
+            bustBytes = JSON.stringify(bustTarget.parts);
+
+            expect(result.bustedThisPass).toBe(true);
+            expect(getTrailingBlankDecisions(db, sessionId).get("assistant-poisoned")).toBe(
+                "strip",
+            );
+            expect(bustTarget.parts.at(-1)).toMatchObject({
+                type: "tool",
+                callID: "call-poisoned",
+            });
+            expect(
+                sessionLog.mock.calls.filter(
+                    (call) =>
+                        call[0] === sessionId &&
+                        typeof call[1] === "string" &&
+                        call[1].includes("demoted message assistant-poisoned from keep to strip"),
+                ),
+            ).toHaveLength(1);
+        } finally {
+            sessionLog.mockRestore();
+        }
+
+        for (let replayIndex = 0; replayIndex < 2; replayIndex += 1) {
+            const replay = buildPass();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, replay.messages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                    trailingBlankSourceDecisions: replay.trailingBlankSourceDecisions,
+                }),
+            );
+            expect(JSON.stringify(findMessage(replay.messages, "assistant-poisoned").parts)).toBe(
+                bustBytes,
+            );
+        }
+    });
+
+    it("preserves a legitimate provider blank without triggering the poison heal", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-blank-legitimate-keep";
+        const buildPass = () => {
+            const rawStoreMessages = [
+                {
+                    info: { id: "assistant-sibling", role: "assistant" },
+                    parts: [{ type: "text", text: "leading sibling text" }],
+                },
+                {
+                    info: { id: "assistant-legitimate", role: "assistant" },
+                    parts: [
+                        { type: "reasoning", text: "merged reasoning", signature: "sig" },
+                        { type: "tool", callID: "call-legitimate", state: { status: "completed" } },
+                        { type: "text", text: " " },
+                    ],
+                },
+                {
+                    info: { id: "assistant-newest", role: "assistant" },
+                    parts: [{ type: "text", text: "newest" }],
+                },
+            ] as unknown as MessageLike[];
+            return {
+                messages: cloneMessages(rawStoreMessages),
+                trailingBlankSourceDecisions:
+                    snapshotTrailingBlankSourceDecisions(rawStoreMessages),
+            };
+        };
+        addMergedReasoningStrippedIds(db, sessionId, ["assistant-legitimate"]);
+        addTrailingBlankDecisions(db, sessionId, [["assistant-legitimate", "keep"]]);
+
+        const bust = buildPass();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, bust.messages, {
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: bust.trailingBlankSourceDecisions,
+            }),
+        );
+        const bustBytes = JSON.stringify(findMessage(bust.messages, "assistant-legitimate").parts);
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-legitimate")).toBe("keep");
+
+        const replay = buildPass();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replay.messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: replay.trailingBlankSourceDecisions,
+            }),
+        );
+        expect(JSON.stringify(findMessage(replay.messages, "assistant-legitimate").parts)).toBe(
+            bustBytes,
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-legitimate")).toBe("keep");
     });
 
     it("skips merged-assistant reasoning persistence and stripping in compaction-off mode", async () => {
