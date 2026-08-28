@@ -286,6 +286,70 @@ describe("map-memories authority applier", () => {
             closeQuietly(db);
         }
     });
+    test("overrides directive file mappings before a MODULE mapping call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-map-directive";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "PROJECT_RULES",
+                content: "When told to inspect a fact, run src/fact.ts first.",
+            });
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 103, ?)",
+            ).run(projectIdentity, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, 103, ?, ?)",
+            ).run(projectIdentity, memory.category, memory.normalizedHash);
+            const calls: Array<{ method: string; body: unknown }> = [];
+            const args = mapArgs(db, dir, projectIdentity);
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [103], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-map-directive",
+                moduleProjectRoot: dir,
+                moduleContextStoreUuid: "store-fixture",
+                moduleAuthorityGeneration: 9,
+                moduleCommandId: "map-directive-command",
+            };
+
+            expect(
+                await applyBatchMappings(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            candidates: ["src/fact.ts"],
+                        },
+                    ],
+                    `<mappings><memory id="${memory.id}" files="src/fact.ts"/></mappings>`,
+                ),
+            ).toEqual({ mapped: 0, independent: 1 });
+            expect(calls[0]).toMatchObject({
+                method: "memory.set_mapping",
+                body: {
+                    arguments: {
+                        rows: [
+                            {
+                                memory_id: 103,
+                                mapped_files: null,
+                                mapping_origin: "host_rejected_fallback",
+                            },
+                        ],
+                    },
+                },
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });
 
 describe("mapMemories disposition", () => {
@@ -826,6 +890,44 @@ describe("applyBatchMappings", () => {
             expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.files).toEqual([
                 "src/fact.ts",
             ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("overrides a directive-shaped PROJECT_RULES file mapping to independent", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:directive-map-safety";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "PROJECT_RULES",
+                content:
+                    "When told to check a cache bust, run src/fact.ts first and never reason by hand.",
+                sourceSessionId: "ses",
+            });
+
+            const result = await applyBatchMappings(
+                mapArgs(db, dir, projectIdentity),
+                [
+                    {
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        candidates: ["src/fact.ts"],
+                    },
+                ],
+                `<mappings><memory id="${memory.id}" files="src/fact.ts"/></mappings>`,
+            );
+
+            expect(result).toEqual({ mapped: 0, independent: 1 });
+            expect(getMemoryVerifications(db, [memory.id]).get(memory.id)).toMatchObject({
+                files: [],
+                hasSentinel: true,
+                mappingOrigin: "host_rejected_fallback",
+            });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toEqual([]);
         } finally {
             closeQuietly(db);
         }

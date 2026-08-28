@@ -34,6 +34,7 @@ import {
     parseMapMemoriesManifest,
     validateMapMemoriesManifest,
 } from "./map-memories-prompt";
+import { isDirectiveShapedProjectRule } from "./memory-claim-safety";
 import {
     DreamerModuleFailureError,
     type DreamerModuleRoute,
@@ -477,7 +478,28 @@ async function applyParsedBatchMappings(
         independent: boolean;
         mappingOrigin: MemoryMappingOrigin;
     }> = [];
+    const batchById = new Map(batch.map((memory) => [memory.id, memory]));
     for (const p of valid) {
+        const memory = batchById.get(p.id);
+        if (
+            !p.independent &&
+            p.files.length > 0 &&
+            memory &&
+            isDirectiveShapedProjectRule(memory.category, memory.content)
+        ) {
+            // File names in workflow rules are usually action targets. Treating
+            // them as backing code would send a behavioral claim to code verify.
+            log(
+                `[dreamer] map-memories safety override: memory_id=${p.id} verdict=file-mapping replacement=independent mapping_origin=host_rejected_fallback reason=directive-shaped-project-rule`,
+            );
+            planned.push({
+                id: p.id,
+                files: [],
+                independent: true,
+                mappingOrigin: "host_rejected_fallback",
+            });
+            continue;
+        }
         if (p.independent) {
             planned.push({
                 id: p.id,
