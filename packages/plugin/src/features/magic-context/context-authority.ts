@@ -1182,7 +1182,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
             "DELETE FROM memory_verifications WHERE memory_id = ?",
         ),
         insertMemoryVerification: db.prepare(
-            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at, mapping_origin) VALUES (?, ?, ?, ?, ?)",
         ),
         noteById: db.prepare("SELECT * FROM notes WHERE id = ?"),
         noteIdByStoreId: db.prepare(
@@ -1643,8 +1643,18 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
             ];
             const verifiedAt = rowNumber(row, "verified_at");
             const mappedAt = rowNumber(row, "updated_at", Date.now());
+            const mappingOrigin =
+                row.mapping_origin === "host_rejected_fallback"
+                    ? "host_rejected_fallback"
+                    : "mapper";
             for (const file of files.length > 0 ? files : [""]) {
-                statements.insertMemoryVerification.run(contextId, file, verifiedAt, mappedAt);
+                statements.insertMemoryVerification.run(
+                    contextId,
+                    file,
+                    verifiedAt,
+                    mappedAt,
+                    mappingOrigin,
+                );
             }
         }
     }

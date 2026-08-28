@@ -5,6 +5,7 @@ import { getAuthorityManagedMarker } from "../../features/magic-context/context-
 import {
     archiveMemory,
     CATEGORY_PRIORITY,
+    clearMemoryVerifications,
     getMemoriesByIds,
     getMemoriesByProject,
     getMemoryByHash,
@@ -350,6 +351,7 @@ function updateMemoryContentInCurrentTransaction(
         db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(memory.id);
     }
     db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(memory.id);
+    clearMemoryVerifications(db, memory.id);
     invalidateMemory(memory.projectPath, memory.id);
 }
 

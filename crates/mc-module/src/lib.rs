@@ -10084,10 +10084,24 @@ impl McHandler {
                 ),
                 _ => return invalid_params_error("mapped_files must be an array or null"),
             };
+            let mapping_origin = match row.get("mapping_origin") {
+                None => "mapper".to_string(),
+                Some(Value::String(origin))
+                    if matches!(origin.as_str(), "mapper" | "host_rejected_fallback") =>
+                {
+                    origin.to_string()
+                }
+                _ => {
+                    return invalid_params_error(
+                        "mapping_origin must be mapper or host_rejected_fallback",
+                    )
+                }
+            };
             updates.push(MappingUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
                 mapped_files,
+                mapping_origin,
             });
         }
         let now = now_ms();
@@ -23966,6 +23980,24 @@ mod tests {
             .rows
             .iter()
             .any(|row| row.full_row_snapshot.get("mapping").is_some()));
+        let fallback_mapping = call_facade(&handler, "memory.set_mapping", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": null, "mapping_origin": "host_rejected_fallback"}]
+        })).await;
+        assert!(matches!(fallback_mapping, HandlerOutcome::Response(_)));
+        let fallback_feed = store
+            .pull_changefeed("memories", 0, 1000)
+            .unwrap()
+            .rows
+            .into_iter()
+            .rev()
+            .find(|row| row.module_row_id == verified_id)
+            .unwrap();
+        assert_eq!(fallback_feed.full_row_snapshot["mapping"], json!([]));
+        assert_eq!(
+            fallback_feed.full_row_snapshot["mapping_origin"],
+            json!("host_rejected_fallback")
+        );
         let generation_error = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation - 1,
             "rows": []

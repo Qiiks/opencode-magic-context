@@ -2873,6 +2873,23 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 82,
+        description: "record the origin of memory file-independent mappings",
+        up(db: Database): void {
+            // This column preserves who made the no-file disposition: the mapper's
+            // explicit independent choice versus a host fallback after rejecting all
+            // supplied paths. Existing mappings predate that distinction, so they
+            // conservatively retain the mapper default.
+            if (!tableExists(db, "memory_verifications")) return;
+            ensureColumn(
+                db,
+                "memory_verifications",
+                "mapping_origin",
+                "TEXT NOT NULL DEFAULT 'mapper'",
+            );
+        },
+    },
 ];
 
 /**

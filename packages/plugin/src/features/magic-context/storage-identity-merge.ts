@@ -231,13 +231,19 @@ function mergeMemoryRow(
             );
         }
         db.prepare(
-            `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
-             SELECT ?, file_path, verified_at, mapped_at
-               FROM memory_verifications
-              WHERE memory_id = ?
-             ON CONFLICT(memory_id, file_path) DO UPDATE SET
-                verified_at = MAX(memory_verifications.verified_at, excluded.verified_at),
-                mapped_at = MAX(memory_verifications.mapped_at, excluded.mapped_at)`,
+            `INSERT INTO memory_verifications
+                 (memory_id, file_path, verified_at, mapped_at, mapping_origin)
+              SELECT ?, file_path, verified_at, mapped_at, mapping_origin
+                FROM memory_verifications
+               WHERE memory_id = ?
+              ON CONFLICT(memory_id, file_path) DO UPDATE SET
+                 verified_at = MAX(memory_verifications.verified_at, excluded.verified_at),
+                 mapped_at = MAX(memory_verifications.mapped_at, excluded.mapped_at),
+                 mapping_origin = CASE
+                     WHEN excluded.mapped_at >= memory_verifications.mapped_at
+                         THEN excluded.mapping_origin
+                     ELSE memory_verifications.mapping_origin
+                 END`,
         ).run(targetId, sourceId);
         db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(sourceId);
         db.prepare(

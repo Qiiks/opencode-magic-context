@@ -2405,6 +2405,16 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE mc_chunk_transcripts ADD COLUMN raw_messages_deflate BLOB NULL;
         ",
     },
+    Migration {
+        version: 51,
+        // A null mapped-files array means file-independent, but it does not explain
+        // whether the mapper chose that outcome or the host rejected every supplied
+        // path. Keep the distinction with the authoritative module mapping.
+        statements: "
+        ALTER TABLE mc_memory_mappings
+            ADD COLUMN mapping_origin TEXT NOT NULL DEFAULT 'mapper';
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4409,6 +4419,7 @@ pub struct MappingUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
     pub mapped_files: Option<Vec<String>>,
+    pub mapping_origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14567,6 +14578,7 @@ impl McStore {
             source_row_id: i64,
             snapshot_json: String,
             mapping_json: Option<String>,
+            mapping_origin: Option<String>,
             category: String,
             normalized_hash: String,
         }
@@ -14590,10 +14602,15 @@ impl McStore {
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                let mapping_origin = object
+                    .get("mapping_origin")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 Ok(PreparedMemorySeed {
                     source_row_id: row.source_row_id,
                     snapshot_json,
                     mapping_json,
+                    mapping_origin,
                     category: object
                         .get("category")
                         .and_then(Value::as_str)
@@ -14776,12 +14793,14 @@ impl McStore {
                          AND source_context_row_id = ?3",
                 )?;
                 let mut mapping_upsert = tx.prepare(
-                    "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO mc_memory_mappings
+                         (memory_id, project_path, mapped_files_json, updated_at, mapping_origin)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(memory_id) DO UPDATE SET
                          project_path = excluded.project_path,
                          mapped_files_json = excluded.mapped_files_json,
-                         updated_at = excluded.updated_at",
+                         updated_at = excluded.updated_at,
+                         mapping_origin = excluded.mapping_origin",
                 )?;
                 let mut mapping_delete =
                     tx.prepare("DELETE FROM mc_memory_mappings WHERE memory_id = ?1")?;
@@ -14948,6 +14967,7 @@ impl McStore {
                             project,
                             mapped_files_json,
                             integer("updated_at").unwrap_or(0),
+                            prepared_row.mapping_origin.as_deref().unwrap_or("mapper"),
                         ])?;
                     } else {
                         mapping_delete.execute(params![module_row_id])?;
@@ -15260,13 +15280,14 @@ impl McStore {
                     .into_iter()
                     .map(|memory| {
                         let mapping = memory_mapping_feed_value(conn, memory.id)?;
+                        let mapping_origin = memory_mapping_origin_feed_value(conn, memory.id)?;
                         Ok(ChangefeedRow {
                             feed_seq: 0,
                             domain: "memories".to_string(),
                             op: "insert".to_string(),
                             module_row_id: memory.id,
                             content_hash: Some(memory.normalized_hash.clone()),
-                            full_row_snapshot: memory_feed_snapshot(&memory, mapping),
+                            full_row_snapshot: memory_feed_snapshot(&memory, mapping, mapping_origin),
                         })
                     })
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -16244,7 +16265,21 @@ fn memory_mapping_feed_value(
     }
 }
 
-fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value) -> Value {
+fn memory_mapping_origin_feed_value(
+    conn: &rusqlite::Connection,
+    memory_id: i64,
+) -> rusqlite::Result<Value> {
+    let origin = conn
+        .query_row(
+            "SELECT mapping_origin FROM mc_memory_mappings WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(origin.map(Value::String).unwrap_or(Value::Null))
+}
+
+fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value, mapping_origin: Value) -> Value {
     serde_json::json!({
         "id": memory.id,
         "project_path": memory.project_path,
@@ -16278,6 +16313,7 @@ fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value) -> Value {
         "mural_cue_at": memory.mural_cue_at,
         "mural_cue_rejection_count": memory.mural_cue_rejection_count,
         "mapping": mapping,
+        "mapping_origin": mapping_origin,
     })
 }
 
@@ -16287,7 +16323,8 @@ fn emit_verification_memory_snapshot_tx(
     feed_seq_before: i64,
 ) -> rusqlite::Result<()> {
     let mapping = memory_mapping_feed_value(tx, memory.id)?;
-    let snapshot = serde_json::to_string(&memory_feed_snapshot(memory, mapping))
+    let mapping_origin = memory_mapping_origin_feed_value(tx, memory.id)?;
+    let snapshot = serde_json::to_string(&memory_feed_snapshot(memory, mapping, mapping_origin))
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let enriched = tx.execute(
         "UPDATE mc_changefeed
@@ -16617,20 +16654,40 @@ fn set_memory_mapping_tx(
             });
             continue;
         }
+        if !matches!(
+            update.mapping_origin.as_str(),
+            "mapper" | "host_rejected_fallback"
+        ) {
+            rejected.push(MappingRejected {
+                memory_id: update.memory_id,
+                reason: "invalid_mapping_origin".to_string(),
+            });
+            continue;
+        }
         let files = serde_json::to_string(&update.mapped_files)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         tx.execute(
-            "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO mc_memory_mappings
+                 (memory_id, project_path, mapped_files_json, updated_at, mapping_origin)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(memory_id) DO UPDATE SET
-                project_path = excluded.project_path,
-                mapped_files_json = excluded.mapped_files_json,
-                updated_at = excluded.updated_at",
-            params![update.memory_id, project, files, now_ms],
+                 project_path = excluded.project_path,
+                 mapped_files_json = excluded.mapped_files_json,
+                 updated_at = excluded.updated_at,
+                 mapping_origin = excluded.mapping_origin",
+            params![
+                update.memory_id,
+                project,
+                files,
+                now_ms,
+                update.mapping_origin
+            ],
         )?;
         let mapping = memory_mapping_feed_value(tx, update.memory_id)?;
-        let snapshot = serde_json::to_string(&memory_feed_snapshot(&memory, mapping))
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let mapping_origin = memory_mapping_origin_feed_value(tx, update.memory_id)?;
+        let snapshot =
+            serde_json::to_string(&memory_feed_snapshot(&memory, mapping, mapping_origin))
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         tx.execute(
             "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
              VALUES ('memories', 'update', ?1, ?2, ?3)",
@@ -25313,6 +25370,7 @@ mod shadow_tests {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
                     mapped_files: Some(vec!["src/old.rs".to_string()]),
+                    mapping_origin: "mapper".to_string(),
                 }],
                 5,
             )
@@ -25426,18 +25484,29 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 2,
                     content_hash_at_prompt: hash(2),
-                    mapped_files: Some(vec!["src/lib.rs".into()]),
+                    mapped_files: None,
+                    mapping_origin: "host_rejected_fallback".to_string(),
                 }],
                 4,
             )
             .unwrap();
         assert_eq!(mapping.accepted, vec![2]);
-        assert!(store
+        let fallback_feed = store
             .pull_changefeed("memories", 0, 100)
             .unwrap()
             .rows
-            .iter()
-            .any(|row| row.full_row_snapshot.get("mapping").is_some()));
+            .into_iter()
+            .rev()
+            .find(|row| row.module_row_id == 2)
+            .unwrap();
+        assert_eq!(
+            fallback_feed.full_row_snapshot["mapping"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            fallback_feed.full_row_snapshot["mapping_origin"],
+            serde_json::json!("host_rejected_fallback")
+        );
         assert_memory_feed_snapshots_complete(&store);
 
         // The live-snapshot arm feeds the mirror resnapshot healer, so its rows must
@@ -25491,6 +25560,7 @@ mod shadow_tests {
                     memory_id: 1,
                     content_hash_at_prompt: hash.clone(),
                     mapped_files: Some(vec!["src/lib.rs".to_string()]),
+                    mapping_origin: "mapper".to_string(),
                 }],
                 2,
             )

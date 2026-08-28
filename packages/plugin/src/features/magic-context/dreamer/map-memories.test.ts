@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertMemory } from "../memory";
 import {
     getMemoryVerifications,
+    getUnmappedMemoryIds,
     recordMemoryMapping,
 } from "../memory/storage-memory-verifications";
 import { runMigrations } from "../migrations";
@@ -526,6 +528,66 @@ describe("mapMemories disposition", () => {
         }
     });
 
+    test("converges all-rejected paths into a marked fallback across consecutive runs", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-rejected-fallback";
+            const dir = tempProject();
+            // The host rejects both in-repo untracked paths and paths outside the
+            // repository. The mixed manifest proves the fallback is all-rejected,
+            // not a special case for only one rejection reason.
+            execFileSync("git", ["init", "-q"], { cwd: dir });
+            execFileSync("git", ["add", "src/fact.ts"], { cwd: dir });
+            writeFileSync(
+                path.join(dir, "src", "untracked.ts"),
+                "export const draft = true;",
+                "utf8",
+            );
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Fact lives in src/untracked.ts.",
+                sourceSessionId: "ses",
+            });
+            const args = mapArgs(db, dir, projectIdentity);
+            const scripted = scriptedMapClient(
+                (_call, ids) =>
+                    `<mappings>${ids.map((id) => `<memory id="${id}" files="src/untracked.ts,/outside-project/fact.ts"/>`).join("")}</mappings>`,
+            );
+            args.client = scripted.client as never;
+
+            const first = await mapMemories(args);
+
+            expect(first).toEqual({
+                mapped: 0,
+                independent: 1,
+                batches: 1,
+                remaining: 0,
+                complete: true,
+            });
+            const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
+            expect(state).toMatchObject({
+                files: [],
+                hasSentinel: true,
+                mappingOrigin: "host_rejected_fallback",
+            });
+            expect(getUnmappedMemoryIds(db, [memory.id])).toEqual([]);
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toEqual([]);
+
+            const second = await mapMemories(args);
+            expect(second).toEqual({
+                mapped: 0,
+                independent: 0,
+                batches: 0,
+                remaining: 0,
+                complete: true,
+            });
+            expect(scripted.promptCalls()).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("reports complete after fully draining the selected set", async () => {
         const db = freshDb();
         try {
@@ -687,6 +749,79 @@ describe("applyBatchMappings", () => {
             expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.files).toEqual([
                 "src/fact.ts",
             ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("preserves mapper-authored independent as distinct from the host fallback", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test-mapper-independent";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Fact lives in src/fact.ts.",
+                sourceSessionId: "ses",
+            });
+
+            const result = await applyBatchMappings(
+                mapArgs(db, dir, projectIdentity),
+                [
+                    {
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        candidates: [],
+                    },
+                ],
+                `<mappings><memory id="${memory.id}" independent="true"/></mappings>`,
+            );
+
+            expect(result).toEqual({ mapped: 0, independent: 1 });
+            expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.mappingOrigin).toBe(
+                "mapper",
+            );
+            expect(selectMapMemoryInputs(db, projectIdentity, dir).map(({ id }) => id)).toEqual([
+                memory.id,
+            ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("keeps accepted paths when a manifest only partially fails normalization", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test-partial-rejection";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Fact lives in src/fact.ts.",
+                sourceSessionId: "ses",
+            });
+
+            const result = await applyBatchMappings(
+                mapArgs(db, dir, projectIdentity),
+                [
+                    {
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        candidates: [],
+                    },
+                ],
+                `<mappings><memory id="${memory.id}" files="src/fact.ts,/outside-project/fact.ts"/></mappings>`,
+            );
+
+            expect(result).toEqual({ mapped: 1, independent: 0 });
+            expect(getMemoryVerifications(db, [memory.id]).get(memory.id)).toMatchObject({
+                files: ["src/fact.ts"],
+                hasSentinel: false,
+                mappingOrigin: "mapper",
+            });
         } finally {
             closeQuietly(db);
         }
