@@ -87,7 +87,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`scripts/`:**
 - Purpose: Support local inspection and maintenance outside the plugin runtime.
 - Contains: Bun and shell scripts for dumps, release coordination, and version sync; package-specific inspection and benchmark scripts live under `packages/plugin/scripts/`.
-- Key files: `scripts/context-dump.ts`, `scripts/release.sh`, `scripts/version-sync.mjs`, `packages/plugin/scripts/tail-view.ts`, `packages/plugin/scripts/backfill-embeddings.ts`, `packages/plugin/scripts/build-schema.ts`, `packages/plugin/scripts/benchmark-tag-queries.ts`, `packages/plugin/scripts/benchmark-message-fts.ts`, `packages/plugin/scripts/export-project-identities.ts`
+- Key files: `scripts/context-dump.ts`, `scripts/release.sh`, `scripts/version-sync.mjs`, `scripts/audit-transform-wire-parity-live.ts`, `scripts/audit-transform-wire-parity.py`, `packages/plugin/scripts/tail-view.ts`, `packages/plugin/scripts/backfill-embeddings.ts`, `packages/plugin/scripts/build-schema.ts`, `packages/plugin/scripts/benchmark-tag-queries.ts`, `packages/plugin/scripts/benchmark-message-fts.ts`, `packages/plugin/scripts/export-project-identities.ts`
 
 **`docs/`:**
 - Purpose: Keep longer-lived subsystem design references, specs, and operational audit notes separate from root operational docs.
@@ -115,7 +115,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/tui/index.tsx`: Register TUI command-palette entries and the sidebar slot for OpenCode TUI.
 - `packages/cli/src/index.ts`: Unified setup/doctor/migrate entry for the separate `@cortexkit/magic-context` package.
 - `packages/cli/src/commands/migrate-session.ts`: Re-home OpenCode sessions across working directories/projects and database boundaries with domain authority verification.
-- `packages/cli/src/commands/migrate.ts`: Migrate OpenCode sessions to Pi or OMP format with phase-tracked `migration_pending` recovery journaling.
+- `packages/cli/src/commands/migrate.ts`: Migrate OpenCode sessions to Pi or OMP format with phase-tracked `migration_pending` recovery journaling and module-managed project authority checks.
 - `packages/cli/src/lib/opencode-plugin-schema-fence.ts`: Inspect pinned OpenCode plugin schema fences against the live database version in `doctor`.
 - `packages/cli/src/lib/embedding-runtime.ts`: Probe the presence of the `onnxruntime-node` native binding and `onnxruntime-web` WASM fallback to verify local embedding runtime health.
 - `packages/cli/src/lib/github-issue.ts`: Format and submit GitHub issue diagnostics bundles with drag-and-drop fallback on transport or auth failures.
@@ -134,7 +134,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 **Core Logic:**
 - `src/plugin/messages-transform.ts`: Wrap the turn transform defensively against `SQLITE_BUSY` and preserve user-terminated tails (`preserveUserTerminatedTail`) when OpenCode concurrently appends pending assistant shells mid-transform.
 - `src/hooks/magic-context/transform.ts`: Run the turn transform; orchestrate tagging, replay paths, prepareCompartmentInjection, and downstream postprocess hand-off.
-- `src/hooks/magic-context/transform-postprocess-phase.ts`: Apply pending ops, heuristic cleanup, deferred-note nudges, **synthetic-todowrite injection (B7)**, and auto-search hints.
+- `src/hooks/magic-context/transform-postprocess-phase.ts`: Apply pending ops, heuristic cleanup, deferred-note nudges, **synthetic-todowrite injection (B7)**, auto-search hints, and sentinel replay preservation across marker windows.
 - `src/hooks/magic-context/hook.ts`: Compose runtime services.
 - `src/hooks/magic-context/strip-content.ts`: Strip and replay reasoning, inline thinking, structural noise, dropped placeholders, merged-assistant reasoning, processed images, and system-injected messages.
 - `src/hooks/magic-context/caveman.ts`: Experimental age-tier text compression for primary sessions.
@@ -150,7 +150,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/hook-handlers.ts`: Prompt hook event handlers, provider-aware reasoning-variant flushes, and tool execution lifecycle hooks.
 - `src/hooks/magic-context/edit-marker.ts`: Implement `edit_marker` mode to compress superseded edits, keeping the `filePath` and a region-hint prefix while dropping the bulky output content.
 - `src/hooks/magic-context/module-transport.ts`: Send live Rust transform, authority, and tool requests over the subc protocol using `SubcClient` and `RouteHandle`, with bounded serialized request handling.
-- `src/hooks/magic-context/rust-mode-transform.ts`: Orchestrate the experimental Rust transform mode, coordinating state sync and LKG (Last Known Good) fallback/replay logic.
+- `src/hooks/magic-context/rust-mode-transform.ts`: Orchestrate the experimental Rust transform mode, coordinating state sync and LKG (Last Known Good) fallback/replay logic with frozen fallback representation preservation across defer recovery.
 - `src/hooks/magic-context/module-state-sync.ts`: Synchronize database state (memories, commits, tags, markers) between host (TS SQLite) and subc (Rust).
 - `src/hooks/magic-context/module-wire.ts`: Translate wire messages, ordinals, and normalizations between host and Rust formats.
 - `src/hooks/magic-context/lkg-slot.ts` and `src/hooks/magic-context/lkg-replay.ts`: Capture and replay the Last Known Good (LKG) transformed state on failure/parking.
@@ -192,14 +192,14 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/shared/window-geometry.ts`: Derives usable soft/hard context windows and reserve geometry across providers and harnesses, honoring user-configured `output_reserve` overrides.
 - `src/shared/models-dev-cache.ts`: Cache and resolve models.dev metadata and SDK window geometry.
 - `src/shared/exit-abort-registry.ts`: Provide a process-wide coordinator to abort active controllers without exceeding listener caps.
-- `src/shared/write-transaction-timing.ts`: Log slow write transactions (>1000ms threshold) post-commit with site and held duration attribution across critical SQLite write sites.
+- `src/shared/write-transaction-timing.ts`: Log slow write transactions (>1000ms threshold, with configurable threshold support) post-commit with site and held duration attribution across critical SQLite write sites.
 - `packages/pi-plugin/src/context-handler.ts`: Core context transform and hook handler for the Pi plugin.
 - `packages/pi-plugin/src/tail-hygiene-walk-pi.ts`: Single-walk tail hygiene measurement and delta tracking for Pi sessions.
 - `packages/pi-plugin/src/ctx-reduce-nudge-pi.ts`: Evaluate Channel 1 and Channel 2 nudges for Pi sessions, queuing Channel 2 via `deliverAs: "nextTurn"`.
 - `packages/pi-plugin/src/clone-inheritance.ts`: Intercept Pi `session_start` fork events and inherit filtered session compartments, tags, and markers.
 - `packages/pi-plugin/src/subagent-runner.ts`: Win32/POSIX-safe subagent executor with command-line length cap mitigations.
 - `packages/pi-plugin/src/commands/ctx-wrapup.ts`: Implement the `/ctx-wrapup` command and orchestrator for Pi sessions.
-- `packages/pi-plugin/src/dreamer/pi-session-api.ts`: Resolve `pi-coding-agent` module and session APIs, using a memoized resolution ladder to support symlinked or nonstandard Pi installs.
+- `packages/pi-plugin/src/dreamer/pi-session-api.ts`: Resolve `pi-coding-agent` module and session APIs from running Pi first, using a memoized resolution ladder with traversal guards and dist-metadata detection to support symlinked or nonstandard Pi installs.
 - `packages/pi-plugin/scripts/experiments/perf/`: Run performance benchmarks and regression checks against production-registered context transform hooks.
 - `crates/mc-module/src/transform.rs`: Evaluates transform passes, applies modifications like metadata tag injection and history compaction in Rust, renders temporal overlays (tag numbers and time gap markers), self-heals boundary divergence, and strips leading model-authored tag imitation prefixes from assistant messages.
 - `crates/mc-module/src/historian.rs`: Evaluates pressure and schedules/runs incremental historian summarizations in Rust.
@@ -217,6 +217,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/selection.rs`: Implement tail-reduction selection to decide which tail items to reduce and produce their `ReductionDecision`s.
 - `crates/mc-module/src/retained_size.rs`: Calculate allocator-oriented retained-size estimates for memory-budgeted module holders.
 - `crates/mc-module/src/differential_goldens.rs`: Validate in-process Rust transform outputs against TS-generated wire fixtures (DG-1..3 goldens).
+- `crates/mc-module/src/bin/mc-caveman-live-differ.rs`: Privacy-preserving stdin/stdout caveman differ binary used by live transform parity audits.
 
 **Tests:** Co-locate tests with source as `src/**/*.test.ts`, for example `src/hooks/magic-context/hook.test.ts`, `src/tools/ctx-memory/tools.test.ts`, and `src/features/magic-context/migrations-v11.test.ts`. End-to-end coverage lives in the separate `packages/e2e-tests/` workspace.
 
