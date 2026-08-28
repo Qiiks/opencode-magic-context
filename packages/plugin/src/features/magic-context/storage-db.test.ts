@@ -218,14 +218,14 @@ describe("upstream migration version lane", () => {
 });
 
 describe("explicit shared storage resolution", () => {
-    it("keeps both path resolution and database opening inside test isolation", () => {
-        const testDataDir = makeTempDir("storage-db-test-guard-");
-        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
-        process.env.XDG_DATA_HOME = makeTempDir("storage-db-preload-xdg-");
+    it("keeps path resolution and database opening in the per-test XDG fixture", () => {
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = makeTempDir("storage-db-test-guard-");
+        const perTestDataHome = makeTempDir("storage-db-preload-xdg-");
+        process.env.XDG_DATA_HOME = perTestDataHome;
         process.env.MAGIC_CONTEXT_STORAGE_DIR = makeTempDir("storage-db-production-");
 
         const resolved = resolveDatabasePath();
-        expect(resolved.dbPath).toBe(resolveDbPath(testDataDir));
+        expect(resolved.dbPath).toBe(resolveDbPath(perTestDataHome));
         const db = openDatabase();
         expect(db).not.toBeNull();
         expect(getDatabasePath(db!)).toBe(resolved.dbPath);

@@ -212,6 +212,13 @@ export interface MagicContextStorageResolution {
 export function getMagicContextStorageResolution(): MagicContextStorageResolution {
     const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim();
     if (testDataDir) {
+        const perTestDataHome = process.env.XDG_DATA_HOME?.trim();
+        if (perTestDataHome && path.resolve(perTestDataHome) !== path.resolve(testDataDir)) {
+            return {
+                path: path.join(perTestDataHome, "cortexkit", "magic-context"),
+                source: "test isolation",
+            };
+        }
         return {
             path: path.join(testDataDir, "cortexkit", "magic-context"),
             source: "test isolation",

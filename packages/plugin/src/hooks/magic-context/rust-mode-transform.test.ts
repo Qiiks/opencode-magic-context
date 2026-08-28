@@ -3862,6 +3862,13 @@ describe("LKG durability across restarts", () => {
                 parts: [{ type: "text", text: "representation B" }],
             },
         ];
+        const representationC = [
+            ...representationB,
+            {
+                info: { id: "m2", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "delta tail" }],
+            },
+        ];
         let pass = 0;
         const transformBodies: Record<string, unknown>[] = [];
         const moduleClient: RustModeModuleClient = {
@@ -3873,7 +3880,7 @@ describe("LKG durability across restarts", () => {
                 return {
                     decision: pass === 4 ? "HARD" : pass === 1 ? "HARD" : "SOFT+",
                     native_messages: structuredClone(
-                        pass === 1 ? representationA : representationB,
+                        pass === 1 ? representationA : pass >= 5 ? representationC : representationB,
                     ),
                 };
             },
@@ -3897,6 +3904,71 @@ describe("LKG durability across restarts", () => {
         expect(busted.messages).toEqual(representationB);
         expect(transformBodies[2]?.tail_delta).toBeUndefined();
         expect(transformBodies[3]?.tail_delta).toBeUndefined();
+
+        const resumedInput = [
+            ...input,
+            {
+                info: {
+                    id: "m2",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "delta tail" }],
+            },
+        ] as MessageLike[];
+        const resumed = { messages: [...resumedInput] as unknown[] };
+        await transform.run(sessionId, resumedInput, resumed, makeMeta(db, sessionId));
+        expect(resumed.messages).toEqual(representationC);
+        expect(transformBodies[4]?.tail_delta).toBeDefined();
+    });
+
+    it("drops a frozen LKG instead of replaying it after an in-process model flip", async () => {
+        const sessionId = `rust-lkg-frozen-model-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeRestartInput(sessionId);
+        const frozenRepresentation = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "frozen representation" }],
+            },
+        ];
+        let calls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                calls += 1;
+                if (calls > 1) throw new Error("daemon unavailable");
+                return {
+                    decision: "HARD",
+                    native_messages: structuredClone(frozenRepresentation),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        await transform.run(
+            sessionId,
+            input,
+            { messages: [...input] },
+            makeMeta(db, sessionId),
+        );
+        const fallback = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, fallback, makeMeta(db, sessionId));
+        expect(fallback.messages).toEqual(frozenRepresentation);
+
+        const switchedInput = structuredClone(input);
+        switchedInput[0]!.info.model = {
+            providerID: "test-provider",
+            modelID: "other-model",
+        };
+        const switched = { messages: [...switchedInput] as unknown[] };
+        await transform.run(sessionId, switchedInput, switched, makeMeta(db, sessionId));
+
+        expect(switched.messages).toEqual(switchedInput);
+        expect(getSlot(sessionId)).toBeUndefined();
+        expect(transform.getState(sessionId).forceFullWire).toBe(true);
     });
 
     it("still refuses a model change on a hydrated slot", async () => {

@@ -1143,14 +1143,29 @@ def compare_provider_matrix(dumps: list[Dump]) -> dict[str, Any]:
     axes: list[dict[str, Any]] = []
     for provider_family, lanes in sorted(grouped.items()):
         for field in fields:
+            def normalize_value(value: Any) -> str:
+                rendered = str(value)
+                if field != "tool_pairing_shapes":
+                    return rendered
+                match = re.fullmatch(
+                    r"calls=(\d+);results=(\d+);adjacency=(valid|invalid)", rendered
+                )
+                if match is None:
+                    return rendered
+                return (
+                    "cardinality="
+                    + ("balanced" if match.group(1) == match.group(2) else "unbalanced")
+                    + f";adjacency={match.group(3)}"
+                )
+
             def value_space(lane: str) -> set[str]:
                 space: set[str] = set()
                 for row in lanes.get(lane, []):
                     value = row[field]
                     if isinstance(value, list):
-                        space.update(str(item) for item in value)
+                        space.update(normalize_value(item) for item in value)
                     else:
-                        space.add(str(value))
+                        space.add(normalize_value(value))
                 return space
 
             ts_space = value_space("ts")
@@ -1198,7 +1213,7 @@ def compare_provider_matrix(dumps: list[Dump]) -> dict[str, Any]:
         ],
         "unexplained_wire_invariants": unexplained_invariants,
         "evidence": rows,
-        "note": "provider families compare observed per-leg value spaces; counts from unlike sessions are inventory only",
+        "note": "provider families compare observed per-leg value spaces; tool-call cardinalities from unlike sessions normalize to balanced/unbalanced adjacency classes and remain inventory only",
     }
 
 
@@ -3607,6 +3622,216 @@ console.log(JSON.stringify({
     return contract
 
 
+HUNT12_REQUIRED_CONTRACT_PATHS = (
+    ("cache_seams", "lkg_freeze_forces_full_wire"),
+    ("cache_seams", "delta_resumes_after_bust_adoption"),
+    ("cache_seams", "frozen_lkg_model_flip_fenced"),
+    ("cache_seams", "marker_absence_retains_sentinel_ids"),
+    ("cache_seams", "compaction_toggle_replays_sentinel_ids"),
+    ("cache_seams", "pi_clone_filters_frozen_ids"),
+    ("cache_seams", "ride_only_supersession_accounted"),
+    ("language_directives", "ts_classifier_localized"),
+    ("language_directives", "rust_classifier_localized"),
+    ("language_directives", "remaining_ts_producers_localized"),
+    ("language_directives", "rust_historian_fire_and_repair_localized"),
+    ("mapping_origin", "module_payload_preserves_origin"),
+    ("mapping_origin", "store_changefeed_and_seed_preserve_origin"),
+    ("mapping_origin", "both_sentinels_are_mapped_and_not_verifiable"),
+    ("mapping_origin", "cross_lane_regressions_present"),
+    ("storage_dir", "test_preload_precedes_override"),
+    ("storage_dir", "per_test_xdg_isolation"),
+    ("storage_dir", "pi_preload_regression_present"),
+    ("storage_dir", "doctor_origins_match"),
+    ("provider_lane_coordinates", "readonly_binding_projection"),
+    ("provider_lane_coordinates", "rootless_responses_regression"),
+)
+
+
+def hunt12_source_invariants(contract: dict[str, Any]) -> list[str]:
+    invariants: list[str] = []
+    for section, field in HUNT12_REQUIRED_CONTRACT_PATHS:
+        if contract.get(section, {}).get(field) is not True:
+            invariants.append(f"hunt12_{section}_{field}_missing")
+    return invariants
+
+
+def summarize_hunt12_source_contract(root: Path) -> dict[str, Any]:
+    def source(path: str) -> str:
+        target = root / path
+        return target.read_text() if target.exists() else ""
+
+    rust_transform = source("packages/plugin/src/hooks/magic-context/rust-mode-transform.ts")
+    rust_transform_test = source(
+        "packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts"
+    )
+    postprocess = source(
+        "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts"
+    )
+    postprocess_test = source(
+        "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts"
+    )
+    clone_test = source("packages/pi-plugin/src/clone-inheritance.test.ts")
+    selection = source("crates/mc-module/src/selection.rs")
+    tail_hygiene = source("crates/mc-module/src/tail_hygiene.rs")
+    transform_rs = source("crates/mc-module/src/transform.rs")
+    classify_ts = source("packages/plugin/src/features/magic-context/dreamer/classify.ts")
+    task_executor = source(
+        "packages/plugin/src/features/magic-context/dreamer/task-executor.ts"
+    )
+    module_rs = source("crates/mc-module/src/lib.rs")
+    historian_rs = source("crates/mc-module/src/historian.rs")
+    historian_chunk_rs = source("crates/mc-module/src/historian_chunk.rs")
+    directive_sources = "\n".join(
+        source(path)
+        for path in (
+            "packages/plugin/src/index.ts",
+            "packages/plugin/src/features/magic-context/sidekick/agent.ts",
+            "packages/plugin/src/features/magic-context/user-memory/review-user-memories.ts",
+            "packages/plugin/src/features/magic-context/dreamer/refresh-primers.ts",
+            "packages/plugin/src/features/magic-context/dreamer/verify.ts",
+            "packages/plugin/src/features/magic-context/dreamer/task-executor.ts",
+        )
+    )
+    map_memories = source(
+        "packages/plugin/src/features/magic-context/dreamer/map-memories.ts"
+    )
+    map_test = source(
+        "packages/plugin/src/features/magic-context/dreamer/map-memories.test.ts"
+    )
+    storage_verifications = source(
+        "packages/plugin/src/features/magic-context/memory/storage-memory-verifications.ts"
+    )
+    verify_gate = source(
+        "packages/plugin/src/features/magic-context/dreamer/verify-gate.ts"
+    )
+    verify_gate_test = source(
+        "packages/plugin/src/features/magic-context/dreamer/verify-gate.test.ts"
+    )
+    context_authority = source(
+        "packages/plugin/src/features/magic-context/context-authority.ts"
+    )
+    store_rs = source("crates/mc-store/src/lib.rs")
+    data_path = source("packages/plugin/src/shared/data-path.ts")
+    data_path_test = source("packages/plugin/src/shared/data-path.test.ts")
+    pi_preload = source("packages/pi-plugin/test-preload.ts")
+    pi_preload_test = source("packages/pi-plugin/src/storage-preload.test.ts")
+    doctors = "\n".join(
+        source(path)
+        for path in (
+            "packages/cli/src/commands/doctor-opencode.ts",
+            "packages/cli/src/commands/doctor-pi.ts",
+            "packages/cli/src/commands/doctor-omp.ts",
+        )
+    )
+    live_helper = source("scripts/audit-transform-wire-parity-live.ts")
+    differ_test = source("scripts/audit-transform-wire-parity.test.py")
+
+    contract = {
+        "evidence_kind": "merged_source_and_executed_regression_contract_not_deployed_runtime",
+        "cache_seams": {
+            "lkg_freeze_forces_full_wire": (
+                "lkgRepresentationFrozen" in rust_transform
+                and "state.forceFullWire = state.lkgRepresentationFrozen" in rust_transform
+            ),
+            "delta_resumes_after_bust_adoption": (
+                "transformBodies[4]?.tail_delta" in rust_transform_test
+            ),
+            "frozen_lkg_model_flip_fenced": (
+                "drops a frozen LKG instead of replaying it after an in-process model flip"
+                in rust_transform_test
+            ),
+            "marker_absence_retains_sentinel_ids": (
+                "Absence from one transform array is not deletion" in postprocess
+                and "stripped placeholder replay across temporary marker windows"
+                in postprocess_test
+            ),
+            "compaction_toggle_replays_sentinel_ids": (
+                "retains frozen ids while compaction is off" in postprocess_test
+            ),
+            "pi_clone_filters_frozen_ids": (
+                "inherits frozen ids that remain on the clone path" in clone_test
+                and "stripped_placeholder_ids" in clone_test
+            ),
+            "ride_only_supersession_accounted": (
+                "supersession_ride_available" in selection
+                and "supersession_withheld_by_tag_window_count" in selection
+                and "red_targets(core)" in tail_hygiene
+                and "&pending_drop_target_ids" in transform_rs
+            ),
+        },
+        "language_directives": {
+            "ts_classifier_localized": (
+                "withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language)"
+                in classify_ts
+                and "language: config.language ?? deps.language" in task_executor
+            ),
+            "rust_classifier_localized": (
+                "classify_system_prompt" in module_rs
+                and "binding.config.language.as_deref()" in module_rs
+            ),
+            "remaining_ts_producers_localized": (
+                directive_sources.count("withContentLanguageDirective(") >= 8
+            ),
+            "rust_historian_fire_and_repair_localized": (
+                "content_language" in historian_chunk_rs
+                and "content_language" in historian_rs
+            ),
+        },
+        "mapping_origin": {
+            "module_payload_preserves_origin": (
+                "mapping_origin: item.mappingOrigin" in map_memories
+                and "mapping_origin must be mapper or host_rejected_fallback" in module_rs
+            ),
+            "store_changefeed_and_seed_preserve_origin": (
+                "mapping_origin = excluded.mapping_origin" in store_rs
+                and "prepared_row.mapping_origin.as_deref().unwrap_or(\"mapper\")"
+                in store_rs
+                and "row.mapping_origin === \"host_rejected_fallback\""
+                in context_authority
+            ),
+            "both_sentinels_are_mapped_and_not_verifiable": (
+                "SELECT DISTINCT memory_id FROM memory_verifications" in storage_verifications
+                and "files.length ?? 0) > 0" in verify_gate
+            ),
+            "cross_lane_regressions_present": (
+                "preserves host-rejected fallback origin through a MODULE mapping call"
+                in map_test
+                and "excludes both no-file sentinel origins" in verify_gate_test
+            ),
+        },
+        "storage_dir": {
+            "test_preload_precedes_override": (
+                data_path.find("const testDataDir")
+                < data_path.find("const explicitStorageDir")
+                and data_path.find("const testDataDir") >= 0
+            ),
+            "per_test_xdg_isolation": (
+                "perTestDataHome" in data_path
+                and "a per-test XDG_DATA_HOME overrides the preload root"
+                in data_path_test
+            ),
+            "pi_preload_regression_present": (
+                "Pi preload isolation outranks the shared storage override"
+                in pi_preload_test
+                and "MAGIC_CONTEXT_TEST_DATA_DIR" in pi_preload
+            ),
+            "doctor_origins_match": doctors.count("storage.source") >= 3,
+        },
+        "provider_lane_coordinates": {
+            "readonly_binding_projection": (
+                "captureLaneCoordinates" in live_helper
+                and "new Database(path, { readonly: true })" in live_helper
+            ),
+            "rootless_responses_regression": (
+                '"instructions": "Identity\\n\\n## Magic Context"' in differ_test
+                and 'responses], ["ts"]' in differ_test
+            ),
+        },
+    }
+    contract["unexplained_invariants"] = hunt12_source_invariants(contract)
+    return contract
+
+
 LIVE_PROVIDER_FAMILIES = (
     "anthropic:anthropic",
     "bedrock:anthropic",
@@ -3628,6 +3853,60 @@ def live_dump_directories(explicit: Path | None) -> list[Path]:
         parent = Path(tempfile.gettempdir())
     roots.update(path for path in parent.glob("opencode-*-auth-dumps") if path.is_dir())
     return sorted(roots)
+
+
+def apply_live_capture_lane_coordinates(
+    dumps: list[Dump], coordinates: dict[str, Any]
+) -> tuple[list[Dump], dict[str, Any]]:
+    def session_hash(session: str) -> str:
+        return hashlib.sha256(session.encode()).hexdigest()[:12]
+
+    sessions_by_hash: dict[str, set[str]] = collections.defaultdict(set)
+    for dump in dumps:
+        sessions_by_hash[session_hash(dump.session)].add(dump.session)
+    lane_by_hash = {
+        str(row.get("session_hash")): str(row.get("lane"))
+        for row in coordinates.get("rows", [])
+        if isinstance(row, dict) and row.get("lane") in ("rust", "ts")
+    }
+    ambiguous = {
+        coordinate
+        for coordinate, sessions in sessions_by_hash.items()
+        if len(sessions) != 1
+    }
+    effective: list[Dump] = []
+    resolved_dumps = 0
+    for dump in dumps:
+        coordinate = session_hash(dump.session)
+        coordinate_lane = lane_by_hash.get(coordinate)
+        lane = (
+            coordinate_lane
+            if dump.lane == "unverified"
+            and coordinate not in ambiguous
+            and coordinate_lane in ("rust", "ts")
+            else dump.lane
+        )
+        if lane != dump.lane:
+            resolved_dumps += 1
+        effective.append(
+            Dump(
+                path=dump.path,
+                session=dump.session,
+                lane=lane,
+                body=dump.body,
+                response=dump.response,
+            )
+        )
+    return effective, {
+        "resolved_dumps": resolved_dumps,
+        "remaining_unverified_dumps": sum(
+            dump.lane == "unverified" for dump in effective
+        ),
+        "ambiguous_capture_hashes": sorted(ambiguous),
+        "coordinate_requested_hashes": coordinates.get("requested_hashes", 0),
+        "coordinate_resolved_hashes": coordinates.get("resolved_hashes", 0),
+        "rule": "served project roots win; otherwise only a collision-free twelve-character session hash joined to a readable live project config enters a lane denominator",
+    }
 
 
 def live_provider_report(dumps: list[Dump]) -> dict[str, Any]:
@@ -3719,7 +3998,10 @@ def live_provider_report(dumps: list[Dump]) -> dict[str, Any]:
 
 
 def invoke_live_probe(
-    args: argparse.Namespace, after_ms: int, engine_after_ms: int
+    args: argparse.Namespace,
+    after_ms: int,
+    engine_after_ms: int,
+    capture_sessions: set[str],
 ) -> dict[str, Any]:
     home = Path.home()
     storage_dir = os.environ.get("MAGIC_CONTEXT_STORAGE_DIR", "").strip()
@@ -3750,6 +4032,11 @@ def invoke_live_probe(
         "--engine-after-ms",
         str(engine_after_ms),
     ]
+    capture_hashes = sorted(
+        {hashlib.sha256(session.encode()).hexdigest()[:12] for session in capture_sessions}
+    )
+    if capture_hashes:
+        command.extend(["--capture-session-hashes", ",".join(capture_hashes)])
     if args.skip_live_rpc:
         command.append("--skip-rpc")
     if args.skip_live_rust_oracle:
@@ -3799,6 +4086,7 @@ def live_leg_verdicts(
     producer: dict[str, Any] | None = None,
     mural: dict[str, Any] | None = None,
     wrapup: dict[str, Any] | None = None,
+    hunt12: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if probe.get("status") == "failed":
         return [
@@ -3819,6 +4107,7 @@ def live_leg_verdicts(
                 (8, 11),
                 (9, 11),
                 (10, 11),
+                (11, 12),
             )
         ]
 
@@ -3879,6 +4168,7 @@ def live_leg_verdicts(
     maintenance_gaps = list(probe.get("maintenance", {}).get("coverage_gaps", []))
     mural_classes = list((mural or {}).get("unexplained_invariants", []))
     wrapup_classes = list((wrapup or {}).get("unexplained_invariants", []))
+    hunt12_classes = list((hunt12 or {}).get("unexplained_invariants", []))
 
     decisions = probe.get("decision_window", {})
     decision_classes = [
@@ -3903,6 +4193,7 @@ def live_leg_verdicts(
         (8, 11, maintenance_classes),
         (9, 11, mural_classes),
         (10, 11, wrapup_classes),
+        (11, 12, hunt12_classes),
     ):
         coverage_gaps = maintenance_gaps if leg == 8 else []
         rows.append(
@@ -3935,19 +4226,27 @@ def run_live(args: argparse.Namespace) -> None:
     dumps, _lane_verification = verify_dump_lanes(
         dumps, expected_rust_sessions, config_overrides
     )
-    provider = live_provider_report(dumps)
     source_root = Path(__file__).resolve().parent.parent
     producer_contract = summarize_historian_producer_contract(source_root)
     mural_contract = summarize_mural_compose_contract(source_root)
     wrapup_contract = summarize_wrapup_contract(source_root)
+    hunt12_contract = summarize_hunt12_source_contract(source_root)
     after_ms = parse_bound(args.after, args.date)
     engine_after_ms = parse_bound(args.engine_after or args.after, args.date)
-    probe = invoke_live_probe(args, after_ms, engine_after_ms)
+    probe = invoke_live_probe(
+        args, after_ms, engine_after_ms, {dump.session for dump in dumps}
+    )
+    dumps, lane_coordinate_coverage = apply_live_capture_lane_coordinates(
+        dumps, probe.get("capture_lane_coordinates", {})
+    )
+    provider = live_provider_report(dumps)
+    provider["lane_coordinate_coverage"] = lane_coordinate_coverage
     unexplained_by_axis = {
         "historian_producer": producer_contract["unexplained_invariants"],
         "maintenance": probe.get("maintenance", {}).get("unexplained_invariants", []),
         "mural_compose": mural_contract["unexplained_invariants"],
         "wrapup": wrapup_contract["unexplained_invariants"],
+        "hunt12_source": hunt12_contract["unexplained_invariants"],
     }
     report = {
         "method": {
@@ -3969,6 +4268,7 @@ def run_live(args: argparse.Namespace) -> None:
         "historian_producer_contract": producer_contract,
         "mural_compose_contract": mural_contract,
         "wrapup_contract": wrapup_contract,
+        "hunt12_source_contract": hunt12_contract,
         "unexplained_bucket": {
             "by_axis": unexplained_by_axis,
             "count": sum(len(values) for values in unexplained_by_axis.values()),
@@ -3976,7 +4276,12 @@ def run_live(args: argparse.Namespace) -> None:
         "window_report_ledger_live": live_ledger_report(args.window_report_ledger),
         "live_probe": probe,
         "leg_verdicts": live_leg_verdicts(
-            provider, probe, producer_contract, mural_contract, wrapup_contract
+            provider,
+            probe,
+            producer_contract,
+            mural_contract,
+            wrapup_contract,
+            hunt12_contract,
         ),
     }
     print(json.dumps(report, ensure_ascii=False, indent=args.indent, sort_keys=True))
@@ -4035,12 +4340,14 @@ def main() -> None:
     producer_contract = summarize_historian_producer_contract(source_root)
     mural_contract = summarize_mural_compose_contract(source_root)
     wrapup_contract = summarize_wrapup_contract(source_root)
+    hunt12_contract = summarize_hunt12_source_contract(source_root)
     unexplained_by_axis = {
         "served_provider_wire": provider_matrix["unexplained_byte_classes"],
         "ctx_facade": facade_parity["unexplained_byte_classes"],
         "historian_producer": producer_contract["unexplained_invariants"],
         "mural_compose": mural_contract["unexplained_invariants"],
         "wrapup": wrapup_contract["unexplained_invariants"],
+        "hunt12_source": hunt12_contract["unexplained_invariants"],
     }
     report = {
         "method": {
@@ -4076,6 +4383,7 @@ def main() -> None:
         "historian_producer_contract": producer_contract,
         "mural_compose_contract": mural_contract,
         "wrapup_contract": wrapup_contract,
+        "hunt12_source_contract": hunt12_contract,
         "unexplained_bucket": {
             "by_axis": unexplained_by_axis,
             "count": sum(len(values) for values in unexplained_by_axis.values()),

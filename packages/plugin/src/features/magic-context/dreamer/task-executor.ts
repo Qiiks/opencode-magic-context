@@ -580,6 +580,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    language: config.language ?? deps.language,
                     ...moduleArgs,
                     onProgress: (processed) => reportProgress(processed),
                 });

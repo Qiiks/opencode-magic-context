@@ -45,6 +45,7 @@ interface Options {
 	engineAfterMs: number;
 	skipRpc: boolean;
 	skipRustOracle: boolean;
+	captureSessionHashes: string[];
 }
 
 function parseArgs(argv: string[]): Options {
@@ -85,6 +86,10 @@ function parseArgs(argv: string[]): Options {
 		engineAfterMs,
 		skipRpc: flags.has("--skip-rpc"),
 		skipRustOracle: flags.has("--skip-rust-oracle"),
+		captureSessionHashes: (values.get("--capture-session-hashes") ?? "")
+			.split(",")
+			.map((value) => value.trim())
+			.filter(Boolean),
 	};
 }
 
@@ -227,6 +232,84 @@ function bindingRows(
 		projectPath: String(row.project_path ?? ""),
 		updatedAt: Number(row.updated_at ?? 0),
 	}));
+}
+
+function opencodeBindingRows(
+	opencode: Database,
+): Array<{ sessionId: string; projectPath: string; updatedAt: number }> {
+	const sessionColumns = columns(opencode, "session");
+	if (!sessionColumns.has("id")) return [];
+	if (sessionColumns.has("directory")) {
+		return (opencode.query("SELECT id, directory FROM session").all() as Row[])
+			.filter((row) => typeof row.directory === "string" && row.directory.length > 0)
+			.map((row) => ({
+				sessionId: String(row.id ?? ""),
+				projectPath: String(row.directory),
+				updatedAt: 0,
+			}));
+	}
+	if (sessionColumns.has("data")) {
+		return (opencode.query("SELECT id, data FROM session").all() as Row[])
+			.map((row) => ({ row, data: safeJson(row.data) }))
+			.filter(({ data }) => typeof data.directory === "string" && data.directory.length > 0)
+			.map(({ row, data }) => ({
+				sessionId: String(row.id ?? ""),
+				projectPath: String(data.directory),
+				updatedAt: 0,
+			}));
+	}
+	return [];
+}
+
+function captureLaneCoordinates(
+	bindings: ReturnType<typeof bindingRows>,
+	requestedHashes: string[],
+): Record<string, unknown> {
+	const bindingsByHash = new Map<string, ReturnType<typeof bindingRows>>();
+	for (const binding of bindings) {
+		const sessionHash = sha256(binding.sessionId).slice(0, 12);
+		const rows = bindingsByHash.get(sessionHash) ?? [];
+		rows.push(binding);
+		bindingsByHash.set(sessionHash, rows);
+	}
+
+	const rows: Row[] = [];
+	const ambiguousHashes: string[] = [];
+	const unresolvedHashes: string[] = [];
+	for (const sessionHash of [...new Set(requestedHashes)].sort()) {
+		const matches = bindingsByHash.get(sessionHash) ?? [];
+		const sessionIds = new Set(matches.map((row) => row.sessionId));
+		if (sessionIds.size > 1) {
+			ambiguousHashes.push(sessionHash);
+			continue;
+		}
+		const resolved = matches
+			.map((binding) => ({ binding, lane: configuredLane(binding.projectPath) }))
+			.filter(({ lane }) => lane !== "unverified");
+		const lanes = new Set(resolved.map(({ lane }) => lane));
+		if (lanes.size > 1) {
+			ambiguousHashes.push(sessionHash);
+			continue;
+		}
+		const coordinate = resolved[0];
+		if (!coordinate) {
+			unresolvedHashes.push(sessionHash);
+			continue;
+		}
+		rows.push({
+			session_hash: sessionHash,
+			lane: coordinate.lane,
+			project_hash: projectFingerprint(coordinate.binding.projectPath),
+		});
+	}
+	return {
+		requested_hashes: new Set(requestedHashes).size,
+		resolved_hashes: rows.length,
+		rows,
+		ambiguous_hashes: ambiguousHashes,
+		unresolved_hashes: unresolvedHashes,
+		rule: "collision-free twelve-character session hash joined to a live session-project binding and readable project config",
+	};
 }
 
 function engineEvidence(
@@ -1612,6 +1695,7 @@ async function main(): Promise<void> {
 		const opencodeSchemaPresent =
 			tableExists(opencode, "session") && tableExists(opencode, "message");
 		const bindings = bindingRows(context);
+		const captureBindings = [...bindings, ...opencodeBindingRows(opencode)];
 		const report = {
 			method: {
 				sqlite_open_options: { readonly: true },
@@ -1619,6 +1703,10 @@ async function main(): Promise<void> {
 				opencode_schema_present: opencodeSchemaPresent,
 				after_ms: options.afterMs,
 			},
+			capture_lane_coordinates: captureLaneCoordinates(
+				captureBindings,
+				options.captureSessionHashes,
+			),
 			engine_truth: engineEvidence(
 				context,
 				store,

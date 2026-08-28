@@ -9593,6 +9593,11 @@ impl McHandler {
             .as_deref()
             .unwrap_or(&binding.config.model_chain);
         let child_session = child_session_id(&authority_project, command_id);
+        let classify_system_prompt = historian_prompt::with_content_language_directive(
+            CLASSIFY_SYSTEM_PROMPT,
+            binding.config.language.as_deref(),
+            historian_prompt::ContentLanguageDirectiveOptions::default(),
+        );
         let _dreamer_run_guard = self.register_dreamer_run(&child_session);
         let mut attempts = 0usize;
         let mut last_error = String::new();
@@ -9609,7 +9614,7 @@ impl McHandler {
             let started = producer
                 .start_with_generation(
                     &child_session,
-                    CLASSIFY_SYSTEM_PROMPT,
+                    classify_system_prompt.as_ref(),
                     prompt_body,
                     model,
                     CLASSIFY_MAX_OUTPUT_TOKENS,
@@ -24203,6 +24208,7 @@ mod tests {
         let route_root = project.to_str().unwrap();
         let mut route_binding = binding(route_root, "ses");
         route_binding.config.model_chain = vec!["test/base-dreamer".to_string()];
+        route_binding.config.language = Some("tr".to_string());
         handler.bind_route(7, route_binding);
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
@@ -24241,6 +24247,12 @@ mod tests {
             json!("test/profile-good-model")
         );
         assert_eq!(response["diagnostics"]["attempts"], json!(2));
+        let systems = producer.systems.lock().expect("systems mutex");
+        assert_eq!(systems.len(), 2);
+        assert!(systems
+            .iter()
+            .all(|system| system
+                .contains("Write human-readable prose you author in: Turkish (Türkçe).")));
     }
 
     #[tokio::test(flavor = "current_thread")]
