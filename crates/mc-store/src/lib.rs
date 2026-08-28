@@ -8493,6 +8493,8 @@ impl McStore {
                         0
                     }));
                 }
+                assignments.push("updated_at = ?".to_string());
+                values.push(rusqlite::types::Value::Integer(now_ms));
                 assignments.push("classified_at = ?".to_string());
                 values.push(rusqlite::types::Value::Integer(now_ms));
                 values.push(rusqlite::types::Value::Integer(update.memory_id));
@@ -16508,8 +16510,8 @@ fn set_memory_verification_tx(
             "verified" => {
                 tx.execute(
                     "UPDATE mc_memories
-                        SET verification_status = 'verified', verified_at = ?1
-                      WHERE id = ?2",
+                         SET verification_status = 'verified', verified_at = ?1, updated_at = ?1
+                       WHERE id = ?2",
                     params![now_ms, update.memory_id],
                 )?;
             }
@@ -21078,6 +21080,7 @@ mod tests {
                 100,
             )
             .unwrap();
+        assert_eq!(store.get_memory_full(1).unwrap().unwrap().updated_at, 100);
         let after = store
             .load_m1_revision_snapshot(own, own, "session", true, 100)
             .unwrap();
@@ -25414,6 +25417,7 @@ mod shadow_tests {
             )
             .unwrap();
         assert_eq!(result.accepted, vec![1]);
+        assert_eq!(store.get_memory_full(1).unwrap().unwrap().updated_at, 10);
         let verified_feed = store
             .pull_changefeed("memories", 0, 100)
             .unwrap()
