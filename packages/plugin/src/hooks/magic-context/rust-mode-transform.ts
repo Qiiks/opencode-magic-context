@@ -933,13 +933,17 @@ function authoritySeedRows(
                   db,
                   memoryRows.map((row) => Number(row.id)),
               )
-            : new Map<number, { files: string[]; hasSentinel: boolean }>();
+            : new Map<number, { files: string[]; hasSentinel: boolean; mappingOrigin: "mapper" }>();
     return memoryRows.map((snapshot) => {
         const id = Number(snapshot.id);
         const mapping = mappings.get(id);
         const seededSnapshot =
             domain === "memories" && mapping
-                ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
+                ? {
+                      ...snapshot,
+                      mapping: mapping.hasSentinel ? null : mapping.files,
+                      mapping_origin: mapping.mappingOrigin,
+                  }
                 : domain === "notes" && snapshot.project_path == null
                   ? { ...snapshot, project_path: projectPath }
                   : snapshot;

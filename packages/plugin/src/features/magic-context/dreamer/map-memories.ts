@@ -18,6 +18,7 @@ import {
     getMemoriesByProject,
     getMemoryVerifications,
     getUnmappedMemoryIds,
+    type MemoryMappingOrigin,
     normalizeVerificationFiles,
     recordMemoryMapping,
 } from "../memory";
@@ -148,11 +149,19 @@ function isTimeoutClassError(error: unknown): boolean {
  *  backing files was persisted as independent. A legitimately-independent
  *  memory that names no existing path is a bystander and is left alone. */
 export function shouldRequeueIndependentMapping(
-    state: { hasSentinel: boolean; files: readonly string[] },
+    state: {
+        hasSentinel: boolean;
+        files: readonly string[];
+        mappingOrigin?: MemoryMappingOrigin;
+    },
     content: string,
     repoDir: string,
 ): boolean {
     if (!state.hasSentinel || state.files.length > 0) return false;
+    // A host rejection is a durable disposition, not the mapper's unsupported
+    // independent choice. It can be reopened by a content rewrite that clears
+    // mappings, but retrying it every cron would recreate the rejected-path loop.
+    if (state.mappingOrigin === "host_rejected_fallback") return false;
     return extractMemoryCandidatePaths(content, repoDir).length > 0;
 }
 
@@ -462,10 +471,20 @@ async function applyParsedBatchMappings(
 
     // Pre-normalize each mapping's files OUTSIDE the transaction (path
     // normalization does git/realpath I/O). Independent → sentinel (empty set).
-    const planned: Array<{ id: number; files: string[]; independent: boolean }> = [];
+    const planned: Array<{
+        id: number;
+        files: string[];
+        independent: boolean;
+        mappingOrigin: MemoryMappingOrigin;
+    }> = [];
     for (const p of valid) {
         if (p.independent) {
-            planned.push({ id: p.id, files: [], independent: true });
+            planned.push({
+                id: p.id,
+                files: [],
+                independent: true,
+                mappingOrigin: "mapper",
+            });
             continue;
         }
         // The parser guarantees independent XOR files-present; a files-empty entry
@@ -479,10 +498,27 @@ async function applyParsedBatchMappings(
             cwd: args.sessionDirectory,
             files: p.files,
         });
-        // Drop a mapping whose paths all failed the existence/escape guard rather
-        // than writing a wrong (empty) one as if it were file-independent.
-        if (normalized.files.length === 0) continue;
-        planned.push({ id: p.id, files: normalized.files, independent: false });
+        if (normalized.files.length === 0) {
+            // Every mapper-supplied file was rejected by the host's containment or
+            // tracked-file checks. Persist a marked no-file disposition so this
+            // memory converges without claiming that the mapper chose independence.
+            log(
+                `[dreamer] map-memories: all ${p.files.length} path(s) for memory ${p.id} were rejected; recording host_rejected_fallback`,
+            );
+            planned.push({
+                id: p.id,
+                files: [],
+                independent: true,
+                mappingOrigin: "host_rejected_fallback",
+            });
+            continue;
+        }
+        planned.push({
+            id: p.id,
+            files: normalized.files,
+            independent: false,
+            mappingOrigin: "mapper",
+        });
     }
     if (planned.length === 0) return { mapped: 0, independent: 0 };
 
@@ -505,6 +541,7 @@ async function applyParsedBatchMappings(
                 memory_id: identity.moduleId,
                 content_hash_at_prompt: identity.normalizedHash,
                 mapped_files: item.independent ? null : item.files,
+                mapping_origin: item.mappingOrigin,
             };
         });
         let response: unknown;
@@ -551,7 +588,7 @@ async function applyParsedBatchMappings(
     const now = Date.now();
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
         for (const item of planned) {
-            recordMemoryMapping(args.db, item.id, item.files, now);
+            recordMemoryMapping(args.db, item.id, item.files, now, item.mappingOrigin);
             item.independent ? (independent += 1) : (mapped += 1);
         }
     });

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import {
@@ -9,11 +10,13 @@ import {
     getMemoriesByProject,
     getMemoryById,
     getMemoryMutationsForRender,
+    getMemoryVerifications,
     getProjectState,
     getUnclassifiedMemoryIds,
     insertMemory,
     insertMemoryIdempotent,
     normalizeStoredProjectPath,
+    recordMemoryMapping,
     setMemoryClassification,
 } from "../../features/magic-context";
 import {
@@ -116,6 +119,7 @@ function createTestDb(dbPath = ":memory:"): Database {
             file_path TEXT NOT NULL,
             verified_at INTEGER NOT NULL,
             mapped_at INTEGER NOT NULL DEFAULT 0,
+            mapping_origin TEXT NOT NULL DEFAULT 'mapper',
             PRIMARY KEY (memory_id, file_path)
         );
         CREATE INDEX IF NOT EXISTS idx_memory_verifications_memory ON memory_verifications(memory_id);
@@ -1165,6 +1169,7 @@ describe("createCtxMemoryTools", () => {
                 category: "CONFIG_DEFAULTS",
                 content: "cache_ttl=5m",
             });
+            recordMemoryMapping(db, memory.id, [], 1_000, "host_rejected_fallback");
 
             const result = await tools.ctx_memory.execute(
                 {
@@ -1177,6 +1182,7 @@ describe("createCtxMemoryTools", () => {
 
             expect(result).toContain(`Updated memory [ID: ${memory.id}]`);
             expect(getMemoryById(db, memory.id)?.content).toBe("cache_ttl=10m");
+            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
             expect(getProjectMemoryEpoch(db, "/repo/project")).toBe(0);
             expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
                 {

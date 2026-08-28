@@ -25,30 +25,18 @@ function seedAppliedVersion(db: Database, version: number): void {
 
 function columnNames(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
-        (row) => row.name,
+        (column) => column.name,
     );
 }
 
-describe("migration v81: durable last-known-good transform snapshots", () => {
-    test("fresh databases include the lkg_slots table and align the schema fence", () => {
+describe("migration v82: memory mapping origin", () => {
+    test("fresh databases record mapping origins and align the schema fence", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
             runMigrations(db);
 
-            expect(columnNames(db, "lkg_slots")).toEqual([
-                "session_id",
-                "json_prefix",
-                "input_id_seq",
-                "input_content_digests",
-                "input_content_signatures",
-                "last_input_message_id",
-                "model_key",
-                "provider_key",
-                "captured_at",
-                "row_version",
-                "capture_sequence",
-            ]);
+            expect(columnNames(db, "memory_verifications")).toContain("mapping_origin");
             expect(LATEST_SUPPORTED_VERSION).toBe(82);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
@@ -56,24 +44,34 @@ describe("migration v81: durable last-known-good transform snapshots", () => {
         }
     });
 
-    test("creates the table on upgrade and remains idempotent", () => {
+    test("upgrades existing mappings to the conservative mapper origin idempotently", () => {
         const db = new Database(":memory:");
         try {
-            seedAppliedVersion(db, 80);
+            db.exec(`
+                CREATE TABLE memory_verifications (
+                    memory_id INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    verified_at INTEGER NOT NULL,
+                    mapped_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (memory_id, file_path)
+                );
+                INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                VALUES (1, '', 0, 1000);
+            `);
+            seedAppliedVersion(db, 81);
 
             runMigrations(db);
             runMigrations(db);
 
+            expect(columnNames(db, "memory_verifications")).toContain("mapping_origin");
             expect(
                 db
-                    .prepare(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='lkg_slots'",
-                    )
+                    .prepare("SELECT mapping_origin FROM memory_verifications WHERE memory_id = 1")
                     .get(),
-            ).toEqual({ name: "lkg_slots" });
+            ).toEqual({ mapping_origin: "mapper" });
             expect(
                 db
-                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 81")
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 82")
                     .get(),
             ).toEqual({ count: 1 });
         } finally {
