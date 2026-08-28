@@ -1099,6 +1099,53 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
 
+        it("refuses Rust partial recomp and session upgrade without touching either authority store", async () => {
+            const sendNotification = mock(async () => {});
+            const moduleCall = mock(async () => ({ disposition: "started" }));
+            const runUpgrade = mock(async () => "TS upgrade ran");
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: { call: moduleCall },
+                runUpgrade,
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    {
+                        command: "ctx-recomp",
+                        sessionID: "ses-rust-maintenance",
+                        arguments: "10-20",
+                    },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
+            );
+            await expectSentinel(
+                handler["command.execute.before"](
+                    {
+                        command: "ctx-session-upgrade",
+                        sessionID: "ses-rust-maintenance",
+                        arguments: "",
+                    },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-SESSION-UPGRADE_HANDLED__",
+            );
+
+            expect(moduleCall).not.toHaveBeenCalled();
+            expect(runUpgrade).not.toHaveBeenCalled();
+            const text = (sendNotification.mock.calls as unknown as Array<[string, string]>)
+                .map(([, notification]) => notification)
+                .join("\n");
+            expect(text).toContain("module supports only a full-session recomp");
+            expect(text).toContain("switch authority through the documented drain flow");
+        });
+
         it("maps every shared wrapup state cell to the TypeScript outcome contract", async () => {
             const matrix = [
                 {
@@ -1165,7 +1212,8 @@ describe("createMagicContextCommandHandler", () => {
                 if (row.disposition !== "already_in_progress") {
                     expect(text, row.cell).toContain(`matrix:${row.cell}`);
                 }
-                if (row.forbiddenHeading) expect(text, row.cell).not.toContain(row.forbiddenHeading);
+                if (row.forbiddenHeading)
+                    expect(text, row.cell).not.toContain(row.forbiddenHeading);
                 if (row.disposition === "retryable") {
                     expect(text, row.cell).toContain("Run /ctx-wrapup again to continue.");
                     expect(text, row.cell).not.toContain("— Failed");

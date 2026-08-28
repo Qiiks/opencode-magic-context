@@ -18,6 +18,37 @@ DATE = "2026-08-27"
 
 
 class AuditTransformWireParityTest(unittest.TestCase):
+    def test_historian_producer_contract_is_exact_and_non_vacuous(self) -> None:
+        module = runpy.run_path(str(SCRIPT))
+        contract = module["summarize_historian_producer_contract"](ROOT)
+        self.assertEqual(contract["unexplained_invariants"], [])
+        self.assertEqual(
+            contract["calibration"]["ts"],
+            {
+                "temperature": 0.1,
+                "max_output_tokens": 32_000,
+                "await_timeout_ms": 600_000,
+            },
+        )
+        self.assertEqual(contract["request_shape"]["pi"], ["system", "user"])
+        self.assertEqual(contract["request_shape"]["rust"], ["system", "user"])
+        self.assertEqual(contract["reference_selection"]["ts"]["rotating_seed_floor"], 4)
+        self.assertEqual(contract["reference_selection"]["rust"]["session_recency_window"], 6)
+
+        mural = module["summarize_mural_compose_contract"](ROOT)
+        self.assertEqual(mural["unexplained_invariants"], [])
+        self.assertEqual(mural["ts"]["sha256"], mural["rust"]["sha256"])
+        self.assertEqual(
+            module["summarize_wrapup_contract"](ROOT)["unexplained_invariants"], []
+        )
+
+        broken = json.loads(json.dumps(contract))
+        broken["calibration"]["ts"]["temperature"] = 1.0
+        self.assertEqual(
+            module["historian_producer_invariants"](broken),
+            ["historian_ts_calibration_triple_diverges"],
+        )
+
     def test_live_leg_5_preserves_the_specific_tag_total_failure_class(self) -> None:
         module = runpy.run_path(str(SCRIPT))
         verdicts = module["live_leg_verdicts"](
@@ -148,6 +179,22 @@ class AuditTransformWireParityTest(unittest.TestCase):
             self.assertEqual(rust["status"], "label_corrected_from_live_config")
             self.assertEqual(ts["configured_lane"], "ts")
             self.assertEqual(report["excluded_unverified_dumps"], [])
+            mural = report["mural_compose_contract"]
+            self.assertEqual(mural["unexplained_invariants"], [])
+            self.assertEqual(mural["ts"]["sha256"], mural["rust"]["sha256"])
+            self.assertEqual(report["wrapup_contract"]["unexplained_invariants"], [])
+            self.assertEqual(report["unexplained_bucket"]["count"], 0)
+
+            producer = report["historian_producer_contract"]
+            self.assertEqual(producer["unexplained_invariants"], [])
+            self.assertEqual(producer["request_shape"]["ts"], ["system", "user"])
+            self.assertEqual(producer["request_shape"]["pi"], ["system", "user"])
+            self.assertEqual(producer["request_shape"]["rust"], ["system", "user"])
+            self.assertEqual(
+                producer["system_prompt"]["ts_sha256"],
+                producer["system_prompt"]["rust_sha256"],
+            )
+
             provider_matrix = report["provider_matrix_parity"]
             self.assertEqual(provider_matrix["unexplained_byte_classes"], [])
             self.assertEqual(provider_matrix["unexplained_wire_invariants"], [])

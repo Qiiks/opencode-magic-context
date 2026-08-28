@@ -3316,6 +3316,296 @@ def compare_ctx_facades(dumps: list[Dump]) -> dict[str, Any]:
     }
 
 
+def historian_producer_invariants(contract: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    system = contract.get("system_prompt", {})
+    if (
+        system.get("ts_sha256") != system.get("pi_sha256")
+        or system.get("ts_sha256") != system.get("rust_sha256")
+        or system.get("ts_bytes") != system.get("pi_bytes")
+        or system.get("ts_bytes") != system.get("rust_bytes")
+    ):
+        result.append("historian_system_prompt_bytes_diverge")
+    calibration = contract.get("calibration", {})
+    expected = {"temperature": 0.1, "max_output_tokens": 32_000, "await_timeout_ms": 600_000}
+    for lane in ("ts", "pi", "rust"):
+        if calibration.get(lane) != expected:
+            result.append(f"historian_{lane}_calibration_triple_diverges")
+    shape = contract.get("request_shape", {})
+    for lane in ("ts", "pi", "rust"):
+        if shape.get(lane) != ["system", "user"]:
+            result.append(f"historian_{lane}_request_shape_not_clean_two_message")
+    model_resolution = contract.get("model_resolution", {})
+    for field in (
+        "ts_harness_scoped",
+        "ts_per_entry_qualifiers",
+        "pi_harness_profile",
+        "rust_host_wire_chain",
+        "rust_module_profile_chain",
+    ):
+        if model_resolution.get(field) is not True:
+            result.append(f"historian_model_resolution_missing_{field}")
+    references = contract.get("reference_selection", {})
+    for lane in ("ts", "pi", "rust"):
+        if references.get(lane) != {
+            "rotating_seed_floor": 4,
+            "session_recency_window": 6,
+            "project_memory_for_dedup": True,
+        }:
+            result.append(f"historian_{lane}_reference_selection_diverges")
+    return result
+
+
+def summarize_wrapup_contract(root: Path) -> dict[str, Any]:
+    ts_source_path = root / "packages/plugin/src/hooks/magic-context/wrapup-orchestrator.ts"
+    ts_test_path = root / "packages/plugin/src/hooks/magic-context/command-handler.test.ts"
+    rust_source_path = root / "crates/mc-module/src/lib.rs"
+    ts_source = ts_source_path.read_text() if ts_source_path.exists() else ""
+    ts_tests = ts_test_path.read_text() if ts_test_path.exists() else ""
+    rust_source = rust_source_path.read_text() if rust_source_path.exists() else ""
+    dispositions = ["completed", "nothing_to_compact", "retryable", "failed"]
+    ts_dispositions = [value for value in dispositions if value in ts_source or value in ts_tests]
+    rust_dispositions = [value for value in dispositions if value in rust_source]
+    invariants: list[str] = []
+    if ts_dispositions != dispositions:
+        invariants.append("wrapup_ts_disposition_vocabulary_diverges")
+    if rust_dispositions != dispositions:
+        invariants.append("wrapup_rust_disposition_vocabulary_diverges")
+    if "for (;;)" not in ts_source or "historianChunkTokens" not in ts_source:
+        invariants.append("wrapup_ts_sequential_chunk_loop_missing")
+    if "wrapup_sessions.lock()" not in rust_source:
+        invariants.append("wrapup_rust_session_lease_missing")
+    if "maps every shared wrapup state cell" not in ts_tests:
+        invariants.append("wrapup_shared_fixture_matrix_missing")
+    if "session_wrapup_drains_beyond_five_rounds_to_the_keep_watermark" not in rust_source:
+        invariants.append("wrapup_rust_full_drain_fixture_missing")
+    return {
+        "evidence_kind": "merged_source_and_matched_fixture_contract_not_deployed_runtime",
+        "ts": {
+            "sequential_round_loop": "for (;;)" in ts_source,
+            "token_capped_chunks": "historianChunkTokens" in ts_source,
+            "lease": "acquireCompartmentLease" in ts_source,
+            "dispositions": ts_dispositions,
+        },
+        "rust": {
+            "sequential_round_loop": "session_wrapup_drains_beyond_five_rounds" in rust_source,
+            "token_capped_chunks": "prepare_historian_action" in rust_source,
+            "lease": "wrapup_sessions.lock()" in rust_source,
+            "dispositions": rust_dispositions,
+        },
+        "shared_fixture_matrix": "maps every shared wrapup state cell" in ts_tests,
+        "unexplained_invariants": invariants,
+    }
+
+
+def summarize_mural_compose_contract(root: Path) -> dict[str, Any]:
+    block = "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>"
+    ts_path = root / "packages/plugin/src/hooks/magic-context/inject-compartments.ts"
+    rust_path = root / "crates/mc-module/src/m0_compose.rs"
+    ts_source = ts_path.read_text() if ts_path.exists() else ""
+    rust_source = rust_path.read_text() if rust_path.exists() else ""
+    ts_present = block.replace("\n", "\\n") in ts_source
+    rust_present = block.replace("\n", "\\n") in rust_source
+    ts_bytes = block.encode() if ts_present else b""
+    rust_bytes = block.encode() if rust_present else b""
+    invariants: list[str] = []
+    if not ts_present or not rust_present or ts_bytes != rust_bytes:
+        invariants.append("mural_m0_block_bytes_diverge")
+    if 'sections.join("\\n\\n")' not in ts_source:
+        invariants.append("mural_ts_m0_separator_diverges")
+    if "m0_bytes.push_str(\"\\n\\n\")" not in rust_source:
+        invariants.append("mural_rust_m0_separator_diverges")
+    return {
+        "evidence_kind": "merged_source_contract_not_deployed_runtime",
+        "ts": {
+            "sha256": hashlib.sha256(ts_bytes).hexdigest() if ts_bytes else None,
+            "bytes": len(ts_bytes),
+            "host_artifact_pool": "mural_manifest",
+        },
+        "rust": {
+            "sha256": hashlib.sha256(rust_bytes).hexdigest() if rust_bytes else None,
+            "bytes": len(rust_bytes),
+            "host_artifact_pool": "mc_project_mural_artifacts",
+        },
+        "shared_gate": ["memory_enabled", "mural_enabled", "supports_vision", "data_url_present"],
+        "unexplained_invariants": invariants,
+    }
+
+
+def summarize_historian_producer_contract(root: Path) -> dict[str, Any]:
+    ts_runtime = """
+import { createHash } from 'node:crypto';
+import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from './packages/plugin/src/hooks/magic-context/historian-prompt.generated.ts';
+import { resolveHistorianAgentOverrides } from './packages/plugin/src/shared/model-resolution.ts';
+const bytes = Buffer.from(COMPARTMENT_AGENT_SYSTEM_PROMPT);
+console.log(JSON.stringify({
+  sha256: createHash('sha256').update(bytes).digest('hex'),
+  bytes: bytes.byteLength,
+  generation: resolveHistorianAgentOverrides({}),
+}));
+"""
+    completed = subprocess.run(
+        ["bun", "-e", ts_runtime],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        ts = json.loads(completed.stdout) if completed.returncode == 0 else {}
+    except json.JSONDecodeError:
+        ts = {}
+
+    rust_prompt_path = root / "crates/mc-module/testdata/historian-system-prompt.txt"
+    rust_prompt = rust_prompt_path.read_bytes() if rust_prompt_path.exists() else b""
+    rust_producer_path = root / "crates/mc-module/src/historian_producer.rs"
+    rust_producer = rust_producer_path.read_text() if rust_producer_path.exists() else ""
+    ts_producer_path = (
+        root
+        / "packages/plugin/src/hooks/magic-context/compartment-runner-historian.ts"
+    )
+    ts_producer = ts_producer_path.read_text() if ts_producer_path.exists() else ""
+    ts_prompt_path = root / "packages/plugin/src/hooks/magic-context/compartment-prompt.ts"
+    ts_prompt_source = ts_prompt_path.read_text() if ts_prompt_path.exists() else ""
+    rust_prompt_source_path = root / "crates/mc-module/src/historian_prompt.rs"
+    rust_prompt_source = (
+        rust_prompt_source_path.read_text() if rust_prompt_source_path.exists() else ""
+    )
+    pi_runner_path = root / "packages/pi-plugin/src/pi-historian-runner.ts"
+    pi_runner_source = pi_runner_path.read_text() if pi_runner_path.exists() else ""
+    pi_subagent_path = root / "packages/pi-plugin/src/subagent-runner.ts"
+    pi_subagent_source = pi_subagent_path.read_text() if pi_subagent_path.exists() else ""
+    pi_index_path = root / "packages/pi-plugin/src/index.ts"
+    pi_index_source = pi_index_path.read_text() if pi_index_path.exists() else ""
+    ts_reference_path = (
+        root / "packages/plugin/src/hooks/magic-context/reference-retrieval.ts"
+    )
+    ts_reference = ts_reference_path.read_text() if ts_reference_path.exists() else ""
+    ts_model_path = root / "packages/plugin/src/shared/model-resolution.ts"
+    ts_model_source = ts_model_path.read_text() if ts_model_path.exists() else ""
+    rust_config_path = root / "crates/mc-module/src/config.rs"
+    rust_config_source = rust_config_path.read_text() if rust_config_path.exists() else ""
+    rust_handler_path = root / "crates/mc-module/src/lib.rs"
+    rust_handler_source = rust_handler_path.read_text() if rust_handler_path.exists() else ""
+
+    generation = ts.get("generation", {}) if isinstance(ts.get("generation"), dict) else {}
+    ts_calibration = {
+        "temperature": generation.get("temperature"),
+        "max_output_tokens": generation.get("maxTokens"),
+        "await_timeout_ms": 600_000 if "DEFAULT_HISTORIAN_TIMEOUT_MS" in ts_producer else None,
+    }
+    rust_calibration = {
+        "temperature": 0.1 if "HISTORIAN_TEMPERATURE: f64 = 0.1" in rust_producer else None,
+        "max_output_tokens": (
+            32_000 if "HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000" in rust_producer else None
+        ),
+        "await_timeout_ms": (
+            600_000
+            if "DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(600)" in rust_producer
+            else None
+        ),
+    }
+    contract = {
+        "evidence_kind": "merged_source_contract_not_deployed_runtime",
+        "system_prompt": {
+            "ts_sha256": ts.get("sha256"),
+            "ts_bytes": ts.get("bytes"),
+            "pi_sha256": (
+                ts.get("sha256")
+                if "COMPARTMENT_AGENT_SYSTEM_PROMPT" in pi_runner_source
+                else None
+            ),
+            "pi_bytes": (
+                ts.get("bytes") if "COMPARTMENT_AGENT_SYSTEM_PROMPT" in pi_runner_source else None
+            ),
+            "rust_sha256": hashlib.sha256(rust_prompt).hexdigest() if rust_prompt else None,
+            "rust_bytes": len(rust_prompt),
+        },
+        "calibration": {
+            "ts": ts_calibration,
+            "pi": {
+                "temperature": (
+                    0.1
+                    if "temperature = 0.1" in pi_runner_source
+                    and "HISTORIAN_CALIBRATION_ENTRY_PATH" in pi_subagent_source
+                    and "MAGIC_CONTEXT_HISTORIAN_TEMPERATURE" in pi_subagent_source
+                    else None
+                ),
+                "max_output_tokens": (
+                    32_000
+                    if "maxOutputTokens = 32_000" in pi_runner_source
+                    and "MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS" in pi_subagent_source
+                    else None
+                ),
+                "await_timeout_ms": (
+                    600_000 if "DEFAULT_HISTORIAN_TIMEOUT_MS" in pi_runner_source else None
+                ),
+            },
+            "rust": rust_calibration,
+        },
+        "request_shape": {
+            "ts": (
+                ["system", "user"]
+                if "agent: agentId" in ts_producer
+                and "parts: [{ type: \"text\", text: prompt" in ts_producer
+                else []
+            ),
+            "pi": (
+                ["system", "user"]
+                if 'args.push("--system-prompt", opts.systemPromptPath)' in pi_subagent_source
+                and "args.push(options.userMessage)" in pi_subagent_source
+                else []
+            ),
+            "rust": (
+                ["system", "user"]
+                if 'params.insert("prompt".into(), json!(prompt))' in rust_producer
+                and 'params.insert("system".into(), json!(system))' in rust_producer
+                else []
+            ),
+        },
+        "reference_selection": {
+            "ts": {
+                "rotating_seed_floor": 4 if "SEED_FLOOR = 4" in ts_reference else None,
+                "session_recency_window": (
+                    6 if "SESSION_REF_WINDOW = 6" in ts_reference else None
+                ),
+                "project_memory_for_dedup": "projectMemory" in ts_prompt_source,
+            },
+            "pi": {
+                "rotating_seed_floor": (
+                    4 if "buildReferenceBlocks" in pi_runner_source else None
+                ),
+                "session_recency_window": (
+                    6 if "buildReferenceBlocks" in pi_runner_source else None
+                ),
+                "project_memory_for_dedup": "projectMemory" in pi_runner_source,
+            },
+            "rust": {
+                "rotating_seed_floor": (
+                    4 if "SEED_FLOOR: usize = 4" in rust_prompt_source else None
+                ),
+                "session_recency_window": (
+                    6 if "SESSION_REF_WINDOW: usize = 6" in rust_prompt_source else None
+                ),
+                "project_memory_for_dedup": "project_memory" in rust_prompt_source,
+            },
+        },
+        "model_resolution": {
+            "ts_harness_scoped": "historian?.[harness]" in ts_model_source,
+            "ts_per_entry_qualifiers": "sameAttempt(candidate, entry)" in ts_model_source,
+            "pi_harness_profile": 'resolveHistorianModel(config, "pi")' in pi_index_source,
+            "rust_host_wire_chain": "historian_model_chain" in rust_handler_source,
+            "rust_module_profile_chain": (
+                "/historian/module_model" in rust_config_source
+                and "/historian/module_fallback_models" in rust_config_source
+            ),
+            "comparison_rule": "model ids and qualifiers are compared within each harness/profile value space",
+        },
+    }
+    contract["unexplained_invariants"] = historian_producer_invariants(contract)
+    return contract
+
+
 LIVE_PROVIDER_FAMILIES = (
     "anthropic:anthropic",
     "bedrock:anthropic",
@@ -3500,7 +3790,13 @@ def live_ledger_report(path: Path | None) -> dict[str, Any]:
     }
 
 
-def live_leg_verdicts(provider: dict[str, Any], probe: dict[str, Any]) -> list[dict[str, Any]]:
+def live_leg_verdicts(
+    provider: dict[str, Any],
+    probe: dict[str, Any],
+    producer: dict[str, Any] | None = None,
+    mural: dict[str, Any] | None = None,
+    wrapup: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if probe.get("status") == "failed":
         return [
             {
@@ -3516,6 +3812,10 @@ def live_leg_verdicts(provider: dict[str, Any], probe: dict[str, Any]) -> list[d
                 (4, 5),
                 (5, 7),
                 (6, "1-4"),
+                (7, 11),
+                (8, 11),
+                (9, 11),
+                (10, 11),
             )
         ]
 
@@ -3571,6 +3871,12 @@ def live_leg_verdicts(provider: dict[str, Any], probe: dict[str, Any]) -> list[d
     if operator.get("coverage", {}).get("observed_lanes", 0) < 2:
         operator_classes.append("missing_live_operator_lane")
 
+    producer_classes = list((producer or {}).get("unexplained_invariants", []))
+    maintenance_classes = list(probe.get("maintenance", {}).get("unexplained_invariants", []))
+    maintenance_gaps = list(probe.get("maintenance", {}).get("coverage_gaps", []))
+    mural_classes = list((mural or {}).get("unexplained_invariants", []))
+    wrapup_classes = list((wrapup or {}).get("unexplained_invariants", []))
+
     decisions = probe.get("decision_window", {})
     decision_classes = [
         str(row.get("class")) for row in decisions.get("unexplained_invariants", [])
@@ -3582,22 +3888,32 @@ def live_leg_verdicts(provider: dict[str, Any], probe: dict[str, Any]) -> list[d
     if decisions.get("scheduler_history", {}).get("rows", 0) == 0:
         decision_classes.append("zero_scheduler_history_rows")
 
-    return [
-        {
-            "leg": leg,
-            "origin_hunt": origin,
-            "verdict": "CLOSED" if not classes else "FINDING",
-            "classes": sorted(set(filter(None, classes))),
-        }
-        for leg, origin, classes in (
-            (1, 6, engine_classes),
-            (2, 8, caveman_classes),
-            (3, 8, provider_classes),
-            (4, 5, pi_classes),
-            (5, 7, operator_classes),
-            (6, "1-4", decision_classes),
+    rows = []
+    for leg, origin, classes in (
+        (1, 6, engine_classes),
+        (2, 8, caveman_classes),
+        (3, 8, provider_classes),
+        (4, 5, pi_classes),
+        (5, 7, operator_classes),
+        (6, "1-4", decision_classes),
+        (7, 11, producer_classes),
+        (8, 11, maintenance_classes),
+        (9, 11, mural_classes),
+        (10, 11, wrapup_classes),
+    ):
+        coverage_gaps = maintenance_gaps if leg == 8 else []
+        rows.append(
+            {
+                "leg": leg,
+                "origin_hunt": origin,
+                "verdict": (
+                    "FINDING" if classes else "GAP" if coverage_gaps else "CLOSED"
+                ),
+                "classes": sorted(set(filter(None, classes))),
+                "coverage_gaps": sorted(set(filter(None, coverage_gaps))),
+            }
         )
-    ]
+    return rows
 
 
 def run_live(args: argparse.Namespace) -> None:
@@ -3617,9 +3933,19 @@ def run_live(args: argparse.Namespace) -> None:
         dumps, expected_rust_sessions, config_overrides
     )
     provider = live_provider_report(dumps)
+    source_root = Path(__file__).resolve().parent.parent
+    producer_contract = summarize_historian_producer_contract(source_root)
+    mural_contract = summarize_mural_compose_contract(source_root)
+    wrapup_contract = summarize_wrapup_contract(source_root)
     after_ms = parse_bound(args.after, args.date)
     engine_after_ms = parse_bound(args.engine_after or args.after, args.date)
     probe = invoke_live_probe(args, after_ms, engine_after_ms)
+    unexplained_by_axis = {
+        "historian_producer": producer_contract["unexplained_invariants"],
+        "maintenance": probe.get("maintenance", {}).get("unexplained_invariants", []),
+        "mural_compose": mural_contract["unexplained_invariants"],
+        "wrapup": wrapup_contract["unexplained_invariants"],
+    }
     report = {
         "method": {
             "mode": "live",
@@ -3637,9 +3963,18 @@ def run_live(args: argparse.Namespace) -> None:
             "sqlite_contract": {"readonly": True},
         },
         "provider_live": provider,
+        "historian_producer_contract": producer_contract,
+        "mural_compose_contract": mural_contract,
+        "wrapup_contract": wrapup_contract,
+        "unexplained_bucket": {
+            "by_axis": unexplained_by_axis,
+            "count": sum(len(values) for values in unexplained_by_axis.values()),
+        },
         "window_report_ledger_live": live_ledger_report(args.window_report_ledger),
         "live_probe": probe,
-        "leg_verdicts": live_leg_verdicts(provider, probe),
+        "leg_verdicts": live_leg_verdicts(
+            provider, probe, producer_contract, mural_contract, wrapup_contract
+        ),
     }
     print(json.dumps(report, ensure_ascii=False, indent=args.indent, sort_keys=True))
 
@@ -3691,6 +4026,19 @@ def main() -> None:
         lane: summarize_lane([dump for dump in dumps if dump.lane == lane])
         for lane in ("rust", "ts", "pi")
     }
+    provider_matrix = compare_provider_matrix(dumps)
+    facade_parity = compare_ctx_facades(dumps)
+    source_root = Path(__file__).resolve().parent.parent
+    producer_contract = summarize_historian_producer_contract(source_root)
+    mural_contract = summarize_mural_compose_contract(source_root)
+    wrapup_contract = summarize_wrapup_contract(source_root)
+    unexplained_by_axis = {
+        "served_provider_wire": provider_matrix["unexplained_byte_classes"],
+        "ctx_facade": facade_parity["unexplained_byte_classes"],
+        "historian_producer": producer_contract["unexplained_invariants"],
+        "mural_compose": mural_contract["unexplained_invariants"],
+        "wrapup": wrapup_contract["unexplained_invariants"],
+    }
     report = {
         "method": {
             "date": args.date,
@@ -3721,11 +4069,18 @@ def main() -> None:
         "ts_pi_cross_harness_parity": compare_ts_pi_axes(
             lane_summaries["ts"], lane_summaries["pi"]
         ),
-        "provider_matrix_parity": compare_provider_matrix(dumps),
+        "provider_matrix_parity": provider_matrix,
+        "historian_producer_contract": producer_contract,
+        "mural_compose_contract": mural_contract,
+        "wrapup_contract": wrapup_contract,
+        "unexplained_bucket": {
+            "by_axis": unexplained_by_axis,
+            "count": sum(len(values) for values in unexplained_by_axis.values()),
+        },
         "excluded_unverified_dumps": [
             dump.path.name for dump in dumps if dump.lane == "unverified"
         ],
-        "ctx_facade_parity": compare_ctx_facades(dumps),
+        "ctx_facade_parity": facade_parity,
     }
     if args.context_db is not None or args.store_db is not None:
         report["engine_adjacent_state"] = summarize_engine_adjacent_state(

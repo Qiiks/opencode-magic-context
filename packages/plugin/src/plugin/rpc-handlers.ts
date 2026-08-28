@@ -2,6 +2,8 @@
  * Server-side RPC handlers. Queries the server's own SQLite DB
  * and returns typed responses for TUI consumption.
  */
+import { randomUUID } from "node:crypto";
+
 import { isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
 import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
@@ -39,6 +41,7 @@ import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-statu
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
+import { RUST_SESSION_UPGRADE_REFUSAL } from "../hooks/magic-context/maintenance-authority";
 import {
     findLastAssistantModelFromOpenCodeDb,
     openCodeDbExists,
@@ -72,6 +75,30 @@ import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 // the next poll cold-starts from the persisted session_meta value's session by
 // re-folding once, which is the acceptable one-time cost design A accepts.
 const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
+export async function executeRustRecompRpc(
+    moduleClient: RustModeModuleClient | undefined,
+    sessionId: string,
+    projectRoot: string,
+): Promise<{ ok: boolean; error?: string }> {
+    if (!moduleClient) return { ok: false, error: "Rust module client is unavailable" };
+    try {
+        await moduleClient.call({
+            sessionId,
+            projectRoot,
+            method: "session.recomp",
+            body: {
+                method: "session.recomp",
+                v: 1,
+                session_id: sessionId,
+                command_id: `rpc-recomp:${randomUUID()}`,
+            },
+        });
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
     tail_hygiene?: WireTailHygieneBaseline | null;
@@ -1017,15 +1044,9 @@ export function registerRpcHandlers(
         return { count: buildCompartmentCount(db, sessionId, moduleStatus) };
     });
 
-    // ── Recomp / session-upgrade: delegate to the shared orchestrator ───────
-    // The RPC dialog paths ("/ctx-recomp" + "Run upgrade now") run through the
-    // SAME runManagedRecomp/runManagedUpgrade as the /ctx-* command paths, so
-    // they get identical model fallback, live progress, terminal state, and
-    // clean messaging. Dogfood 2026-05-30: the old RPC upgrade handler lacked
-    // model fallback (failed when the primary historian model returned empty,
-    // while /ctx-session-upgrade succeeded via fallback) and the command path
-    // lacked progress (left the sidebar stuck on a stale "failed"). One runner
-    // closes both gaps permanently.
+    // Under TypeScript authority, the RPC dialogs share the same recomp/upgrade
+    // orchestrators as /ctx-* commands. Rust authority branches below: recomp goes
+    // to session.recomp, while session upgrade refuses because the module owns state.
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
@@ -1061,6 +1082,10 @@ export function registerRpcHandlers(
     rpcServer.handle("recomp", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        const dir = String(params.directory ?? directory);
+        if (config.transform_mode === "rust") {
+            return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
+        }
         const db = getDb();
         if (!db) return { ok: false, error: "db unavailable" };
 
@@ -1091,6 +1116,9 @@ export function registerRpcHandlers(
     rpcServer.handle("upgrade", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        if (config.transform_mode === "rust") {
+            return { ok: false, error: RUST_SESSION_UPGRADE_REFUSAL };
+        }
         const db = getDb();
         if (!db) return { ok: false, error: "db unavailable" };
 

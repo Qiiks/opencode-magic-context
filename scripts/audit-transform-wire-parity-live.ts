@@ -1427,6 +1427,83 @@ async function operatorEvidence(
 	};
 }
 
+function maintenanceDistribution(
+	db: Database,
+	table: string,
+	afterMs: number,
+): { rows: number; dispositions: Record<string, number>; rounds: number } {
+	if (!tableExists(db, table)) return { rows: 0, dispositions: {}, rounds: 0 };
+	const tableColumns = columns(db, table);
+	const hasDisposition = tableColumns.has("disposition");
+	const hasRounds = tableColumns.has("rounds");
+	const selected = [
+		hasDisposition ? "disposition" : "NULL AS disposition",
+		hasRounds ? "rounds" : "0 AS rounds",
+	].join(", ");
+	const rows = db
+		.query(`SELECT ${selected} FROM "${table}" WHERE created_at >= ?`)
+		.all(afterMs) as Row[];
+	const dispositions: Record<string, number> = {};
+	let rounds = 0;
+	for (const row of rows) {
+		const disposition = String(row.disposition ?? "recorded");
+		dispositions[disposition] = (dispositions[disposition] ?? 0) + 1;
+		rounds += Number(row.rounds ?? 0) || 0;
+	}
+	return { rows: rows.length, dispositions, rounds };
+}
+
+export function maintenanceCoverageGaps(evidence: {
+	recomp: { rows: number };
+	wrapup: { rows: number };
+	dreamer_appliers: { rows: number };
+}): string[] {
+	const gaps: string[] = [];
+	if (evidence.recomp.rows === 0) gaps.push("zero_live_rust_recomp_commands");
+	if (evidence.wrapup.rows === 0) gaps.push("zero_live_rust_wrapup_commands");
+	if (evidence.dreamer_appliers.rows === 0)
+		gaps.push("zero_live_rust_dreamer_apply_commands");
+	return gaps.sort();
+}
+
+export function maintenanceFailureClasses(evidence: {
+	recomp: { rows: number; dispositions: Record<string, number> };
+	wrapup: { rows: number; dispositions: Record<string, number> };
+	dreamer_appliers: { rows: number };
+}): string[] {
+	const classes: string[] = [];
+	for (const disposition of Object.keys(evidence.recomp.dispositions)) {
+		if (!["started", "already_in_progress", "nothing_to_do"].includes(disposition))
+			classes.push("unknown_rust_recomp_disposition");
+	}
+	for (const disposition of Object.keys(evidence.wrapup.dispositions)) {
+		if (!["completed", "nothing_to_compact", "failed"].includes(disposition))
+			classes.push("unknown_rust_wrapup_disposition");
+	}
+	return [...new Set(classes)].sort();
+}
+
+function maintenanceEvidence(store: Database, afterMs: number): Record<string, unknown> {
+	const recomp = maintenanceDistribution(store, "mc_recomp_commands", afterMs);
+	const wrapup = maintenanceDistribution(store, "mc_wrapup_commands", afterMs);
+	const dreamer = maintenanceDistribution(store, "mc_dream_task_commands", afterMs);
+	const evidence = {
+		cutoff_ms: afterMs,
+		recomp,
+		wrapup,
+		dreamer_appliers: dreamer,
+	};
+	return {
+		...evidence,
+		coverage_gaps: maintenanceCoverageGaps({
+			recomp,
+			wrapup,
+			dreamer_appliers: dreamer,
+		}),
+		unexplained_invariants: maintenanceFailureClasses(evidence),
+	};
+}
+
 function decisionEvidence(
 	context: Database,
 	store: Database,
@@ -1571,6 +1648,7 @@ async function main(): Promise<void> {
 				bindings,
 				options.afterMs,
 			),
+			maintenance: maintenanceEvidence(store, options.afterMs),
 		};
 		process.stdout.write(`${JSON.stringify(report)}\n`);
 	} finally {

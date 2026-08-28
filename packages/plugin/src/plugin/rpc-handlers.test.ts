@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
@@ -23,6 +23,7 @@ import {
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
+    executeRustRecompRpc,
     loadRustSessionStatus,
 } from "./rpc-handlers";
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
@@ -37,6 +38,38 @@ function createTestDb(): Database {
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+});
+
+describe("Rust maintenance RPC routing", () => {
+    test("routes recomp to the module with a replay-safe command id", async () => {
+        const call = mock(async () => ({ ok: true, disposition: "started" }));
+
+        expect(
+            await executeRustRecompRpc(
+                { call } as unknown as RustModeModuleClient,
+                "ses-rust-recomp-rpc",
+                "/fixture/project",
+            ),
+        ).toEqual({ ok: true });
+        expect(call).toHaveBeenCalledTimes(1);
+        expect(call.mock.calls[0]?.[0]).toMatchObject({
+            sessionId: "ses-rust-recomp-rpc",
+            projectRoot: "/fixture/project",
+            method: "session.recomp",
+            body: {
+                method: "session.recomp",
+                v: 1,
+                session_id: "ses-rust-recomp-rpc",
+                command_id: expect.stringMatching(/^rpc-recomp:/),
+            },
+        });
+    });
+
+    test("fails closed when the module transport is unavailable", async () => {
+        expect(
+            await executeRustRecompRpc(undefined, "ses-rust-recomp-rpc", "/fixture/project"),
+        ).toEqual({ ok: false, error: "Rust module client is unavailable" });
+    });
 });
 
 describe("Rust session status reads", () => {

@@ -2,8 +2,40 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	evaluateOperatorTagTotalContract,
+	maintenanceCoverageGaps,
+	maintenanceFailureClasses,
 	operatorTagTotalFailureClasses,
 } from "./audit-transform-wire-parity-live";
+
+describe("hunt-11 maintenance coverage contract", () => {
+	test("keeps zero coverage distinct from matched disposition vocabulary", () => {
+		expect(
+			maintenanceCoverageGaps({
+				recomp: { rows: 0 },
+				wrapup: { rows: 0 },
+				dreamer_appliers: { rows: 0 },
+			}),
+		).toEqual([
+			"zero_live_rust_dreamer_apply_commands",
+			"zero_live_rust_recomp_commands",
+			"zero_live_rust_wrapup_commands",
+		]);
+		expect(
+			maintenanceFailureClasses({
+				recomp: { rows: 1, dispositions: { started: 1 } },
+				wrapup: { rows: 1, dispositions: { completed: 1 } },
+				dreamer_appliers: { rows: 1 },
+			}),
+		).toEqual([]);
+		expect(
+			maintenanceFailureClasses({
+				recomp: { rows: 0, dispositions: {} },
+				wrapup: { rows: 0, dispositions: {} },
+				dreamer_appliers: { rows: 0 },
+			}),
+		).toEqual([]);
+	});
+});
 
 describe("hunt-9 live operator tag total contract", () => {
 	test("requires the Rust status total to match stable module-store rows", () => {
