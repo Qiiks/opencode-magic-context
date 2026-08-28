@@ -30,6 +30,7 @@ import {
 import { resolveContextWindowGeometry } from "./event-resolvers";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
+import { RUST_PARTIAL_RECOMP_REFUSAL, RUST_SESSION_UPGRADE_REFUSAL } from "./maintenance-authority";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import type { NotificationParams } from "./send-session-notification";
@@ -909,6 +910,8 @@ export function createMagicContextCommandHandler(deps: {
                     result = `## Magic Recomp — Invalid Arguments\n\n${parsedArgs.message}`;
                 } else if (parsedArgs.kind === "upgrade") {
                     result = executeRecompUpgradeStub(deps.db, sessionId);
+                } else if (rustMode && parsedArgs.kind === "partial") {
+                    result = `## Magic Recomp — Unavailable\n\n${RUST_PARTIAL_RECOMP_REFUSAL}`;
                 } else if (rustMode) {
                     try {
                         const value = await callRust("session.recomp", {
@@ -1032,6 +1035,8 @@ export function createMagicContextCommandHandler(deps: {
                 if (!sessionId) {
                     result =
                         "## Session Upgrade\n\nThis prompt is not attached to a session yet — send a message first, then run `/ctx-session-upgrade`.";
+                } else if (rustMode) {
+                    result = `## Session Upgrade — Unavailable\n\n${RUST_SESSION_UPGRADE_REFUSAL}`;
                 } else {
                     result = await executeSessionUpgrade(deps, sessionId);
                 }
