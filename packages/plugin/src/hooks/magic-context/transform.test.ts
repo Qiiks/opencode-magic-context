@@ -1110,9 +1110,12 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — main transform stripped step-start with the recovered provider,
-        // and postprocess used that same provider for the whole-message sentinel.
-        expect(messages[1].parts[1]).toEqual({ type: "text", text: "" });
+        //#then — main transform strips the step-start with the recovered provider.
+        // The raw suffix decision is `strip`, so postprocess also removes that
+        // Magic Context sentinel instead of freezing it as a provider blank.
+        expect(messages[1].parts).toHaveLength(1);
+        expect(messages[1].parts[0]).toMatchObject({ type: "text" });
+        expect(messages[1].parts[0]?.text).toContain("visible");
         expect(messages[2].parts).toEqual([{ type: "text", text: "" }]);
     });
 

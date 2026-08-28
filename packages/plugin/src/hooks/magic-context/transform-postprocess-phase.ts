@@ -28,6 +28,7 @@ import {
 import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
+    demoteTrailingBlankKeepDecisions,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getTrailingBlankDecisions,
@@ -90,12 +91,14 @@ import {
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripCandidateIds,
     findTrailingBlankDecisionCandidates,
+    snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
     type TrailingBlankDecision,
+    type TrailingBlankSourceDecisions,
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
@@ -654,6 +657,8 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
+    /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
+    trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
@@ -834,6 +839,8 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
+    const trailingBlankSourceDecisions =
+        args.trailingBlankSourceDecisions ?? snapshotTrailingBlankSourceDecisions(args.messages);
     // Capture before todo/history synthesis can add assistant messages. Reasoning replay skips a
     // metadata-only OpenCode request shell, while trailing-blank freezing still tracks that newest
     // host message because its shape can change before the next pass.
@@ -2127,6 +2134,51 @@ export async function runPostTransformPhase(
         typeof trailingBlankNewestAssistant?.info.id === "string"
             ? trailingBlankNewestAssistant.info.id
             : undefined;
+
+    if (isCacheBustingPass && trailingBlankDecisions.size > 0) {
+        const poisonedKeepIds: string[] = [];
+        for (const [id, decision] of trailingBlankDecisions) {
+            if (id === newestAssistantId || trailingBlankSourceDecisions.get(id) !== "strip") {
+                continue;
+            }
+            if (decision === "keep" || decision.startsWith("keep:")) {
+                poisonedKeepIds.push(id);
+            }
+        }
+        if (poisonedKeepIds.length > 0) {
+            try {
+                const demotedIds = demoteTrailingBlankKeepDecisions(
+                    args.db,
+                    args.sessionId,
+                    poisonedKeepIds,
+                );
+                if (demotedIds === null) {
+                    args.passOutcome?.record("trailing-blank-heal-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "trailing blank heal: persistence failed; retaining frozen keep decisions",
+                    );
+                } else {
+                    for (const id of demotedIds) {
+                        trailingBlankDecisions.set(id, "strip");
+                        bustedThisPass = true;
+                        sessionLog(
+                            args.sessionId,
+                            `trailing blank heal: demoted message ${id} from keep to strip because its source has no trailing blank`,
+                        );
+                    }
+                }
+            } catch (error) {
+                args.passOutcome?.record("trailing-blank-heal-exception");
+                sessionLog(
+                    args.sessionId,
+                    "transform failed healing trailing blank decisions:",
+                    error,
+                );
+            }
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -2151,7 +2203,10 @@ export async function runPostTransformPhase(
         const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
-            { refreshMessageId: newestAssistantId },
+            {
+                refreshMessageId: newestAssistantId,
+                sourceDecisions: trailingBlankSourceDecisions,
+            },
         );
         // A defer pass can safely establish only the newest assistant's shape: it
         // has no cached continuation after it. Historical messages without a prior

@@ -113,6 +113,7 @@ import { modelAcceptsEmptyContent } from "./sentinel";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
+    snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
@@ -866,6 +867,10 @@ export function createTransform(deps: TransformDeps) {
         // System prompt change detection is handled in experimental.chat.system.transform
         // (see system-prompt-hash.ts), not here. The messages transform only receives
         // user/assistant messages, not the system prompt.
+
+        // Freeze the harness-derived suffix shape before tagging, structural-noise
+        // sentinels, and synthetic injections can alter the live message graph.
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
@@ -2229,6 +2234,7 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            trailingBlankSourceDecisions,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
