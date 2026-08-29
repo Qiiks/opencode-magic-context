@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { resolveHistorianModel } from "../shared/model-resolution";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
 import { resolveConfigProfile } from "./profiles";
+import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "./schema/magic-context";
 import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
 
 /**
@@ -109,6 +110,43 @@ function loadWithUserAndProjectConfig(
         }
     }
 }
+
+describe("loadPluginConfig — preload user-config isolation", () => {
+    it("resolves schema-default embedding config for a fixture with no config (#388)", () => {
+        const projectDir = mkdtempSync(join(tmpdir(), "mc-config-preload-fixture-"));
+        try {
+            // The test preload owns this default. A per-test XDG_CONFIG_HOME assignment
+            // still overrides it through loadWithUserConfig below.
+            expect(process.env.XDG_CONFIG_HOME).toContain("mc-plugin-test-xdg-pid-");
+            expect(loadPluginConfig(projectDir).embedding).toEqual({
+                provider: "local",
+                model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+            });
+        } finally {
+            rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+
+    it("allows a test-scoped XDG_CONFIG_HOME to override the preload default", () => {
+        const preloadConfigHome = process.env.XDG_CONFIG_HOME;
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "https://fixture.example/v1",
+                    model: "fixture-model",
+                },
+            }),
+        );
+
+        expect(result.embedding).toMatchObject({
+            provider: "openai-compatible",
+            endpoint: "https://fixture.example/v1",
+            model: "fixture-model",
+        });
+        expect(process.env.XDG_CONFIG_HOME).toBe(preloadConfigHome);
+    });
+});
 
 describe("loadPluginConfig — graduated mural config", () => {
     it("adopts legacy experimental.mural at the top-level and warns once", () => {

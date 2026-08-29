@@ -41,6 +41,7 @@ import {
     registerProjectShadowEmbedding,
     sweepAllRegisteredProjects,
     sweepStaleEmbeddingIdentitiesForProject,
+    TestProviderFactoryRequiredError,
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
@@ -281,6 +282,50 @@ describe("project embedding registry", () => {
             providerIdentity: "embedding-provider:off",
             runtimeFingerprint: "embedding-provider:off",
         });
+    });
+
+    it("fails closed before a test constructs a provider without a factory (#388)", () => {
+        expect(process.env.MAGIC_CONTEXT_TEST_DATA_DIR).toBeTruthy();
+
+        let thrown: unknown;
+        try {
+            registerProjectShadowEmbedding(
+                useTempDb(),
+                "git:no-test-provider-factory",
+                {
+                    provider: "synapse",
+                    model: "test-synapse-model",
+                    synapse_fingerprint: "test-fingerprint",
+                    synapse_table_epoch: 1,
+                    synapse_dims: 8,
+                } as unknown as EmbeddingConfig,
+                "/tmp/no-test-provider-factory",
+            );
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(TestProviderFactoryRequiredError);
+        expect(thrown).toMatchObject({
+            name: "TestProviderFactoryRequiredError",
+            message:
+                "test constructed a network-capable embedding provider without a test factory — install _setTestProviderFactoryForProject or set embedding.provider off in the fixture",
+        });
+    });
+
+    it("keeps provider off as a clean null without a test factory", async () => {
+        const db = useTempDb();
+        registerProjectEmbedding(
+            db,
+            "git:test-provider-off",
+            { provider: "off" },
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/test-provider-off",
+        );
+
+        await expect(
+            embedTextForProject("git:test-provider-off", "not embedded"),
+        ).resolves.toBeNull();
     });
 
     it("default local config (no local_dtype) keeps the golden identity — no re-embed on upgrade (#259)", () => {
