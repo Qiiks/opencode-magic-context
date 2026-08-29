@@ -1,5 +1,6 @@
 import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import { type ContextDatabase, getActiveTagsBySession } from "../../features/magic-context/storage";
+import { getRecentTagOwnerMessageIds } from "../../features/magic-context/storage-tags";
 import type { PendingOp } from "../../features/magic-context/types";
 import { isEditTool } from "./edit-marker";
 import type { TagTarget } from "./tag-messages";
@@ -19,6 +20,19 @@ const TODOWRITE_KEEP = 1;
 
 /** Preserve tool entries owned by the newest 20 messages as continuation context. */
 export const SUPERSESSION_RECENT_MESSAGE_WINDOW = 20;
+
+/**
+ * Derive the continuation floor from persisted tag ordinals rather than the
+ * current provider projection. Marker advances can temporarily contract that
+ * projection, but persisted rows retain each owner's chronological position,
+ * so a missing owner cannot become reclaimable before it reappears.
+ */
+export function recentSupersessionOwnerMessageIds(
+    db: ContextDatabase,
+    sessionId: string,
+): Set<string> {
+    return getRecentTagOwnerMessageIds(db, sessionId, SUPERSESSION_RECENT_MESSAGE_WINDOW);
+}
 
 // Tools whose output is worthless once the call ran. ctx_note is handled
 // separately because only its read/dismiss actions are zero-value.

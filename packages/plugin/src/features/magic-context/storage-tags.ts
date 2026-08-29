@@ -118,6 +118,8 @@ export interface MessageTokenTotal {
 }
 
 const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
+const RECENT_OWNER_SCAN_PAGE_SIZE = 128;
+const recentTagOwnerStatements = new WeakMap<Database, PreparedStatement>();
 
 function ownerMessageIdForTagRow(row: {
     type: string;
@@ -128,6 +130,63 @@ function ownerMessageIdForTagRow(row: {
         return row.tool_owner_message_id ?? row.message_id;
     }
     return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+}
+
+function getRecentTagOwnerStatement(db: Database): PreparedStatement {
+    let statement = recentTagOwnerStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT type, message_id, tool_owner_message_id
+             FROM tags
+             WHERE session_id = ?
+             ORDER BY tag_number DESC, id DESC
+             LIMIT ? OFFSET ?`,
+        );
+        recentTagOwnerStatements.set(db, statement);
+    }
+    return statement;
+}
+
+/**
+ * Return known message owners in descending persisted tag order. Paging stops
+ * as soon as the requested number of distinct owners is found, so the common
+ * newest-20 lookup does not materialize a long session's complete tag table.
+ * Dropped and compacted rows remain part of the chronology by design.
+ */
+export function getRecentTagOwnerMessageIds(
+    db: Database,
+    sessionId: string,
+    maxOwners: number,
+): Set<string> {
+    const recent = new Set<string>();
+    if (!Number.isFinite(maxOwners) || maxOwners <= 0) return recent;
+
+    const statement = getRecentTagOwnerStatement(db);
+    let offset = 0;
+    while (recent.size < maxOwners) {
+        const rows = statement.all(sessionId, RECENT_OWNER_SCAN_PAGE_SIZE, offset) as Array<{
+            type: unknown;
+            message_id: unknown;
+            tool_owner_message_id: unknown;
+        }>;
+        for (const row of rows) {
+            if (typeof row.type !== "string" || typeof row.message_id !== "string") continue;
+            const ownerId =
+                row.type === "tool"
+                    ? typeof row.tool_owner_message_id === "string"
+                        ? row.tool_owner_message_id
+                        : null
+                    : row.message_id.replace(CONTENT_ID_SUFFIX, "");
+            // Reclaim selectors withhold legacy tool rows whose owner is unknown.
+            // Skip them here too so they do not consume a known-owner slot.
+            if (!ownerId || recent.has(ownerId)) continue;
+            recent.add(ownerId);
+            if (recent.size >= maxOwners) break;
+        }
+        if (rows.length < RECENT_OWNER_SCAN_PAGE_SIZE) break;
+        offset += rows.length;
+    }
+    return recent;
 }
 
 /**

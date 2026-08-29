@@ -93,6 +93,7 @@ import {
 	clearHistorianFailureState,
 	clearPersistedReasoningWatermark,
 	getAutoSearchHintDecisions,
+	getEmergencyInputSample,
 	getNoteNudgeAnchors,
 	getOverflowState,
 	type PendingPiCompactionMarker,
@@ -2678,6 +2679,15 @@ export function registerPiContextHandler(
 			const forceMaterialization =
 				!options.compactionOff &&
 				usagePercentage >= forceMaterializationPercentage;
+			// Leaving the force band ends the pressure episode. Fresh usage samples
+			// inside the band do not release this latch; only a later re-entry may
+			// originate another emergency batch.
+			if (
+				!forceMaterialization &&
+				getEmergencyInputSample(options.db, sessionId) > 0
+			) {
+				clearEmergencyDropSample(options.db, sessionId);
+			}
 
 			// 95% emergency block: usage is dangerous enough that we
 			// MUST wait for any in-flight historian to finish so its
@@ -5076,6 +5086,21 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (shouldRunHeuristics && args.heuristics) {
 		try {
 			const tHeuristic = performance.now();
+			const independentMutationBeforeHeuristics =
+				pendingOpsDidMutate || foldExecutedThisPass;
+			// A queued drop or completed hard fold already changes provider-visible
+			// bytes on this pass. Rearm so accumulated candidates join that same cache
+			// rebuild instead of waiting for a new pressure period. Do not treat frozen
+			// status replay as a new mutation: Pi rebuilds raw messages every pass, so
+			// replay is expected restoration and must not authorize another emergency
+			// batch on every pass.
+			if (
+				args.forceMaterialization === true &&
+				independentMutationBeforeHeuristics &&
+				getEmergencyInputSample(args.db, args.sessionId) > 0
+			) {
+				clearEmergencyDropSample(args.db, args.sessionId);
+			}
 			heuristicsResult = applyPiHeuristicCleanup(
 				args.sessionId,
 				args.db,

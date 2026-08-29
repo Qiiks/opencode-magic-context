@@ -2122,6 +2122,9 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit", 0, "tool-1");
         insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "todowrite", 0, "tool-2");
         insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "todowrite", 0, "tool-3");
+        for (const [index, message] of recentTail.entries()) {
+            insertTag(db, sessionId, message.info.id, "message", 50, index + 4);
+        }
         queuePendingOp(db, sessionId, 1, "drop", 1);
         advanceToolReclaimWatermark(db, sessionId, 1);
         return { trigger, older, newer, recentTail };
@@ -2178,6 +2181,89 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         expect(statuses.get(2)).toBe("dropped"); // superseded todowrite
         expect(statuses.get(3)).toBe("active"); // newest todowrite kept
     });
+
+    for (const shape of ["head", "tail"] as const) {
+        it(`keeps the newest-20 owner floor stable across ${shape} contraction and re-expansion`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `ses-smart-${shape}-contraction`;
+            const trigger = makeToolMessage("priced-trigger");
+            const owners = Array.from({ length: 22 }, (_, index) =>
+                makeToolMessage(`owner-${index + 1}`),
+            );
+            insertTag(
+                db,
+                sessionId,
+                "priced-trigger",
+                "tool",
+                100,
+                1,
+                0,
+                "bash",
+                0,
+                "priced-trigger",
+            );
+            const targets = new Map<number, TagTarget>([[1, makeDropTarget(trigger)]]);
+            for (const [index, owner] of owners.entries()) {
+                const tagNumber = index + 2;
+                insertTag(
+                    db,
+                    sessionId,
+                    `status-${index + 1}`,
+                    "tool",
+                    100,
+                    tagNumber,
+                    0,
+                    "bash_status",
+                    0,
+                    owner.info.id,
+                );
+                targets.set(tagNumber, makeDropTarget(owner));
+            }
+            queuePendingOp(db, sessionId, 1, "drop", 1);
+            advanceToolReclaimWatermark(db, sessionId, 1);
+
+            const absentOwnerId = shape === "head" ? "owner-3" : "owner-22";
+            const contractedOwners =
+                shape === "head"
+                    ? owners.filter(
+                          (owner) => !["owner-1", "owner-2", "owner-3"].includes(owner.info.id),
+                      )
+                    : owners.filter((owner) => owner.info.id !== absentOwnerId);
+            const contractedMessages = [trigger, ...contractedOwners];
+
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, contractedMessages, {
+                    schedulerDecision: "execute",
+                    smartDrops: true,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    sessionMeta: getOrCreateSessionMeta(db, sessionId),
+                }),
+            );
+
+            const absentTagNumber = Number(absentOwnerId.split("-")[1]) + 1;
+            expect(
+                getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === absentTagNumber)
+                    ?.status,
+            ).toBe("active");
+
+            const replayOwners = Array.from({ length: 22 }, (_, index) =>
+                makeToolMessage(`owner-${index + 1}`),
+            );
+            const replayTargets = new Map<number, TagTarget>();
+            for (const [index, owner] of replayOwners.entries()) {
+                replayTargets.set(index + 2, makeDropTarget(owner));
+            }
+            const replayTarget = replayOwners.find((owner) => owner.info.id === absentOwnerId);
+            if (!replayTarget) throw new Error("expected replay owner");
+            const originalBytes = JSON.stringify(replayTarget);
+
+            applyFlushedStatuses(sessionId, db, replayTargets, getTagsBySession(db, sessionId));
+
+            expect(JSON.stringify(replayTarget)).toBe(originalBytes);
+        });
+    }
 
     it("ON but plain DEFER pass: nothing is dropped (reclaim block requires a known bust)", async () => {
         db = new Database(":memory:");

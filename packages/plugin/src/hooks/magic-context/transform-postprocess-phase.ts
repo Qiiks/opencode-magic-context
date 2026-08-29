@@ -107,7 +107,7 @@ import {
 import {
     buildEditSupersessionReclaim,
     buildSupersessionReclaimOps,
-    SUPERSESSION_RECENT_MESSAGE_WINDOW,
+    recentSupersessionOwnerMessageIds,
 } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
 import {
@@ -147,17 +147,6 @@ const routinePressureAppliedBySession = new BoundedSessionMap<boolean>(100);
 export function resetDegradedCacheCount(sessionId: string): void {
     degradedCacheCountBySession.delete(sessionId);
     routinePressureAppliedBySession.delete(sessionId);
-}
-
-function recentSupersessionMessageIds(messages: MessageLike[]): Set<string> {
-    const recent = new Set<string>();
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const id = messages[index]?.info.id;
-        if (typeof id !== "string" || recent.has(id)) continue;
-        recent.add(id);
-        if (recent.size >= SUPERSESSION_RECENT_MESSAGE_WINDOW) break;
-    }
-    return recent;
 }
 
 export type DeferredCompactionMarkerClearOutcome =
@@ -1496,7 +1485,7 @@ export async function runPostTransformPhase(
             // lane's continuation floor independently of protected_tags.
             const editMarkerTagIds = new Set<number>();
             if (args.smartDrops) {
-                const recentMessageIds = recentSupersessionMessageIds(args.messages);
+                const recentMessageIds = recentSupersessionOwnerMessageIds(args.db, args.sessionId);
                 const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
                 const supersessionOps = buildSupersessionReclaimOps({
                     db: args.db,
