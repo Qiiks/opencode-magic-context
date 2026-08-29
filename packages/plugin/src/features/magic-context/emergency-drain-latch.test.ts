@@ -160,6 +160,16 @@ describe("emergency drain catch-up latch", () => {
         expect(allowed.overQuotaBypass).toBe(true);
     });
 
+    it("does not let a future failure timestamp suppress catch-up indefinitely", () => {
+        const t = 6_500_000;
+        exhaustWindowBudget(db, SID, 96, t);
+        recordHistorianDrainFailure(db, SID, t + 7 * 24 * 60 * 60_000);
+
+        const allowed = reserve(db, SID, 96, t + 20);
+        expect(allowed.ok).toBe(true);
+        expect(allowed.overQuotaBypass).toBe(true);
+    });
+
     it("clearEmergencyDrainLatch resets the latch (tail-exhausted no-op)", () => {
         const t = 7_000_000;
         exhaustWindowBudget(db, SID, 96, t);

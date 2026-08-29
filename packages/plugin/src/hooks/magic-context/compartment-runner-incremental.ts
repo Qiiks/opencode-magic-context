@@ -31,6 +31,7 @@ import {
     clearEmergencyRecovery,
     clearHistorianDrainFailure,
     clearHistorianFailureState,
+    describeProtectedTailDrainBudgetSkip,
     getOverflowState,
     incrementHistorianFailure,
     isWrapupInProgress,
@@ -344,12 +345,9 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                   executeThresholdPercentage: boundarySnapshot.executeThresholdPercentage,
               });
         if (!reserve.ok) {
-            sessionLog(
-                sessionId,
-                `historian rate-limit skip: ${reserve.skippedReason ?? "quota exhausted"}`,
-            );
+            sessionLog(sessionId, describeProtectedTailDrainBudgetSkip(reserve));
             telemetry.status = "noop";
-            telemetry.failureReason = "protected-tail drain quota exhausted";
+            telemetry.failureReason = "internal protected-tail drain budget spent";
             return;
         }
         drainReservation = reserve.reservation;

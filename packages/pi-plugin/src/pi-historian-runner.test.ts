@@ -1,4 +1,4 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import { acquireCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
 import {
 	appendCompartments,
@@ -19,6 +19,7 @@ import {
 import { getUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import type { ProtectedTailBoundarySnapshot } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
+import * as loggerModule from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type {
 	SubagentRunner,
@@ -341,10 +342,13 @@ describe("runPiHistorian", () => {
 		}
 	});
 
-	it("skips when the protected-tail drain quota is exhausted", async () => {
+	it("logs internal budget state when the protected-tail drain budget is spent", async () => {
 		const boundary = makeBoundarySnapshot();
 		const usable = Math.round(
 			(boundary.contextLimit * boundary.executeThresholdPercentage) / 100,
+		);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
 		);
 		const { db, runner } = await runHistorianWith({
 			outputs: [successXml()],
@@ -370,7 +374,12 @@ describe("runPiHistorian", () => {
 			expect(
 				loadProtectedTailMeta(db, "ses-historian").protectedTailDrainTokens,
 			).toBe(9000);
+			expect(logSpy).toHaveBeenCalledWith(
+				"ses-historian",
+				"historian skip: internal drain budget spent (9000/9000 tokens; resets in 10m)",
+			);
 		} finally {
+			logSpy.mockRestore();
 			closeQuietly(db);
 		}
 	});
