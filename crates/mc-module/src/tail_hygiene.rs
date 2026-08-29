@@ -14,6 +14,7 @@ use crate::ck_wire::{FlatBlock, FlatProjection};
 
 pub(crate) const CHANNEL1_MIN_TOKENS: i64 = 60_000;
 pub(crate) const CHANNEL1_FLOOR_TOKENS: i64 = 25_000;
+pub(crate) const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 25_000;
 pub(crate) const CHANNEL2_FLOOR_TOKENS: i64 = 50_000;
 pub(crate) const CHANNEL2_SEVERITY_THRESHOLD: f64 = 0.75;
 
@@ -43,6 +44,25 @@ impl HygieneBand {
             Self::Firm => "firm",
             Self::Urgent => "urgent",
             Self::Channel2 => "channel2",
+        }
+    }
+
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Quiet => 0,
+            Self::Gentle => 1,
+            Self::Firm => 2,
+            Self::Urgent => 3,
+            Self::Channel2 => 4,
+        }
+    }
+
+    pub(crate) fn from_channel1_level(value: &str) -> Self {
+        match value {
+            "gentle" => Self::Gentle,
+            "firm" => Self::Firm,
+            "urgent" => Self::Urgent,
+            _ => Self::Quiet,
         }
     }
 }
@@ -732,6 +752,11 @@ pub(crate) fn refresh_tail_hygiene_baseline(
             generation_invalidated: false,
             baseline_parts: measured.parts,
             content_signature: measured.content_signature,
+            channel1_post_reduce_grace_baseline_u: previous
+                .and_then(|baseline| baseline.channel1_post_reduce_grace_baseline_u),
+            channel1_post_reduce_grace_pre_level: previous
+                .map(|baseline| baseline.channel1_post_reduce_grace_pre_level.clone())
+                .unwrap_or_default(),
         };
     }
 
@@ -777,6 +802,28 @@ pub(crate) fn effective_tail_hygiene(baseline: &TailHygieneBaseline) -> (i64, i6
         .saturating_add(baseline.turn_delta_u)
         .clamp(0, t);
     (u, t)
+}
+
+pub(crate) fn channel1_refire_tokens(tail_tokens: i64) -> i64 {
+    let scaled = (0.08 * tail_tokens.max(0) as f64).round() as i64;
+    CHANNEL1_REFIRE_FLOOR_TOKENS.max(scaled)
+}
+
+/// Grace holds until U regrows by one full cadence or the band worsens beyond
+/// the band observed before ctx_reduce. Channel 2 remains a higher safety band.
+pub(crate) fn post_reduce_grace_holds(
+    baseline: &TailHygieneBaseline,
+    reclaimable_tokens: i64,
+    tail_tokens: i64,
+    current_band: HygieneBand,
+) -> bool {
+    let Some(grace_u) = baseline.channel1_post_reduce_grace_baseline_u else {
+        return false;
+    };
+    let pre_reduce_band =
+        HygieneBand::from_channel1_level(&baseline.channel1_post_reduce_grace_pre_level);
+    let regrowth = reclaimable_tokens.saturating_sub(grace_u.max(0));
+    regrowth < channel1_refire_tokens(tail_tokens) && current_band.rank() <= pre_reduce_band.rank()
 }
 
 pub(crate) fn hygiene_band(u: i64, t: i64) -> HygieneBand {

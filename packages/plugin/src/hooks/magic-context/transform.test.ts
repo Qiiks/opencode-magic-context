@@ -1667,7 +1667,7 @@ describe("createTransform", () => {
         expect(channel1StateBySession.has("ses-sub-ch1")).toBe(true);
     });
 
-    it("resets the persisted Channel 1 band when baseline refresh sees a smaller tail", async () => {
+    it("preserves Channel 1 crossing state when a baseline refresh sees a smaller tail", async () => {
         useTempDataHome("context-transform-band-reset-");
         const sessionId = "ses-band-reset";
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
@@ -1708,13 +1708,15 @@ describe("createTransform", () => {
             },
         );
 
-        expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
-        expect(getChannel1NudgeState(db, sessionId)).toEqual({ level: "", ordinal: 0 });
+        // The next tool-output decision observes a lower band and rearms it.
+        // Clearing here would turn the same post-reduce band into a full crossing.
+        expect(getLastNudgeUndropped(db, sessionId)).toBe(80_000);
+        expect(getChannel1NudgeState(db, sessionId)).toEqual({ level: "urgent", ordinal: 12 });
         expect(
             db
                 .prepare("SELECT last_nudge_level FROM session_meta WHERE session_id = ?")
                 .get(sessionId),
-        ).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
+        ).toEqual({ last_nudge_level: '{"level":"urgent","ordinal":12}' });
     });
 
     it("Unit B: primary without callable ctx_reduce gets NO Channel 1 baseline (latent-gap fix)", async () => {

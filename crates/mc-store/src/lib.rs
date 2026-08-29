@@ -3522,6 +3522,12 @@ pub struct TailHygieneBaseline {
     pub generation_invalidated: bool,
     pub baseline_parts: Vec<TailHygienePartMeasurement>,
     pub content_signature: String,
+    /// U captured only after queued ctx_reduce drops have been excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel1_post_reduce_grace_baseline_u: Option<i64>,
+    /// Channel-1 band observed before ctx_reduce; empty only for a legacy/unfired cycle.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel1_post_reduce_grace_pre_level: String,
 }
 
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.

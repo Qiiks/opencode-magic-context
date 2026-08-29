@@ -152,7 +152,7 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
         expect(channel1RefireTokens(1_000_000)).toBe(80_000);
     });
 
-    it("post-reduce suppression clears cadence and band state", () => {
+    it("holds dirty post-reduce input without resetting the observed band", () => {
         const decision = decideChannel1({
             ...base,
             baselineU: 70_000,
@@ -161,20 +161,99 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
             hasRecentReduce: true,
         });
         expect(decision.fire).toBe(false);
-        expect(decision.nextLastNudge).toBe(0);
-        expect(decision.nextLastNudgeLevel).toBe("");
+        expect(decision.nextLastNudge).toBe(60_000);
+        expect(decision.nextLastNudgeLevel).toBe("urgent");
     });
 
-    it("a measured U collapse re-arms the cycle", () => {
-        const decision = decideChannel1({
+    it("records a measured U collapse quietly and re-arms an upward crossing", () => {
+        const collapse = decideChannel1({
             ...base,
             baselineU: 30_000,
             baselineT: 100_000,
             lastNudgeUndropped: 80_000,
             lastNudgeLevel: "urgent",
         });
-        expect(decision.fire).toBe(true);
-        expect(decision.level).toBe("gentle");
+        expect(collapse.fire).toBe(false);
+        expect(collapse.nextLastNudge).toBe(30_000);
+        expect(collapse.nextLastNudgeLevel).toBe("gentle");
+        const recrossing = decideChannel1({
+            ...base,
+            baselineU: 45_000,
+            baselineT: 100_000,
+            lastNudgeUndropped: collapse.nextLastNudge,
+            lastNudgeLevel: collapse.nextLastNudgeLevel,
+        });
+        expect(recrossing.fire).toBe(true);
+        expect(recrossing.level).toBe("firm");
+        expect(recrossing.sticky).toBe(false);
+    });
+
+    it("pins post-reduce grace to post-drop U until full regrowth", () => {
+        const specimen = {
+            ...base,
+            baselineU: 60_000,
+            baselineT: 150_000,
+            lastNudgeUndropped: 30_000,
+            lastNudgeLevel: "firm" as const,
+            lastFireOrdinal: 0,
+            currentRealUserTurnCount: 5,
+            postReduceGraceBaselineU: 60_000,
+            postReduceGracePreLevel: "firm" as const,
+        };
+        const immediate = decideChannel1(specimen);
+        expect(immediate.fire).toBe(false);
+        expect(immediate.clearPostReduceGrace).toBe(false);
+        const almost = decideChannel1({ ...specimen, baselineU: 84_999 });
+        expect(almost.fire).toBe(false);
+        const regrown = decideChannel1({ ...specimen, baselineU: 85_000 });
+        expect(regrown.fire).toBe(true);
+        expect(regrown.sticky).toBe(true);
+        expect(regrown.clearPostReduceGrace).toBe(true);
+
+        // Mutation control: removing grace makes the immediate same-band cadence fire.
+        expect(
+            decideChannel1({
+                ...specimen,
+                postReduceGraceBaselineU: undefined,
+                postReduceGracePreLevel: undefined,
+            }).fire,
+        ).toBe(true);
+    });
+
+    it("breaks grace on a band escalation while Channel 2 remains independent", () => {
+        const escalation = decideChannel1({
+            ...base,
+            baselineU: 61_000,
+            baselineT: 100_000,
+            lastNudgeUndropped: 60_000,
+            lastNudgeLevel: "firm",
+            lastFireOrdinal: 8,
+            currentRealUserTurnCount: 8,
+            postReduceGraceBaselineU: 60_000,
+            postReduceGracePreLevel: "firm",
+        });
+        expect(escalation.fire).toBe(true);
+        expect(escalation.level).toBe("urgent");
+        expect(escalation.sticky).toBe(false);
+        expect(escalation.clearPostReduceGrace).toBe(true);
+
+        const channel1Held = decideChannel1({
+            ...base,
+            baselineU: 75_000,
+            baselineT: 100_000,
+            lastNudgeUndropped: 74_000,
+            lastNudgeLevel: "urgent",
+            postReduceGraceBaselineU: 74_000,
+            postReduceGracePreLevel: "urgent",
+        });
+        expect(channel1Held.fire).toBe(false);
+        expect(
+            evaluateChannel2({
+                ...base,
+                baselineU: 75_000,
+                baselineT: 100_000,
+            }).shouldTrigger,
+        ).toBe(true);
     });
 });
 
@@ -274,7 +353,7 @@ describe("reminder rendering", () => {
         ).toBe(false);
     });
 
-    it("dampens same-level refires before three real user turns but not escalations", () => {
+    it("keeps every same-band re-fire sticky while escalations stay full", () => {
         expect(
             shouldUseStickyChannel1Reminder({
                 lastLevel: "firm",
@@ -288,9 +367,9 @@ describe("reminder rendering", () => {
                 lastLevel: "firm",
                 lastOrdinal: 10,
                 level: "firm",
-                currentRealUserTurnCount: 13,
+                currentRealUserTurnCount: 15,
             }),
-        ).toBe(false);
+        ).toBe(true);
         expect(
             shouldUseStickyChannel1Reminder({
                 lastLevel: "firm",
@@ -307,7 +386,7 @@ describe("reminder rendering", () => {
                 level: "firm",
                 currentRealUserTurnCount: 12,
             }),
-        ).toBe(false);
+        ).toBe(true);
 
         const sticky = buildChannel1Reminder("firm", 70_000, 16, undefined, true);
         expect(sticky).toContain(
@@ -315,6 +394,8 @@ describe("reminder rendering", () => {
         );
         const escalation = buildChannel1Reminder("urgent", 80_000, 16, undefined, false);
         expect(escalation).toContain("Housekeeping backlog: 16 spent tool outputs (~80k tokens)");
+        expect(escalation).toContain("a ctx_reduce pass is due");
+        expect(sticky).not.toContain("a ctx_reduce pass is due");
     });
 });
 

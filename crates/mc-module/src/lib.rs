@@ -25187,6 +25187,8 @@ mod tests {
             generation_invalidated: false,
             baseline_parts: Vec::new(),
             content_signature: String::new(),
+            channel1_post_reduce_grace_baseline_u: None,
+            channel1_post_reduce_grace_pre_level: String::new(),
         });
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)

@@ -714,6 +714,7 @@ export function refreshPiTailHygieneBaseline(
 			generationInvalidated: false,
 			baselineParts: measured.parts,
 			contentSignature: measured.contentSignature,
+			channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
 		};
 	}
 
