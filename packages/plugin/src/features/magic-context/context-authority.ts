@@ -922,6 +922,136 @@ const MEMORY_SNAPSHOT_COLUMNS = [
     "mural_cue_rejection_count",
 ] as const;
 
+const IMMUTABLE_MEMORY_SNAPSHOT_COLUMNS = ["project_path", "first_seen_at", "created_at"] as const;
+const CLASSIFICATION_MEMORY_SNAPSHOT_COLUMNS = [
+    "importance",
+    "scope",
+    "shareable",
+    "source_type",
+    "classified_at",
+] as const;
+const VERIFICATION_MEMORY_SNAPSHOT_COLUMNS = [
+    "verification_status",
+    "verified_at",
+    "mapping",
+    "mapping_origin",
+] as const;
+const MURAL_MEMORY_SNAPSHOT_COLUMNS = [
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
+] as const;
+const UPDATED_MEMORY_SNAPSHOT_COLUMNS = [
+    "category",
+    "content",
+    "normalized_hash",
+    "source_session_id",
+    "seen_count",
+    "retrieval_count",
+    "updated_at",
+    "last_seen_at",
+    "last_retrieved_at",
+    "status",
+    "expires_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+] as const;
+
+type ExistingMemoryRow = {
+    project_path?: string;
+    category?: string;
+    content?: string;
+    normalized_hash?: string;
+    importance?: number | null;
+    scope?: string;
+    shareable?: number;
+    source_session_id?: string | null;
+    source_type?: string | null;
+    seen_count?: number;
+    retrieval_count?: number;
+    first_seen_at?: number;
+    created_at?: number;
+    updated_at?: number;
+    last_seen_at?: number;
+    last_retrieved_at?: number | null;
+    status?: string;
+    expires_at?: number | null;
+    verification_status?: string;
+    verified_at?: number | null;
+    classified_at?: number | null;
+    superseded_by_memory_id?: number | null;
+    merged_from?: string | null;
+    metadata_json?: string | null;
+    mural_cue?: string | null;
+    mural_cue_hash?: string | null;
+    mural_cue_at?: number | null;
+    mural_cue_rejection_count?: number | null;
+};
+
+interface MemoryRecencyGuard {
+    effectiveRow: Record<string, unknown>;
+    hostUpdatedNewer: boolean;
+    hostVerificationNewer: boolean;
+}
+
+function memorySnapshotTimestamp(row: Record<string, unknown>, key: string): number {
+    const value = row[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function parsedMemorySnapshot(
+    snapshotJson: string,
+    fallback: Record<string, unknown>,
+): Record<string, unknown> {
+    try {
+        const parsed: unknown = JSON.parse(snapshotJson);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+function guardMemorySnapshotByRecency(args: {
+    row: Record<string, unknown>;
+    snapshot: Record<string, unknown>;
+    existing?: ExistingMemoryRow;
+}): MemoryRecencyGuard {
+    const effectiveRow = { ...args.row };
+    if (!args.existing) {
+        return { effectiveRow, hostUpdatedNewer: false, hostVerificationNewer: false };
+    }
+    const existing = args.existing as Record<string, unknown>;
+    const preserve = (columns: readonly string[]): void => {
+        for (const column of columns) {
+            if (Object.hasOwn(existing, column)) {
+                effectiveRow[column] = existing[column];
+            }
+        }
+    };
+    preserve(IMMUTABLE_MEMORY_SNAPSHOT_COLUMNS);
+
+    const hostUpdatedNewer =
+        memorySnapshotTimestamp(existing, "updated_at") >
+        memorySnapshotTimestamp(args.snapshot, "updated_at");
+    const hostClassificationNewer =
+        hostUpdatedNewer ||
+        memorySnapshotTimestamp(existing, "classified_at") >
+            memorySnapshotTimestamp(args.snapshot, "classified_at");
+    const snapshotCarriesUpdatedAt = hasSnapshotField(args.snapshot, "updated_at");
+    const hostVerificationNewer = hostUpdatedNewer && snapshotCarriesUpdatedAt;
+    const hostMuralNewer = hostUpdatedNewer && snapshotCarriesUpdatedAt;
+
+    if (hostUpdatedNewer) preserve(UPDATED_MEMORY_SNAPSHOT_COLUMNS);
+    if (hostClassificationNewer) preserve(CLASSIFICATION_MEMORY_SNAPSHOT_COLUMNS);
+    if (hostVerificationNewer) preserve(VERIFICATION_MEMORY_SNAPSHOT_COLUMNS);
+    if (hostMuralNewer) preserve(MURAL_MEMORY_SNAPSHOT_COLUMNS);
+    return { effectiveRow, hostUpdatedNewer, hostVerificationNewer };
+}
+
 function hasSnapshotField(row: Record<string, unknown>, key: string): boolean {
     // Own-property checks distinguish a missing snapshot field from an explicit null clear.
     // biome-ignore lint/suspicious/noPrototypeBuiltins: snapshot objects may have an untrusted prototype
@@ -1300,7 +1430,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
             "UPDATE mirror_memory_repair_state SET dirty = 0, updated_at = ? WHERE id = 1",
         ),
         repairCandidates: db.prepare(
-            `SELECT memory.id, live.full_row_snapshot
+            `SELECT memory.id, memory.updated_at, memory.classified_at, live.full_row_snapshot
                FROM memories memory
                JOIN mirror_identity identity
                  ON identity.domain = 'memories'
@@ -1316,10 +1446,14 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
         ),
         repairMemory: db.prepare(
             `UPDATE memories
-                SET source_type = COALESCE(?, source_type),
-                    importance = COALESCE(?, importance),
+                SET source_type = COALESCE(source_type, ?),
+                    importance = COALESCE(importance, ?),
                     updated_at = ?
-              WHERE id = ?`,
+              WHERE id = ?
+                AND COALESCE(updated_at, 0) <= ?
+                AND COALESCE(classified_at, 0) <= ?
+                AND ((source_type IS NULL AND ? IS NOT NULL)
+                  OR (importance IS NULL AND ? IS NOT NULL))`,
         ),
         updateCursor: db.prepare(
             "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
@@ -1548,38 +1682,7 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         feed.module_row_id,
         statements,
     );
-    const existing = statements.memoryById.get(contextId) as
-        | {
-              project_path?: string;
-              category?: string;
-              content?: string;
-              normalized_hash?: string;
-              importance?: number | null;
-              scope?: string;
-              shareable?: number;
-              source_session_id?: string | null;
-              source_type?: string | null;
-              seen_count?: number;
-              retrieval_count?: number;
-              first_seen_at?: number;
-              created_at?: number;
-              updated_at?: number;
-              last_seen_at?: number;
-              last_retrieved_at?: number | null;
-              status?: string;
-              expires_at?: number | null;
-              verification_status?: string;
-              verified_at?: number | null;
-              classified_at?: number | null;
-              superseded_by_memory_id?: number | null;
-              merged_from?: string | null;
-              metadata_json?: string | null;
-              mural_cue?: string | null;
-              mural_cue_hash?: string | null;
-              mural_cue_at?: number | null;
-              mural_cue_rejection_count?: number | null;
-          }
-        | undefined;
+    const existing = statements.memoryById.get(contextId) as ExistingMemoryRow | undefined;
     if (existing && existing.project_path !== moduleProject) {
         // Mirror identities identify rows but never authorize moving ownership between projects;
         // keep the durable row untouched when stale or corrupt metadata points across that boundary.
@@ -1588,53 +1691,72 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         );
         return;
     }
+    const retainedRecencySnapshot = parsedMemorySnapshot(snapshotJson, row);
+    const recencySnapshot = hasSnapshotField(row, "updated_at")
+        ? row
+        : hasSnapshotField(row, "classified_at")
+          ? { ...retainedRecencySnapshot, classified_at: row.classified_at }
+          : retainedRecencySnapshot;
+    const recencyGuard = guardMemorySnapshotByRecency({
+        row,
+        snapshot: recencySnapshot,
+        existing,
+    });
+    const projectedRow = recencyGuard.effectiveRow;
     const has = (key: string): boolean => hasSnapshotField(row, key);
     const nullableNumber = (key: string, previous: number | null | undefined): number | null =>
         has(key)
-            ? typeof row[key] === "number" && Number.isFinite(row[key])
-                ? row[key]
+            ? typeof projectedRow[key] === "number" && Number.isFinite(projectedRow[key])
+                ? projectedRow[key]
                 : null
             : (previous ?? null);
     const nullableString = (key: string, previous: string | null | undefined): string | null =>
-        has(key) ? rowNullableString(row, key) : (previous ?? null);
-    const hasSuperseded = has("superseded_by_memory_id");
+        has(key) ? rowNullableString(projectedRow, key) : (previous ?? null);
+    const hasSuperseded = has("superseded_by_memory_id") && !recencyGuard.hostUpdatedNewer;
     const previousHash = existing?.normalized_hash;
 
     // A feed update is allowed to be a sparse legacy snapshot. An absent property means
     // "unchanged"; only a property explicitly present as null is a genuine clear.
     statements.updateMemory.run(
         has("project_path")
-            ? rowString(row, "project_path")
+            ? rowString(projectedRow, "project_path")
             : (existing?.project_path ?? moduleProject),
         has("category")
-            ? rowString(row, "category", "CONSTRAINTS")
+            ? rowString(projectedRow, "category", "CONSTRAINTS")
             : (existing?.category ?? "CONSTRAINTS"),
-        has("content") ? rowString(row, "content") : (existing?.content ?? ""),
+        has("content") ? rowString(projectedRow, "content") : (existing?.content ?? ""),
         has("normalized_hash")
-            ? rowString(row, "normalized_hash")
+            ? rowString(projectedRow, "normalized_hash")
             : (existing?.normalized_hash ?? ""),
         has("importance")
-            ? typeof row.importance === "number" && Number.isFinite(row.importance)
-                ? row.importance
+            ? typeof projectedRow.importance === "number" &&
+              Number.isFinite(projectedRow.importance)
+                ? projectedRow.importance
                 : null
             : (existing?.importance ?? null),
-        has("scope") ? rowString(row, "scope", "project") : (existing?.scope ?? "project"),
-        has("shareable") ? rowNumber(row, "shareable") : (existing?.shareable ?? 0),
+        has("scope") ? rowString(projectedRow, "scope", "project") : (existing?.scope ?? "project"),
+        has("shareable") ? rowNumber(projectedRow, "shareable") : (existing?.shareable ?? 0),
         nullableString("source_session_id", existing?.source_session_id),
         nullableString("source_type", existing?.source_type),
-        has("seen_count") ? rowNumber(row, "seen_count", 1) : (existing?.seen_count ?? 1),
+        has("seen_count") ? rowNumber(projectedRow, "seen_count", 1) : (existing?.seen_count ?? 1),
         has("retrieval_count")
-            ? rowNumber(row, "retrieval_count")
+            ? rowNumber(projectedRow, "retrieval_count")
             : (existing?.retrieval_count ?? 0),
-        has("first_seen_at") ? rowNumber(row, "first_seen_at") : (existing?.first_seen_at ?? 0),
-        has("created_at") ? rowNumber(row, "created_at") : (existing?.created_at ?? 0),
-        has("updated_at") ? rowNumber(row, "updated_at") : (existing?.updated_at ?? 0),
-        has("last_seen_at") ? rowNumber(row, "last_seen_at") : (existing?.last_seen_at ?? 0),
+        has("first_seen_at")
+            ? rowNumber(projectedRow, "first_seen_at")
+            : (existing?.first_seen_at ?? 0),
+        has("created_at") ? rowNumber(projectedRow, "created_at") : (existing?.created_at ?? 0),
+        has("updated_at") ? rowNumber(projectedRow, "updated_at") : (existing?.updated_at ?? 0),
+        has("last_seen_at")
+            ? rowNumber(projectedRow, "last_seen_at")
+            : (existing?.last_seen_at ?? 0),
         nullableNumber("last_retrieved_at", existing?.last_retrieved_at),
-        has("status") ? rowString(row, "status", "active") : (existing?.status ?? "active"),
+        has("status")
+            ? rowString(projectedRow, "status", "active")
+            : (existing?.status ?? "active"),
         nullableNumber("expires_at", existing?.expires_at),
         has("verification_status")
-            ? rowString(row, "verification_status", "unverified")
+            ? rowString(projectedRow, "verification_status", "unverified")
             : (existing?.verification_status ?? "unverified"),
         nullableNumber("verified_at", existing?.verified_at),
         nullableNumber("classified_at", existing?.classified_at),
@@ -1645,16 +1767,16 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         nullableString("mural_cue_hash", existing?.mural_cue_hash),
         nullableNumber("mural_cue_at", existing?.mural_cue_at),
         has("mural_cue_rejection_count")
-            ? rowNumber(row, "mural_cue_rejection_count")
+            ? rowNumber(projectedRow, "mural_cue_rejection_count")
             : (existing?.mural_cue_rejection_count ?? 0),
         contextId,
     );
-    if (hasSuperseded && typeof row.superseded_by_memory_id === "number") {
+    if (hasSuperseded && typeof projectedRow.superseded_by_memory_id === "number") {
         const translated = mirrorIdentity(
             db,
             "memories",
             moduleProject,
-            row.superseded_by_memory_id,
+            projectedRow.superseded_by_memory_id,
             statements,
         );
         if (translated) {
@@ -1664,30 +1786,34 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
             statements.upsertPendingReference.run(
                 moduleProject,
                 feed.module_row_id,
-                row.superseded_by_memory_id,
+                projectedRow.superseded_by_memory_id,
             );
         }
     } else if (hasSuperseded) {
         statements.deletePendingReference.run(moduleProject, feed.module_row_id);
     }
-    const appliedHash = has("normalized_hash") ? rowString(row, "normalized_hash") : previousHash;
+    const appliedHash = has("normalized_hash")
+        ? rowString(projectedRow, "normalized_hash")
+        : previousHash;
     if (previousHash !== appliedHash && appliedHash !== undefined) {
         statements.deleteMemoryEmbeddings.run(contextId);
     }
     // Mapping snapshots replace the whole side table. An array is a durable mapping (an empty
     // array is the file-independent sentinel); null is a mapping tombstone and leaves no rows.
-    if (has("mapping")) {
+    if (has("mapping") && !recencyGuard.hostVerificationNewer) {
         statements.deleteMemoryVerifications.run(contextId);
-        if (Array.isArray(row.mapping)) {
+        if (Array.isArray(projectedRow.mapping)) {
             const files = [
                 ...new Set(
-                    row.mapping.filter((file): file is string => typeof file === "string").sort(),
+                    projectedRow.mapping
+                        .filter((file): file is string => typeof file === "string")
+                        .sort(),
                 ),
             ];
-            const verifiedAt = rowNumber(row, "verified_at");
-            const mappedAt = rowNumber(row, "updated_at", Date.now());
+            const verifiedAt = rowNumber(projectedRow, "verified_at");
+            const mappedAt = rowNumber(projectedRow, "updated_at", Date.now());
             const mappingOrigin =
-                row.mapping_origin === "host_rejected_fallback"
+                projectedRow.mapping_origin === "host_rejected_fallback"
                     ? "host_rejected_fallback"
                     : "mapper";
             for (const file of files.length > 0 ? files : [""]) {
@@ -1708,6 +1834,8 @@ function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
     if (pending?.dirty !== 1) return;
     const candidates = statements.repairCandidates.all() as Array<{
         id: number;
+        updated_at?: number | null;
+        classified_at?: number | null;
         full_row_snapshot?: string | null;
     }>;
     for (const candidate of candidates) {
@@ -1731,9 +1859,24 @@ function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
                 ? snapshot.importance
                 : null;
         if (sourceType === null && importance === null) continue;
-        // This idempotent repair handles stores where sparse mapping records overwrote
-        // source_type and importance with null before the mirror retained full snapshots.
-        statements.repairMemory.run(sourceType, importance, Date.now(), candidate.id);
+        const snapshotVintage = Math.max(
+            memorySnapshotTimestamp(snapshot, "updated_at"),
+            memorySnapshotTimestamp(snapshot, "classified_at"),
+        );
+        const hostVintage = Math.max(candidate.updated_at ?? 0, candidate.classified_at ?? 0);
+        if (hostVintage > snapshotVintage) continue;
+        // Fill only missing metadata. A non-null host value is never replaced by an older
+        // retained snapshot, and the SQL repeats the vintage check at the write boundary.
+        statements.repairMemory.run(
+            sourceType,
+            importance,
+            Date.now(),
+            candidate.id,
+            snapshotVintage,
+            snapshotVintage,
+            sourceType,
+            importance,
+        );
     }
     // The candidate query is an intentional full pass only while dirty. Clearing the flag
     // makes subsequent mirror pages avoid the unindexed scan entirely.

@@ -2623,6 +2623,69 @@ describe("Rust mode authority adapter", () => {
         expect(output.messages).toEqual(input);
     });
 
+    it("parks a typed non-retryable state-sync failure after the first pass", async () => {
+        const sessionId = `rust-state-sync-non-retryable-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let stateSyncCalls = 0;
+        let transformCalls = 0;
+        let toastCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "state_sync") {
+                    stateSyncCalls += 1;
+                    throw Object.assign(new Error("workspace constraint"), {
+                        code: "state_sync_non_retryable",
+                    });
+                }
+                if (method === "transform") transformCalls += 1;
+                return { ok: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+                notifyParked: () => {
+                    toastCalls += 1;
+                },
+            });
+            const first = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                first,
+                { messages: first as unknown[] },
+                makeMeta(db, sessionId),
+            );
+
+            expect(transform.getState(sessionId).parked).toBe(true);
+            expect(stateSyncCalls).toBe(1);
+            expect(transformCalls).toBe(0);
+            expect(toastCalls).toBe(1);
+            expect(
+                logSpy.mock.calls
+                    .filter(([loggedSession]) => loggedSession === sessionId)
+                    .map(([, message]) => message)
+                    .find((message) => message.startsWith("rust pass:")),
+            ).toContain("decision=error reason=state_sync_non_retryable served_from=raw");
+
+            for (let pass = 0; pass < 2; pass += 1) {
+                const parked = makeMessages(sessionId);
+                await transform.run(
+                    sessionId,
+                    parked,
+                    { messages: parked as unknown[] },
+                    makeMeta(db, sessionId),
+                );
+            }
+            expect(stateSyncCalls).toBe(1);
+            expect(transformCalls).toBe(0);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
         const sessionId = `rust-failure-${Date.now()}`;
         sessions.push(sessionId);
