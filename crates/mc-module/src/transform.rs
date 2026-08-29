@@ -3195,6 +3195,9 @@ fn apply_once(
         }
     }
     let req = rebased_req.as_ref().unwrap_or(ingress_req);
+    // Snapshot the store-derived request before any renderer mutation can add sentinels,
+    // canonical blanks, or synthetic composition artifacts.
+    let trailing_blank_source_decisions = snapshot_trailing_blank_source_decisions(req);
 
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection = if rebased_req.is_some() {
@@ -5311,13 +5314,40 @@ fn apply_once(
             true,
         )?;
     }
-    // Recheck trailing blanks on every pass, including deferred passes. The build
-    // above already applied stored decisions, so removing a provider-added blank
-    // from an older message restores its previously served bytes. On a deferred
+    // A stored keep is stale when the original assistant has no trailing blank. Demote it only
+    // while that assistant is also in the current output and this pass is already invalidating the
+    // provider cache, so the first strip cannot be delayed until a later deferred pass.
+    let healed_trailing_blank_ids = heal_poisoned_trailing_blank_decisions(
+        &mut core,
+        req,
+        &trailing_blank_source_decisions,
+        &built_output.messages,
+        is_provider_prefix_mutation_pass,
+    );
+    if !healed_trailing_blank_ids.is_empty() {
+        built_output = build_output_with_tags(
+            &core,
+            output_meta,
+            &projection,
+            req,
+            (tagging_active || auto_search_active).then_some(&tag_overlay),
+            tail_reclaim_enabled && !req.is_subagent,
+            mutation_exempt_mid,
+            &tag_numbers,
+            meta.reasoning_cleared_through_tag
+                .max(meta.reasoning_cleared_through_ordinal),
+            transition_committed,
+            output_cache_snapshot.as_ref(),
+            true,
+        )?;
+    }
+    // Recheck trailing blanks on every pass, including deferred passes. Decisions come only from
+    // the immutable ingress snapshot and are intersected with the served projection. On a deferred
     // pass, record only the newest assistant because no cached message follows it.
     let (trailing_blank_decisions_updated, newest_keep_updated) = refresh_trailing_blank_decisions(
         &mut core,
         req,
+        &trailing_blank_source_decisions,
         &built_output.messages,
         is_provider_prefix_mutation_pass,
     );
@@ -5541,6 +5571,12 @@ fn apply_once(
             req.session_id,
             transition_shapes.poisoned_reasoning_arc_ids.join(","),
             row_version,
+        );
+    }
+    for mid in &healed_trailing_blank_ids {
+        eprintln!(
+            "mc-module: trailing-blank-heal session={} mid={} reason=source_without_trailing_blank pass_row={}",
+            req.session_id, mid, row_version,
         );
     }
     timings.store_memories = m1_revision_read_timings.memories_ms;
@@ -11914,6 +11950,43 @@ enum FrozenTrailingBlankDecision {
     Strip,
 }
 
+type TrailingBlankSourceDecisions = HashMap<String, (FrozenTrailingBlankDecision, usize)>;
+
+fn trailing_blank_source_decision(
+    message: &CkIngressMessage,
+) -> Option<(FrozenTrailingBlankDecision, usize)> {
+    if message.ck.role != "assistant" {
+        return None;
+    }
+    let trailing_count = message
+        .ck
+        .content
+        .iter()
+        .rev()
+        .take_while(|block| is_sentinel_invisible_text_block(block))
+        .count();
+    if message.ck.content.is_empty() || trailing_count == message.ck.content.len() {
+        Some((FrozenTrailingBlankDecision::Keep, 1))
+    } else if trailing_count == 0 {
+        Some((FrozenTrailingBlankDecision::Strip, 0))
+    } else if trailing_count <= 10_000 {
+        Some((FrozenTrailingBlankDecision::Keep, trailing_count))
+    } else {
+        None
+    }
+}
+
+fn snapshot_trailing_blank_source_decisions(
+    req: &TransformRequest,
+) -> TrailingBlankSourceDecisions {
+    req.messages
+        .iter()
+        .filter_map(|message| {
+            trailing_blank_source_decision(message).map(|decision| (message.mid.clone(), decision))
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UserTerminatedTailDecision {
     Unchanged,
@@ -12040,7 +12113,7 @@ fn canonical_blank_block() -> CkWireBlock {
     })
 }
 
-fn apply_frozen_trailing_blank_decision(
+pub(crate) fn apply_frozen_trailing_blank_decision(
     core: &CoreState,
     profile: SerializerProfile,
     provider_id: Option<&str>,
@@ -12064,10 +12137,12 @@ fn apply_frozen_trailing_blank_decision(
         .iter()
         .rposition(|block| !is_sentinel_invisible_text_block(block))
     else {
-        if message.content.len() == 1 && message.content.first() == Some(&canonical_blank) {
+        if message.content.is_empty()
+            || (message.content.len() == 1 && message.content.first() == Some(&canonical_blank))
+        {
             return 0;
         }
-        let mutations = message.content.len().max(1);
+        let mutations = message.content.len();
         message.content = vec![canonical_blank];
         message.mark_modified();
         return mutations;
@@ -12085,6 +12160,11 @@ fn apply_frozen_trailing_blank_decision(
         0
     };
     if keep_count > 0 {
+        // A keep may canonicalize a suffix supplied by the harness, but cannot recreate a suffix
+        // that is absent from the current source shape.
+        if trailing_count == 0 {
+            return 0;
+        }
         let blank_index = last_meaningful_index + 1;
         let suffix_is_canonical = trailing_count == keep_count
             && message.content[blank_index..]
@@ -12110,9 +12190,66 @@ fn apply_frozen_trailing_blank_decision(
     trailing_count
 }
 
+fn heal_poisoned_trailing_blank_decisions(
+    core: &mut CoreState,
+    req: &TransformRequest,
+    source_decisions: &TrailingBlankSourceDecisions,
+    rendered_messages: &[ServedMessage],
+    can_mutate_provider_prefix: bool,
+) -> Vec<String> {
+    if !can_mutate_provider_prefix
+        || SerializerProfile::parse(&req.serializer_profile)
+            != Some(SerializerProfile::OpencodeAiSdk)
+        || req.provider_id.as_deref() != Some("anthropic")
+    {
+        return Vec::new();
+    }
+
+    let newest_assistant_mid = latest_assistant_mid(&req.messages);
+    let visible_assistant_ids = rendered_messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.meta.harness_id.as_deref())
+        .collect::<HashSet<_>>();
+    let mut healed_ids = source_decisions
+        .iter()
+        .filter_map(|(mid, (decision, _))| {
+            (*decision == FrozenTrailingBlankDecision::Strip
+                && newest_assistant_mid != Some(mid.as_str())
+                && visible_assistant_ids.contains(mid.as_str())
+                && frozen_trailing_blank_decision(core, mid)
+                    == Some(FrozenTrailingBlankDecision::Keep))
+            .then(|| mid.clone())
+        })
+        .collect::<Vec<_>>();
+    healed_ids.sort();
+    if healed_ids.is_empty() {
+        return healed_ids;
+    }
+
+    let replaced_keys = healed_ids
+        .iter()
+        .flat_map(|mid| {
+            [
+                format!("strip:trailing_blank_keep:{mid}"),
+                format!("strip:trailing_blank_strip:{mid}"),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    core.frozen_units
+        .retain(|unit| !replaced_keys.contains(&unit.key));
+    core.frozen_units.extend(
+        healed_ids
+            .iter()
+            .map(|mid| strip_unit("trailing_blank_strip", mid, "")),
+    );
+    healed_ids
+}
+
 fn refresh_trailing_blank_decisions(
     core: &mut CoreState,
     req: &TransformRequest,
+    source_decisions: &TrailingBlankSourceDecisions,
     rendered_messages: &[ServedMessage],
     record_historical: bool,
 ) -> (usize, bool) {
@@ -12131,22 +12268,9 @@ fn refresh_trailing_blank_decisions(
         if rendered.role != "assistant" {
             continue;
         }
-        let trailing_count = rendered
-            .content
-            .iter()
-            .rev()
-            .take_while(|block| is_sentinel_invisible_text_block(block))
-            .count();
-        let (decision, keep_count) =
-            if rendered.content.is_empty() || trailing_count == rendered.content.len() {
-                (FrozenTrailingBlankDecision::Keep, 1)
-            } else if trailing_count == 0 {
-                (FrozenTrailingBlankDecision::Strip, 0)
-            } else if trailing_count <= 10_000 {
-                (FrozenTrailingBlankDecision::Keep, trailing_count)
-            } else {
-                continue;
-            };
+        let Some(&(decision, keep_count)) = source_decisions.get(mid) else {
+            continue;
+        };
         let frozen = frozen_trailing_blank_decision(core, mid);
         let frozen_matches = frozen == Some(decision)
             && (decision == FrozenTrailingBlankDecision::Strip
@@ -18740,6 +18864,38 @@ pub(crate) mod tests {
         keep_core
             .frozen_units
             .push(strip_unit("trailing_blank_keep", "target", ""));
+        let mut missing_trailing = assistant(stable_content(false));
+        let missing_trailing_bytes = serde_json::to_vec(&missing_trailing).unwrap();
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &keep_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                "target",
+                &mut missing_trailing,
+            ),
+            0
+        );
+        assert_eq!(
+            serde_json::to_vec(&missing_trailing).unwrap(),
+            missing_trailing_bytes,
+            "a frozen keep must not manufacture an absent suffix"
+        );
+        let mut empty = assistant(Vec::new());
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &keep_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                "target",
+                &mut empty,
+            ),
+            0
+        );
+        assert!(empty.content.is_empty());
+
         let mut newest_with_trailing = assistant(stable_content(true));
         apply_frozen_trailing_blank_decision(
             &keep_core,
@@ -18873,6 +19029,119 @@ pub(crate) mod tests {
                 &mut non_anthropic,
             ),
             0
+        );
+    }
+
+    #[test]
+    fn trailing_blank_decisions_mint_from_ingress_instead_of_rendered_sentinels() {
+        let target = CkIngressMessage {
+            mid: "target".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "store-derived answer".to_string(),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("target".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "trailing-source-only",
+            "cfg",
+            vec![target.clone()],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        let source_decisions = snapshot_trailing_blank_source_decisions(&request);
+        let mut composed = target.ck;
+        composed.content.push(canonical_blank_block());
+        let rendered = vec![ServedMessage::from_message(composed)];
+        let mut core = CoreState::default();
+
+        assert_eq!(
+            refresh_trailing_blank_decisions(
+                &mut core,
+                &request,
+                &source_decisions,
+                &rendered,
+                true,
+            ),
+            (1, false)
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&core, "target"),
+            Some(FrozenTrailingBlankDecision::Strip),
+            "the rendered sentinel must not mint a keep"
+        );
+    }
+
+    #[test]
+    fn trailing_blank_poison_heal_excludes_newest_and_legitimate_keeps() {
+        fn source_assistant(mid: &str, ordinal: u64, trailing: bool) -> CkIngressMessage {
+            let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: format!("answer-{mid}"),
+            })];
+            if trailing {
+                content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " ".to_string(),
+                }));
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        let historical = source_assistant("legitimate", 1, true);
+        let newest = source_assistant("newest", 2, false);
+        let mut request = profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "trailing-heal-exclusions",
+            "cfg",
+            vec![historical.clone(), newest.clone()],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        let source_decisions = snapshot_trailing_blank_source_decisions(&request);
+        let rendered = vec![
+            ServedMessage::from_message(historical.ck),
+            ServedMessage::from_message(newest.ck),
+        ];
+        let mut core = CoreState::default();
+        core.frozen_units
+            .push(strip_unit("trailing_blank_keep", "legitimate", ""));
+        core.frozen_units
+            .push(strip_unit("trailing_blank_keep", "newest", ""));
+
+        assert!(heal_poisoned_trailing_blank_decisions(
+            &mut core,
+            &request,
+            &source_decisions,
+            &rendered,
+            true,
+        )
+        .is_empty());
+        assert_eq!(
+            frozen_trailing_blank_decision(&core, "legitimate"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&core, "newest"),
+            Some(FrozenTrailingBlankDecision::Keep)
         );
     }
 
@@ -19244,6 +19513,195 @@ pub(crate) mod tests {
         assert_eq!(
             message_bytes(&structural_replay, "structural"),
             structural_bytes
+        );
+    }
+
+    fn trailing_regression_assistant(
+        mid: &str,
+        ordinal: u64,
+        trailing_text: Option<&str>,
+        structural_finish: bool,
+    ) -> CkIngressMessage {
+        let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Text {
+            text: format!("answer-{mid}"),
+        })];
+        if structural_finish {
+            content.push(CkWireBlock::bare(ck_wire::CkKind::Opaque(
+                ck_wire::OpaqueBlock {
+                    source: json!({ "source": "opencode" }),
+                    kind: "step-finish".to_string(),
+                    raw: json!({ "type": "step-finish", "reason": "tool-calls" }),
+                    arc: None,
+                },
+            )));
+        }
+        if let Some(text) = trailing_text {
+            content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: text.to_string(),
+            }));
+        }
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some(mid.to_string()),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    fn trailing_regression_request(
+        session: &str,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
+        let mut request = profile_req(SerializerProfile::OpencodeAiSdk, session, "cfg", messages);
+        request.provider_id = Some("anthropic".to_string());
+        request
+    }
+
+    fn trailing_regression_message_bytes(response: &TransformResponse, mid: &str) -> Vec<u8> {
+        response
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+            .expect("trailing-blank regression target must be served")
+            .canonical_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn poisoned_trailing_blank_keep_heals_only_on_a_visible_bust_and_replays_stably() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-poison-heal";
+        let bootstrap = run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+        assert_eq!(bootstrap.action, "HARD");
+
+        let mut loaded = store.load(session).unwrap();
+        loaded
+            .core
+            .frozen_units
+            .push(strip_unit("trailing_blank_keep", "poisoned", ""));
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let messages = || {
+            vec![
+                item("user-0", 1, "start"),
+                trailing_regression_assistant("poisoned", 2, None, true),
+                trailing_regression_assistant("newest", 3, None, false),
+            ]
+        };
+        let defer = run(
+            &store,
+            &trailing_regression_request(session, messages()),
+            &spine(),
+        );
+        assert_eq!(defer.action, "SOFT+");
+        let defer_target = defer
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("poisoned"))
+            .unwrap();
+        assert_eq!(defer_target.content.last(), Some(&canonical_blank_block()));
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "poisoned"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+
+        let mut bust_request = trailing_regression_request(session, messages());
+        bust_request.render_config = "cfg-bust".to_string();
+        let bust = run(&store, &bust_request, &spine());
+        assert_eq!(bust.action, "HARD");
+        let bust_bytes = trailing_regression_message_bytes(&bust, "poisoned");
+        let bust_target = bust
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("poisoned"))
+            .unwrap();
+        assert!(matches!(
+            &bust_target.content.last().unwrap().kind,
+            ck_wire::CkKind::Text { text } if text == "answer-poisoned"
+        ));
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "poisoned"),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+
+        for _ in 0..2 {
+            let mut replay_request = trailing_regression_request(session, messages());
+            replay_request.render_config = "cfg-bust".to_string();
+            let replay = run(&store, &replay_request, &spine());
+            assert_eq!(replay.action, "SOFT+");
+            assert_eq!(
+                trailing_regression_message_bytes(&replay, "poisoned"),
+                bust_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn decisionless_historical_late_blank_is_bounded_by_the_next_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-decisionless-late";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+
+        let messages = || {
+            vec![
+                item("user-0", 1, "start"),
+                trailing_regression_assistant("late", 2, Some(" \t"), false),
+                trailing_regression_assistant("newest", 3, None, false),
+            ]
+        };
+        let defer = run(
+            &store,
+            &trailing_regression_request(session, messages()),
+            &spine(),
+        );
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "late"),
+            None
+        );
+        let defer_bytes = trailing_regression_message_bytes(&defer, "late");
+
+        let mut bust_request = trailing_regression_request(session, messages());
+        bust_request.render_config = "cfg-bust".to_string();
+        let bust = run(&store, &bust_request, &spine());
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "late"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+        let bust_bytes = trailing_regression_message_bytes(&bust, "late");
+        assert_ne!(
+            bust_bytes, defer_bytes,
+            "the already-priced bust canonicalizes the late store blank once"
+        );
+
+        let mut replay_request = trailing_regression_request(session, messages());
+        replay_request.render_config = "cfg-bust".to_string();
+        let replay = run(&store, &replay_request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            trailing_regression_message_bytes(&replay, "late"),
+            bust_bytes
         );
     }
 
