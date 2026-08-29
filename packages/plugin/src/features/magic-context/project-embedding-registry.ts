@@ -239,6 +239,15 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
 let projectSweepInProgress = false;
 let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
 
+export class TestProviderFactoryRequiredError extends Error {
+    constructor() {
+        super(
+            "test constructed a network-capable embedding provider without a test factory — install _setTestProviderFactoryForProject or set embedding.provider off in the fixture",
+        );
+        this.name = "TestProviderFactoryRequiredError";
+    }
+}
+
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
     fingerprint?: string;
@@ -468,12 +477,20 @@ function createProvider(
     config: EmbeddingConfig,
     context?: { projectRoot: string; session: string },
 ): EmbeddingProvider | null {
+    // `off` is an intentional no-provider configuration, including in tests.
+    if (config.provider === "off") {
+        return null;
+    }
+
     if (testProviderFactory) {
         return testProviderFactory(config);
     }
 
-    if (config.provider === "off") {
-        return null;
+    // The preload sets this process-only marker for every Bun test that wires
+    // Magic Context's test isolation. A factory makes provider construction
+    // explicit so a fixture can never silently use a live endpoint or model.
+    if (process.env.MAGIC_CONTEXT_TEST_DATA_DIR?.trim()) {
+        throw new TestProviderFactoryRequiredError();
     }
 
     if (config.provider === "openai-compatible") {

@@ -1,10 +1,14 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
 
-test("Pi preload isolation outranks the shared storage override", () => {
+test("Pi preload isolates storage and user config", () => {
 	const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 	expect(testDataDir).toBeTruthy();
-	const resolverPath = path.resolve(import.meta.dir, "../../plugin/src/shared/data-path.ts");
+	expect(process.env.XDG_CONFIG_HOME).toBe(testDataDir);
+	const resolverPath = path.resolve(
+		import.meta.dir,
+		"../../plugin/src/shared/data-path.ts",
+	);
 	const script = `const { getMagicContextStorageResolution } = await import(${JSON.stringify(
 		resolverPath,
 	)}); process.stdout.write(JSON.stringify(getMagicContextStorageResolution()));`;
