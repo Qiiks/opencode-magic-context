@@ -2,7 +2,7 @@ import type { BuiltinCommandConfig } from "./types";
 
 const COMPACTION_ENABLED_PATH = `compaction${".enabled"}`;
 
-export function getMagicContextBuiltinCommands(compactionEnabled = true): BuiltinCommandConfig {
+export function getMagicContextBuiltinCommands(compactionEnabled = true) {
     const unavailableInCompactionOff = (command: string) =>
         `Unavailable when ${COMPACTION_ENABLED_PATH} is false: /${command} manages compacted history.`;
 
@@ -47,5 +47,9 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true): Builti
             description:
                 "Embedding status, or start/pause history compartment embedding (start | pause)",
         },
-    };
+    } satisfies BuiltinCommandConfig;
 }
+
+export type MagicContextBuiltinCommandName = keyof ReturnType<
+    typeof getMagicContextBuiltinCommands
+>;

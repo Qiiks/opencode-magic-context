@@ -23,6 +23,7 @@ import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
+import type { CommandExecuteInput, CommandExecuteOutput } from "./command-handler";
 import {
     cachedToolPermissionDenied,
     resolveTodowriteAvailability,
@@ -53,6 +54,7 @@ import {
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
 import { clearIgnoredMessages, flushIgnoredMessages } from "./send-session-notification";
 import { variantChangeBustsProviderCache } from "./sentinel";
+import { matchStrippedMagicContextCommand } from "./stripped-command";
 import { normalizeTodoStateJson } from "./todo-view";
 
 export type LiveModelBySession = Map<string, { providerID: string; modelID: string }>;
@@ -135,6 +137,21 @@ export type FlushedSessions = Set<string>;
 
 export type LastHeuristicsTurnId = Map<string, string>;
 
+type CommandNotificationParams = {
+    agent?: string;
+    variant?: string;
+    providerId?: string;
+    modelId?: string;
+};
+
+export interface MagicContextCommandHandler {
+    "command.execute.before": (
+        input: CommandExecuteInput,
+        output: CommandExecuteOutput,
+        params: CommandNotificationParams,
+    ) => Promise<unknown>;
+}
+
 export function getLiveNotificationParams(
     sessionId: string,
     liveModelBySession: LiveModelBySession,
@@ -174,15 +191,48 @@ export function createChatMessageHook(args: {
     /** E5 — one-time session upgrade reminder. Optional: only wired when the
      *  historian can run (so an upgrade is actually possible). Self-gates. */
     upgradeReminder?: (sessionId: string) => Promise<void>;
+    /** The native slash-command handler, reused when Desktop removes the slash. */
+    commandHandler?: MagicContextCommandHandler;
 }) {
-    return async (input: {
-        sessionID?: string;
-        variant?: string;
-        agent?: string;
-        model?: { providerID?: string; modelID?: string };
-    }) => {
+    return async (
+        input: {
+            sessionID?: string;
+            variant?: string;
+            agent?: string;
+            model?: { providerID?: string; modelID?: string };
+        },
+        output?: {
+            parts?: Array<{
+                type: string;
+                text?: string;
+                ignored?: boolean;
+                synthetic?: boolean;
+            }>;
+        },
+    ) => {
         const sessionId = input.sessionID;
         if (!sessionId) return;
+
+        const strippedCommand =
+            args.commandHandler && output?.parts
+                ? matchStrippedMagicContextCommand(output.parts)
+                : null;
+        if (strippedCommand && args.commandHandler && output?.parts) {
+            await args.commandHandler["command.execute.before"](
+                {
+                    command: strippedCommand.command,
+                    sessionID: sessionId,
+                    arguments: strippedCommand.arguments,
+                },
+                { parts: output.parts },
+                {
+                    agent: input.agent,
+                    variant: input.variant,
+                    providerId: input.model?.providerID,
+                    modelId: input.model?.modelID,
+                },
+            );
+        }
 
         // E5: fire-and-forget one-time upgrade reminder for legacy sessions.
         // Self-gating + model-invisible, so it never affects the prompt prefix.
@@ -418,15 +468,9 @@ export function createEventHook(args: {
     };
 }
 
-export function createCommandExecuteBeforeHook(commandHandler: {
-    "command.execute.before": (
-        input: import("./command-handler").CommandExecuteInput,
-        output: import("./command-handler").CommandExecuteOutput,
-        params: { agent?: string; variant?: string; providerId?: string; modelId?: string },
-    ) => Promise<unknown>;
-}) {
+export function createCommandExecuteBeforeHook(commandHandler: MagicContextCommandHandler) {
     return async (input: unknown, output: unknown) => {
-        const typedInput = input as import("./command-handler").CommandExecuteInput & {
+        const typedInput = input as CommandExecuteInput & {
             agent?: string;
             variant?: string;
             providerID?: string;
@@ -439,8 +483,8 @@ export function createCommandExecuteBeforeHook(commandHandler: {
             modelId: typedInput.modelID,
         };
         return commandHandler["command.execute.before"](
-            typedInput as import("./command-handler").CommandExecuteInput,
-            output as import("./command-handler").CommandExecuteOutput,
+            typedInput as CommandExecuteInput,
+            output as CommandExecuteOutput,
             params,
         );
     };
