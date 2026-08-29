@@ -321,6 +321,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object";
 }
 
+function moduleFailureCode(error: unknown): string | null {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        if (typeof current.code === "string" && current.code.length > 0) return current.code;
+        if (typeof current.message === "string") {
+            try {
+                const detail: unknown = JSON.parse(current.message);
+                if (isRecord(detail) && typeof detail.code === "string") return detail.code;
+            } catch {
+                // Human-readable transport errors need no typed classification.
+            }
+        }
+        current = current.cause;
+    }
+    return null;
+}
+
+function isNonRetryableStateSyncFailure(error: unknown): boolean {
+    return moduleFailureCode(error) === "state_sync_non_retryable";
+}
+
 /**
  * OpenCode retains the original messages array when it serializes a transform result.
  * Mutate that array in place so the module response reaches the wire, while returning
@@ -1451,7 +1474,9 @@ export function createRustModeTransform(
     };
 
     const markFailure = (sessionId: string, state: RustSessionState, error: unknown): void => {
-        state.consecutiveFailures += 1;
+        state.consecutiveFailures = isNonRetryableStateSyncFailure(error)
+            ? Math.max(RUST_FAILURE_PARK_THRESHOLD, state.consecutiveFailures + 1)
+            : state.consecutiveFailures + 1;
         state.failureCount += 1;
         sessionLog(sessionId, "rust transform failed; attempting LKG replay:", error);
         if (state.consecutiveFailures < RUST_FAILURE_PARK_THRESHOLD || state.parked) return;
@@ -3004,7 +3029,7 @@ export function createRustModeTransform(
             if (replayed) state.forceFullWire = true;
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
-            materializeReason = "none";
+            materializeReason = moduleFailureCode(error) ?? "none";
             markFailure(sessionId, state, error);
             if (!replayed) {
                 try {

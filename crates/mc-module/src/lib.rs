@@ -9161,6 +9161,17 @@ impl McHandler {
             Err(ModuleStateSyncError::AuthoritySeqMismatch { expected, found }) => {
                 state_sync_seq_mismatch_error(expected, found)
             }
+            Err(ModuleStateSyncError::NonRetryableStoreConstraint { detail }) => {
+                HandlerOutcome::Error {
+                    code: "state_sync_non_retryable".to_string(),
+                    message: json!({
+                        "code": "state_sync_non_retryable",
+                        "retryable": false,
+                        "detail": detail,
+                    })
+                    .to_string(),
+                }
+            }
             Err(ModuleStateSyncError::HistorianBusy { phase }) => {
                 historian_compartment_sync_busy_error(phase)
             }

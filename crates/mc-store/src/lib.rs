@@ -4789,6 +4789,7 @@ pub enum StateImportError {
 #[derive(Debug)]
 pub enum ModuleStateSyncError {
     Store(McStoreError),
+    NonRetryableStoreConstraint { detail: String },
     GenerationMismatch { expected: u64, found: u64 },
     AuthoritySeqMismatch { expected: u64, found: u64 },
     HistorianBusy { phase: HistorianPhase },
@@ -4976,6 +4977,9 @@ impl std::fmt::Display for ModuleStateSyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModuleStateSyncError::Store(e) => write!(f, "store: {e}"),
+            ModuleStateSyncError::NonRetryableStoreConstraint { detail } => {
+                write!(f, "non-retryable state-sync store constraint: {detail}")
+            }
             ModuleStateSyncError::GenerationMismatch { expected, found } => write!(
                 f,
                 "shadow generation mismatch: expected {expected}, found {found}"
@@ -5392,6 +5396,7 @@ fn validated_seed_boundary(
 
 enum ModuleStateSyncTxnOutcome {
     Committed(ModuleStateSyncResult),
+    NonRetryableStoreConstraint { detail: String },
     GenerationMismatch { found: u64 },
     AuthoritySeqMismatch { found: u64 },
     HistorianBusy { phase: HistorianPhase },
@@ -9765,7 +9770,18 @@ impl McStore {
                 );
             }
             if request.workspace_present {
-                replace_workspace_tx(tx, request.project_path, request.workspace)?;
+                if let Err(error) =
+                    replace_workspace_tx(tx, request.project_path, request.workspace)
+                {
+                    if error.sqlite_error_code()
+                        == Some(rusqlite::ErrorCode::ConstraintViolation)
+                    {
+                        return Ok(ModuleStateSyncTxnOutcome::NonRetryableStoreConstraint {
+                            detail: error.to_string(),
+                        });
+                    }
+                    return Err(error);
+                }
             }
             // Each authority pool has exactly one writer. When the module owns memories, this
             // state-sync lane can only mirror module changes back to TypeScript; applying the
@@ -9862,6 +9878,9 @@ impl McStore {
 
         match outcome {
             ModuleStateSyncTxnOutcome::Committed(result) => Ok(result),
+            ModuleStateSyncTxnOutcome::NonRetryableStoreConstraint { detail } => {
+                Err(ModuleStateSyncError::NonRetryableStoreConstraint { detail })
+            }
             ModuleStateSyncTxnOutcome::GenerationMismatch { found } => {
                 Err(ModuleStateSyncError::GenerationMismatch {
                     expected: request.shadow_generation,
@@ -15592,12 +15611,21 @@ fn replace_workspace_tx(
     project_path: &str,
     workspace: Option<&ModuleWorkspaceRow>,
 ) -> rusqlite::Result<()> {
+    // Authority workspaces store the bound domain identity as their owning member, while
+    // state sync addresses the route by filesystem path. Clear a replaced workspace through
+    // either spelling, but retain a same-name row so reactivation preserves its durable id.
     tx.execute(
         "DELETE FROM mc_workspaces
           WHERE id IN (
-              SELECT workspace_id FROM mc_workspace_members WHERE project_path = ?1
-          )",
-        params![project_path],
+              SELECT member.workspace_id
+                FROM mc_workspace_members member
+                LEFT JOIN mc_authority_route_bindings binding
+                  ON binding.route_project_root = ?1
+               WHERE member.project_path = ?1
+                  OR member.project_path = binding.project
+          )
+            AND (?2 IS NULL OR name <> ?2)",
+        params![project_path, workspace.map(|row| row.name.as_str())],
     )?;
     let Some(workspace) = workspace else {
         return Ok(());
@@ -15606,15 +15634,30 @@ fn replace_workspace_tx(
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     tx.execute(
         "INSERT INTO mc_workspaces (name, created_at, updated_at, share_categories)
-         VALUES (?1, 0, 0, ?2)",
+         VALUES (?1, 0, 0, ?2)
+         ON CONFLICT(name) DO UPDATE SET
+             name = excluded.name,
+             share_categories = excluded.share_categories",
         params![&workspace.name, share_categories],
     )?;
-    let workspace_id = tx.last_insert_rowid();
+    let workspace_id: i64 = tx.query_row(
+        "SELECT id FROM mc_workspaces WHERE name = ?1",
+        params![&workspace.name],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "DELETE FROM mc_workspace_members WHERE workspace_id = ?1",
+        params![workspace_id],
+    )?;
     for member in &workspace.members {
         tx.execute(
             "INSERT INTO mc_workspace_members
                 (workspace_id, project_path, display_name, display_path, added_at)
-             VALUES (?1, ?2, ?3, ?4, 0)",
+             VALUES (?1, ?2, ?3, ?4, 0)
+             ON CONFLICT(project_path) DO UPDATE SET
+                 workspace_id = excluded.workspace_id,
+                 display_name = excluded.display_name,
+                 display_path = excluded.display_path",
             params![
                 workspace_id,
                 &member.project_path,
@@ -23828,6 +23871,55 @@ mod shadow_tests {
 
         apply_state_sync_sections(&mixed, 3, Some(&[]), true, None);
         assert_eq!(section_snapshot(&mixed), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn authority_workspace_reactivation_reuses_the_durable_workspace_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .bind_authority_route("context", "git:identity", "project")
+            .unwrap();
+        let workspace = ModuleWorkspaceRow {
+            name: "authority-workspace-stable".to_string(),
+            share_categories: vec!["CONSTRAINTS".to_string()],
+            members: vec![ModuleWorkspaceMemberRow {
+                project_path: "git:identity".to_string(),
+                display_name: "project".to_string(),
+                display_path: "/worktrees/project".to_string(),
+            }],
+        };
+
+        apply_state_sync_sections(&store, 0, None, true, Some(&workspace));
+        let first_id = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT id FROM mc_workspaces WHERE name = ?1",
+                    params![&workspace.name],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+
+        // TypeScript mode does not send a workspace section to the dormant module store.
+        apply_state_sync_sections(&store, 1, None, false, None);
+        apply_state_sync_sections(&store, 2, None, true, Some(&workspace));
+
+        let reactivated = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT workspace.id, member.project_path
+                       FROM mc_workspaces workspace
+                       JOIN mc_workspace_members member ON member.workspace_id = workspace.id
+                      WHERE workspace.name = ?1",
+                    params![&workspace.name],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(reactivated, (first_id, "git:identity".to_string()));
     }
 
     #[test]
