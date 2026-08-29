@@ -457,6 +457,67 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
+        it("echoes content when the authority-state probe fails", async () => {
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
+            ).run("/repo/project", "store-1", Date.now());
+            const content = "preserve this exact prompt\nincluding its second line";
+            const authorityError = "supervisor state: MODULE transport unavailable";
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => {
+                        throw new Error(authorityError);
+                    },
+                },
+            });
+
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "write", category: "CONSTRAINTS", content },
+                toolContext(),
+            );
+
+            expect(result).toContain(
+                `Error: Rust memory authority is unavailable. ${authorityError}`,
+            );
+            expect(result).toContain("Write REFUSED and NOT saved");
+            expect(result).toContain("RESEND the same call");
+            expect(result).toContain("typically recovers in seconds-to-minutes");
+            expect(result).toContain(`Content to resend:\n${content}`);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("echoes content when the module call fails outside a drain", async () => {
+            const content = "module failure must preserve this content";
+            const moduleError = "supervisor state: MODULE call failed";
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async () => {
+                        throw new Error(moduleError);
+                    },
+                },
+            });
+
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "merge", ids: [1, 2], content },
+                toolContext(),
+            );
+
+            expect(result).toContain(`Error: Rust module ctx_memory failed. ${moduleError}`);
+            expect(result).toContain("Write REFUSED and NOT saved");
+            expect(result).toContain("RESEND the same call");
+            expect(result).toContain(`Content to resend:\n${content}`);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
         it("does not echo content attached to a read-only module refusal", async () => {
             const moduleTools = createCtxMemoryTools({
                 db,
