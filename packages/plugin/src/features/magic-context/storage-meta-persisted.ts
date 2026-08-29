@@ -155,12 +155,31 @@ export interface ProtectedTailDrainReservation {
     tokens: number;
 }
 
+export interface ProtectedTailDrainBudgetState {
+    windowStartedAt: number;
+    resetsAt: number;
+    resetInMs: number;
+    spentTokens: number;
+    limitTokens: number;
+}
+
 export interface ProtectedTailDrainReserveResult {
     ok: boolean;
     reservedTokens: number;
     overQuotaBypass: boolean;
     reservation: ProtectedTailDrainReservation | null;
+    budgetState: ProtectedTailDrainBudgetState | null;
     skippedReason?: string;
+}
+
+/** Describe the internal limiter without implying that the model provider rejected a request. */
+export function describeProtectedTailDrainBudgetSkip(
+    result: ProtectedTailDrainReserveResult,
+): string {
+    const state = result.budgetState;
+    if (!state) return "historian skip: internal drain budget spent";
+    const resetMinutes = Math.max(1, Math.ceil(state.resetInMs / 60_000));
+    return `historian skip: internal drain budget spent (${state.spentTokens}/${state.limitTokens} tokens; resets in ${resetMinutes}m)`;
 }
 
 export interface WrapupInProgressState {
@@ -766,22 +785,34 @@ export function reserveProtectedTailDrainTokens(args: {
     const now = args.now ?? Date.now();
     const requested = Math.max(0, Math.floor(args.trueRawTokens));
     if (requested === 0) {
-        return { ok: true, reservedTokens: 0, overQuotaBypass: false, reservation: null };
+        return {
+            ok: true,
+            reservedTokens: 0,
+            overQuotaBypass: false,
+            reservation: null,
+            budgetState: null,
+        };
     }
     let result: ProtectedTailDrainReserveResult = {
         ok: false,
         reservedTokens: 0,
         overQuotaBypass: false,
         reservation: null,
-        skippedReason: "quota exhausted",
+        budgetState: null,
+        skippedReason: "internal drain budget spent",
     };
     args.db.transaction(() => {
         ensureSessionMetaRow(args.db, args.sessionId);
         let meta = loadProtectedTailMeta(args.db, args.sessionId);
-        if (now - meta.protectedTailDrainWindowStartedAt > DRAIN_WINDOW_MS) {
-            // Reset the per-window budget. The emergency latch is usage-driven and
-            // deliberately NOT cleared here — it must persist across window
-            // boundaries until usage returns to the safe zone.
+        const windowStartedAt = meta.protectedTailDrainWindowStartedAt;
+        const windowExpired =
+            windowStartedAt <= 0 ||
+            windowStartedAt > now ||
+            now - windowStartedAt >= DRAIN_WINDOW_MS;
+        if (windowExpired) {
+            // Expiry is checked before every reservation, including skipped attempts.
+            // A future timestamp is invalid wall-clock state and starts a fresh window
+            // instead of holding the session behind the limiter until that time arrives.
             args.db
                 .prepare(
                     `UPDATE session_meta
@@ -816,30 +847,47 @@ export function reserveProtectedTailDrainTokens(args: {
         const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
         let reserved = Math.min(requested, args.perRunCap, remaining);
         let bypass = false;
-        // While the latch is active, drain a chunk EVERY pass past the window budget
-        // — UNLESS a recent historian failure is still in its backoff window (so a
-        // broken historian can't retry-thrash under the latch).
+        // While emergency draining is active, reserve a chunk on every pass beyond
+        // the normal window budget unless a recent historian failure is still backing
+        // off. A future failure timestamp is ignored because it cannot represent a
+        // recent failure after the wall clock moved backward.
         const inFailureBackoff =
             meta.historianDrainFailureAt > 0 &&
+            meta.historianDrainFailureAt <= now &&
             now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
         if (reserved <= 0 && latchActive && !inFailureBackoff) {
             reserved = Math.min(requested, args.perRunCap);
             bypass = true;
         }
-        if (reserved <= 0) return;
+
+        const activeWindowStartedAt = meta.protectedTailDrainWindowStartedAt;
+        const budgetState = (spentTokens: number): ProtectedTailDrainBudgetState => ({
+            windowStartedAt: activeWindowStartedAt,
+            resetsAt: activeWindowStartedAt + DRAIN_WINDOW_MS,
+            resetInMs: Math.max(0, activeWindowStartedAt + DRAIN_WINDOW_MS - now),
+            spentTokens,
+            limitTokens: budget,
+        });
+        if (reserved <= 0) {
+            result = {
+                ...result,
+                budgetState: budgetState(meta.protectedTailDrainTokens),
+            };
+            return;
+        }
         args.db
             .prepare(
                 `UPDATE session_meta
-                 SET protected_tail_drain_window_started_at = CASE WHEN protected_tail_drain_window_started_at = 0 THEN ? ELSE protected_tail_drain_window_started_at END,
-                     protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
+                 SET protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
                  WHERE session_id = ?`,
             )
-            .run(now, reserved, args.sessionId);
+            .run(reserved, args.sessionId);
         result = {
             ok: true,
             reservedTokens: reserved,
             overQuotaBypass: bypass,
             reservation: { sessionId: args.sessionId, runId: args.runId, tokens: reserved },
+            budgetState: budgetState(meta.protectedTailDrainTokens + reserved),
         };
     })();
     return result;
