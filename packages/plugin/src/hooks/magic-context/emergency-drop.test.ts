@@ -200,7 +200,7 @@ describe("planEmergencyDrop — target math", () => {
         expect(plan.tagNumbers).not.toContain(20);
     });
 
-    it("is idempotent across consecutive ≥85% passes on the same usage sample (no over-drop)", () => {
+    it("latches the whole force-pressure episode across fresh usage samples", () => {
         // 20 T3 tags × 1000 bytes (≈250 tokens each). currentTotal 100k, ceiling
         // 60k. First pass drops down to target and latches the usage sample.
         const tags = Array.from({ length: 20 }, (_, i) => tag(i + 1, "bash", 1000));
@@ -227,20 +227,21 @@ describe("planEmergencyDrop — target math", () => {
             priorInputSample: 100_000, // latched from the first drop
         });
         expect(second.shouldDrop).toBe(false);
-        expect(second.reason).toContain("same-input-sample");
-        // A FRESH (lower) sample releases the latch so it can re-evaluate.
+        expect(second.reason).toContain("pressure-episode-latched");
+        // A fresh provider sample is still the same pressure LEVEL, not a new
+        // application edge. The caller explicitly rearms only after force-band
+        // exit or an independent provider-visible mutation.
         const third = planWithFloor({
             tags,
             maxTag: 20,
             protectedTags: 0,
-            currentTotalInputTokens: 95_000, // new measured pressure
+            currentTotalInputTokens: 95_000,
             ceilingTokens: 60_000,
             hasPriorDrop: true,
             priorInputSample: 100_000,
         });
-        // Released (not the same-sample no-op); may or may not drop depending on
-        // remaining tail, but it is NOT short-circuited by the latch.
-        expect(third.reason).not.toContain("same-input-sample");
+        expect(third.shouldDrop).toBe(false);
+        expect(third.reason).toContain("pressure-episode-latched");
     });
 
     it("counts tool input + reasoning bytes in BOTH floor and reclaim (no under-evict)", () => {
@@ -374,8 +375,10 @@ describe("planEmergencyDrop — idempotence via status='active' (no scalar water
             tags,
             maxTag: 10,
             protectedTags: 0,
-            hasPriorDrop: true,
-            priorInputSample: 0, // fresh sample (0) ≠ current → latch released
+            hasPriorDrop: false,
+            // The caller reset the episode latch to 0 because another mutation
+            // already priced this pass, so newly eligible tags may ride it.
+            priorInputSample: 0,
             currentTotalInputTokens: 10_000,
             ceilingTokens: 1_000,
         });
