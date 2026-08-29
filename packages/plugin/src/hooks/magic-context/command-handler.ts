@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
 import type { DreamerConfig, SidekickConfig } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
+import type { MagicContextBuiltinCommandName } from "../../features/builtin-commands/commands";
 import { getDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
@@ -132,6 +133,36 @@ export function parseWrapupArgs(
         return { ok: false, message: "messages_to_keep must be a positive integer." };
     }
     return { ok: true, messagesToKeep };
+}
+
+const commandArgumentValidators: Record<MagicContextBuiltinCommandName, (raw: string) => boolean> =
+    {
+        "ctx-status": (raw) => raw.trim() === "",
+        "ctx-recomp": (raw) => parseRecompArgs(raw).kind !== "error",
+        "ctx-wrapup": (raw) => parseWrapupArgs(raw).ok,
+        "ctx-session-upgrade": (raw) => raw.trim() === "",
+        "ctx-flush": (raw) => raw.trim() === "",
+        "ctx-aug": (raw) => raw.trim().length > 0,
+        "ctx-dream": (raw) => {
+            const requested = raw.trim();
+            return requested === "" || isCanonicalDreamTask(requested);
+        },
+        "ctx-embed": (raw) => {
+            const subcommand = raw.trim().toLowerCase();
+            return subcommand === "" || subcommand === "start" || subcommand === "pause";
+        },
+    };
+
+/**
+ * Conservative pre-dispatch gate for Desktop prompts that lost their slash.
+ * The actual command handler still parses the accepted text, so intercepted and
+ * native slash commands share one execution path and one argument interpretation.
+ */
+export function acceptsMagicContextCommandArguments(
+    command: MagicContextBuiltinCommandName,
+    raw: string,
+): boolean {
+    return commandArgumentValidators[command](raw);
 }
 
 export interface CommandExecuteInput {

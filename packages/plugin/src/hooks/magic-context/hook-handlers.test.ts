@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -18,6 +18,7 @@ import type { Channel1State } from "./ctx-reduce-nudge";
 import { EMPTY_TASK_OUTPUT_SENTINEL } from "./empty-task-output";
 import {
     createChatMessageHook,
+    createCommandExecuteBeforeHook,
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
@@ -391,6 +392,110 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
         } finally {
             closeQuietly(db);
         }
+    });
+});
+
+describe("Desktop stripped-command interception", () => {
+    function createCommandHook(commandHandler: {
+        "command.execute.before": (
+            input: { command: string; sessionID: string; arguments: string },
+            output: { parts: Array<{ type: string; text?: string }> },
+            params: Record<string, unknown>,
+        ) => Promise<unknown>;
+    }) {
+        const db = createTestDb();
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession: new Map(),
+            variantBySession: new Map(),
+            agentBySession: new Map(),
+            historyRefreshSessions: new Set(),
+            systemPromptRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            commandHandler,
+        });
+        return { db, hook };
+    }
+
+    test("routes accepted wrapup arguments through the native command handler", async () => {
+        const execute = mock(async () => undefined);
+        const { db, hook } = createCommandHook({ "command.execute.before": execute });
+        try {
+            await hook(
+                {
+                    sessionID: "ses-wrapup",
+                    agent: "build",
+                    variant: "high",
+                    model: { providerID: "anthropic", modelID: "claude" },
+                },
+                { parts: [{ type: "text", text: "ctx-wrapup 2" }] },
+            );
+
+            expect(execute).toHaveBeenCalledTimes(1);
+            expect(execute.mock.calls[0]?.[0]).toEqual({
+                command: "ctx-wrapup",
+                sessionID: "ses-wrapup",
+                arguments: "2",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("does not route trailing or surrounding prose", async () => {
+        const execute = mock(async () => undefined);
+        const { db, hook } = createCommandHook({ "command.execute.before": execute });
+        try {
+            for (const text of [
+                "ctx-status extra prose sentence",
+                "Please run ctx-status before continuing.",
+            ]) {
+                await hook({ sessionID: "ses-prose" }, { parts: [{ type: "text", text }] });
+            }
+
+            expect(execute).not.toHaveBeenCalled();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("leaves native slash dispatch on the same handler adapter", async () => {
+        const execute = mock(async () => undefined);
+        const nativeHook = createCommandExecuteBeforeHook({ "command.execute.before": execute });
+        const output = { parts: [{ type: "text", text: "" }] };
+
+        await nativeHook(
+            {
+                command: "ctx-status",
+                sessionID: "ses-native-command",
+                arguments: "",
+                agent: "build",
+                variant: "high",
+                providerID: "anthropic",
+                modelID: "claude",
+            },
+            output,
+        );
+
+        expect(execute).toHaveBeenCalledWith(
+            {
+                command: "ctx-status",
+                sessionID: "ses-native-command",
+                arguments: "",
+                agent: "build",
+                variant: "high",
+                providerID: "anthropic",
+                modelID: "claude",
+            },
+            output,
+            {
+                agent: "build",
+                variant: "high",
+                providerId: "anthropic",
+                modelId: "claude",
+            },
+        );
     });
 });
 

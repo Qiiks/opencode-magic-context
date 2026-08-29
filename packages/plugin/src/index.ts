@@ -638,7 +638,7 @@ const server: Plugin = async (ctx) => {
         "command.execute.before": async (input, output) => {
             await magicContextRuntime.magicContext?.["command.execute.before"]?.(input, output);
         },
-        "chat.message": async (input, _output) => {
+        "chat.message": async (input, output) => {
             // The first real prompt is the lazy-load boundary. Awaiting here keeps
             // the tokenizer out of cold start while ensuring synchronous token
             // estimates later in this prompt use the installed package.
@@ -657,7 +657,7 @@ const server: Plugin = async (ctx) => {
             if (provId && modId && agent) {
                 lastChatContext = { providerID: provId, modelID: modId, agentName: agent };
             }
-            await magicContextRuntime.magicContext?.["chat.message"]?.(input);
+            await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
         },
         "tool.definition": async (input, output) => {
             // Attribute tool schema tokens to the most recent chat-message context.

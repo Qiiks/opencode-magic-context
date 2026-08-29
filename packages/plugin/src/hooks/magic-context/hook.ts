@@ -1534,6 +1534,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions,
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
+            commandHandler,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable

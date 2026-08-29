@@ -379,6 +379,67 @@ describe("magic-context hook", () => {
         expect(typeof hook["tool.execute.after"]).toBe("function");
     });
 
+    it("intercepts a Desktop slashless status command before an LLM completion", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-stripped-status-");
+        const promptMocks = createPromptMocks();
+        const hook = requireHook(createMagicContextHook(createMockDeps(promptMocks)));
+        let persistedCommandRows = 0;
+        let llmCompletions = 0;
+
+        const promptPipeline = async () => {
+            await hook["chat.message"]!(
+                {
+                    sessionID: "ses-stripped-status",
+                    agent: "build",
+                    model: { providerID: "anthropic", modelID: "claude" },
+                    variant: "high",
+                },
+                {
+                    message: {} as never,
+                    parts: [{ type: "text", text: "ctx-status" } as never],
+                },
+            );
+            persistedCommandRows += 1;
+            llmCompletions += 1;
+        };
+
+        await expectSentinel(promptPipeline(), "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__");
+
+        expect(persistedCommandRows).toBe(0);
+        expect(llmCompletions).toBe(0);
+        expect(promptMocks.prompt).toHaveBeenCalledTimes(1);
+        const notification = promptMocks.prompt?.mock.calls[0]?.[0] as {
+            body?: {
+                noReply?: boolean;
+                parts?: Array<{ text?: string; ignored?: boolean }>;
+            };
+        };
+        expect(notification.body?.noReply).toBe(true);
+        expect(notification.body?.parts?.[0]?.ignored).toBe(true);
+        expect(notification.body?.parts?.[0]?.text).toContain("## Magic Context Status");
+    });
+
+    it("keeps the native slash-command path unchanged", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-native-status-");
+        const promptMocks = createPromptMocks();
+        const hook = requireHook(createMagicContextHook(createMockDeps(promptMocks)));
+
+        await expectSentinel(
+            hook["command.execute.before"]!(
+                { command: "ctx-status", sessionID: "ses-native-status", arguments: "" },
+                { parts: [] },
+            ),
+            "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+        );
+
+        expect(promptMocks.prompt).toHaveBeenCalledTimes(1);
+        const notification = promptMocks.prompt?.mock.calls[0]?.[0] as {
+            body?: { noReply?: boolean; parts?: Array<{ ignored?: boolean }> };
+        };
+        expect(notification.body?.noReply).toBe(true);
+        expect(notification.body?.parts?.[0]?.ignored).toBe(true);
+    });
+
     it("re-arms auto-embed when the first transform precedes compartment work", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-auto-embed-data-");
         const projectDir = makeTempDir("hook-auto-embed-project-");
