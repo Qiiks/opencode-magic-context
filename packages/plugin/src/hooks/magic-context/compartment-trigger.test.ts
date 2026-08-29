@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
 import {
     closeDatabase,
     insertTag,
@@ -14,8 +15,17 @@ import {
 import type { SessionMeta } from "../../features/magic-context/types";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { checkCompartmentTrigger, type InMemoryTailSource } from "./compartment-trigger";
+import {
+    checkCompartmentTrigger,
+    formatProjectedPostDropPercentage,
+    type InMemoryTailSource,
+} from "./compartment-trigger";
 import type { RawMessage } from "./read-session-raw";
+
+it("formats an unavailable post-drop projection without a percent suffix", () => {
+    expect(formatProjectedPostDropPercentage(null)).toBe("none");
+    expect(formatProjectedPostDropPercentage(67.54)).toBe("67.5%");
+});
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;

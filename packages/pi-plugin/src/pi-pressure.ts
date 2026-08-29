@@ -91,3 +91,66 @@ export function computePiPressure(
 	const percentage = contextLimit > 0 ? (inputTokens / contextLimit) * 100 : 0;
 	return { inputTokens, percentage };
 }
+
+export interface PiPressureSnapshot extends PiPressure {
+	/** Usable prompt-token denominator used for both percentage and display. */
+	contextLimit?: number;
+}
+
+export interface ResolvePiPressureSnapshotArgs {
+	persistedPercentage: number;
+	persistedInputTokens: number;
+	liveInputTokens?: number | null;
+	usableContextLimit?: number;
+}
+
+/**
+ * Resolve one pressure pair for every Pi scheduler and display consumer.
+ *
+ * Pi's live estimate protects long, tool-heavy turns between assistant usage rows,
+ * while the persisted input count is the provider-reported prompt-token source.
+ * Whichever numerator is larger is divided by the actual usable window exactly
+ * once. A separate safety-scaled denominator would make the percentage disagree
+ * with the token/limit pair shown to users.
+ */
+export function resolvePiPressureSnapshot(
+	args: ResolvePiPressureSnapshotArgs,
+): PiPressureSnapshot {
+	const persistedInputTokens =
+		Number.isFinite(args.persistedInputTokens) && args.persistedInputTokens > 0
+			? args.persistedInputTokens
+			: 0;
+	const liveInputTokens =
+		typeof args.liveInputTokens === "number" &&
+		Number.isFinite(args.liveInputTokens) &&
+		args.liveInputTokens > 0
+			? args.liveInputTokens
+			: 0;
+	const inputTokens = Math.max(persistedInputTokens, liveInputTokens);
+	const contextLimit =
+		typeof args.usableContextLimit === "number" &&
+		Number.isFinite(args.usableContextLimit) &&
+		args.usableContextLimit > 0
+			? args.usableContextLimit
+			: undefined;
+
+	if (contextLimit !== undefined) {
+		return {
+			inputTokens,
+			percentage: inputTokens > 0 ? (inputTokens / contextLimit) * 100 : 0,
+			contextLimit,
+		};
+	}
+
+	return {
+		inputTokens: persistedInputTokens,
+		percentage:
+			Number.isFinite(args.persistedPercentage) && args.persistedPercentage > 0
+				? args.persistedPercentage
+				: 0,
+	};
+}
+
+export function formatPiPressureForLog(snapshot: PiPressureSnapshot): string {
+	return `usage=${snapshot.percentage.toFixed(1)}% (${snapshot.inputTokens} tokens, limit=${snapshot.contextLimit ?? "?"})`;
+}

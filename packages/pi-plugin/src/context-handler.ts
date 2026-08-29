@@ -215,6 +215,10 @@ import {
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
+import {
+	formatPiPressureForLog,
+	resolvePiPressureSnapshot,
+} from "./pi-pressure";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
 	convertEntriesToRawMessages,
@@ -254,22 +258,6 @@ import { createPiTranscript } from "./transcript-pi";
 /** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */
 const EMERGENCY_BLOCK_PERCENTAGE = 95;
 
-// estimateTokens (char-based) under-counts the real provider
-// tokenizer + untagged structural/reasoning parts: the observed overflow was
-// >400K real vs a ~340K forward estimate (~15% gap). Scaling the limit DOWN for
-// the forward percentage reaches the derived force and absolute 95% emergency
-// bands at a real size that corresponds to the window, not the under-counted estimate.
-// 0.85 (not 0.90): 0.90 would make the 95% emergency band fire only at ~360K
-// estimated, still short of the >400K real seen here.
-const FORWARD_PRESSURE_LIMIT_FACTOR = 0.85;
-
-// Returns { percentage, inputTokens } floored by Pi's FORWARD usage estimate.
-// piUsage.tokens = last assistant usage + estimateTokens of every message after
-// it (pi-mono estimateContextTokens), recomputed from the LIVE array each call —
-// so it catches a mid-turn balloon the message_end-persisted trailing number
-// misses. Keep ONLY .tokens (forward, input-side); .percent is discarded (counts
-// output on Pi's own denominator). Immune to NULL token_count (live array, not
-// our tag store). NEVER lowers (max), so it's never less reactive than today.
 function isPiHardCacheExpired(
 	lastResponseTime: number,
 	ttlMs: number,
@@ -280,31 +268,6 @@ function isPiHardCacheExpired(
 	// fold is a paid cache rebuild). Keep the comparators identical — the Rust
 	// doc comment asserts this parity and an audit caught them disagreeing.
 	return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
-}
-
-function applyForwardPressureFloor(
-	trailingPercentage: number,
-	trailingInputTokens: number,
-	piUsageTokens: number | null | undefined,
-	correctedLimit: number | undefined,
-): { percentage: number; inputTokens: number } {
-	const forwardTokens =
-		typeof piUsageTokens === "number" && piUsageTokens > 0 ? piUsageTokens : 0;
-	if (forwardTokens === 0 || !isSaneLimit(correctedLimit)) {
-		return { percentage: trailingPercentage, inputTokens: trailingInputTokens };
-	}
-	// Scale the LIMIT only for this forward percentage — do NOT mutate the real
-	// usageContextLimit (history-budget + emergency-drop ceiling rely on the true
-	// limit) and do NOT inflate forwardTokens (emergency-drop needs the raw
-	// current assembled size).
-	const forwardPressureLimit = correctedLimit * FORWARD_PRESSURE_LIMIT_FACTOR;
-	const forwardPercentage = (forwardTokens / forwardPressureLimit) * 100;
-	return forwardPercentage > trailingPercentage
-		? {
-				percentage: forwardPercentage,
-				inputTokens: Math.max(trailingInputTokens, forwardTokens),
-			}
-		: { percentage: trailingPercentage, inputTokens: trailingInputTokens };
 }
 
 let injectM0M1PiForRun = injectM0M1Pi;
@@ -324,10 +287,8 @@ let mutationGateObserverForTests:
 	| undefined;
 
 export const __test = {
-	FORWARD_PRESSURE_LIMIT_FACTOR,
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
-	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
 	buildPiToolOwnerMap,
 	readPiBranchEntriesForContext,
@@ -2543,12 +2504,12 @@ export function registerPiContextHandler(
 				usagePercentage = (usageInputTokens / usageContextLimit) * 100;
 			}
 			({ percentage: usagePercentage, inputTokens: usageInputTokens } =
-				applyForwardPressureFloor(
-					usagePercentage,
-					usageInputTokens,
-					piUsage?.tokens,
-					usageContextLimit,
-				));
+				resolvePiPressureSnapshot({
+					persistedPercentage: usagePercentage,
+					persistedInputTokens: usageInputTokens,
+					liveInputTokens: piUsage?.tokens,
+					usableContextLimit: usageContextLimit,
+				}));
 			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
 			// Emergency bump LAST so it floors recovery pressure without capping
 			// a higher live forward-pressure reading.
@@ -2837,7 +2798,7 @@ export function registerPiContextHandler(
 
 			sessionLog(
 				sessionId,
-				`transform: usage=${usagePercentage.toFixed(1)}% (${usageInputTokens} tokens, limit=${usageContextLimit ?? "?"}) decision=${schedulerDecision}${forceMaterialization ? " force=true" : ""}${isEmergency ? " EMERGENCY=true" : ""}${isCacheBusting ? " busting=true" : ""}`,
+				`transform: ${formatPiPressureForLog({ percentage: usagePercentage, inputTokens: usageInputTokens, contextLimit: usageContextLimit })} decision=${schedulerDecision}${forceMaterialization ? " force=true" : ""}${isEmergency ? " EMERGENCY=true" : ""}${isCacheBusting ? " busting=true" : ""}`,
 			);
 			logTransformTiming(
 				sessionId,
@@ -3892,12 +3853,12 @@ function maybeFireHistorian(args: {
 			};
 			usageSource = "piUsage fallback";
 		}
-		usage = applyForwardPressureFloor(
-			usage.percentage,
-			usage.inputTokens,
-			piUsage?.tokens,
-			usageContextLimit,
-		);
+		usage = resolvePiPressureSnapshot({
+			persistedPercentage: usage.percentage,
+			persistedInputTokens: usage.inputTokens,
+			liveInputTokens: piUsage?.tokens,
+			usableContextLimit: usageContextLimit,
+		});
 		sessionLog(
 			sessionId,
 			`historian trigger eval: usage=${usage.percentage.toFixed(1)}% (${usage.inputTokens} tokens) [${usageSource}], checking trigger...`,

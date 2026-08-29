@@ -414,6 +414,10 @@ function getUnsummarizedTailInfo(
     });
 }
 
+export function formatProjectedPostDropPercentage(value: number | null): string {
+    return value === null ? "none" : `${value.toFixed(1)}%`;
+}
+
 export function checkCompartmentTrigger(
     db: Database,
     sessionId: string,
@@ -635,7 +639,7 @@ export function checkCompartmentTrigger(
 
         sessionLog(
             sessionId,
-            `compartment trigger: force-firing at ${usage.percentage.toFixed(1)}% (projected post-drop ${projectedPostDropPercentage?.toFixed(1) ?? "none"}%)`,
+            `compartment trigger: force-firing at ${usage.percentage.toFixed(1)}% (projected post-drop ${formatProjectedPostDropPercentage(projectedPostDropPercentage)})`,
         );
         if (tailInfo.boundarySnapshot && hasRunnableCompartmentWindow(tailInfo.boundarySnapshot)) {
             return {
@@ -762,7 +766,7 @@ export function checkCompartmentTrigger(
 
     sessionLog(
         sessionId,
-        `compartment trigger: proactive fire at ${usage.percentage.toFixed(1)}% (floor=${proactiveTriggerPercentage}% projected post-drop=${projectedPostDropPercentage?.toFixed(1) ?? "none"}% target=${relativePostDropTarget.toFixed(1)}%)`,
+        `compartment trigger: proactive fire at ${usage.percentage.toFixed(1)}% (floor=${proactiveTriggerPercentage}% projected post-drop=${formatProjectedPostDropPercentage(projectedPostDropPercentage)} target=${relativePostDropTarget.toFixed(1)}%)`,
     );
     return {
         shouldFire: true,
