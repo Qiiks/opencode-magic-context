@@ -786,3 +786,26 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
         }
     });
 });
+
+describe("buildStatusDetail — Rust host paths", () => {
+    test("marks host paths module-side only for Rust mode", () => {
+        const db = createTestDb();
+        try {
+            const rustDetail = buildStatusDetail(
+                db,
+                "ses-rust-host-paths",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+            );
+            const tsDetail = buildStatusDetail(db, "ses-ts-host-paths", process.cwd(), undefined, {
+                transform_mode: "ts",
+            });
+
+            expect(rustDetail.hostBackendsModuleSide).toBe(true);
+            expect(tsDetail.hostBackendsModuleSide).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});

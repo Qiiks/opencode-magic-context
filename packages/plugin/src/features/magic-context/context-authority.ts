@@ -7,6 +7,42 @@ export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
 export type AuthorityState = "TS" | "PREPARING" | "MODULE" | "DRAINING";
 
+type AuthorityRoutingLocation = "TS" | "MODULE";
+
+// Authority status is sampled on every transform pass. Keep this process-local
+// memory so the declaration tells an operator about a real routing change rather
+// than repeating after every pass while the module remains authoritative.
+const observedAuthorityRoutingByProject = new Map<string, AuthorityRoutingLocation>();
+
+/**
+ * Declare the user-visible host-path routing only when the project changes owner.
+ * A first MODULE observation is intentional: a restarted host must still explain
+ * that an already-active module owns those paths.
+ */
+export function observeAuthorityRouting(
+    projectPath: string,
+    location: AuthorityRoutingLocation,
+): void {
+    const previous = observedAuthorityRoutingByProject.get(projectPath);
+    if (previous === location) return;
+    observedAuthorityRoutingByProject.set(projectPath, location);
+
+    if (location === "MODULE") {
+        log(
+            `[magic-context] project ${projectPath} authority → MODULE: host backends → MODULE: ctx_memory, ctx_note; historian: module-side`,
+        );
+    } else if (previous === "MODULE") {
+        log(
+            `[magic-context] project ${projectPath} authority → TS: host backends → TypeScript: ctx_memory, ctx_note; historian: host-side`,
+        );
+    }
+}
+
+/** Test-only reset for process-local routing observation state. */
+export function resetAuthorityRoutingObservationsForTest(): void {
+    observedAuthorityRoutingByProject.clear();
+}
+
 export interface AuthorityStatus {
     context_store_uuid: string;
     project: string;

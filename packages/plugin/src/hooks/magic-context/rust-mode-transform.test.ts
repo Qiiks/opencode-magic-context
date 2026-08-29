@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
+    resetAuthorityRoutingObservationsForTest,
 } from "../../features/magic-context/context-authority";
 import { insertMemory } from "../../features/magic-context/memory";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
@@ -349,20 +350,31 @@ describe("Rust mode authority adapter", () => {
         deps.sessionDirectoryBySession?.set(sessionId, "/session/root-b");
         const runner = createRustModeTransformImpl(deps, { moduleClient: module });
         const messages = makeMessages(sessionId);
+        resetAuthorityRoutingObservationsForTest();
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            await runner.run(sessionId, messages, { messages: [...messages] }, makeMeta(db, sessionId));
 
-        await runner.run(sessionId, messages, { messages: [...messages] }, makeMeta(db, sessionId));
-
-        expect(authorityRoots.length).toBeGreaterThan(0);
-        expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
-        expect(
-            db
-                .prepare(
-                    "SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode'",
-                )
-                .get(sessionId),
-        ).toEqual({
-            project_path: resolveProjectIdentityForSession("/session/root-b", false),
-        });
+            expect(authorityRoots.length).toBeGreaterThan(0);
+            expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
+            expect(
+                db
+                    .prepare(
+                        "SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode'",
+                    )
+                    .get(sessionId),
+            ).toEqual({
+                project_path: resolveProjectIdentityForSession("/session/root-b", false),
+            });
+            expect(
+                logSpy.mock.calls.filter(([message]) =>
+                    String(message).includes("authority → MODULE: host backends → MODULE"),
+                ),
+            ).toHaveLength(1);
+        } finally {
+            logSpy.mockRestore();
+            resetAuthorityRoutingObservationsForTest();
+        }
     });
 
     it("transports the host-resolved output_reserve as Rust usable_soft", () => {

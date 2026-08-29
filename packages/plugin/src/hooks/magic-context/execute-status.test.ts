@@ -122,4 +122,35 @@ describe("executeStatus", () => {
         expect(status).not.toContain("Infinity");
         db.close();
     });
+
+    test("shows module-routed host paths only in Rust mode", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+
+        const tsStatus = executeStatus(db, SESSION_ID, 20);
+        const rustStatus = executeStatus(
+            db,
+            SESSION_ID,
+            20,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            true,
+        );
+
+        expect(rustStatus).toContain("### Rust Mode");
+        expect(rustStatus).toContain(
+            "Host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
+        );
+        expect(tsStatus).not.toContain("Host backends → MODULE");
+        db.close();
+    });
 });

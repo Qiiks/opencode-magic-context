@@ -12,6 +12,7 @@ import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount,
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
 import { formatTailHygiene } from "../shared/tail-hygiene-status"
+import { RUST_MODE_HOST_PATHS_LINE } from "../shared/rust-mode-status"
 import { formatWindowDerivationLine } from "../shared/window-geometry"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
 import { isCompactionEnabled } from "../config/agent-disable"
@@ -320,6 +321,13 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 </box>
                 )
             })()}
+
+            {s().hostBackendsModuleSide && (
+                <box marginTop={1} width="100%" flexDirection="column">
+                    <text fg={t().text}><b>Rust Mode</b></text>
+                    <text fg={t().textMuted}>{RUST_MODE_HOST_PATHS_LINE}</text>
+                </box>
+            )}
 
             <box flexDirection="row" width="100%" marginTop={1} gap={4}>
                 {compactionOff() ? (

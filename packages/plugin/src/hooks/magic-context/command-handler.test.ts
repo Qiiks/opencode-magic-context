@@ -635,6 +635,7 @@ describe("createMagicContextCommandHandler", () => {
             expect(text).toContain("- Dropped: 1");
             expect(text).toContain("- Drops: 1");
             expect(text).toContain("**Protected tags:** 5");
+            expect(text).not.toContain("Host backends → MODULE");
         });
 
         it("lists queued drop operations", async () => {
@@ -1319,6 +1320,9 @@ describe("createMagicContextCommandHandler", () => {
                 "ses-rust-status",
                 expect.stringContaining("- Coverage ordinal: 17"),
                 {},
+            );
+            expect(String(sendNotification.mock.calls[0]?.[1])).toContain(
+                "Host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
             );
         });
 

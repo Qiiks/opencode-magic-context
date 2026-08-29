@@ -79,4 +79,17 @@ describe("formatStatusDetailMarkdown", () => {
 - **Tags:** 4 active, 1 dropped; 2 pending drops
 - **Execute threshold:** 65.0%`);
     });
+
+    test("shows module-routed host paths only in Rust-mode chat fallback", () => {
+        const rustStatus = formatStatusDetailMarkdown({
+            ...STATUS_FIXTURE,
+            hostBackendsModuleSide: true,
+        });
+        const tsStatus = formatStatusDetailMarkdown(STATUS_FIXTURE);
+
+        expect(rustStatus).toContain(
+            "Host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
+        );
+        expect(tsStatus).not.toContain("Host backends → MODULE");
+    });
 });
