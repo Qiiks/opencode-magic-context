@@ -870,6 +870,8 @@ export function createMagicContextCommandHandler(deps: {
                                 : undefined,
                             windowGeometry,
                             tailHygiene,
+                            undefined,
+                            Boolean(rustMode),
                         );
                         const moduleStatus = rustStatus
                             ? `\n\n${formatRustStatusText(rustStatus)}`

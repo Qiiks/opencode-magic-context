@@ -5,6 +5,7 @@ import {
     drainAuthority,
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
+    observeAuthorityRouting,
 } from "../../features/magic-context/context-authority";
 import {
     isLinkedGitWorktree,
@@ -398,6 +399,18 @@ export async function recoverTsAuthorityProject(args: {
         })),
     );
 
+    // A restarted TypeScript host may find a project that is still module-owned.
+    // Record MODULE routing before the authority drain clears its marker so the
+    // later return to TypeScript is legible as a routing transition.
+    if (
+        statuses.some(
+            ({ authority }) =>
+                authority !== null && authority !== undefined && authority.state !== "TS",
+        )
+    ) {
+        observeAuthorityRouting(args.projectPath, "MODULE");
+    }
+
     let drainedDomain = false;
     for (const { domain, authority } of statuses) {
         if (!authority || authority.state === "TS") continue;
@@ -436,6 +449,7 @@ export async function recoverTsAuthorityProject(args: {
     // view re-renders any changes mirrored during recovery.
     if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
         bumpProjectMemoryEpoch(args.db, args.projectPath);
+        observeAuthorityRouting(args.projectPath, "TS");
         return "completed";
     }
     return "retryable";

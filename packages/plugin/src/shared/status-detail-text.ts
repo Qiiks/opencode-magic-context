@@ -1,4 +1,5 @@
 import type { StatusDetail } from "./rpc-types";
+import { RUST_MODE_HOST_PATHS_LINE } from "./rust-mode-status";
 
 function formatCount(value: number): string {
     return Math.round(value).toLocaleString();
@@ -39,6 +40,7 @@ export function formatStatusDetailMarkdown(detail: StatusDetail): string {
         `- **Usage:** ${detail.usagePercentage.toFixed(1)}% (${formatCount(detail.inputTokens)} / ${usableLimit})`,
         `- **Cache lane:** ${formatCacheLane(detail)}`,
         `- **Historian:** ${[historianState, ...historianDetails].join("; ")}`,
+        ...(detail.hostBackendsModuleSide ? [`- ${RUST_MODE_HOST_PATHS_LINE}`] : []),
         `- **Memory:** ${formatCount(detail.memoryCount)} active; ${formatCount(detail.memoryBlockCount)} injected`,
         `- **Tags:** ${formatCount(detail.activeTags)} active, ${formatCount(detail.droppedTags)} dropped; ${formatCount(detail.pendingOpsCount)} pending drops`,
         `- **Execute threshold:** ${detail.executeThreshold.toFixed(1)}%${detail.executeThresholdClamped ? " (clamped)" : ""}`,

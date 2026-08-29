@@ -7,6 +7,7 @@ import {
     checksumAuthoritySeedRows,
     drainAuthority,
     ensureContextStoreUuid,
+    observeAuthorityRouting,
     prepareAuthority,
     pullMemoryMirrorOnce,
     reconcileAuthorityProject,
@@ -1108,7 +1109,7 @@ async function prepareRustMemoryAuthority(args: {
             }
         }
         if (preparing.length > 0) {
-            await prepareAuthority({
+            const prepared = await prepareAuthority({
                 db,
                 projectPath,
                 domains: preparing,
@@ -1116,10 +1117,15 @@ async function prepareRustMemoryAuthority(args: {
                 seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
                 checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
             });
+            for (const authority of prepared) statuses.set(authority.domain, authority);
         }
     }
 
     await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
+    observeAuthorityRouting(
+        projectPath,
+        domains.every((domain) => statuses.get(domain)?.state === "MODULE") ? "MODULE" : "TS",
+    );
     state.memoryAuthorityReady = true;
     args.onProjectPrepared?.(projectPath);
 }

@@ -1,7 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import * as logger from "../../shared/logger";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus, ChangefeedPage } from "./context-authority";
 import {
@@ -14,10 +16,12 @@ import {
     getAuthorityManagedMarker,
     getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
+    observeAuthorityRouting,
     prepareAuthority,
     pullAndApplyMirrorPage,
     reconcileAuthorityProject,
     registerModuleNoteEvaluationBridge,
+    resetAuthorityRoutingObservationsForTest,
 } from "./context-authority";
 import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/storage-memory";
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
@@ -78,6 +82,52 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 }
 
 describe("memory authority protocol", () => {
+    test("declares host-path routing once for each ownership transition", () => {
+        resetAuthorityRoutingObservationsForTest();
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            observeAuthorityRouting("/repo/transition", "TS");
+            observeAuthorityRouting("/repo/transition", "MODULE");
+            observeAuthorityRouting("/repo/transition", "MODULE");
+            observeAuthorityRouting("/repo/transition", "TS");
+            observeAuthorityRouting("/repo/transition", "TS");
+
+            const declarations = logSpy.mock.calls
+                .map(([message]) => message)
+                .filter((message) => message.includes("project /repo/transition authority"));
+            expect(
+                declarations.filter((message) => message.includes("authority → MODULE")),
+            ).toHaveLength(1);
+            expect(
+                declarations.filter((message) => message.includes("authority → TS")),
+            ).toHaveLength(1);
+            expect(declarations[0]).toContain(
+                "host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
+            );
+        } finally {
+            logSpy.mockRestore();
+            resetAuthorityRoutingObservationsForTest();
+        }
+    });
+
+    test("declares a boot-time MODULE authority once", () => {
+        resetAuthorityRoutingObservationsForTest();
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            observeAuthorityRouting("/repo/boot", "MODULE");
+            observeAuthorityRouting("/repo/boot", "MODULE");
+
+            const declarations = logSpy.mock.calls
+                .map(([message]) => message)
+                .filter((message) => message.includes("project /repo/boot authority → MODULE"));
+            expect(declarations).toHaveLength(1);
+            expect(declarations[0]).toContain("ctx_memory, ctx_note; historian: module-side");
+        } finally {
+            logSpy.mockRestore();
+            resetAuthorityRoutingObservationsForTest();
+        }
+    });
+
     test("historical sparse note feed rows preserve rich local columns", () => {
         const database = db();
         const localStoreUuid = ensureContextStoreUuid(database);

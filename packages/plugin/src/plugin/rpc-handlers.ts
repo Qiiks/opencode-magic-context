@@ -657,6 +657,7 @@ export function buildStatusDetail(
     );
     const detail: StatusDetail = {
         ...base,
+        hostBackendsModuleSide: config?.transform_mode === "rust",
         activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,

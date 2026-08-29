@@ -14,6 +14,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
 import type { TailHygieneStatus } from "../../shared/rpc-types";
+import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status";
 import type { Database } from "../../shared/sqlite";
 import { formatTailHygiene } from "../../shared/tail-hygiene-status";
 import {
@@ -71,6 +72,7 @@ export function executeStatus(
     windowGeometry?: WindowGeometryResult,
     tailHygiene?: TailHygieneStatus,
     contextUsage?: { inputTokens: number; percentage: number },
+    rustMode = false,
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -158,6 +160,8 @@ export function executeStatus(
 
         const storage = getMagicContextStorageResolution();
         lines.push("", `**Storage:** ${storage.path} (${storage.source})`);
+
+        if (rustMode) lines.push("", "### Rust Mode", `- ${RUST_MODE_HOST_PATHS_LINE}`);
 
         if (tailHygiene !== undefined) {
             lines.push(
