@@ -284,10 +284,7 @@ describe("subagent-runner pure helpers", () => {
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
 		);
 		expect(historian).toEqual(
-			expect.arrayContaining([
-				"--extension",
-				"/tmp/historian-calibration.js",
-			]),
+			expect.arrayContaining(["--extension", "/tmp/historian-calibration.js"]),
 		);
 		const sidekick = buildArgsForTest(
 			{ ...baseOptions, agent: "sidekick" },

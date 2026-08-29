@@ -539,7 +539,7 @@ export function fenceBoundaryForToolArcs(
     lastCompartmentEndOrdinal: number,
     recentOpenArcCutoff: number,
 ): number {
-    let boundary = fenceBoundaryForCompletedToolArcs(
+    const boundary = fenceBoundaryForCompletedToolArcs(
         candidate,
         arcs,
         lastCompartmentEndOrdinal + 1,

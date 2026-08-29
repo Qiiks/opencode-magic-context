@@ -353,7 +353,12 @@ describe("Rust mode authority adapter", () => {
         resetAuthorityRoutingObservationsForTest();
         const logSpy = spyOn(logger, "log").mockImplementation(() => {});
         try {
-            await runner.run(sessionId, messages, { messages: [...messages] }, makeMeta(db, sessionId));
+            await runner.run(
+                sessionId,
+                messages,
+                { messages: [...messages] },
+                makeMeta(db, sessionId),
+            );
 
             expect(authorityRoots.length).toBeGreaterThan(0);
             expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
@@ -3955,7 +3960,11 @@ describe("LKG durability across restarts", () => {
                 return {
                     decision: pass === 4 ? "HARD" : pass === 1 ? "HARD" : "SOFT+",
                     native_messages: structuredClone(
-                        pass === 1 ? representationA : pass >= 5 ? representationC : representationB,
+                        pass === 1
+                            ? representationA
+                            : pass >= 5
+                              ? representationC
+                              : representationB,
                     ),
                 };
             },
@@ -4023,12 +4032,7 @@ describe("LKG durability across restarts", () => {
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        await transform.run(
-            sessionId,
-            input,
-            { messages: [...input] },
-            makeMeta(db, sessionId),
-        );
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
         const fallback = { messages: [...input] as unknown[] };
         await transform.run(sessionId, input, fallback, makeMeta(db, sessionId));
         expect(fallback.messages).toEqual(frozenRepresentation);
@@ -4308,12 +4312,7 @@ describe("authoritySeedRows — supersede pointer resolution (issue #377)", () =
         return db;
     }
 
-    function insert(
-        db: ContextDatabase,
-        project: string,
-        content: string,
-        status: string,
-    ): number {
+    function insert(db: ContextDatabase, project: string, content: string, status: string): number {
         const now = Date.now();
         db.prepare(
             `INSERT INTO memories
@@ -4322,9 +4321,7 @@ describe("authoritySeedRows — supersede pointer resolution (issue #377)", () =
                 last_seen_at, status)
              VALUES (?, 'ARCHITECTURE', ?, ?, 'agent', 1, 0, ?, ?, ?, ?, ?)`,
         ).run(project, content, `hash-${content}`, now, now, now, now, status);
-        return Number(
-            (db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id,
-        );
+        return Number((db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
     }
 
     it("drops a supersede pointer whose target is absent from the seed set", () => {

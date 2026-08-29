@@ -85,9 +85,7 @@ describe("runClassify disposition", () => {
             const result = await runClassify(args);
 
             expect(result.classified).toBe(10);
-            expect(system).toContain(
-                "Write human-readable prose you author in: Turkish (Türkçe).",
-            );
+            expect(system).toContain("Write human-readable prose you author in: Turkish (Türkçe).");
         } finally {
             closeQuietly(db);
         }

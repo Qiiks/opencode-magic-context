@@ -989,14 +989,18 @@ export class PiSubagentRunner implements SubagentRunner {
 							...process.env,
 							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
 							...(options.temperature !== undefined
-								? { MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(options.temperature) }
+								? {
+										MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
+											options.temperature,
+										),
+									}
 								: {}),
 							...(options.maxOutputTokens !== undefined
 								? {
-									MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
-										options.maxOutputTokens,
-									),
-								}
+										MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
+											options.maxOutputTokens,
+										),
+									}
 								: {}),
 						},
 						// stdout = JSON events; stderr = diagnostics. stdin is a pipe

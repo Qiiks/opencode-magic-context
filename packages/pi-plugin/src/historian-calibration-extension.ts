@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const HISTORIAN_TEMPERATURE_ENV = "MAGIC_CONTEXT_HISTORIAN_TEMPERATURE";
-export const HISTORIAN_MAX_OUTPUT_TOKENS_ENV = "MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS";
+export const HISTORIAN_MAX_OUTPUT_TOKENS_ENV =
+	"MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS";
 
 function finiteNumber(value: string | undefined): number | undefined {
 	if (value === undefined || value.trim().length === 0) return undefined;
@@ -15,7 +16,8 @@ export function calibrateHistorianProviderPayload(
 	temperature: number,
 	maxOutputTokens: number,
 ): unknown {
-	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return payload;
+	if (typeof payload !== "object" || payload === null || Array.isArray(payload))
+		return payload;
 	const calibrated = { ...(payload as Record<string, unknown>) };
 	const generationConfig = calibrated.generationConfig;
 	if (
@@ -59,9 +61,15 @@ export function calibrateHistorianProviderPayload(
 
 export default function historianCalibrationExtension(pi: ExtensionAPI): void {
 	const temperature = finiteNumber(process.env[HISTORIAN_TEMPERATURE_ENV]);
-	const maxOutputTokens = finiteNumber(process.env[HISTORIAN_MAX_OUTPUT_TOKENS_ENV]);
+	const maxOutputTokens = finiteNumber(
+		process.env[HISTORIAN_MAX_OUTPUT_TOKENS_ENV],
+	);
 	if (temperature === undefined || maxOutputTokens === undefined) return;
 	pi.on("before_provider_request", (event) =>
-		calibrateHistorianProviderPayload(event.payload, temperature, maxOutputTokens),
+		calibrateHistorianProviderPayload(
+			event.payload,
+			temperature,
+			maxOutputTokens,
+		),
 	);
 }

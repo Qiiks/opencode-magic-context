@@ -241,7 +241,10 @@ function formatTodoLine(
 	theme: Theme,
 	options: { showId?: boolean } = {},
 ): string {
-	const glyph = theme.fg(STATUS_COLOR[todo.status], todo.status === "in_progress" ? spinGlyph() : STATUS_GLYPH[todo.status]);
+	const glyph = theme.fg(
+		STATUS_COLOR[todo.status],
+		todo.status === "in_progress" ? spinGlyph() : STATUS_GLYPH[todo.status],
+	);
 	const id =
 		options.showId && todo.id ? `${theme.fg("accent", `#${todo.id}`)} ` : "";
 	const color =
@@ -449,7 +452,10 @@ export class TodoOverlay {
 				this.uiCtx.setWidget(WIDGET_KEY, undefined);
 				this.widgetRegistered = false;
 				this.tui = undefined;
-				if (this.spinTimer) { clearInterval(this.spinTimer); this.spinTimer = undefined; }
+				if (this.spinTimer) {
+					clearInterval(this.spinTimer);
+					this.spinTimer = undefined;
+				}
 			}
 			return;
 		}
@@ -468,7 +474,10 @@ export class TodoOverlay {
 						invalidate: () => {
 							this.widgetRegistered = false;
 							this.tui = undefined;
-							if (this.spinTimer) { clearInterval(this.spinTimer); this.spinTimer = undefined; }
+							if (this.spinTimer) {
+								clearInterval(this.spinTimer);
+								this.spinTimer = undefined;
+							}
 						},
 					};
 				},
@@ -503,7 +512,10 @@ export class TodoOverlay {
 	}
 
 	dispose(): void {
-		if (this.spinTimer) { clearInterval(this.spinTimer); this.spinTimer = undefined; }
+		if (this.spinTimer) {
+			clearInterval(this.spinTimer);
+			this.spinTimer = undefined;
+		}
 		if (this.uiCtx) this.uiCtx.setWidget(WIDGET_KEY, undefined);
 		this.widgetRegistered = false;
 		this.tui = undefined;
