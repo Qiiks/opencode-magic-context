@@ -3,11 +3,13 @@ import {
     addStaleReduceStrippedIds,
     applyStrippedPlaceholderDelta,
     type ContextDatabase,
+    captureChannel1PostReduceGraceBaseline,
     clearDeferredExecutePendingIfMatches,
     clearPendingCompactionMarkerStateIf,
     clearPersistedTodoSyntheticAnchor,
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
+    getChannel1NudgeState,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
@@ -111,6 +113,7 @@ import { byteSize, prependTag } from "./tag-content-primitives";
 import {
     assertTailHygieneContentUnchanged,
     countRealUserMessages,
+    effectiveTailHygiene,
     refreshTailHygieneBaseline,
     sameTailHygieneStructuralSignature,
     type TailHygieneStructuralSignature,
@@ -2419,6 +2422,25 @@ export async function runPostTransformPhase(
                     previous,
                 });
                 const structuralSignature = tailHygieneStructuralSignature(args.messages);
+                const effective = effectiveTailHygiene(baseline);
+                const durableGrace =
+                    baseline.evaluable && !baseline.generationInvalidated
+                        ? captureChannel1PostReduceGraceBaseline(
+                              args.db,
+                              args.sessionId,
+                              effective.u,
+                          )
+                        : getChannel1NudgeState(args.db, args.sessionId);
+                baseline.channel1PostReduceGrace =
+                    durableGrace.postReduceGracePending ||
+                    durableGrace.postReduceGraceBaselineU !== undefined
+                        ? {
+                              pending: durableGrace.postReduceGracePending === true,
+                              baselineU: durableGrace.postReduceGraceBaselineU,
+                              preReduceLevel:
+                                  durableGrace.postReduceGracePreLevel ?? durableGrace.level,
+                          }
+                        : undefined;
                 args.channel1StateBySession.set(args.sessionId, {
                     ...baseline,
                     usableWindow: args.usableWindow,

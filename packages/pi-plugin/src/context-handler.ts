@@ -60,12 +60,14 @@ import {
 	adoptPiFallbackMessageTag,
 	adoptPiFallbackToolOwnerTag,
 	type ContextDatabase,
+	captureChannel1PostReduceGraceBaseline,
 	casChannel2NudgeState,
 	clearPendingPiCompactionMarkerStateIf,
 	deriveTagLoadFloor,
 	findAdoptableFallbackTags,
 	findPiFallbackToolOwnerTags,
 	getActiveTagsBySession,
+	getChannel1NudgeState,
 	getDroppedTagsByNumbers,
 	getHistorianFailureState,
 	getMaxDroppedTagNumber,
@@ -97,7 +99,6 @@ import {
 	peekDeferredExecutePending,
 	pruneAutoSearchHintDecisions,
 	pruneNoteNudgeAnchors,
-	resetLastNudgeCycleIfTailShrank,
 	setDeferredExecutePendingIfAbsent,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
@@ -172,6 +173,7 @@ import {
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
+
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
@@ -3128,7 +3130,24 @@ export function registerPiContextHandler(
 						previous: getPiChannel1Baseline(sessionId),
 					});
 					const effective = effectivePiTailHygiene(baseline);
-					resetLastNudgeCycleIfTailShrank(options.db, sessionId, effective.u);
+					const durableGrace =
+						baseline.evaluable && !baseline.generationInvalidated
+							? captureChannel1PostReduceGraceBaseline(
+									options.db,
+									sessionId,
+									effective.u,
+								)
+							: getChannel1NudgeState(options.db, sessionId);
+					baseline.channel1PostReduceGrace =
+						durableGrace.postReduceGracePending ||
+						durableGrace.postReduceGraceBaselineU !== undefined
+							? {
+									pending: durableGrace.postReduceGracePending === true,
+									baselineU: durableGrace.postReduceGraceBaselineU,
+									preReduceLevel:
+										durableGrace.postReduceGracePreLevel ?? durableGrace.level,
+								}
+							: undefined;
 					const oldestReclaimableToolTags = getOldestActiveUnprotectedToolTags(
 						options.db,
 						sessionId,

@@ -1022,9 +1022,9 @@ export function clearEmergencyDropSample(db: Database, sessionId: string): void 
 }
 
 // ---- Channel 1 (in-turn tool-output ctx_reduce nudge) cadence + band state ----
-// `last_nudge_undropped` records the `undropped` estimate when Channel 1 last
-// fired. The existing `last_nudge_level` scalar holds the paired level and last
-// real-user-turn counter as JSON, so no schema change is needed for dampening.
+// `last_nudge_undropped` records the U watermark for cadence. The existing
+// `last_nudge_level` scalar holds band, turn cadence, and post-reduce grace as
+// JSON so the state machine remains durable without another schema column.
 export type PersistedChannel1NudgeLevel = "" | "gentle" | "firm" | "urgent";
 
 interface PersistedLastNudgeUndroppedRow {
@@ -1036,9 +1036,16 @@ interface PersistedLastNudgeLevelRow {
 }
 
 export interface PersistedChannel1NudgeState {
+    /** Currently observed band; an upward change is the only full-copy crossing. */
     level: PersistedChannel1NudgeLevel;
     /** Real-user-turn counter at the last fire; the JSON key stays stable. */
     ordinal: number;
+    /** Waiting for the first tail walk whose U already excludes queued drops. */
+    postReduceGracePending?: boolean;
+    /** U measured after queued drops were excluded. */
+    postReduceGraceBaselineU?: number;
+    /** Band observed before the complying ctx_reduce call. */
+    postReduceGracePreLevel?: PersistedChannel1NudgeLevel;
 }
 
 const EMPTY_CHANNEL1_NUDGE_STATE: PersistedChannel1NudgeState = { level: "", ordinal: 0 };
@@ -1065,15 +1072,36 @@ function normalizeLastNudgeLevel(value: unknown): PersistedChannel1NudgeLevel {
 
 function parseChannel1NudgeState(raw: string): PersistedChannel1NudgeState {
     try {
-        const parsed = JSON.parse(raw) as { level?: unknown; ordinal?: unknown };
+        const parsed = JSON.parse(raw) as {
+            level?: unknown;
+            ordinal?: unknown;
+            postReduceGracePending?: unknown;
+            postReduceGraceBaselineU?: unknown;
+            postReduceGracePreLevel?: unknown;
+        };
         if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-            return {
+            const state: PersistedChannel1NudgeState = {
                 level: normalizeLastNudgeLevel(parsed.level),
                 ordinal:
                     typeof parsed.ordinal === "number"
                         ? Math.max(0, Math.round(parsed.ordinal))
                         : 0,
             };
+            if (parsed.postReduceGracePending === true) state.postReduceGracePending = true;
+            if (
+                typeof parsed.postReduceGraceBaselineU === "number" &&
+                Number.isFinite(parsed.postReduceGraceBaselineU)
+            ) {
+                state.postReduceGraceBaselineU = Math.max(
+                    0,
+                    Math.round(parsed.postReduceGraceBaselineU),
+                );
+            }
+            const preLevel = normalizeLastNudgeLevel(parsed.postReduceGracePreLevel);
+            if (preLevel !== "" || parsed.postReduceGracePreLevel === "") {
+                state.postReduceGracePreLevel = preLevel;
+            }
+            return state;
         }
     } catch {
         // Legacy rows stored only the cadence level as a scalar.
@@ -1082,10 +1110,21 @@ function parseChannel1NudgeState(raw: string): PersistedChannel1NudgeState {
 }
 
 function serializeChannel1NudgeState(value: PersistedChannel1NudgeState): string {
-    return JSON.stringify({
+    const serialized: Record<string, boolean | number | string> = {
         level: normalizeLastNudgeLevel(value.level),
         ordinal: Math.max(0, Math.round(value.ordinal)),
-    });
+    };
+    if (value.postReduceGracePending === true) serialized.postReduceGracePending = true;
+    if (value.postReduceGraceBaselineU !== undefined) {
+        serialized.postReduceGraceBaselineU = Math.max(
+            0,
+            Math.round(value.postReduceGraceBaselineU),
+        );
+    }
+    if (value.postReduceGracePreLevel !== undefined) {
+        serialized.postReduceGracePreLevel = normalizeLastNudgeLevel(value.postReduceGracePreLevel);
+    }
+    return JSON.stringify(serialized);
 }
 
 export function getLastNudgeUndropped(db: Database, sessionId: string): number {
@@ -1128,6 +1167,53 @@ export function setChannel1NudgeState(
             serializeChannel1NudgeState(value),
             sessionId,
         );
+    })();
+}
+
+/** Record compliance without guessing U from the stale pre-drop baseline. */
+export function markChannel1PostReduceGracePending(
+    db: Database,
+    sessionId: string,
+): PersistedChannel1NudgeState {
+    return db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        const current = getChannel1NudgeState(db, sessionId);
+        const next: PersistedChannel1NudgeState = {
+            level: current.level,
+            ordinal: current.ordinal,
+            postReduceGracePending: true,
+            postReduceGracePreLevel: current.level,
+        };
+        db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
+            serializeChannel1NudgeState(next),
+            sessionId,
+        );
+        return next;
+    })();
+}
+
+/** Start grace from the first U value that has already excluded queued drops. */
+export function captureChannel1PostReduceGraceBaseline(
+    db: Database,
+    sessionId: string,
+    measuredUndropped: number,
+): PersistedChannel1NudgeState {
+    return db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        const current = getChannel1NudgeState(db, sessionId);
+        if (current.postReduceGracePending !== true) return current;
+        const baselineU = Math.max(0, Math.round(measuredUndropped));
+        const next: PersistedChannel1NudgeState = {
+            level: current.level,
+            ordinal: current.ordinal,
+            postReduceGraceBaselineU: baselineU,
+            postReduceGracePreLevel: current.postReduceGracePreLevel ?? current.level,
+        };
+        db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
+            serializeChannel1NudgeState(next),
+            sessionId,
+        );
+        return next;
     })();
 }
 

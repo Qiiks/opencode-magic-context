@@ -38,7 +38,6 @@ import {
     getOverflowState,
     loadProtectedTailMeta,
     recordOverflowDetected,
-    resetLastNudgeCycleIfTailShrank,
     resetProtectedTailNoEligibleHead,
     setDeferredExecutePendingIfAbsent,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -2536,11 +2535,6 @@ export function createTransform(deps: TransformDeps) {
         // cadence and run the existing Channel-2 lease logic.
         const channelBaseline = deps.channel1StateBySession?.get(sessionId);
         if (ctxReduceCallable && !compactionOff && channelBaseline) {
-            const measuredU = Math.min(
-                Math.max(0, channelBaseline.baselineT + channelBaseline.turnDeltaT),
-                Math.max(0, channelBaseline.baselineU + channelBaseline.turnDeltaU),
-            );
-            resetLastNudgeCycleIfTailShrank(db, sessionId, measuredU);
             if (
                 channelBaseline.evaluable &&
                 !channelBaseline.generationInvalidated &&

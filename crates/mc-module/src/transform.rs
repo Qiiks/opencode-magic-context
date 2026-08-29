@@ -45,9 +45,10 @@ use crate::selection::{
     SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
-    effective_tail_hygiene, hygiene_band, measure_tail_hygiene_with_pending_drops,
-    queued_tag_numbers, real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand,
-    CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
+    channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
+    measure_tail_hygiene_with_pending_drops, post_reduce_grace_holds, queued_tag_numbers,
+    real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS,
+    CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -105,8 +106,6 @@ const CAV_KEY_PREFIX: &str = "cav:";
 /// separated upstream session keys. Five edges corresponds to three arm/clear cycles
 /// when the initial arm is not counted as evidence of multiplexing by itself.
 const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
-const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 25_000;
-const CHANNEL1_GENTLE_FRACTION: f64 = 0.20;
 const CHANNEL2_DIRECTIVE_LEASE_TTL_MS: i64 = 10 * 60 * 1_000;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const USER_HINT_FRAGMENT_CHAR_CAP: usize = 80;
@@ -1732,10 +1731,12 @@ struct ActiveTagForNudge {
 #[derive(Debug, Clone)]
 struct Channel1Decision {
     fire: bool,
+    sticky: bool,
     level: Channel1Level,
     reclaimable_tokens: i64,
     next_last_nudge: i64,
     next_last_level: String,
+    clear_post_reduce_grace: bool,
 }
 
 #[derive(Debug, Default)]
@@ -5195,7 +5196,7 @@ fn apply_once(
         &protected_block_ids,
         &pending_drop_target_ids,
     );
-    let current_hygiene_baseline = if is_bust_pass {
+    let mut current_hygiene_baseline = if is_bust_pass {
         let refreshed = refresh_tail_hygiene_baseline(
             hygiene_measurement,
             true,
@@ -5219,6 +5220,29 @@ fn apply_once(
     rearm_channel2_after_measured_collapse(&mut meta, is_bust_pass);
     let agent_drops_applied_this_pass =
         pending_agent_drops_applied_this_pass(&pending_agent_drops, &loaded.core, &core);
+    if meta.channel1_reduce_suppressed || agent_drops_applied_this_pass {
+        if let Some(baseline) = current_hygiene_baseline
+            .as_mut()
+            .filter(|baseline| baseline.evaluable && !baseline.generation_invalidated)
+        {
+            // Measurement already excludes queued drops from U. Capturing any
+            // earlier value would make compliance grace expire immediately.
+            let post_reduce_u = effective_tail_hygiene(baseline).0;
+            baseline.channel1_post_reduce_grace_baseline_u = Some(post_reduce_u);
+            baseline.channel1_post_reduce_grace_pre_level = meta.channel1_last_nudge_level.clone();
+            meta.channel1_reduce_suppressed = false;
+            if let Some(persisted) = meta.tail_hygiene_baseline.as_mut() {
+                persisted.channel1_post_reduce_grace_baseline_u = Some(post_reduce_u);
+                persisted.channel1_post_reduce_grace_pre_level =
+                    baseline.channel1_post_reduce_grace_pre_level.clone();
+            } else {
+                meta.tail_hygiene_baseline = Some(baseline.clone());
+            }
+        } else {
+            // Keep the pending bit until a trustworthy post-drop U exists.
+            meta.channel1_reduce_suppressed = true;
+        }
+    }
 
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
@@ -9371,28 +9395,20 @@ fn maybe_append_channel1_nudge(
         input.mutation_exempt_mid,
     );
     let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
-    let measured_reclaimable = input
-        .baseline
-        .map_or(0, |baseline| effective_tail_hygiene(baseline).0);
-    let cycle_reset = input.agent_drops_applied_this_pass
-        || meta.channel1_reduce_suppressed
-        || measured_reclaimable < meta.channel1_last_nudge_undropped.max(0);
-    if cycle_reset {
-        meta.channel1_last_fire_level.clear();
-        meta.channel1_last_fire_ordinal = 0;
-    }
-    if input.agent_drops_applied_this_pass {
-        meta.channel1_last_nudge_undropped = 0;
-        meta.channel1_last_nudge_level.clear();
-        meta.channel1_reduce_suppressed = false;
+    if input.agent_drops_applied_this_pass || meta.channel1_reduce_suppressed {
         return None;
     }
-    let decision = decide_channel1(input.baseline, meta);
+    let current_real_user_turn_count = real_user_turn_count(input.projection);
+    let decision = decide_channel1(input.baseline, meta, current_real_user_turn_count);
     meta.channel1_last_nudge_undropped = decision.next_last_nudge;
     meta.channel1_last_nudge_level = decision.next_last_level;
-    let was_suppressed = meta.channel1_reduce_suppressed;
-    meta.channel1_reduce_suppressed = false;
-    if was_suppressed || !decision.fire {
+    if decision.clear_post_reduce_grace {
+        if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
+            baseline.channel1_post_reduce_grace_baseline_u = None;
+            baseline.channel1_post_reduce_grace_pre_level.clear();
+        }
+    }
+    if !decision.fire {
         return None;
     }
     let existing_blocks = input
@@ -9408,19 +9424,12 @@ fn maybe_append_channel1_nudge(
         input.mutation_exempt_mid,
     )?;
     let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags, &queued_tag_numbers);
-    let current_real_user_turn_count = real_user_turn_count(input.projection);
-    let sticky = should_use_sticky_channel1_reminder(
-        &meta.channel1_last_fire_level,
-        meta.channel1_last_fire_ordinal,
-        decision.level,
-        current_real_user_turn_count,
-    );
     let reminder = build_channel1_reminder(
         decision.level,
         decision.reclaimable_tokens,
         reclaimable_tool_output_count(input.baseline),
         &hint,
-        sticky,
+        decision.sticky,
     );
     meta.channel1_last_fire_level = decision.level.as_str().to_string();
     meta.channel1_last_fire_ordinal = current_real_user_turn_count;
@@ -9840,70 +9849,115 @@ fn build_channel2_host_reminder(
     format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
-fn decide_channel1(baseline: Option<&TailHygieneBaseline>, meta: &ModuleMeta) -> Channel1Decision {
+fn decide_channel1(
+    baseline: Option<&TailHygieneBaseline>,
+    meta: &ModuleMeta,
+    current_real_user_turn_count: u64,
+) -> Channel1Decision {
     let (reclaimable_tokens, tail_tokens) = baseline.map_or((0, 0), effective_tail_hygiene);
-    let severity = reclaimable_tokens as f64 / tail_tokens.max(1) as f64;
-    let reset_cycle = meta.channel1_reduce_suppressed
-        || reclaimable_tokens < meta.channel1_last_nudge_undropped.max(0);
-    let last_nudge = if reset_cycle {
-        0
-    } else {
-        meta.channel1_last_nudge_undropped.max(0)
-    };
-    let last_level = if reset_cycle {
-        None
-    } else {
-        Channel1Level::parse(&meta.channel1_last_nudge_level)
-    };
-    let last_level_string = |level: Option<Channel1Level>| {
-        level
-            .map(|level| level.as_str().to_string())
-            .unwrap_or_default()
-    };
-    let quiet = |next_last_nudge: i64, next_last_level: String| Channel1Decision {
+    let previous_level = Channel1Level::parse(&meta.channel1_last_nudge_level);
+    let mut next_last_nudge = meta.channel1_last_nudge_undropped.max(0);
+    let mut next_last_level = meta.channel1_last_nudge_level.clone();
+    let mut clear_post_reduce_grace = false;
+    let quiet = |level: Channel1Level,
+                 next_last_nudge: i64,
+                 next_last_level: String,
+                 clear_post_reduce_grace: bool| Channel1Decision {
         fire: false,
-        level: Channel1Level::Gentle,
+        sticky: false,
+        level,
         reclaimable_tokens,
         next_last_nudge,
         next_last_level,
+        clear_post_reduce_grace,
     };
 
-    if baseline.is_none_or(|baseline| !baseline.evaluable || baseline.generation_invalidated) {
-        return quiet(last_nudge, last_level_string(last_level));
-    }
+    let Some(baseline) =
+        baseline.filter(|baseline| baseline.evaluable && !baseline.generation_invalidated)
+    else {
+        return quiet(
+            Channel1Level::Gentle,
+            next_last_nudge,
+            next_last_level,
+            false,
+        );
+    };
     if meta.channel1_reduce_suppressed {
-        return quiet(0, String::new());
+        return quiet(
+            Channel1Level::Gentle,
+            next_last_nudge,
+            next_last_level,
+            false,
+        );
     }
-    if tail_tokens < CHANNEL1_MIN_TOKENS || reclaimable_tokens < CHANNEL1_FLOOR_TOKENS {
-        return quiet(last_nudge, last_level_string(last_level));
+
+    let measured_band = hygiene_band(reclaimable_tokens, tail_tokens);
+    if post_reduce_grace_holds(baseline, reclaimable_tokens, tail_tokens, measured_band) {
+        let level = match measured_band {
+            HygieneBand::Firm => Channel1Level::Firm,
+            HygieneBand::Urgent | HygieneBand::Channel2 => Channel1Level::Urgent,
+            HygieneBand::Quiet | HygieneBand::Gentle => Channel1Level::Gentle,
+        };
+        return quiet(level, next_last_nudge, next_last_level, false);
     }
-    if severity < CHANNEL1_GENTLE_FRACTION {
-        return quiet(last_nudge, last_level_string(last_level));
+    if baseline.channel1_post_reduce_grace_baseline_u.is_some() {
+        clear_post_reduce_grace = true;
     }
-    let level = match hygiene_band(reclaimable_tokens, tail_tokens) {
+
+    let level = match measured_band {
         HygieneBand::Urgent | HygieneBand::Channel2 => Channel1Level::Urgent,
         HygieneBand::Firm => Channel1Level::Firm,
         HygieneBand::Gentle => Channel1Level::Gentle,
-        HygieneBand::Quiet => return quiet(last_nudge, last_level_string(last_level)),
+        HygieneBand::Quiet => {
+            return quiet(
+                Channel1Level::Gentle,
+                0,
+                String::new(),
+                clear_post_reduce_grace,
+            )
+        }
     };
-    let escalated = last_level.is_none_or(|last| level.rank() > last.rank());
-    let cadence_reached = last_level.is_some()
-        && reclaimable_tokens.saturating_sub(last_nudge) >= channel1_refire_tokens(tail_tokens);
-    if !escalated && !cadence_reached {
-        return quiet(last_nudge, last_level_string(last_level));
+    let previous_rank = previous_level.map_or(0, Channel1Level::rank);
+    let current_rank = level.rank();
+
+    // Entering a lower band is recorded without rendering. A later upward
+    // transition is then a genuine crossing eligible for one full reminder.
+    if current_rank < previous_rank {
+        next_last_nudge = reclaimable_tokens;
+        next_last_level = level.as_str().to_string();
+        return quiet(
+            level,
+            next_last_nudge,
+            next_last_level,
+            clear_post_reduce_grace,
+        );
     }
+
+    let crossed_from_below = current_rank > previous_rank;
+    let cadence_reached = current_rank == previous_rank
+        && reclaimable_tokens.saturating_sub(next_last_nudge)
+            >= channel1_refire_tokens(tail_tokens);
+    let sticky_turn_gap_reached = meta.channel1_last_fire_ordinal > current_real_user_turn_count
+        || current_real_user_turn_count.saturating_sub(meta.channel1_last_fire_ordinal)
+            >= CHANNEL1_STICKY_REAL_USER_TURN_GAP;
+    if !crossed_from_below && (!cadence_reached || !sticky_turn_gap_reached) {
+        return quiet(
+            level,
+            next_last_nudge,
+            next_last_level,
+            clear_post_reduce_grace,
+        );
+    }
+
     Channel1Decision {
         fire: true,
+        sticky: !crossed_from_below,
         level,
         reclaimable_tokens,
         next_last_nudge: reclaimable_tokens,
         next_last_level: level.as_str().to_string(),
+        clear_post_reduce_grace,
     }
-}
-
-fn channel1_refire_tokens(tail_tokens: i64) -> i64 {
-    let scaled = (0.08 * tail_tokens.max(0) as f64).round() as i64;
-    CHANNEL1_REFIRE_FLOOR_TOKENS.max(scaled)
 }
 
 #[cfg(test)]
@@ -9928,7 +9982,7 @@ mod nudge_formula_tests {
     }
 
     fn decision(meta: &ModuleMeta) -> Channel1Decision {
-        decide_channel1(meta.tail_hygiene_baseline.as_ref(), meta)
+        decide_channel1(meta.tail_hygiene_baseline.as_ref(), meta, 5)
     }
 
     fn pending(id: &str, armed_at_ms: i64, watermark: u64) -> PendingChannel2Directive {
@@ -9968,6 +10022,74 @@ mod nudge_formula_tests {
         assert!(decision(&before_cadence).fire);
         assert_eq!(channel1_refire_tokens(200_000), 25_000);
         assert_eq!(channel1_refire_tokens(400_000), 32_000);
+    }
+
+    #[test]
+    fn post_reduce_grace_uses_post_drop_u_and_breaks_on_escalation() {
+        let mut meta = nudge_meta(60_000, 150_000);
+        meta.channel1_last_nudge_undropped = 30_000;
+        meta.channel1_last_nudge_level = "firm".to_string();
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_baseline_u = Some(60_000);
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_pre_level = "firm".to_string();
+
+        let immediate = decision(&meta);
+        assert!(!immediate.fire);
+        assert!(!immediate.clear_post_reduce_grace);
+        meta.tail_hygiene_baseline.as_mut().unwrap().baseline_u = 84_999;
+        assert!(!decision(&meta).fire);
+        meta.tail_hygiene_baseline.as_mut().unwrap().baseline_u = 85_000;
+        let regrown = decision(&meta);
+        assert!(regrown.fire);
+        assert!(regrown.sticky);
+        assert!(regrown.clear_post_reduce_grace);
+
+        // Mutation control: without grace, the immediate same-band cadence fires.
+        meta.tail_hygiene_baseline.as_mut().unwrap().baseline_u = 60_000;
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_baseline_u = None;
+        assert!(decision(&meta).fire);
+
+        meta.tail_hygiene_baseline = Some(baseline(61_000, 100_000));
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_baseline_u = Some(60_000);
+        meta.tail_hygiene_baseline
+            .as_mut()
+            .unwrap()
+            .channel1_post_reduce_grace_pre_level = "firm".to_string();
+        let escalated = decide_channel1(meta.tail_hygiene_baseline.as_ref(), &meta, 0);
+        assert!(escalated.fire);
+        assert_eq!(escalated.level, Channel1Level::Urgent);
+        assert!(!escalated.sticky);
+        assert!(escalated.clear_post_reduce_grace);
+    }
+
+    #[test]
+    fn same_band_full_copy_is_once_and_sticky_waits_five_turns() {
+        let first = decision(&nudge_meta(30_000, 75_000));
+        assert!(first.fire);
+        assert!(!first.sticky);
+
+        let mut same_band = nudge_meta(55_000, 137_500);
+        same_band.channel1_last_nudge_undropped = first.next_last_nudge;
+        same_band.channel1_last_nudge_level = first.next_last_level;
+        same_band.channel1_last_fire_ordinal = 0;
+        let within_turn = decide_channel1(same_band.tail_hygiene_baseline.as_ref(), &same_band, 0);
+        assert!(!within_turn.fire);
+        let four_turns = decide_channel1(same_band.tail_hygiene_baseline.as_ref(), &same_band, 4);
+        assert!(!four_turns.fire);
+        let five_turns = decide_channel1(same_band.tail_hygiene_baseline.as_ref(), &same_band, 5);
+        assert!(five_turns.fire);
+        assert!(five_turns.sticky);
     }
 
     #[test]
@@ -10154,14 +10276,14 @@ mod nudge_formula_tests {
             Channel1Level::Firm,
             3,
         ));
-        assert!(!should_use_sticky_channel1_reminder(
+        assert!(should_use_sticky_channel1_reminder(
             "firm",
             1,
             Channel1Level::Firm,
-            4,
+            6,
         ));
-        // A legacy raw message ordinal must not compare as a user-turn count.
-        assert!(!should_use_sticky_channel1_reminder(
+        // Legacy numeric ordinal values cannot promote a same-band sticky reminder back to full form.
+        assert!(should_use_sticky_channel1_reminder(
             "firm",
             160_750,
             Channel1Level::Firm,
@@ -10183,7 +10305,9 @@ mod nudge_formula_tests {
 
     #[test]
     fn channel2_aggregate_uses_persisted_all_class_walk_and_holds_invalid_baselines() {
-        let measured = baseline(60_000, 90_000);
+        let mut measured = baseline(60_000, 90_000);
+        measured.channel1_post_reduce_grace_baseline_u = Some(59_000);
+        measured.channel1_post_reduce_grace_pre_level = "urgent".to_string();
         assert_eq!(
             channel2_token_aggregate(Some(&measured)),
             Some((60_000, 90_000))
@@ -10345,23 +10469,19 @@ fn oldest_reclaimable_hint(
     candidates
 }
 
-const CHANNEL1_STICKY_REAL_USER_TURN_GAP: u64 = 3;
+const CHANNEL1_STICKY_REAL_USER_TURN_GAP: u64 = 5;
 
+#[cfg(test)]
 fn should_use_sticky_channel1_reminder(
     last_level: &str,
     last_ordinal: u64,
     level: Channel1Level,
     current_real_user_turn_count: u64,
 ) -> bool {
-    // Never-fired is encoded by an empty last_level, never by ordinal zero: a
-    // window with no real user rows (a pure tool stream) legitimately fires at
-    // count 0 and must still dampen its re-fires. Older module metadata stored
-    // a raw message ordinal here; a raw ordinal greater than the real-user
-    // counter is an incompatible legacy unit, so let one full reminder replace
-    // it instead of damping accidentally.
+    // Turn cadence decides whether the re-fire happens; once a band crossing
+    // has rendered, every later reminder in that band stays calm and sticky.
+    let _ = (last_ordinal, current_real_user_turn_count);
     last_level == level.as_str()
-        && current_real_user_turn_count >= last_ordinal
-        && current_real_user_turn_count - last_ordinal < CHANNEL1_STICKY_REAL_USER_TURN_GAP
 }
 
 fn reclaimable_tool_output_count(baseline: Option<&TailHygieneBaseline>) -> usize {
@@ -26948,8 +27068,43 @@ pub(crate) mod tests {
             assert_eq!(tail_bytes(&replay, "result2"), first_result);
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
+            let mut grace_meta = s.load("nudge").unwrap();
+            let grace_u =
+                effective_tail_hygiene(grace_meta.meta.tail_hygiene_baseline.as_ref().unwrap()).0;
+            let grace_level = grace_meta.meta.channel1_last_nudge_level.clone();
+            let grace_baseline = grace_meta.meta.tail_hygiene_baseline.as_mut().unwrap();
+            grace_baseline.channel1_post_reduce_grace_baseline_u = Some(grace_u);
+            grace_baseline.channel1_post_reduce_grace_pre_level = grace_level;
+            s.commit(
+                "nudge",
+                grace_meta.row_version,
+                &grace_meta.core,
+                &grace_meta.meta,
+            )
+            .unwrap();
+            let grace_replay = run(&s, &request, &spine());
+            assert_eq!(tail_bytes(&grace_replay, "result2"), first_result);
+            assert_eq!(
+                grace_replay
+                    .messages()
+                    .iter()
+                    .map(|message| message.canonical_bytes())
+                    .collect::<Vec<_>>(),
+                replay
+                    .messages()
+                    .iter()
+                    .map(|message| message.canonical_bytes())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+
             let mut refire_meta = s.load("nudge").unwrap();
+            let refire_baseline = refire_meta.meta.tail_hygiene_baseline.as_mut().unwrap();
+            refire_baseline.channel1_post_reduce_grace_baseline_u = None;
+            refire_baseline.channel1_post_reduce_grace_pre_level.clear();
             refire_meta.meta.channel1_last_nudge_undropped = 0;
+            // Exercise reminder wording after the five-real-user-turn cadence gate without adding another fixture turn.
+            refire_meta.meta.channel1_last_fire_ordinal = u64::MAX;
             s.commit(
                 "nudge",
                 refire_meta.row_version,
@@ -27047,13 +27202,17 @@ pub(crate) mod tests {
             );
             assert!(!tail_bytes(&applying, "result5").contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+            assert!(after_applying
+                .meta
+                .tail_hygiene_baseline
+                .as_ref()
+                .and_then(|baseline| baseline.channel1_post_reduce_grace_baseline_u)
+                .is_some());
 
             let resumed = run(&s, &applying_request, &spine());
             let resumed_result = tail_bytes(&resumed, "result5");
-            assert!(resumed_result.contains("<system-reminder>"));
-            assert!(resumed_result.contains("Housekeeping"));
-            assert!(!resumed_result.contains("Reminder: "));
-            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 2);
+            assert!(!resumed_result.contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
         });
     }
 

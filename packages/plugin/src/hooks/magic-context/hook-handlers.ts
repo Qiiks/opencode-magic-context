@@ -15,7 +15,7 @@ import {
     clearHistorianFailureState,
     getChannel1NudgeState,
     getLastNudgeUndropped,
-    resetLastNudgeCycle,
+    markChannel1PostReduceGracePending,
     setChannel1NudgeState,
     setLastNudgeUndropped,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -35,7 +35,6 @@ import {
     type Channel1State,
     decideChannel1,
     reclaimableToolOutputCount,
-    shouldUseStickyChannel1Reminder,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
 import { annotateEmptyTaskOutput } from "./empty-task-output";
@@ -534,36 +533,45 @@ function maybeInjectChannel1Nudge(
         turnDeltaT: state.turnDeltaT,
         lastNudgeUndropped: getLastNudgeUndropped(args.db, sessionId),
         lastNudgeLevel: nudgeState.level,
+        lastFireOrdinal: nudgeState.ordinal,
+        currentRealUserTurnCount: state.realUserTurnCount,
         hasRecentReduce: false,
+        postReduceGracePending: nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: nudgeState.postReduceGracePreLevel,
         evaluable: state.evaluable,
         generationInvalidated: state.generationInvalidated,
     });
 
     // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);
+    const nextNudgeState = {
+        ...nudgeState,
+        level: decision.nextLastNudgeLevel,
+        postReduceGracePending: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGracePending,
+        postReduceGraceBaselineU: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGraceBaselineU,
+        postReduceGracePreLevel: decision.clearPostReduceGrace
+            ? undefined
+            : nudgeState.postReduceGracePreLevel,
+    };
     if (!decision.fire) {
-        setChannel1NudgeState(args.db, sessionId, {
-            ...nudgeState,
-            level: decision.nextLastNudgeLevel,
-        });
+        setChannel1NudgeState(args.db, sessionId, nextNudgeState);
         return;
     }
 
-    const sticky = shouldUseStickyChannel1Reminder({
-        lastLevel: nudgeState.level,
-        lastOrdinal: nudgeState.ordinal,
-        level: decision.level,
-        currentRealUserTurnCount: state.realUserTurnCount,
-    });
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
         reclaimableToolOutputCount(state.baselineParts),
         state.oldestReclaimableToolTags,
-        sticky,
+        decision.sticky,
     );
     setChannel1NudgeState(args.db, sessionId, {
-        level: decision.level,
+        ...nextNudgeState,
         ordinal: state.realUserTurnCount,
     });
     sessionLog(
@@ -613,9 +621,19 @@ export function createToolExecuteAfterHook(args: {
                 state.generationInvalidated = true;
             }
             try {
-                resetLastNudgeCycle(args.db, typedInput.sessionID);
+                const grace = markChannel1PostReduceGracePending(args.db, typedInput.sessionID);
+                if (state) {
+                    state.channel1PostReduceGrace = {
+                        pending: true,
+                        preReduceLevel: grace.postReduceGracePreLevel ?? grace.level,
+                    };
+                }
             } catch (error) {
-                sessionLog(typedInput.sessionID, "channel1 reduce reset failed (ignored):", error);
+                sessionLog(
+                    typedInput.sessionID,
+                    "channel1 reduce grace arm failed (ignored):",
+                    error,
+                );
             }
         } else {
             // Channel 1: append an in-turn ctx_reduce nudge when the rendered-tail

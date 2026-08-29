@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+	captureChannel1PostReduceGraceBaseline,
 	getChannel1NudgeState,
 	getChannel2NudgeClaim,
 	getChannel2NudgeClaimedAt,
@@ -103,6 +104,7 @@ describe("maybeChannel1ReminderForToolResult", () => {
 							: [reminder.reclaimable_tokens, 120_000];
 				setPiChannel1Baseline(sessionId, {
 					...channel2BaselineFields(baselineU, baselineT),
+					realUserTurnCount: reminder.sticky ? 6 : 1,
 					reducedSinceRefresh: false,
 					baselineParts: reclaimableToolOutputParts(
 						reminder.reclaimable_tool_outputs,
@@ -327,37 +329,64 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		clearPiChannel1State(SESSION);
 	});
 
-	it("gives an applying drop pass one fire-free baseline before resuming", () => {
+	it("keeps the post-reduce specimen quiet until U regrows by a full delta", () => {
 		const db = createTestDb();
-		setPiChannel1Baseline(SESSION, {
-			...channel2BaselineFields(90_000, 120_000),
-			reducedSinceRefresh: false,
-			agentDropsAppliedThisPass: true,
-			oldestReclaimableToolTags: [],
-		});
-		const applyingPass = maybeChannel1ReminderForToolResult({
-			db,
-			sessionId: SESSION,
-			toolName: "bash",
-			content: [{ type: "text", text: "output on applying pass" }],
-		});
-		expect(applyingPass).toBeNull();
-
-		setPiChannel1Baseline(SESSION, {
-			...channel2BaselineFields(90_000, 120_000),
+		const measured = (baselineU: number, realUserTurnCount: number) => ({
+			...channel2BaselineFields(baselineU, 145_000),
+			realUserTurnCount,
 			reducedSinceRefresh: false,
 			agentDropsAppliedThisPass: false,
 			oldestReclaimableToolTags: [],
 		});
-		const nextPass = maybeChannel1ReminderForToolResult({
+		setPiChannel1Baseline(SESSION, {
+			...measured(30_000, 0),
+			baselineT: 72_000,
+		});
+		const first = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
 			toolName: "bash",
-			content: [{ type: "text", text: "output on next pass" }],
+			content: [{ type: "text", text: "first output" }],
 		});
-		expect(nextPass?.text).toContain(
-			"Housekeeping backlog: spent tool outputs (~90k tokens)",
-		);
+		expect(first?.text).toContain("Housekeeping:");
+		expect(first?.text).not.toContain("Reminder:");
+
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "ctx_reduce",
+				content: [{ type: "text", text: "queued drops" }],
+			}),
+		).toBeNull();
+		captureChannel1PostReduceGraceBaseline(db, SESSION, 60_000);
+		setPiChannel1Baseline(SESSION, measured(60_000, 0));
+		const immediate = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "immediate next output" }],
+		});
+		expect(immediate).toBeNull();
+
+		setPiChannel1Baseline(SESSION, measured(84_999, 5));
+		expect(
+			maybeChannel1ReminderForToolResult({
+				db,
+				sessionId: SESSION,
+				toolName: "bash",
+				content: [{ type: "text", text: "almost regrown" }],
+			}),
+		).toBeNull();
+		setPiChannel1Baseline(SESSION, measured(85_000, 5));
+		const regrown = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "regrown" }],
+		});
+		expect(regrown?.text).toContain("Reminder:");
+		expect(regrown?.text).not.toContain("a ctx_reduce pass is due");
 		clearPiChannel1State(SESSION);
 	});
 
@@ -479,16 +508,13 @@ describe("maybeChannel1ReminderForToolResult", () => {
 
 		// Live repro: m0/m1 are two synthetic user rows in the same real turn.
 		setPiChannel1Baseline(SESSION, baseline(80_000, 180_000, sameTurnCount));
-		const sticky = maybeChannel1ReminderForToolResult({
+		const sameTurn = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
 			toolName: "bash",
 			content: [{ type: "text", text: "second output" }],
 		});
-		expect(sticky?.text).toContain(
-			"Reminder: spent tool outputs (~80k tokens) are still reclaimable",
-		);
-		expect(sticky?.text).not.toContain("of this session");
+		expect(sameTurn).toBeNull();
 
 		const threeRealTurnsLater = [
 			{ role: "user", content: "m0 head" },
@@ -502,18 +528,27 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			SESSION,
 			baseline(110_000, 240_000, realUserTurns(threeRealTurnsLater, 2)),
 		);
-		const expired = maybeChannel1ReminderForToolResult({
+		const beforeFiveTurns = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
 			toolName: "bash",
 			content: [{ type: "text", text: "third output" }],
 		});
-		expect(expired?.text).toContain(
-			"Housekeeping: spent tool outputs (~110k tokens)",
-		);
-		expect(expired?.text).not.toContain("Reminder: spent tool outputs");
+		expect(beforeFiveTurns).toBeNull();
 
-		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 4));
+		setPiChannel1Baseline(SESSION, baseline(110_000, 240_000, 6));
+		const sticky = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "five turns later" }],
+		});
+		expect(sticky?.text).toContain(
+			"Reminder: spent tool outputs (~110k tokens) are still reclaimable",
+		);
+		expect(sticky?.text).not.toContain("a ctx_reduce pass is due");
+
+		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 6));
 		const escalation = maybeChannel1ReminderForToolResult({
 			db,
 			sessionId: SESSION,
@@ -558,9 +593,8 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "legacy output" }],
 		});
 		expect(block?.text).toContain(
-			"Housekeeping: spent tool outputs (~80k tokens)",
+			"Reminder: spent tool outputs (~80k tokens) are still reclaimable",
 		);
-		expect(block?.text).not.toContain("Reminder: spent tool outputs");
 		expect(
 			db
 				.prepare(
@@ -595,6 +629,11 @@ describe("maybeDeliverChannel2Pi", () => {
 	function armStrongBaseline(sessionId: string): void {
 		setPiChannel1Baseline(sessionId, {
 			...channel2BaselineFields(75_000, 100_000),
+			channel1PostReduceGrace: {
+				pending: false,
+				baselineU: 74_000,
+				preReduceLevel: "urgent",
+			},
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 9, toolName: "bash" }],
 		});

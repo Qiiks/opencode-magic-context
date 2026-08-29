@@ -1355,7 +1355,7 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
-	it("resets the persisted Channel 1 band when baseline refresh sees a smaller tail", async () => {
+	it("preserves Channel 1 crossing state when a baseline refresh sees a smaller tail", async () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-band-reset";
@@ -1376,10 +1376,12 @@ describe("registerPiContextHandler", () => {
 				fakeContext(sessionId) as never,
 			);
 
-			expect(getLastNudgeUndropped(db, sessionId)).toBe(0);
+			// The next tool-result decision observes a lower band and rearms it.
+			// Clearing here would turn the same post-reduce band into a full crossing.
+			expect(getLastNudgeUndropped(db, sessionId)).toBe(80_000);
 			expect(getChannel1NudgeState(db, sessionId)).toEqual({
-				level: "",
-				ordinal: 0,
+				level: "urgent",
+				ordinal: 12,
 			});
 			expect(
 				db
@@ -1387,7 +1389,7 @@ describe("registerPiContextHandler", () => {
 						"SELECT last_nudge_level FROM session_meta WHERE session_id = ?",
 					)
 					.get(sessionId),
-			).toEqual({ last_nudge_level: '{"level":"","ordinal":0}' });
+			).toEqual({ last_nudge_level: '{"level":"urgent","ordinal":12}' });
 		} finally {
 			closeQuietly(db);
 		}

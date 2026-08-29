@@ -45,6 +45,17 @@ export interface TailHygieneStructuralSignature {
     totalBytes: number;
 }
 
+export type TailHygieneChannel1Level = "" | "gentle" | "firm" | "urgent";
+
+export interface TailHygienePostReduceGrace {
+    /** True between the ctx_reduce call and the first post-drop tail measurement. */
+    pending: boolean;
+    /** Reclaimable mass after queued drops have already been excluded from U. */
+    baselineU?: number;
+    /** Channel-1 band observed immediately before ctx_reduce ran. */
+    preReduceLevel: TailHygieneChannel1Level;
+}
+
 export interface TailHygieneBaseline {
     baselineU: number;
     baselineT: number;
@@ -58,6 +69,8 @@ export interface TailHygieneBaseline {
     baselineParts: TailHygienePartMeasurement[];
     /** Signature of the array served by the current pass, including valid appended deltas. */
     contentSignature: string;
+    /** Live mirror of the durable nudge grace state; it never contributes rendered bytes. */
+    channel1PostReduceGrace?: TailHygienePostReduceGrace;
 }
 
 interface ToolPartIdentity {
@@ -734,6 +747,7 @@ export function refreshTailHygieneBaseline(input: {
             generationInvalidated: false,
             baselineParts: measured.parts,
             contentSignature: measured.contentSignature,
+            channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
         };
     }
 
