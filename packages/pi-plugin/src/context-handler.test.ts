@@ -2465,7 +2465,7 @@ describe("registerPiContextHandler", () => {
 		});
 	});
 
-	it("latches same-sample emergency drops but re-runs on fresh forward growth", async () => {
+	it("latches one emergency batch per force-pressure episode and rearms only on safe edges", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-forward-emergency-latch";
 		const largeToolOutput = "x".repeat(12_000);
@@ -2484,7 +2484,7 @@ describe("registerPiContextHandler", () => {
 			) => Promise<{ messages: never[] }>;
 			const buildMessages = () => {
 				const messages = [userMessage("start tool burst", 1)];
-				for (let i = 0; i < 20; i++) {
+				for (let i = 0; i < 40; i++) {
 					messages.push(assistantToolCall(`call-${i}`, "bash", {}, 2 + i * 2), {
 						...toolResultMessage(`call-${i}`, largeToolOutput, 3 + i * 2),
 						toolName: "bash",
@@ -2508,6 +2508,11 @@ describe("registerPiContextHandler", () => {
 					}),
 				} as never);
 			};
+			const droppedToolCount = () =>
+				getTagsBySession(db, sessionId).filter(
+					(tag) => tag.type === "tool" && tag.status === "dropped",
+				).length;
+
 			await runPass(1_000);
 			updateSessionMeta(db, sessionId, {
 				lastResponseTime: Date.now(),
@@ -2517,9 +2522,7 @@ describe("registerPiContextHandler", () => {
 			});
 
 			await runPass(85_000);
-			const firstDropped = getTagsBySession(db, sessionId).filter(
-				(tag) => tag.type === "tool" && tag.status === "dropped",
-			).length;
+			const firstDropped = droppedToolCount();
 			const toolCount = getTagsBySession(db, sessionId).filter(
 				(tag) => tag.type === "tool",
 			).length;
@@ -2527,17 +2530,26 @@ describe("registerPiContextHandler", () => {
 			expect(firstDropped).toBeLessThan(toolCount);
 			expect(getEmergencyInputSample(db, sessionId)).toBe(85_000);
 
-			await runPass(85_000);
-			const sameSampleDropped = getTagsBySession(db, sessionId).filter(
-				(tag) => tag.type === "tool" && tag.status === "dropped",
-			).length;
-			expect(sameSampleDropped).toBe(firstDropped);
-
 			await runPass(90_000);
-			const freshGrowthDropped = getTagsBySession(db, sessionId).filter(
-				(tag) => tag.type === "tool" && tag.status === "dropped",
-			).length;
-			expect(freshGrowthDropped).toBeGreaterThan(sameSampleDropped);
+			expect(droppedToolCount()).toBe(firstDropped);
+
+			await runPass(70_000);
+			expect(getEmergencyInputSample(db, sessionId)).toBe(0);
+			await runPass(90_000);
+			const afterPressureExit = droppedToolCount();
+			expect(afterPressureExit).toBeGreaterThan(firstDropped);
+
+			await runPass(92_000);
+			expect(droppedToolCount()).toBe(afterPressureExit);
+			const independentDrop = getTagsBySession(db, sessionId).find(
+				(tag) => tag.type === "tool" && tag.status === "active",
+			);
+			if (!independentDrop)
+				throw new Error("expected an active tool for the priced mutation");
+			queuePendingOp(db, sessionId, independentDrop.tagNumber, "drop", 1);
+
+			await runPass(93_000);
+			expect(droppedToolCount()).toBeGreaterThan(afterPressureExit + 1);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
