@@ -482,6 +482,10 @@ try {
     const route = await client.routeOpen(
         { kind: "tool_provider", module_id: moduleId },
         { project_root: projectRoot, harness: "transport-probe", session },
+        {
+            // Inherited SUBC_* credentials identify a daemon-supervised module, not this independent host.
+            consumerIdentity: null,
+        },
     );
     routeOpenMs = performance.now() - routeOpenStartedAt;
     try {

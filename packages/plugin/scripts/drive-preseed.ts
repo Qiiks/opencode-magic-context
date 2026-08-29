@@ -38,6 +38,10 @@ const client = await SubcClient.connect({ connectionFile, handshakeTimeoutMs: 10
 const route = await client.routeOpen(
     { kind: "tool_provider", module_id: "magic-context" },
     { project_root: process.cwd(), harness: "opencode", session },
+    {
+        // Inherited SUBC_* credentials identify a daemon-supervised module, not this independent host.
+        consumerIdentity: null,
+    },
 );
 const body = {
     kind: "state_import",
