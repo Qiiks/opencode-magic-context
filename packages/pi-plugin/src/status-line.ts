@@ -4,6 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { resolvePiWindowGeometry } from "./pi-context-limit";
+import { resolvePiPressureSnapshot } from "./pi-pressure";
 
 const STATUS_KEY = "magic-context";
 const RECENT_FAILURE_MS = 60_000;
@@ -96,7 +97,6 @@ export function renderStatusText(
 		meta.last_input_tokens >= 0
 			? meta.last_input_tokens
 			: undefined;
-	const inputTokens = liveInputTokens ?? persistedInputTokens;
 	const windowGeometry = resolvePiWindowGeometry({
 		rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
 		model: ctx.model,
@@ -111,13 +111,17 @@ export function renderStatusText(
 				? meta.last_context_percentage
 				: undefined,
 	});
-	const usableSoft = windowGeometry?.usableSoft;
-	const pct =
-		inputTokens !== undefined && usableSoft !== undefined && usableSoft > 0
-			? (inputTokens / usableSoft) * 100
-			: typeof meta?.last_context_percentage === "number"
-				? meta.last_context_percentage
-				: undefined;
+	const pressure =
+		liveInputTokens !== undefined || persistedInputTokens !== undefined
+			? resolvePiPressureSnapshot({
+					persistedPercentage: meta?.last_context_percentage ?? 0,
+					persistedInputTokens: persistedInputTokens ?? 0,
+					liveInputTokens,
+					usableContextLimit: windowGeometry?.usableSoft,
+				})
+			: undefined;
+	const inputTokens = pressure?.inputTokens;
+	const pct = pressure?.percentage;
 	const state = renderHistorianState(meta, recompSessions.has(sessionId));
 	return `mc: ${inputTokens === undefined ? "--" : fmt(inputTokens)} (${pct === undefined ? "--" : `${Math.round(pct)}%`}) · ${state}`;
 }

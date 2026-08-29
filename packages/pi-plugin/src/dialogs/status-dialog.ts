@@ -46,6 +46,7 @@ import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
+import { resolvePiPressureSnapshot } from "../pi-pressure";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 // Mirror packages/plugin/src/tui/slots/sidebar-content.tsx COLORS so the Pi
@@ -430,13 +431,6 @@ export function buildPiStatusDetail(
 ): StatusDialogDetail {
 	const usage = ctx.getContextUsage?.();
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
-	const hasPersistedPressure =
-		meta.lastInputTokens > 0 && meta.lastContextPercentage > 0;
-	const inputTokens = hasPersistedPressure
-		? meta.lastInputTokens
-		: typeof usage?.tokens === "number"
-			? usage.tokens
-			: 0;
 	let detectedContextLimit: number | undefined;
 	try {
 		const detected = getOverflowState(deps.db, sessionId).detectedContextLimit;
@@ -451,11 +445,15 @@ export function buildPiStatusDetail(
 		persistedInputTokens: meta.lastInputTokens,
 		persistedPercentage: meta.lastContextPercentage,
 	});
-	const contextLimit = windowGeometry?.usableSoft ?? 0;
-	const usagePercentage =
-		contextLimit > 0 && inputTokens > 0
-			? (inputTokens / contextLimit) * 100
-			: meta.lastContextPercentage;
+	const pressure = resolvePiPressureSnapshot({
+		persistedPercentage: meta.lastContextPercentage,
+		persistedInputTokens: meta.lastInputTokens,
+		liveInputTokens: usage?.tokens,
+		usableContextLimit: windowGeometry?.usableSoft,
+	});
+	const inputTokens = pressure.inputTokens;
+	const contextLimit = pressure.contextLimit ?? 0;
+	const usagePercentage = pressure.percentage;
 
 	const compartments = getCompartments(deps.db, sessionId);
 	const metaRow = readSessionMetaRow(deps.db, sessionId);

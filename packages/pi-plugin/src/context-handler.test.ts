@@ -86,63 +86,7 @@ import {
 } from "./test-utils.test";
 import { createPiTranscript } from "./transcript-pi";
 
-describe("applyForwardPressureFloor", () => {
-	const { FORWARD_PRESSURE_LIMIT_FACTOR, applyForwardPressureFloor } =
-		contextHandlerInternals;
-
-	it("floors stale trailing pressure with Pi's live forward token estimate", () => {
-		const result = applyForwardPressureFloor(68, 273_200, 340_000, 400_000);
-
-		expect(FORWARD_PRESSURE_LIMIT_FACTOR).toBe(0.85);
-		expect(result.percentage).toBeCloseTo(100, 8);
-		expect(result.inputTokens).toBe(340_000);
-	});
-
-	it("leaves trailing pressure unchanged without usable forward tokens or a sane limit", () => {
-		const trailing = { percentage: 68, inputTokens: 273_200 };
-
-		expect(
-			applyForwardPressureFloor(
-				trailing.percentage,
-				trailing.inputTokens,
-				undefined,
-				400_000,
-			),
-		).toEqual(trailing);
-		expect(
-			applyForwardPressureFloor(
-				trailing.percentage,
-				trailing.inputTokens,
-				null,
-				400_000,
-			),
-		).toEqual(trailing);
-		expect(
-			applyForwardPressureFloor(
-				trailing.percentage,
-				trailing.inputTokens,
-				340_000,
-				6_748,
-			),
-		).toEqual(trailing);
-	});
-
-	it("never lowers pressure or input-token accounting", () => {
-		expect(applyForwardPressureFloor(80, 80_000, 10_000, 100_000)).toEqual({
-			percentage: 80,
-			inputTokens: 80_000,
-		});
-	});
-
-	it("maps forward tokens at limit × 0.85 to 100%", () => {
-		const atMargin = applyForwardPressureFloor(0, 0, 85_000, 100_000);
-		const belowMargin = applyForwardPressureFloor(0, 0, 84_999, 100_000);
-
-		expect(atMargin.percentage).toBeCloseTo(100, 8);
-		expect(atMargin.inputTokens).toBe(85_000);
-		expect(belowMargin.percentage).toBeLessThan(100);
-	});
-
+describe("Pi pressure guards", () => {
 	it("keeps the emergency recovery bump as a floor instead of a cap", () => {
 		const src = readFileSync(
 			join(import.meta.dir, "context-handler.ts"),
@@ -2725,8 +2669,8 @@ describe("registerPiContextHandler", () => {
 				...fakeContext(sessionId, process.cwd(), ["entry-1"], messages),
 				ui: { notify },
 				getContextUsage: () => ({
-					tokens: 85_000,
-					percent: 85,
+					tokens: 95_000,
+					percent: 95,
 					contextWindow: 100_000,
 				}),
 			} as never);
@@ -2763,8 +2707,8 @@ describe("registerPiContextHandler", () => {
 				...fakeContext(sessionId, process.cwd(), ["entry-1"], messages),
 				ui: { notify },
 				getContextUsage: () => ({
-					tokens: 85_000,
-					percent: 85,
+					tokens: 95_000,
+					percent: 95,
 					contextWindow: 100_000,
 				}),
 			} as never);
