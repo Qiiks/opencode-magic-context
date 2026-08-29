@@ -2136,9 +2136,20 @@ export async function runPostTransformPhase(
             : undefined;
 
     if (isCacheBustingPass && trailingBlankDecisions.size > 0) {
+        // A source snapshot can outlive the message's projection when a marker trims history.
+        // Heal only IDs still present now so the first strip cannot land later on a defer serve.
+        const visibleMessageIds = new Set(
+            args.messages.flatMap((message) =>
+                typeof message.info.id === "string" ? [message.info.id] : [],
+            ),
+        );
         const poisonedKeepIds: string[] = [];
         for (const [id, decision] of trailingBlankDecisions) {
-            if (id === newestAssistantId || trailingBlankSourceDecisions.get(id) !== "strip") {
+            if (
+                id === newestAssistantId ||
+                !visibleMessageIds.has(id) ||
+                trailingBlankSourceDecisions.get(id) !== "strip"
+            ) {
                 continue;
             }
             if (decision === "keep" || decision.startsWith("keep:")) {

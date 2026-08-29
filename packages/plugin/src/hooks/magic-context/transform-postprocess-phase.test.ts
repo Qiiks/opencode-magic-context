@@ -3246,6 +3246,76 @@ describe("final message representation", () => {
         }
     });
 
+    it("does not first-apply a marker-absent poison heal when the id returns on defer", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-blank-marker-absence";
+        const buildPass = () => {
+            const rawStoreMessages = [
+                {
+                    info: { id: "assistant-poisoned", role: "assistant" },
+                    parts: [
+                        { type: "text", text: "answer before structural marker" },
+                        { type: "step-finish", reason: "tool-calls" },
+                    ],
+                },
+                {
+                    info: { id: "assistant-newest", role: "assistant" },
+                    parts: [{ type: "text", text: "newest" }],
+                },
+            ] as unknown as MessageLike[];
+            const trailingBlankSourceDecisions =
+                snapshotTrailingBlankSourceDecisions(rawStoreMessages);
+            const messages = cloneMessages(rawStoreMessages);
+            stripStructuralNoise(messages);
+            return { messages, trailingBlankSourceDecisions };
+        };
+        addTrailingBlankDecisions(db, sessionId, [["assistant-poisoned", "keep"]]);
+
+        const markerAbsent = buildPass();
+        markerAbsent.messages.splice(0, 1);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, markerAbsent.messages, {
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: markerAbsent.trailingBlankSourceDecisions,
+            }),
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-poisoned")).toBe("keep");
+
+        const defer = buildPass();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, defer.messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: defer.trailingBlankSourceDecisions,
+            }),
+        );
+        const deferBytes = JSON.stringify(findMessage(defer.messages, "assistant-poisoned").parts);
+        expect(findMessage(defer.messages, "assistant-poisoned").parts.at(-1)).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-poisoned")).toBe("keep");
+
+        const visibleBust = buildPass();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, visibleBust.messages, {
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: visibleBust.trailingBlankSourceDecisions,
+            }),
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-poisoned")).toBe("strip");
+        expect(JSON.stringify(findMessage(visibleBust.messages, "assistant-poisoned").parts)).not.toBe(
+            deferBytes,
+        );
+        expect(findMessage(visibleBust.messages, "assistant-poisoned").parts.at(-1)).toEqual({
+            type: "text",
+            text: "answer before structural marker",
+        });
+    });
+
     it("preserves a legitimate provider blank without triggering the poison heal", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -3487,6 +3557,64 @@ describe("final message representation", () => {
             );
             expect(JSON.stringify(replayMessages[0].parts)).toBe(firstBytes);
         }
+    });
+
+    it("bounds a decisionless historical late blank at the next bust", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-blank-decisionless-late";
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: "assistant-late", role: "assistant" },
+                    parts: [
+                        { type: "text", text: "historical answer" },
+                        { type: "text", text: " \t" },
+                    ],
+                },
+                {
+                    info: { id: "assistant-newest", role: "assistant" },
+                    parts: [{ type: "text", text: "newest answer" }],
+                },
+            ] as unknown as MessageLike[];
+
+        const deferMessages = buildMessages();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        const deferBytes = JSON.stringify(findMessage(deferMessages, "assistant-late").parts);
+        expect(getTrailingBlankDecisions(db, sessionId).has("assistant-late")).toBe(false);
+        expect(findMessage(deferMessages, "assistant-late").parts.at(-1)).toEqual({
+            type: "text",
+            text: " \t",
+        });
+
+        const bustMessages = buildMessages();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, bustMessages, {
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-late")).toBe("keep");
+        expect(findMessage(bustMessages, "assistant-late").parts.at(-1)).toEqual({
+            type: "text",
+            text: "",
+        });
+        const bustBytes = JSON.stringify(findMessage(bustMessages, "assistant-late").parts);
+        expect(bustBytes).not.toBe(deferBytes);
+
+        const replayMessages = buildMessages();
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replayMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(JSON.stringify(findMessage(replayMessages, "assistant-late").parts)).toBe(bustBytes);
     });
 
     it("freezes defer-served trailing shapes before late provider blanks arrive", async () => {
