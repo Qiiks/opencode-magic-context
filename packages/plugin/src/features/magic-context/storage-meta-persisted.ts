@@ -970,18 +970,16 @@ export function clearPersistedReasoningWatermark(db: Database, sessionId: string
 }
 
 // ---- Tiered emergency-drop watermark (Phase 2) ----
-// `last_emergency_input_sample` is the `currentTotalInputTokens` reading at the
-// moment the tiered emergency drop last acted. It is the SOLE idempotence latch
-// for the emergency drop (there is intentionally no tag-number watermark — a
-// scalar "dropped-through" cursor wrongly excludes still-active lower-numbered
-// tags after a non-contiguous tier-ordered drop; dropped tags already leave the
-// `status='active'` set, so they can't be re-selected). The drop reduces the
-// wire, but the provider hasn't re-measured it yet — the persisted usage stays
-// at the pre-drop value until the next assistant response lands. Without this
-// latch a second force-band pass on the SAME stale reading recomputes the floor from
-// the now-smaller active tail and over-drops the rest of the tail (and busts the
-// cache again). We only re-evaluate once a FRESH provider sample arrives (the
-// reading changes). Reset to 0 on model change (which moves the ceiling).
+// `last_emergency_input_sample` is the pressure-episode latch for the tiered
+// emergency drop. Zero means no originating batch has acted in the current force
+// episode; non-zero records the usage at that batch. Fresh provider samples do
+// not release it, because sustained force-band residency otherwise ages one tag
+// at a time past the protected tail and mints one bust per execute pass. The
+// postprocess caller resets it after pressure exits or immediately before an
+// independent provider-visible mutation, so accumulated candidates either start
+// one pressure bust or ride an already-priced bust. There is deliberately no
+// tag-number watermark: tier-ordered drops are non-contiguous, and a scalar
+// cursor would exclude still-active lower-numbered tags.
 interface PersistedEmergencyInputSampleRow {
     last_emergency_input_sample: number;
 }
@@ -1002,9 +1000,8 @@ export function getEmergencyInputSample(db: Database, sessionId: string): number
 }
 
 /**
- * Latch the usage sample on every emergency acting pass, including when the
- * selector finds no eligible target. This stops repeated cache busts on the same
- * stale sample; the 95% block remains the backstop for genuine "nothing left to drop".
+ * Latch every emergency evaluation in a force-band episode, including one with
+ * no eligible target. The 95% block remains the backstop for genuine exhaustion.
  */
 export function setEmergencyDropSample(db: Database, sessionId: string, inputSample: number): void {
     db.transaction(() => {

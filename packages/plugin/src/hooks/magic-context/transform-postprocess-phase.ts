@@ -28,7 +28,9 @@ import {
 import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
+    clearEmergencyDropSample,
     demoteTrailingBlankKeepDecisions,
+    getEmergencyInputSample,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getTrailingBlankDecisions,
@@ -100,7 +102,11 @@ import {
     type TrailingBlankDecision,
     type TrailingBlankSourceDecisions,
 } from "./strip-content";
-import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
+import {
+    buildEditSupersessionReclaim,
+    buildSupersessionReclaimOps,
+    SUPERSESSION_RECENT_MESSAGE_WINDOW,
+} from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
 import {
     assertTailHygieneContentUnchanged,
@@ -133,9 +139,22 @@ const DEGRADE_CACHE_WARNING_THRESHOLD = 10;
 // Bounded (LRU, max 100) so a crashed/never-reset session can't leak an entry
 // forever in a long-running process — matches the other per-session caches.
 const degradedCacheCountBySession = new BoundedSessionMap<number>(100);
+const routinePressureAppliedBySession = new BoundedSessionMap<boolean>(100);
 
 export function resetDegradedCacheCount(sessionId: string): void {
     degradedCacheCountBySession.delete(sessionId);
+    routinePressureAppliedBySession.delete(sessionId);
+}
+
+function recentSupersessionMessageIds(messages: MessageLike[]): Set<string> {
+    const recent = new Set<string>();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const id = messages[index]?.info.id;
+        if (typeof id !== "string" || recent.has(id)) continue;
+        recent.add(id);
+        if (recent.size >= SUPERSESSION_RECENT_MESSAGE_WINDOW) break;
+    }
+    return recent;
 }
 
 export type DeferredCompactionMarkerClearOutcome =
@@ -882,6 +901,23 @@ export async function runPostTransformPhase(
     // ≥ the force-materialize threshold.
     const emergencyDropEligible =
         !compactionOff && args.contextUsage.percentage >= args.forceMaterializationPercentage;
+    const executePressureEligible = args.schedulerDecision === "execute" || emergencyDropEligible;
+    if (!executePressureEligible) {
+        routinePressureAppliedBySession.delete(args.sessionId);
+    } else if (args.fullFeatureMode && alreadyRanThisTurn) {
+        // The shared once-per-turn map proves an earlier pass in this pressure
+        // episode already ran even when this process-local episode map is cold.
+        routinePressureAppliedBySession.set(args.sessionId, true);
+    }
+    const routinePressureAlreadyApplied =
+        args.fullFeatureMode &&
+        executePressureEligible &&
+        routinePressureAppliedBySession.get(args.sessionId) === true;
+    // A pressure episode ends below the force band. Clear its emergency edge
+    // latch here so a later re-entry can originate one new batched reclaim.
+    if (!emergencyDropEligible && getEmergencyInputSample(args.db, args.sessionId) > 0) {
+        clearEmergencyDropSample(args.db, args.sessionId);
+    }
     const activeCompartmentRun = args.canRunCompartments
         ? getActiveCompartmentRun(args.sessionId)
         : undefined;
@@ -1243,10 +1279,38 @@ export async function runPostTransformPhase(
             const heuristicTags = shouldApplyPendingOps
                 ? getActiveTagsBySession(args.db, args.sessionId)
                 : args.tags;
+            const independentMutationBeforeHeuristics =
+                pendingOpsDidMutate ||
+                args.didMutateFromFlushedStatuses ||
+                foldExecutedThisPass ||
+                args.historyRebuiltThisPass ||
+                args.compartmentInjectionRebuiltFromDb ||
+                args.rebuiltHistoryFromInitialPrepare;
+            // An independent mutation is already pricing this pass. Rearm the
+            // emergency batch so all candidates accumulated during sustained
+            // force pressure can ride it instead of waiting for another episode.
+            if (
+                emergencyDropEligible &&
+                independentMutationBeforeHeuristics &&
+                getEmergencyInputSample(args.db, args.sessionId) > 0
+            ) {
+                clearEmergencyDropSample(args.db, args.sessionId);
+            }
+            // Routine age-sensitive rewrites get one originating application per
+            // continuous execute-pressure episode, not one per user turn. Later
+            // force-band passes may run emergency selection, but caveman/reasoning/
+            // dedup first-apply only when another mutation is already priced. The
+            // pressure latch clears on a real defer, so a 50% threshold cannot make
+            // every new turn a fresh rewrite opportunity while usage stays high.
+            let routineCleanupApplied =
+                !args.fullFeatureMode ||
+                !routinePressureAlreadyApplied ||
+                materializationRequested ||
+                independentMutationBeforeHeuristics;
             // Pending ops run just before heuristics and can drop active tags.
             // Emergency floor math must see that post-op active set; otherwise
             // already-reclaimed tags stay in floorTags and the planner over-evicts.
-            const cleanup = applyHeuristicCleanup(
+            let cleanup = applyHeuristicCleanup(
                 args.sessionId,
                 args.db,
                 args.targets,
@@ -1267,10 +1331,42 @@ export async function runPostTransformPhase(
                                   ceilingTokens: args.emergencyCeilingTokens,
                               }
                             : undefined,
+                    routine: routineCleanupApplied,
                     caveman: cavemanConfig,
                 },
                 heuristicTags,
             );
+            if (!routineCleanupApplied && cleanup.emergencyDroppedTools > 0) {
+                // The emergency selector just created the episode's one pressure
+                // bust. Drain the routine lanes into that same pass, then keep them
+                // frozen on later force-band passes.
+                const ridingCleanup = applyHeuristicCleanup(
+                    args.sessionId,
+                    args.db,
+                    args.targets,
+                    args.messageTagNumbers,
+                    {
+                        protectedTags: args.protectedTags,
+                        routine: true,
+                        caveman: cavemanConfig,
+                    },
+                    getActiveTagsBySession(args.db, args.sessionId),
+                );
+                cleanup = {
+                    droppedTools: cleanup.droppedTools + ridingCleanup.droppedTools,
+                    deduplicatedTools: cleanup.deduplicatedTools + ridingCleanup.deduplicatedTools,
+                    droppedInjections: cleanup.droppedInjections + ridingCleanup.droppedInjections,
+                    emergencyDroppedTools: cleanup.emergencyDroppedTools,
+                    emergencyReclaimedTokens: cleanup.emergencyReclaimedTokens,
+                    compressedTextTags:
+                        cleanup.compressedTextTags + ridingCleanup.compressedTextTags,
+                    mutatedTextTags: cleanup.mutatedTextTags + ridingCleanup.mutatedTextTags,
+                };
+                routineCleanupApplied = true;
+            }
+            if (routineCleanupApplied && args.fullFeatureMode && executePressureEligible) {
+                routinePressureAppliedBySession.set(args.sessionId, true);
+            }
             logTransformTiming(
                 args.sessionId,
                 "applyHeuristicCleanup",
@@ -1303,22 +1399,21 @@ export async function runPostTransformPhase(
             // providers keep their reasoning intact. Inline-thinking stripping
             // below stays provider-independent (it removes literal <thinking> tags
             // from text, never touches typed reasoning parts).
-            const clearedReasoning = canUseEmptySentinels
-                ? clearOldReasoning(
-                      args.messages,
-                      args.reasoningByMessage,
-                      args.messageTagNumbers,
-                      args.clearReasoningAge,
-                  )
-                : 0;
-            if (canUseEmptySentinels) {
+            const clearedReasoning =
+                routineCleanupApplied && canUseEmptySentinels
+                    ? clearOldReasoning(
+                          args.messages,
+                          args.reasoningByMessage,
+                          args.messageTagNumbers,
+                          args.clearReasoningAge,
+                      )
+                    : 0;
+            if (routineCleanupApplied && canUseEmptySentinels) {
                 stripClearedReasoning(args.messages);
             }
-            const strippedInline = stripInlineThinking(
-                args.messages,
-                args.messageTagNumbers,
-                args.clearReasoningAge,
-            );
+            const strippedInline = routineCleanupApplied
+                ? stripInlineThinking(args.messages, args.messageTagNumbers, args.clearReasoningAge)
+                : 0;
             if (clearedReasoning > 0 || strippedInline > 0) {
                 // Compute and persist the reasoning watermark so future defer passes
                 // can replay the same clearing without re-computing the cutoff.
@@ -1370,10 +1465,18 @@ export async function runPostTransformPhase(
         }
 
         const toolReclaimExecutePass = !compactionOff && args.schedulerDecision === "execute";
-        const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate;
+        const alreadyMutatingThisPass =
+            pendingOpsDidMutate ||
+            heuristicOrReasoningDidMutate ||
+            args.didMutateFromFlushedStatuses ||
+            foldExecutedThisPass ||
+            args.historyRebuiltThisPass ||
+            args.compartmentInjectionRebuiltFromDb ||
+            args.rebuiltHistoryFromInitialPrepare;
+        const toolReclaimApplicationOpportunity = toolReclaimExecutePass && alreadyMutatingThisPass;
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;
-        if (toolReclaimExecutePass && alreadyMutatingThisPass && !emergencyDropEligible) {
+        if (toolReclaimApplicationOpportunity && !emergencyDropEligible) {
             const syntheticPendingOps = buildSyntheticToolReclaimOps({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -1386,14 +1489,18 @@ export async function runPostTransformPhase(
             // superseded edits to an edit_marker (keep filePath + region hint).
             // Merged into the same gated apply as the age-based sweep. Dedupe
             // against those ops (a tag can qualify under more than one rule).
+            // The newest 20 owner messages remain untouched, matching the module
+            // lane's continuation floor independently of protected_tags.
             const editMarkerTagIds = new Set<number>();
             if (args.smartDrops) {
+                const recentMessageIds = recentSupersessionMessageIds(args.messages);
                 const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
                 const supersessionOps = buildSupersessionReclaimOps({
                     db: args.db,
                     sessionId: args.sessionId,
                     targets: args.targets,
                     pendingOps,
+                    recentMessageIds,
                 });
                 for (const op of supersessionOps) {
                     if (!selectedIds.has(op.tagId)) {
@@ -1406,6 +1513,7 @@ export async function runPostTransformPhase(
                     sessionId: args.sessionId,
                     targets: args.targets,
                     pendingOps,
+                    recentMessageIds,
                 });
                 for (const op of editReclaim.ops) {
                     // A superseded edit only compresses if no earlier rule already
@@ -1442,7 +1550,11 @@ export async function runPostTransformPhase(
             }
         }
         args.batch?.finalize();
-        if (toolReclaimExecutePass) {
+        // Advance whenever reclaim could have applied, even if no tags were
+        // selected. Plain execute-band residency does not advance the watermark;
+        // otherwise each newly eligible tag could drop separately instead of
+        // waiting for the next independently priced batch.
+        if (toolReclaimApplicationOpportunity) {
             const maxTagNumber = advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
             args.sessionMeta.toolReclaimWatermark = Math.max(
                 args.sessionMeta.toolReclaimWatermark ?? 0,

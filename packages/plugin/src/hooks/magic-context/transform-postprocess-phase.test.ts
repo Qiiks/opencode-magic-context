@@ -20,6 +20,7 @@ import {
     insertTag,
     queueM0Mutation,
     queuePendingOp,
+    saveSourceContent,
     setChannel2NudgeState,
     setPendingCompactionMarkerState,
     updateSessionMeta,
@@ -366,6 +367,10 @@ function thinkingParts(message: MessageLike): ThinkingLikePart[] {
 function makeMessageTarget(message: MessageLike): TagTarget {
     return {
         message,
+        getContent: () => {
+            const part = message.parts[0] as { text?: unknown } | undefined;
+            return typeof part?.text === "string" ? part.text : null;
+        },
         setContent: (content: string) => {
             const part = message.parts[0] as { text?: string } | undefined;
             if (part?.text === content) return false;
@@ -1889,7 +1894,7 @@ describe("two-pass tool reclaim", () => {
         expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(2);
     });
 
-    it("advances the watermark on execute even when the auto-drop gate is closed", async () => {
+    it("freezes the watermark on execute when no reclaim application opportunity exists", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-reclaim-advance";
@@ -1905,7 +1910,7 @@ describe("two-pass tool reclaim", () => {
             }),
         );
 
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(1);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(0);
         expect(tagStatuses(sessionId).get(1)).toBe("active");
     });
 
@@ -1930,6 +1935,168 @@ describe("two-pass tool reclaim", () => {
     });
 });
 
+describe("issue #386 sustained execute-pressure batching", () => {
+    it("keeps caveman bytes stable on consecutive force passes after this turn already ran", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-386-caveman-pressure";
+        const turnId = "turn-386";
+        const longText =
+            "I just really basically wanted to clearly explain the stable cache prefix while pressure remains high. ".repeat(
+                6,
+            );
+        const messages: MessageLike[] = [];
+        const targets = new Map<number, TagTarget>();
+        const messageTagNumbers = new Map<MessageLike, number>();
+        for (let tagNumber = 1; tagNumber <= 35; tagNumber += 1) {
+            const message = {
+                info: {
+                    id: `text-${tagNumber}`,
+                    role: tagNumber % 2 === 0 ? "assistant" : "user",
+                },
+                parts: [{ type: "text", text: longText }],
+            } as MessageLike;
+            messages.push(message);
+            insertTag(db, sessionId, `text-${tagNumber}`, "message", longText.length, tagNumber);
+            saveSourceContent(db, sessionId, tagNumber, longText);
+            targets.set(tagNumber, makeMessageTarget(message));
+            messageTagNumbers.set(message, tagNumber);
+        }
+        updateSessionMeta(db, sessionId, { cacheTtl: "5m" });
+        const lastHeuristicsTurnId = new Map([[sessionId, turnId]]);
+        const executeThresholdPercentage = 50;
+        const contextLimit = 100_000;
+        const exactConfig = {
+            schedulerDecision: "execute" as const,
+            contextUsage: { percentage: 90, inputTokens: 90_000 },
+            emergencyCeilingTokens: Math.floor(contextLimit * (executeThresholdPercentage / 100)),
+            forceMaterializationPercentage: 85,
+            protectedTags: 12,
+            clearReasoningAge: 30,
+            smartDrops: true,
+            cavemanTextCompression: { enabled: true, minChars: 300 },
+            resolvedProviderID: "anthropic",
+            currentTurnId: turnId,
+            lastHeuristicsTurnId,
+        };
+        const baseline = JSON.stringify(messages);
+
+        for (const [passIndex, inputTokens] of [90_000, 91_000].entries()) {
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    ...exactConfig,
+                    currentTurnId: passIndex === 0 ? turnId : `${turnId}-next`,
+                    contextUsage: { percentage: 90, inputTokens },
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    messageTagNumbers,
+                    sessionMeta: getOrCreateSessionMeta(db, sessionId),
+                }),
+            );
+            expect(JSON.stringify(messages)).toBe(baseline);
+        }
+
+        expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("5m");
+        expect(getOrCreateSessionMeta(db, sessionId).lastTransformError).toBeNull();
+        expect(getTagsBySession(db, sessionId).every((tag) => tag.cavemanDepth === 0)).toBe(true);
+    });
+
+    it("batches force reclaim once, stays byte-stable, then rides the next independent bust", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-386-emergency-pressure";
+        const turnId = "turn-386";
+        const messages: MessageLike[] = [];
+        const targets = new Map<number, TagTarget>();
+        for (let tagNumber = 1; tagNumber <= 30; tagNumber += 1) {
+            const message = makeToolMessage(`tool-${tagNumber}`);
+            messages.push(message);
+            targets.set(tagNumber, makeDropTarget(message));
+            insertTag(
+                db,
+                sessionId,
+                `call-${tagNumber}`,
+                "tool",
+                4_000,
+                tagNumber,
+                0,
+                "bash",
+                0,
+                `tool-${tagNumber}`,
+            );
+        }
+        updateSessionMeta(db, sessionId, { cacheTtl: "5m" });
+        const lastHeuristicsTurnId = new Map([[sessionId, turnId]]);
+        const executeThresholdPercentage = 50;
+        const contextLimit = 100_000;
+        const runPressurePass = async (inputTokens: number) =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "execute",
+                    contextUsage: { percentage: 90, inputTokens },
+                    emergencyCeilingTokens: Math.floor(
+                        contextLimit * (executeThresholdPercentage / 100),
+                    ),
+                    forceMaterializationPercentage: 85,
+                    protectedTags: 12,
+                    clearReasoningAge: 30,
+                    smartDrops: true,
+                    cavemanTextCompression: { enabled: true, minChars: 300 },
+                    resolvedProviderID: "anthropic",
+                    currentTurnId: turnId,
+                    lastHeuristicsTurnId,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    sessionMeta: getOrCreateSessionMeta(db, sessionId),
+                }),
+            );
+
+        await runPressurePass(90_000);
+        const firstStatuses = new Map(
+            getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
+        );
+        for (let tagNumber = 1; tagNumber <= 18; tagNumber += 1) {
+            expect(firstStatuses.get(tagNumber)).toBe("dropped");
+        }
+        const pricedPrefix = JSON.stringify(messages.slice(0, 30));
+
+        for (let tagNumber = 31; tagNumber <= 32; tagNumber += 1) {
+            const message = makeToolMessage(`tool-${tagNumber}`);
+            messages.push(message);
+            targets.set(tagNumber, makeDropTarget(message));
+            insertTag(
+                db,
+                sessionId,
+                `call-${tagNumber}`,
+                "tool",
+                4_000,
+                tagNumber,
+                0,
+                "bash",
+                0,
+                `tool-${tagNumber}`,
+            );
+        }
+
+        await runPressurePass(91_000);
+        const secondStatuses = new Map(
+            getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
+        );
+        expect(secondStatuses.get(19)).toBe("active");
+        expect(secondStatuses.get(20)).toBe("active");
+        expect(JSON.stringify(messages.slice(0, 30))).toBe(pricedPrefix);
+
+        queuePendingOp(db, sessionId, 19, "drop", 1);
+        await runPressurePass(92_000);
+        const ridingStatuses = new Map(
+            getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
+        );
+        expect(ridingStatuses.get(19)).toBe("dropped");
+        expect(ridingStatuses.get(20)).toBe("dropped");
+        expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("5m");
+    });
+});
+
 describe("smart-drops supersession reclaim (flag-gated)", () => {
     function tagStatuses(sessionId: string): Map<number, string> {
         return new Map(getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]));
@@ -1943,26 +2110,31 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         trigger: MessageLike;
         older: MessageLike;
         newer: MessageLike;
+        recentTail: MessageLike[];
     } {
         const trigger = makeToolMessage("tool-1");
         const older = makeToolMessage("tool-2");
         const newer = makeToolMessage("tool-3");
-        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit");
-        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "todowrite");
-        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "todowrite");
+        const recentTail = Array.from({ length: 20 }, (_, index) => ({
+            info: { id: `recent-${index + 1}`, role: index % 2 === 0 ? "user" : "assistant" },
+            parts: [{ type: "text", text: `recent message ${index + 1}` }],
+        })) as MessageLike[];
+        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit", 0, "tool-1");
+        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "todowrite", 0, "tool-2");
+        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "todowrite", 0, "tool-3");
         queuePendingOp(db, sessionId, 1, "drop", 1);
         advanceToolReclaimWatermark(db, sessionId, 1);
-        return { trigger, older, newer };
+        return { trigger, older, newer, recentTail };
     }
 
     it("OFF (default): superseded todowrite is NOT dropped even on a mutating execute pass", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-smart-off";
-        const { trigger, older, newer } = seedTodowriteSession(sessionId);
+        const { trigger, older, newer, recentTail } = seedTodowriteSession(sessionId);
 
         await runPostTransformPhase(
-            basePostTransformArgs(db, sessionId, [trigger, older, newer], {
+            basePostTransformArgs(db, sessionId, [trigger, older, newer, ...recentTail], {
                 schedulerDecision: "execute",
                 smartDrops: false,
                 tags: getActiveTagsBySession(db, sessionId),
@@ -1985,10 +2157,10 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-smart-on";
-        const { trigger, older, newer } = seedTodowriteSession(sessionId);
+        const { trigger, older, newer, recentTail } = seedTodowriteSession(sessionId);
 
         await runPostTransformPhase(
-            basePostTransformArgs(db, sessionId, [trigger, older, newer], {
+            basePostTransformArgs(db, sessionId, [trigger, older, newer, ...recentTail], {
                 schedulerDecision: "execute",
                 smartDrops: true,
                 tags: getActiveTagsBySession(db, sessionId),
@@ -2011,10 +2183,10 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-smart-defer";
-        const { trigger, older, newer } = seedTodowriteSession(sessionId);
+        const { trigger, older, newer, recentTail } = seedTodowriteSession(sessionId);
 
         await runPostTransformPhase(
-            basePostTransformArgs(db, sessionId, [trigger, older, newer], {
+            basePostTransformArgs(db, sessionId, [trigger, older, newer, ...recentTail], {
                 schedulerDecision: "defer",
                 smartDrops: true,
                 tags: getActiveTagsBySession(db, sessionId),
@@ -3307,9 +3479,9 @@ describe("final message representation", () => {
             }),
         );
         expect(getTrailingBlankDecisions(db, sessionId).get("assistant-poisoned")).toBe("strip");
-        expect(JSON.stringify(findMessage(visibleBust.messages, "assistant-poisoned").parts)).not.toBe(
-            deferBytes,
-        );
+        expect(
+            JSON.stringify(findMessage(visibleBust.messages, "assistant-poisoned").parts),
+        ).not.toBe(deferBytes);
         expect(findMessage(visibleBust.messages, "assistant-poisoned").parts.at(-1)).toEqual({
             type: "text",
             text: "answer before structural marker",
