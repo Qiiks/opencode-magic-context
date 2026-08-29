@@ -1694,7 +1694,7 @@ export function buildPiCompactionSummary(
  * cut at, so defer there too.
  */
 export function findFirstKeptEntryId(
-	entries: unknown[],
+	entries: readonly unknown[],
 	lastCompactedOrdinal: number,
 ): string | null {
 	const rawMessages = convertEntriesToRawMessages(entries);
