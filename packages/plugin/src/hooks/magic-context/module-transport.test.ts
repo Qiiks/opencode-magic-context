@@ -110,7 +110,7 @@ function deferred<T = void>(): {
 }
 
 describe("SubcModuleTransport", () => {
-    it("uses the shared v2 client while preserving route identity and flat request bytes", async () => {
+    it("omits an ambient supervised identity while preserving route identity and flat request bytes", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "module-subc-v2-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
         const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
@@ -127,6 +127,10 @@ describe("SubcModuleTransport", () => {
             resolveServer = resolve;
             rejectServer = reject;
         });
+        const previousModuleId = process.env.SUBC_MODULE_ID;
+        const previousLaunchNonce = process.env.SUBC_LAUNCH_NONCE;
+        process.env.SUBC_MODULE_ID = "other-supervised-module";
+        process.env.SUBC_LAUNCH_NONCE = "a".repeat(64);
         const server = createServer((socket) => {
             acceptedSocket = socket;
             void (async () => {
@@ -204,15 +208,6 @@ describe("SubcModuleTransport", () => {
             transport.closeSession("session-1");
             await serverWork;
 
-            const consumerIdentity =
-                process.env.SUBC_MODULE_ID && process.env.SUBC_LAUNCH_NONCE
-                    ? {
-                          consumer_identity: {
-                              module_id: process.env.SUBC_MODULE_ID,
-                              launch_nonce: process.env.SUBC_LAUNCH_NONCE,
-                          },
-                      }
-                    : {};
             expect(routeOpenBody).toEqual({
                 op: "route.open",
                 target: { kind: "tool_provider", module_id: "magic-context" },
@@ -221,7 +216,6 @@ describe("SubcModuleTransport", () => {
                     harness: "opencode",
                     session: "session-1",
                 },
-                ...consumerIdentity,
             });
             expect(requestBody).toEqual(flatBody);
             expect(routeHeader).toEqual(
@@ -252,6 +246,10 @@ describe("SubcModuleTransport", () => {
             acceptedSocket?.destroy();
             await new Promise<void>((resolve) => server.close(() => resolve()));
             rmSync(tempDir, { recursive: true, force: true });
+            if (previousModuleId === undefined) delete process.env.SUBC_MODULE_ID;
+            else process.env.SUBC_MODULE_ID = previousModuleId;
+            if (previousLaunchNonce === undefined) delete process.env.SUBC_LAUNCH_NONCE;
+            else process.env.SUBC_LAUNCH_NONCE = previousLaunchNonce;
         }
     });
 

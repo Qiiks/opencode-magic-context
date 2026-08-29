@@ -39,7 +39,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { SubcClient, type BindIdentity } from "@cortexkit/subc-client";
+import {
+    SubcClient,
+    type BindIdentity,
+    type RouteHandle,
+    type RouteOpenOptions,
+    type RouteTarget,
+} from "@cortexkit/subc-client";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
@@ -47,6 +53,19 @@ const RUST_E2E_PID_FILE = "rust-e2e-pids.json";
 const BROCA_ID = "broca";
 const BROCA_SCRIPT = join(REPO_ROOT, "packages/e2e-tests/src/rust-runner/fake-broca.ts");
 const RUST_E2E_STALE_PID_AGE_MS = 30 * 60 * 1_000;
+
+function routeOpenWithoutAmbientConsumerIdentity(
+    client: SubcClient,
+    target: RouteTarget,
+    identity: BindIdentity,
+    options: Omit<RouteOpenOptions, "consumerIdentity"> = {},
+): Promise<RouteHandle> {
+    return client.routeOpen(target, identity, {
+        ...options,
+        // Inherited SUBC_* credentials identify a daemon-supervised module, not this independent host.
+        consumerIdentity: null,
+    });
+}
 
 type RustE2eProcessRole = "daemon" | "module" | "producer";
 
@@ -708,10 +727,10 @@ export class HermeticSubcStack {
         }));
         let route: Awaited<ReturnType<SubcClient["routeOpen"]>> | null = null;
         try {
-            route = await client.routeOpen(
+            route = await routeOpenWithoutAmbientConsumerIdentity(
+                client,
                 { kind: "tool_provider", module_id: MODULE_ID },
                 identity,
-                { consumerIdentity: null },
             );
             const response = await client.request(route, { method, v: 1, session_id: sessionId });
             return (response && typeof response === "object" ? response : {}) as Record<string, unknown>;

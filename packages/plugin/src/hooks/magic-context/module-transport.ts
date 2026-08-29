@@ -6,6 +6,7 @@ import {
     isConsumerReconnectTransient,
     Priority,
     type RouteHandle,
+    type RouteOpenOptions,
     type RouteTarget,
     SocketClosedError,
     SocketTimeoutError,
@@ -129,6 +130,19 @@ function isConnectionFailure(error: unknown): boolean {
             ].includes(code) ||
             /\bclient closed\b|\bconnection closed\b|\bclosed the connection\b/i.test(message)
         );
+    });
+}
+
+function routeOpenWithoutAmbientConsumerIdentity(
+    client: SubcClient,
+    target: RouteTarget,
+    identity: BindIdentity,
+    options: Omit<RouteOpenOptions, "consumerIdentity"> = {},
+): Promise<RouteHandle> {
+    return client.routeOpen(target, identity, {
+        ...options,
+        // Inherited SUBC_* credentials identify a daemon-supervised module, not this independent host.
+        consumerIdentity: null,
     });
 }
 
@@ -773,7 +787,7 @@ export class SubcModuleTransport {
                 session: `${this.routeSessionPrefix}${sessionId}`,
             };
             const route = await this.beforeDeadline(
-                client.routeOpen(target, identity),
+                routeOpenWithoutAmbientConsumerIdentity(client, target, identity),
                 deadlineMs,
                 "opening the module route",
             );
