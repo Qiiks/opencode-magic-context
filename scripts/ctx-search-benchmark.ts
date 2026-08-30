@@ -7,17 +7,22 @@ import { dirname, join, resolve } from "node:path";
 import { loadPluginConfig } from "../packages/plugin/src/config";
 import {
 	buildCanonicalChunkTextFromFts,
+	CHUNK_WINDOW_SAFETY_RATIO,
 	loadCompartmentChunkEmbeddingsForSearch,
 } from "../packages/plugin/src/features/magic-context/compartment-chunk-embedding";
+import { estimateTokens } from "../packages/plugin/src/hooks/magic-context/read-session-formatting";
 import { getLastCompartmentEndMessage } from "../packages/plugin/src/features/magic-context/compartment-storage";
 import { cosineSimilarity } from "../packages/plugin/src/features/magic-context/memory/cosine-similarity";
 import { sanitizeFtsQuery } from "../packages/plugin/src/features/magic-context/memory/storage-memory-fts";
 import {
 	embedBatchForProject,
+	embedShadowTextForProject,
 	embedTextForProject,
 	type getProjectEmbeddingSnapshot,
 	registerProjectEmbedding,
+	registerProjectShadowEmbedding,
 } from "../packages/plugin/src/features/magic-context/project-embedding-registry";
+import { resolveEmbeddingRouting } from "../packages/plugin/src/plugin/embedding-routing";
 import {
 	type CapturedQueryEmbedding,
 	type UnifiedSearchOptions,
@@ -92,6 +97,7 @@ interface CliArgs {
 	contextDbPath: string;
 	openCodeDbPath: string;
 	skipP1: boolean;
+	compareSpaces: boolean;
 }
 
 interface SafeHit {
@@ -258,6 +264,7 @@ Options:
   --context-db PATH  Live context.db path (opened via file: URI mode=ro)
   --opencode-db PATH Live opencode.db path (opened via file: URI mode=ro)
   --skip-p1          Skip the on-the-fly P1-summary probe
+  --compare-spaces   Compare qwen primary and Synapse shadow end-to-end
   --help             Show this help`);
 		process.exit(0);
 	}
@@ -279,6 +286,7 @@ Options:
 			value("--opencode-db") ?? join(getDataDir(), "opencode", "opencode.db"),
 		),
 		skipP1: args.includes("--skip-p1"),
+		compareSpaces: args.includes("--compare-spaces"),
 	};
 }
 
@@ -1024,6 +1032,559 @@ function offlineFusion(
 		.slice(0, 10);
 }
 
+type EmbeddingSpace = "qwen" | "synapse";
+
+type EmbeddingSnapshot = NonNullable<ReturnType<typeof getProjectEmbeddingSnapshot>>;
+
+interface TimedEmbedding {
+	project: string;
+	milliseconds: number;
+	ok: boolean;
+}
+
+function percentile(values: readonly number[], quantile: number): number | null {
+	if (values.length === 0) return null;
+	const sorted = [...values].sort((left, right) => left - right);
+	return Number(sorted[Math.ceil(quantile * sorted.length) - 1].toFixed(1));
+}
+
+function latencySummary(samples: readonly TimedEmbedding[]) {
+	const firstByProject = new Set<string>();
+	const cold: number[] = [];
+	const warm: number[] = [];
+	for (const sample of samples) {
+		if (!firstByProject.has(sample.project)) {
+			firstByProject.add(sample.project);
+			cold.push(sample.milliseconds);
+		} else {
+			warm.push(sample.milliseconds);
+		}
+	}
+	return {
+		totalN: samples.length,
+		succeeded: samples.filter((sample) => sample.ok).length,
+		cold: { n: cold.length, p50Ms: percentile(cold, 0.5), p95Ms: percentile(cold, 0.95) },
+		warm: { n: warm.length, p50Ms: percentile(warm, 0.5), p95Ms: percentile(warm, 0.95) },
+	};
+}
+
+function countQuery(db: DatabaseType, sql: string, ...params: unknown[]): number {
+	return numberValue(db.prepare(sql).get(...params), "count");
+}
+
+function auditSpaceCoverage(db: DatabaseType, fixture: Fixture) {
+	const now = Date.now();
+	const projects = Object.entries(fixture.projects).map(([key, project]) => {
+		const primary = db
+			.prepare(
+				`SELECT model_id AS modelId, chunk_model_id AS chunkModelId
+				 FROM embedding_registrations WHERE project_path = ?`,
+			)
+			.get(project.projectPath) as { modelId: string; chunkModelId: string } | undefined;
+		if (!primary) throw new Error(`Missing primary descriptor for ${key}`);
+		const descriptors = db
+			.prepare(
+				`SELECT scope, model_id AS modelId, fingerprint, table_epoch AS tableEpoch,
+				        dims, updated_at AS updatedAt
+				 FROM shadow_embedding_registrations
+				 WHERE project_path = ? ORDER BY updated_at DESC`,
+			)
+			.all(project.projectPath) as Array<{
+				scope: "memory" | "commit" | "chunk";
+				modelId: string;
+				fingerprint: string;
+				tableEpoch: number;
+				dims: number;
+				updatedAt: number;
+			}>;
+		const current = new Map<string, (typeof descriptors)[number]>();
+		for (const descriptor of descriptors) {
+			if (!current.has(descriptor.scope)) current.set(descriptor.scope, descriptor);
+		}
+		for (const scope of ["memory", "commit", "chunk"] as const) {
+			if (!current.has(scope)) throw new Error(`Missing current ${scope} shadow descriptor for ${key}`);
+		}
+		const memoryShadow = current.get("memory") as (typeof descriptors)[number];
+		const commitShadow = current.get("commit") as (typeof descriptors)[number];
+		const chunkShadow = current.get("chunk") as (typeof descriptors)[number];
+		const eligibleMemory =
+			"m.project_path = ? AND m.status IN ('active','permanent') AND (m.expires_at IS NULL OR m.expires_at > ?)";
+		const memoryHoles = db
+			.prepare(
+				`SELECT m.id, m.created_at AS createdAt FROM memories m
+				 JOIN memory_embeddings ep ON ep.memory_id=m.id AND ep.model_id=?
+				 LEFT JOIN memory_embeddings es ON es.memory_id=m.id AND es.model_id=?
+				 WHERE ${eligibleMemory} AND es.memory_id IS NULL ORDER BY m.created_at`,
+			)
+			.all(primary.modelId, memoryShadow.modelId, project.projectPath, now) as Array<{
+				id: number;
+				createdAt: number;
+			}>;
+		const commitHoles = db
+			.prepare(
+				`SELECT c.sha, c.committed_at AS createdAt FROM git_commits c
+				 JOIN git_commit_embeddings ep ON ep.sha=c.sha AND ep.model_id=?
+				 LEFT JOIN git_commit_embeddings es ON es.sha=c.sha AND es.model_id=?
+				 WHERE c.project_path=? AND es.sha IS NULL ORDER BY c.committed_at`,
+			)
+			.all(primary.modelId, commitShadow.modelId, project.projectPath) as Array<{
+				sha: string;
+				createdAt: number;
+			}>;
+		const chunkHoles = db
+			.prepare(
+				`SELECT ep.compartment_id AS id, c.created_at AS createdAt, COUNT(*) AS missingRows
+				 FROM compartment_chunk_embeddings ep
+				 JOIN compartments c ON c.id=ep.compartment_id
+				 LEFT JOIN compartment_chunk_embeddings es
+				   ON es.compartment_id=ep.compartment_id AND es.window_index=ep.window_index AND es.model_id=?
+				 WHERE ep.project_path=? AND ep.model_id=? AND es.id IS NULL
+				 GROUP BY ep.compartment_id ORDER BY c.created_at`,
+			)
+			.all(chunkShadow.modelId, project.projectPath, primary.chunkModelId) as Array<{
+				id: number;
+				createdAt: number;
+				missingRows: number;
+			}>;
+		const dimensions = (scope: "memory" | "commit" | "chunk", modelId: string) => {
+			if (scope === "memory") {
+				return db
+					.prepare(
+						`SELECT LENGTH(e.embedding)/4 AS dims, COUNT(*) AS rows FROM memory_embeddings e
+						 JOIN memories m ON m.id=e.memory_id WHERE m.project_path=? AND e.model_id=? GROUP BY dims`,
+					)
+					.all(project.projectPath, modelId);
+			}
+			if (scope === "commit") {
+				return db
+					.prepare(
+						`SELECT LENGTH(e.embedding)/4 AS dims, COUNT(*) AS rows FROM git_commit_embeddings e
+						 JOIN git_commits c ON c.sha=e.sha WHERE c.project_path=? AND e.model_id=? GROUP BY dims`,
+					)
+					.all(project.projectPath, modelId);
+			}
+			return db
+				.prepare(
+					`SELECT dims, COUNT(*) AS rows FROM compartment_chunk_embeddings
+					 WHERE project_path=? AND model_id=? GROUP BY dims`,
+				)
+				.all(project.projectPath, modelId);
+		};
+		const orphanRows = descriptors
+			.filter((descriptor) => current.get(descriptor.scope)?.modelId !== descriptor.modelId)
+			.map((descriptor) => ({
+				scope: descriptor.scope,
+				modelId: descriptor.modelId,
+				fingerprint: descriptor.fingerprint,
+				tableEpoch: descriptor.tableEpoch,
+				rows:
+					descriptor.scope === "memory"
+						? countQuery(
+								db,
+								`SELECT COUNT(*) AS count FROM memory_embeddings e JOIN memories m ON m.id=e.memory_id
+								 WHERE m.project_path=? AND e.model_id=?`,
+								project.projectPath,
+								descriptor.modelId,
+							)
+						: descriptor.scope === "commit"
+							? countQuery(
+									db,
+									`SELECT COUNT(*) AS count FROM git_commit_embeddings e JOIN git_commits c ON c.sha=e.sha
+									 WHERE c.project_path=? AND e.model_id=?`,
+									project.projectPath,
+									descriptor.modelId,
+								)
+							: countQuery(
+									db,
+									"SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path=? AND model_id=?",
+									project.projectPath,
+									descriptor.modelId,
+								),
+			}));
+		const range = (rows: readonly { createdAt: number }[]) => ({
+			oldest: rows.length > 0 ? new Date(rows[0].createdAt).toISOString() : null,
+			newest: rows.length > 0 ? new Date(rows.at(-1)?.createdAt ?? 0).toISOString() : null,
+		});
+		return {
+			key,
+			projectPath: project.projectPath,
+			currentIdentity: {
+				model: memoryShadow.modelId,
+				fingerprint: memoryShadow.fingerprint,
+				tableEpoch: memoryShadow.tableEpoch,
+			},
+			memory: {
+				primaryRows: countQuery(
+					db,
+					`SELECT COUNT(*) AS count FROM memories m JOIN memory_embeddings e ON e.memory_id=m.id AND e.model_id=? WHERE ${eligibleMemory}`,
+					primary.modelId,
+					project.projectPath,
+					now,
+				),
+				shadowRows: countQuery(
+					db,
+					`SELECT COUNT(*) AS count FROM memories m JOIN memory_embeddings e ON e.memory_id=m.id AND e.model_id=? WHERE ${eligibleMemory}`,
+					memoryShadow.modelId,
+					project.projectPath,
+					now,
+				),
+				holes: memoryHoles.length,
+				holeIds: memoryHoles.map((row) => row.id),
+				holeAge: range(memoryHoles),
+				dimensions: dimensions("memory", memoryShadow.modelId),
+			},
+			commit: {
+				primaryRows: countQuery(
+					db,
+					`SELECT COUNT(*) AS count FROM git_commits c JOIN git_commit_embeddings e ON e.sha=c.sha AND e.model_id=? WHERE c.project_path=?`,
+					primary.modelId,
+					project.projectPath,
+				),
+				shadowRows: countQuery(
+					db,
+					`SELECT COUNT(*) AS count FROM git_commits c JOIN git_commit_embeddings e ON e.sha=c.sha AND e.model_id=? WHERE c.project_path=?`,
+					commitShadow.modelId,
+					project.projectPath,
+				),
+				holes: commitHoles.length,
+				holeIds: commitHoles.map((row) => row.sha),
+				holeAge: range(commitHoles),
+				dimensions: dimensions("commit", commitShadow.modelId),
+			},
+			chunk: {
+				primaryRows: countQuery(
+					db,
+					"SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path=? AND model_id=?",
+					project.projectPath,
+					primary.chunkModelId,
+				),
+				shadowRows: countQuery(
+					db,
+					"SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path=? AND model_id=?",
+					project.projectPath,
+					chunkShadow.modelId,
+				),
+				itemHoles: chunkHoles.length,
+				rowHoles: chunkHoles.reduce((sum, row) => sum + row.missingRows, 0),
+				holeIds: chunkHoles.map((row) => row.id),
+				holeAge: range(chunkHoles),
+				hashMismatches: countQuery(
+					db,
+					`SELECT COUNT(*) AS count FROM compartment_chunk_embeddings ep
+					 JOIN compartment_chunk_embeddings es ON es.compartment_id=ep.compartment_id
+					  AND es.window_index=ep.window_index AND es.model_id=?
+					 WHERE ep.project_path=? AND ep.model_id=? AND ep.chunk_hash<>es.chunk_hash`,
+					chunkShadow.modelId,
+					project.projectPath,
+					primary.chunkModelId,
+				),
+				dimensions: dimensions("chunk", chunkShadow.modelId),
+			},
+			rotationOrphans: orphanRows,
+		};
+	});
+	const outageLedger = db
+		.prepare(
+			`SELECT project_path AS projectPath, scope, status, COUNT(*) AS rows,
+			        MIN(created_at) AS oldest, MAX(updated_at) AS newest
+			 FROM synapse_batch_ledger
+			 WHERE project_path IN (${Object.keys(fixture.projects)
+				.map(() => "?")
+				.join(",")}) AND created_at>=? AND created_at<?
+			 GROUP BY project_path, scope, status ORDER BY project_path, scope, status`,
+		)
+		.all(
+			...Object.values(fixture.projects).map((project) => project.projectPath),
+			Date.parse("2026-08-25T00:00:00Z"),
+			Date.parse("2026-08-30T00:00:00Z"),
+		);
+	return { projects, outageLedger };
+}
+
+function auditFullContext(db: DatabaseType, fixture: Fixture) {
+	const projectPaths = Object.values(fixture.projects).map((project) => project.projectPath);
+	const placeholders = projectPaths.map(() => "?").join(",");
+	const overCap = new Set<string>();
+	const counts: Record<string, { total: number; overCap: number; maxTokens: number }> = {
+		compartment: { total: 0, overCap: 0, maxTokens: 0 },
+		memory: { total: 0, overCap: 0, maxTokens: 0 },
+		git_commit: { total: 0, overCap: 0, maxTokens: 0 },
+	};
+	const record = (
+		source: keyof typeof counts,
+		id: number | string,
+		text: string,
+		countTotal = true,
+	) => {
+		const tokens = estimateTokens(text);
+		const bucket = counts[source];
+		if (countTotal) bucket.total += 1;
+		bucket.maxTokens = Math.max(bucket.maxTokens, tokens);
+		if (tokens > 8192) {
+			bucket.overCap += 1;
+			overCap.add(`${source}:${id}`);
+		}
+	};
+	counts.compartment.total = countQuery(
+		db,
+		`SELECT COUNT(DISTINCT e.compartment_id) AS count
+		 FROM compartment_chunk_embeddings e JOIN embedding_registrations r
+		   ON r.project_path=e.project_path AND r.chunk_model_id=e.model_id
+		 WHERE e.project_path IN (${placeholders})`,
+		...projectPaths,
+	);
+	// A raw compartment above 8,192 estimated tokens necessarily produced more
+	// than one 90%-budget window. Restrict canonical reconstruction to that
+	// superset; scanning every FTS transcript is prohibitively expensive on a live store.
+	const compartments = db
+		.prepare(
+			`SELECT c.id, c.session_id AS sessionId, c.start_message AS startOrdinal,
+			        c.end_message AS endOrdinal
+			 FROM compartments c JOIN compartment_chunk_embeddings e ON e.compartment_id=c.id
+			 JOIN embedding_registrations r ON r.project_path=e.project_path AND r.chunk_model_id=e.model_id
+			 WHERE e.project_path IN (${placeholders})
+			 GROUP BY c.id HAVING COUNT(*) > 1`,
+		)
+		.all(...projectPaths) as Array<{
+			id: number;
+			sessionId: string;
+			startOrdinal: number;
+			endOrdinal: number;
+		}>;
+	for (const row of compartments) {
+		record(
+			"compartment",
+			row.id,
+			buildCanonicalChunkTextFromFts(
+				db,
+				row.sessionId,
+				row.startOrdinal,
+				row.endOrdinal,
+			),
+			false,
+		);
+	}
+	for (const row of db
+		.prepare(`SELECT id, content FROM memories WHERE project_path IN (${placeholders})`)
+		.all(...projectPaths) as Array<{ id: number; content: string }>) {
+		record("memory", row.id, row.content);
+	}
+	for (const row of db
+		.prepare(`SELECT sha, message FROM git_commits WHERE project_path IN (${placeholders})`)
+		.all(...projectPaths) as Array<{ sha: string; message: string }>) {
+		record("git_commit", row.sha, row.message);
+	}
+	const golds = fixture.queries.flatMap((query) =>
+		query.gold
+			.filter((gold) => overCap.has(`${gold.source}:${gold.id}`))
+			.map((gold) => ({ queryId: query.id, source: gold.source, id: gold.id })),
+	);
+	return {
+		qwenInputCapTokens: 8192,
+		chunkWindowSafetyRatio: CHUNK_WINDOW_SAFETY_RATIO,
+		sharedConfiguredChunkCapTokens: 8192,
+		counts,
+		overCapGolds: golds,
+	};
+}
+
+function recallSummary(measurements: readonly QueryMeasurement[]) {
+	const lanes = ["chunk_vector", "memory_hybrid", "commit"];
+	const output: Record<string, Record<string, Record<string, number>>> = {};
+	for (const lane of lanes) {
+		output[lane] = {};
+		for (const space of ["qwen", "synapse"] as const) {
+			const ranks = measurements.map((measurement) => measurement.lanes[`${space}_${lane}`].rank);
+			output[lane][space] = Object.fromEntries(
+				[1, 5, 10].map((cutoff) => [
+					`recallAt${cutoff}`,
+					Number(
+						(ranks.filter((rank) => rank !== null && rank <= cutoff).length / ranks.length).toFixed(4),
+					),
+				]),
+			);
+		}
+	}
+	return output;
+}
+
+async function runSpaceComparison(args: {
+	cli: CliArgs;
+	fixture: Fixture;
+	db: DatabaseType;
+	openCodeDb: DatabaseType;
+	primarySnapshots: Map<string, EmbeddingSnapshot>;
+	shadowSnapshots: Map<string, EmbeddingSnapshot>;
+	config: ReturnType<typeof loadPluginConfig>;
+}): Promise<void> {
+	const { cli, fixture, db, openCodeDb, primarySnapshots, shadowSnapshots, config } = args;
+	const validation = validateGolds(db, openCodeDb, fixture);
+	const coverage = auditSpaceCoverage(db, fixture);
+	const fullContext = auditFullContext(db, fixture);
+	const caches: Record<EmbeddingSpace, Map<string, Promise<CapturedQueryEmbedding | null>>> = {
+		qwen: new Map(),
+		synapse: new Map(),
+	};
+	const timings: Record<EmbeddingSpace, TimedEmbedding[]> = { qwen: [], synapse: [] };
+	const embedOnce = (
+		space: EmbeddingSpace,
+		projectKey: string,
+		text: string,
+	): Promise<CapturedQueryEmbedding | null> => {
+		const cacheKey = `${projectKey}\u0000${text}`;
+		let promise = caches[space].get(cacheKey);
+		if (promise) return promise;
+		promise = (async () => {
+			const started = performance.now();
+			let captured: CapturedQueryEmbedding | null;
+			if (space === "qwen") {
+				captured = await embedTextForProject(
+					fixture.projects[projectKey].projectPath,
+					text,
+					undefined,
+					"query",
+				);
+			} else {
+				const projectPath = fixture.projects[projectKey].projectPath;
+				const vector = await embedShadowTextForProject(projectPath, text);
+				const primary = primarySnapshots.get(projectKey);
+				const shadow = shadowSnapshots.get(projectKey);
+				captured =
+					vector && primary && shadow
+						? {
+								vector,
+								modelId: shadow.modelId,
+								chunkModelId: shadow.chunkModelId,
+								generation: primary.generation,
+							}
+						: null;
+			}
+			timings[space].push({
+				project: projectKey,
+				milliseconds: Number((performance.now() - started).toFixed(1)),
+				ok: captured !== null,
+			});
+			return captured;
+		})();
+		caches[space].set(cacheKey, promise);
+		return promise;
+	};
+	const measurements: QueryMeasurement[] = [];
+	for (const [index, query] of fixture.queries.entries()) {
+		const project = fixture.projects[query.project];
+		const maxOrdinal = getLastCompartmentEndMessage(db, project.sessionId);
+		const visibleMemoryIds = getVisibleMemoryIds(db, project.sessionId);
+		const laneResults: Record<string, SafeHit[]> = {};
+		for (const space of ["qwen", "synapse"] as const) {
+			const captured = await embedOnce(space, query.project, query.query);
+			if (!captured) throw new Error(`${space} query embedding failed for ${query.id}`);
+			const shared: UnifiedSearchOptions = {
+				limit: 10,
+				memoryEnabled: true,
+				embeddingEnabled: true,
+				embedQuery: async () => captured,
+				isEmbeddingRuntimeEnabled: () => true,
+				maxMessageOrdinal: maxOrdinal,
+				gitCommitsEnabled: true,
+				visibleMemoryIds,
+				explicitSearch: true,
+				countRetrievals: false,
+				measurementDisabled: true,
+			};
+			const memory = await unifiedSearch(
+				db,
+				project.sessionId,
+				project.projectPath,
+				query.query,
+				{ ...shared, sources: ["memory"] },
+			);
+			const commits = await unifiedSearch(
+				db,
+				project.sessionId,
+				project.projectPath,
+				query.query,
+				{ ...shared, sources: ["git_commit"] },
+			);
+			laneResults[`${space}_memory_hybrid`] = memory.map(safeResult);
+			laneResults[`${space}_commit`] = commits.map(safeResult);
+			laneResults[`${space}_chunk_vector`] = rawChunkSearch(
+				db,
+				project,
+				captured.chunkModelId,
+				captured.vector,
+				maxOrdinal,
+				10,
+			);
+		}
+		const lanes = Object.fromEntries(
+			Object.entries(laneResults).map(([name, hits]) => [name, summarize(hits, query.gold, 10)]),
+		);
+		measurements.push({
+			id: query.id,
+			class: query.class,
+			style: query.style,
+			project: query.project,
+			query: query.query,
+			expectedFilter: query.expectedFilter,
+			gold: query.gold,
+			extractedTerms: [],
+			lanes,
+		});
+		console.log(
+			`[${index + 1}/${fixture.queries.length}] ${query.id}: chunk q=${lanes.qwen_chunk_vector.rank ?? "miss"} s=${lanes.synapse_chunk_vector.rank ?? "miss"}`,
+		);
+	}
+	const paired = measurements.map((measurement) => ({
+		id: measurement.id,
+		class: measurement.class,
+		project: measurement.project,
+		ranks: Object.fromEntries(
+			["chunk_vector", "memory_hybrid", "commit"].map((lane) => [
+				lane,
+				{
+					qwen: measurement.lanes[`qwen_${lane}`].rank,
+					synapse: measurement.lanes[`synapse_${lane}`].rank,
+					disagreesAt10:
+						(measurement.lanes[`qwen_${lane}`].rank !== null) !==
+						(measurement.lanes[`synapse_${lane}`].rank !== null),
+				},
+			]),
+		),
+	}));
+	const output = {
+		schemaVersion: 2,
+		study: "synapse-phase-2-cutover",
+		generatedAt: new Date().toISOString(),
+		fixture: { path: cli.fixturePath, version: fixture.version, queryCount: fixture.queries.length },
+		readOnlyStores: {
+			contextDb: cli.contextDbPath,
+			openCodeDb: cli.openCodeDbPath,
+			openMode: "file: URI mode=ro + readonly constructor flag",
+		},
+		embedding: {
+			primaryProvider: config.embedding.provider,
+			primaryModel: "model" in config.embedding ? config.embedding.model : "off",
+			shadowProvider: "synapse",
+			primary: Object.fromEntries(primarySnapshots),
+			shadow: Object.fromEntries(shadowSnapshots),
+		},
+		validation,
+		coverage,
+		fullContext,
+		latency: {
+			qwen: latencySummary(timings.qwen),
+			synapse: latencySummary(timings.synapse),
+			rawSamples: timings,
+		},
+		recall: recallSummary(measurements),
+		paired,
+		queries: measurements,
+	};
+	mkdirSync(dirname(cli.outputPath), { recursive: true });
+	writeFileSync(cli.outputPath, `${JSON.stringify(output, null, 2)}\n`);
+	console.log(`Wrote ${cli.outputPath}`);
+}
+
 async function main(): Promise<void> {
 	const args = parseArgs();
 	const fixture = loadFixture(args.fixturePath);
@@ -1034,8 +1595,6 @@ async function main(): Promise<void> {
 		throw new Error("Could not initialize in-memory registration database");
 
 	try {
-		const validation = validateGolds(db, openCodeDb, fixture);
-		const coverage = auditCoverage(db, fixture.asOf);
 		const config = loadPluginConfig(process.cwd());
 		const projectSnapshots = new Map<
 			string,
@@ -1074,6 +1633,60 @@ async function main(): Promise<void> {
 			projectSnapshots.set(key, snapshot);
 		}
 
+		if (args.compareSpaces) {
+			const shadowSnapshots = new Map<string, EmbeddingSnapshot>();
+			for (const [key, project] of Object.entries(fixture.projects)) {
+				const routing = await resolveEmbeddingRouting({
+					config,
+					projectRoot: process.cwd(),
+					session: `benchmark:${key}`,
+				});
+				if (!routing.shadow) {
+					throw new Error(
+						`Synapse shadow routing unavailable for ${key}: ${routing.warnings.join("; ")}`,
+					);
+				}
+				const shadow = registerProjectShadowEmbedding(
+					scratch,
+					project.projectPath,
+					routing.shadow,
+					process.cwd(),
+				);
+				if (!shadow) throw new Error(`Could not register Synapse shadow for ${key}`);
+				const live = db
+					.prepare(
+						`SELECT scope, model_id AS modelId FROM shadow_embedding_registrations
+						 WHERE project_path=? AND updated_at=(
+						   SELECT MAX(updated_at) FROM shadow_embedding_registrations s2
+						   WHERE s2.project_path=shadow_embedding_registrations.project_path
+						     AND s2.scope=shadow_embedding_registrations.scope
+						 )`,
+					)
+					.all(project.projectPath) as Array<{ scope: string; modelId: string }>;
+				const liveMemory = live.find((row) => row.scope === "memory")?.modelId;
+				const liveChunk = live.find((row) => row.scope === "chunk")?.modelId;
+				if (liveMemory !== shadow.modelId || liveChunk !== shadow.chunkModelId) {
+					throw new Error(
+						`Discovered Synapse identity does not match live shadow corpus for ${key}: ` +
+							`discovered=${shadow.modelId}/${shadow.chunkModelId}, live=${liveMemory}/${liveChunk}`,
+					);
+				}
+				shadowSnapshots.set(key, shadow);
+			}
+			await runSpaceComparison({
+				cli: args,
+				fixture,
+				db,
+				openCodeDb,
+				primarySnapshots: projectSnapshots,
+				shadowSnapshots,
+				config,
+			});
+			return;
+		}
+
+		const validation = validateGolds(db, openCodeDb, fixture);
+		const coverage = auditCoverage(db, fixture.asOf);
 		const queryEmbeddingCache = new Map<
 			string,
 			Promise<CapturedQueryEmbedding | null>
@@ -1323,3 +1936,6 @@ async function main(): Promise<void> {
 }
 
 await main();
+// The shared subc client intentionally stays connected for plugin processes.
+// A one-shot comparison has no later work, so terminate after all finally blocks close its databases.
+if (process.argv.includes("--compare-spaces")) process.exit(0);
