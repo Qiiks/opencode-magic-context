@@ -29,11 +29,44 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
 import { RustTestHarness } from "../src/rust-harness";
 import { driveToSteadyState, rustPrereqs } from "../src/rust-scenario-support";
 
 describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () => {
     let h: RustTestHarness;
+
+    async function statusSnapshot(sessionId: string, method: "status" | "session.status"): Promise<string> {
+        return Promise.race([
+            h.subc
+                .moduleStatus(sessionId, h.env.workdir, method)
+                .then((value) => JSON.stringify(value))
+                .catch((error) => `${method} failed: ${String(error)}`),
+            Bun.sleep(5_000).then(() => `${method} timed out after 5000ms`),
+        ]);
+    }
+
+    async function rethrowWithDiagnostics(sessionId: string, error: unknown): Promise<never> {
+        let pluginLog = "";
+        try {
+            pluginLog = readFileSync(h.logPath, "utf8").slice(-8_000);
+        } catch {
+            // OpenCode can fail before plugin initialization creates the log.
+        }
+        const [status, sessionStatus] = await Promise.all([
+            statusSnapshot(sessionId, "status"),
+            statusSnapshot(sessionId, "session.status"),
+        ]);
+        throw new Error(
+            `park self-heal failed: ${String(error)}\n` +
+                `status: ${status}\n` +
+                `session store state: ${sessionStatus}\n` +
+                `rust passes: ${JSON.stringify(h.readRustPasses().map((pass) => pass.raw))}\n` +
+                `module log:\n${h.subc.moduleLog().slice(-8_000)}\n` +
+                `daemon log:\n${h.subc.daemonLog().slice(-8_000)}\n` +
+                `plugin log:\n${pluginLog}`,
+        );
+    }
 
     beforeEach(async () => {
         h = await RustTestHarness.create({
@@ -49,91 +82,106 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
     // Arm A — always active where prereqs are met.
     it("recovers after a mid-session module restart without permanent degradation", async () => {
         const sessionId = await h.createSession();
-        await driveToSteadyState(h, sessionId, 3);
+        try {
+            await driveToSteadyState(h, sessionId, 3);
 
-        const before = h.readRustPasses();
-        expect(before.some((p) => p.servedFrom === "transform")).toBe(true);
-        const beforeCount = before.length;
+            const before = h.readRustPasses();
+            expect(before.some((p) => p.servedFrom === "transform")).toBe(true);
+            const beforeCount = before.length;
 
-        // Kill and restart the module against the same daemon + store. This is the
-        // clean fault-injection window the daemon supervises: the store's
-        // single-writer lease is released and re-acquired, and the plugin's subc
-        // client transparently reconnects on its next call.
-        await h.subc.restartModule();
-        await Bun.sleep(500);
+            // Kill and restart the module against the same daemon + store. This is the
+            // clean fault-injection window the daemon supervises: the store's
+            // single-writer lease is released and re-acquired, and the plugin's subc
+            // client transparently reconnects on its next call.
+            await h.subc.restartModule();
+            await Bun.sleep(500);
 
-        // Subsequent passes must recover. The first may fail during the reconnect
-        // window; what matters is the session does not permanently degrade.
-        for (let i = 4; i <= 7; i += 1) {
-            h.mock.setDefault({
-                text: `post-restart assistant ${i}`,
-                usage: {
-                    input_tokens: 2_000 * i,
-                    output_tokens: 20,
-                    cache_creation_input_tokens: 1_000,
-                },
-            });
-            await h.sendPrompt(sessionId, `post-restart turn ${i}: ${h.ballast(400)}`);
-            await Bun.sleep(300);
+            // Subsequent passes must recover. The first may fail during the reconnect
+            // window; what matters is the session does not permanently degrade.
+            for (let i = 4; i <= 7; i += 1) {
+                h.mock.setDefault({
+                    text: `post-restart assistant ${i}`,
+                    usage: {
+                        input_tokens: 2_000 * i,
+                        output_tokens: 20,
+                        cache_creation_input_tokens: 1_000,
+                    },
+                });
+                await h.sendPrompt(sessionId, `post-restart turn ${i}: ${h.ballast(400)}`, {
+                    timeoutMs: 30_000,
+                });
+                await Bun.sleep(300);
+            }
+
+            const all = await h.waitForRustPasses(beforeCount + 4);
+            const after = all.slice(beforeCount);
+
+            // Wedge-free recovery: the module served real transforms again after the
+            // restart, and the session is not left permanently parked.
+            expect(after.some((p) => p.servedFrom === "transform")).toBe(true);
+            expect(after.at(-1)!.decision).not.toBe("parked");
+        } catch (error) {
+            await rethrowWithDiagnostics(sessionId, error);
         }
-
-        const all = await h.waitForRustPasses(beforeCount + 4);
-        const after = all.slice(beforeCount);
-
-        // Wedge-free recovery: the module served real transforms again after the
-        // restart, and the session is not left permanently parked.
-        expect(after.some((p) => p.servedFrom === "transform")).toBe(true);
-        expect(after.at(-1)!.decision).not.toBe("parked");
     }, 300_000);
 
-    // Arm B — the merged park-self-heal fix makes this pass.
+    // Prove that a session parked by repeated transport failures resumes once
+    // the module is healthy, without recreating the OpenCode session.
     it(
         "un-parks and resumes serving after the module recovers from a prolonged outage",
         async () => {
             const sessionId = await h.createSession();
-            await driveToSteadyState(h, sessionId, 3);
-            const beforeCount = h.readRustPasses().length;
+            try {
+                await driveToSteadyState(h, sessionId, 3);
+                const beforeCount = h.readRustPasses().length;
 
-            // Prolonged outage: kill the module and keep it down across several
-            // passes so the adapter crosses its three-failure park threshold.
-            await h.subc.killModuleAndWait();
-            for (let i = 4; i <= 8; i += 1) {
-                h.mock.setDefault({
-                    text: `outage assistant ${i}`,
-                    usage: {
-                        input_tokens: 2_000 * i,
-                        output_tokens: 20,
-                        cache_creation_input_tokens: 1_000,
-                    },
-                });
-                await h.sendPrompt(sessionId, `outage turn ${i}: ${h.ballast(400)}`);
-                await Bun.sleep(300);
+                // Prolonged outage: kill the module and keep it down across several
+                // passes so the adapter crosses its three-failure park threshold.
+                await h.subc.killModuleAndWait();
+                for (let i = 4; i <= 8; i += 1) {
+                    h.mock.setDefault({
+                        text: `outage assistant ${i}`,
+                        usage: {
+                            input_tokens: 2_000 * i,
+                            output_tokens: 20,
+                            cache_creation_input_tokens: 1_000,
+                        },
+                    });
+                    await h.sendPrompt(sessionId, `outage turn ${i}: ${h.ballast(400)}`, {
+                        timeoutMs: 30_000,
+                    });
+                    await Bun.sleep(300);
+                }
+
+                // Restore the module and drive enough passes for the self-heal probe
+                // cadence to retry and recover.
+                await h.subc.restartModule();
+                await Bun.sleep(500);
+                for (let i = 9; i <= 18; i += 1) {
+                    h.mock.setDefault({
+                        text: `recovery assistant ${i}`,
+                        usage: {
+                            input_tokens: 2_000 * i,
+                            output_tokens: 20,
+                            cache_creation_input_tokens: 1_000,
+                        },
+                    });
+                    await h.sendPrompt(sessionId, `recovery turn ${i}: ${h.ballast(400)}`, {
+                        timeoutMs: 30_000,
+                    });
+                    await Bun.sleep(300);
+                }
+
+                const all = await h.waitForRustPasses(beforeCount + 15);
+                const recovery = all.slice(beforeCount + 5);
+
+                // Outcome: after the module recovers the session un-parks and serves
+                // real transforms again — no permanent park.
+                expect(recovery.some((p) => p.servedFrom === "transform")).toBe(true);
+                expect(recovery.at(-1)!.decision).not.toBe("parked");
+            } catch (error) {
+                await rethrowWithDiagnostics(sessionId, error);
             }
-
-            // Restore the module and drive enough passes for the self-heal probe
-            // cadence to retry and recover.
-            await h.subc.restartModule();
-            await Bun.sleep(500);
-            for (let i = 9; i <= 18; i += 1) {
-                h.mock.setDefault({
-                    text: `recovery assistant ${i}`,
-                    usage: {
-                        input_tokens: 2_000 * i,
-                        output_tokens: 20,
-                        cache_creation_input_tokens: 1_000,
-                    },
-                });
-                await h.sendPrompt(sessionId, `recovery turn ${i}: ${h.ballast(400)}`);
-                await Bun.sleep(300);
-            }
-
-            const all = await h.waitForRustPasses(beforeCount + 15);
-            const recovery = all.slice(beforeCount + 5);
-
-            // Outcome: after the module recovers the session un-parks and serves
-            // real transforms again — no permanent park.
-            expect(recovery.some((p) => p.servedFrom === "transform")).toBe(true);
-            expect(recovery.at(-1)!.decision).not.toBe("parked");
         },
         300_000,
     );

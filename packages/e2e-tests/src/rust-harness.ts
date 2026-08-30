@@ -77,7 +77,7 @@ export interface SdkClient {
                 parts: Array<{ type: "text"; text: string }>;
                 agent?: string;
             };
-        }) => Promise<{ data?: unknown }>;
+        }) => Promise<{ data?: unknown; error?: unknown }>;
         revert: (opts: {
             path: { id: string };
             body: { messageID: string; partID?: string };
@@ -465,6 +465,14 @@ export class RustTestHarness {
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencodeInstance
                     .stderr()
                     .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}`,
+            );
+        }
+        if (result.data === undefined) {
+            throw new Error(
+                `sendPrompt returned without session data: ${JSON.stringify(result.error ?? null)}\n` +
+                    `stdout:\n${this.opencodeInstance.stdout().slice(-2000)}\n` +
+                    `stderr:\n${this.opencodeInstance.stderr().slice(-2000)}\n` +
+                    `module log:\n${this.subc.moduleLog().slice(-2000)}`,
             );
         }
         return result;
