@@ -23,6 +23,11 @@ const failures: EmbeddingFailure[] = [
         reason: "response had keys [object, results] but data[] was absent",
         retryable: false,
     },
+    {
+        class: "certification_refusal",
+        reason: "SYNAPSE certification refused embedding: not_certified",
+        retryable: false,
+    },
 ];
 
 describe("formatEmbedFailureSummary", () => {
@@ -34,5 +39,18 @@ describe("formatEmbedFailureSummary", () => {
         } else {
             expect(summary).not.toContain("Run /ctx-embed start again to retry them.");
         }
+    });
+
+    test("renders certification refusals with the cause and recovery instead of the generic stall message", () => {
+        const summary = formatEmbedFailureSummary(0, 193, {
+            class: "certification_refusal",
+            reason: "SYNAPSE certification refused embedding: not_certified",
+            retryable: false,
+        });
+
+        expect(summary).toContain("not_certified");
+        expect(summary).toContain("recertify SYNAPSE");
+        expect(summary).toContain("embedding.fallback_provider");
+        expect(summary).not.toContain("provider returned no result");
     });
 });

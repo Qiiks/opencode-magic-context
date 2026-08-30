@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { SubcCallError } from "@cortexkit/subc-client";
 import {
     _resetSynapseClientForTests,
     getSynapseLaneIdentity,
+    SYNAPSE_ERROR_VOCABULARY,
     SYNAPSE_MAX_INPUT_TOKENS,
     type SynapseClientLike,
     SynapseEmbeddingProvider,
@@ -151,6 +153,109 @@ describe("SynapseEmbeddingProvider", () => {
 
         expect(await provider.embed("hello")).toBeNull();
         expect(await provider.embed("again")).toBeNull();
+    });
+});
+
+describe("SYNAPSE certification refusals", () => {
+    const contractErrorsSection = `
+        StableError::new("deadline_exceeded")
+        StableError::new("not_certified")
+        StableError::new("substitution_rejected")
+        StableError::new("artifact_invalid")
+        StableError::new("owned_cuda_unsupported")
+        StableError::new("probe_required")
+        StableError::new("migration_required")
+        StableError::new("module_restarted")
+        StableError::new("invalid_request")
+        StableError::new("declared_identity_not_accepted")
+        StableError::new("remote_identity_drift")
+        StableError::new("provider_protocol_violation")
+        StableError::new("idempotency_conflict")
+        StableError::new("needs_reauth")
+        StableError::new("needs_reauth_expired")
+        StableError::new("remote_deployment_changed")
+        StableError::new("credential_config_invalid")
+        StableError::new("op_not_supported_for_remote")
+        StableError::new("sentinel_calibration_refused")
+    `;
+
+    function parsedContractVocabulary(section: string): string[] {
+        return [...section.matchAll(/StableError::new\("([^"]+)"\)/g)].map((match) => match[1]);
+    }
+
+    function certificationCallError(detail: string): SubcCallError {
+        const error = new SubcCallError(
+            "terminal",
+            "SYNAPSE refused embedding",
+            "certification_refused",
+        );
+        // Match the additive 0.10.0 getter directly on the managed-call error;
+        // this does not rely on an implementation-specific cause chain.
+        Object.defineProperty(error, "detail", { value: detail });
+        return error;
+    }
+
+    function providerForQueryError(error: Error): SynapseEmbeddingProvider {
+        const client = new MockSynapseClient();
+        client.call = async <Response = unknown>(_module: string, method: string) => {
+            if (method === "models.list") {
+                return {
+                    models: [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-live",
+                            table_epoch: 0,
+                            dims: 3,
+                        },
+                    ],
+                } as Response;
+            }
+            throw error;
+        };
+        return new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            clientFactory: async () => client,
+        });
+    }
+
+    it("pins the classification vocabulary to SYNAPSE's drift-guarded Errors section", () => {
+        // Pin this snapshot to SYNAPSE's drift-guarded Errors contract so a
+        // newly documented reason must be reviewed here. It was mechanically
+        // extracted from synapse@c43cd33 crates/synapse-core/src/error_contract.rs
+        // because this worktree cannot access the SYNAPSE checkout directly.
+        expect(parsedContractVocabulary(contractErrorsSection)).toEqual(SYNAPSE_ERROR_VOCABULARY);
+    });
+
+    it.each([
+        "not_certified",
+        "probe_required",
+        "migration_required",
+    ])("classifies the retained detail %s as a certification refusal", async (detail) => {
+        const provider = providerForQueryError(certificationCallError(detail));
+
+        expect(await provider.embed("hello")).toBeNull();
+        const failure = provider.getLastFailureReason();
+        expect(failure).toEqual({
+            class: "certification_refusal",
+            reason: `SYNAPSE certification refused embedding: ${detail}`,
+            retryable: false,
+        });
+    });
+
+    it("keeps a pre-0.10 client shape in the wildcard certification class", async () => {
+        const oldClientError = Object.assign(new Error("SYNAPSE refused embedding"), {
+            code: "certification_refused",
+        });
+        const provider = providerForQueryError(oldClientError);
+
+        expect(await provider.embed("hello")).toBeNull();
+        expect(provider.getLastFailureReason()).toEqual({
+            class: "certification_refusal",
+            reason: "SYNAPSE certification refused embedding: unknown reason",
+            retryable: false,
+        });
     });
 });
 

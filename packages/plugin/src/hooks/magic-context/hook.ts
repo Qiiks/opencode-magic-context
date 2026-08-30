@@ -87,6 +87,7 @@ import {
     resolveExecuteThresholdDetail,
     resolveModelKey,
 } from "./event-resolvers";
+import { formatEmbedFailureSummary } from "./format-embed-failure";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { createDbLkgPersistence } from "./lkg-persist";
@@ -667,7 +668,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             case "stalled":
                 return terminal(
                     "skipped",
-                    `Embedded ${outcome.embedded} compartments; ${outcome.remaining} could not be embedded (the provider returned no result). Run /ctx-embed start again to retry them.`,
+                    formatEmbedFailureSummary(outcome.embedded, outcome.remaining, outcome.failure),
                 );
             default:
                 return terminal(
