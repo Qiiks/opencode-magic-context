@@ -50,7 +50,7 @@ export interface SdkClient {
                 parts: Array<{ type: "text"; text: string }>;
                 agent?: string;
             };
-        }) => Promise<{ data?: unknown }>;
+        }) => Promise<{ data?: unknown; error?: unknown }>;
     };
 }
 
@@ -280,6 +280,13 @@ export class TestHarness {
         if (result === null) {
             throw new Error(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencode.stderr().slice(-2000)}`,
+            );
+        }
+        if (result.data === undefined) {
+            throw new Error(
+                `sendPrompt returned without session data: ${JSON.stringify(result.error ?? null)}\n` +
+                    `stdout:\n${this.opencode.stdout().slice(-2000)}\n` +
+                    `stderr:\n${this.opencode.stderr().slice(-2000)}`,
             );
         }
         this.assertMagicContextProcessed(sessionId);

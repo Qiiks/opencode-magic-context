@@ -19,26 +19,39 @@ if [[ "$#" -ne 0 ]]; then
 fi
 
 run_e2e_group() {
-    local mode="$1" label="$2" files="$3" output status
+    local mode="$1" label="$2" files="$3" file output file_status group_status
     echo "  [e2e:$mode:$label:start] bun test..."
-    status=0
-    # Rust stacks create real daemon, module, and OpenCode processes. Serial file
-    # execution keeps their sockets, ports, and timing drills isolated.
-    # shellcheck disable=SC2086 # The manifest emits repository-controlled test paths.
-    output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 --max-concurrency=1 $files 2>&1) || status=$?
-    echo "$output"
-    if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
-        echo "Error: e2e ($mode/$label) failed (fail count > 0)" >&2
+    group_status=0
+
+    # A Bun process can retain timers, child-process handlers, and inherited
+    # process state after a suite finishes. Give every real daemon/module/OpenCode
+    # stack a fresh parent process so one suite cannot starve a later restart.
+    for file in $files; do
+        echo "  [e2e:$mode:$label:file:start] $file"
+        file_status=0
+        output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 --max-concurrency=1 "$file" 2>&1) || file_status=$?
+        echo "$output"
+        if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+            echo "Error: e2e ($mode/$label) file $file failed (fail count > 0)" >&2
+            echo "  [e2e:$mode:$label:file:end] $file status=fail"
+            group_status=1
+            continue
+        fi
+        if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+            echo "Error: e2e ($mode/$label) file $file produced no passing-test summary (crash, timeout, or zero tests collected)" >&2
+            echo "  [e2e:$mode:$label:file:end] $file status=fail"
+            group_status=1
+            continue
+        fi
+        if [[ "$file_status" -ne 0 ]]; then
+            echo "  [e2e:$mode:$label:file] $file note: tests passed but Bun exited $file_status (known post-completion panic) — tolerated"
+        fi
+        echo "  [e2e:$mode:$label:file:end] $file status=pass"
+    done
+
+    if [[ "$group_status" -ne 0 ]]; then
         echo "  [e2e:$mode:$label:end] status=fail"
         return 1
-    fi
-    if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
-        echo "Error: e2e ($mode/$label) produced no passing-test summary (crash, timeout, or zero tests collected)" >&2
-        echo "  [e2e:$mode:$label:end] status=fail"
-        return 1
-    fi
-    if [[ "$status" -ne 0 ]]; then
-        echo "  [e2e:$mode:$label] note: tests passed but Bun exited $status (known post-completion panic) — tolerated"
     fi
     echo "  [e2e:$mode:$label:end] status=pass"
 }

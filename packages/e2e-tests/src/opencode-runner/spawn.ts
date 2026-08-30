@@ -207,16 +207,6 @@ export function sweepOrphanedServes(): number {
     return reaped;
 }
 
-/**
- * Pick a random free port by asking the OS for one. Uses Bun.serve + immediate stop.
- */
-async function pickFreePort(): Promise<number> {
-    const server = Bun.serve({ port: 0, fetch: () => new Response() });
-    const port: number = server.port ?? 0;
-    server.stop(true);
-    if (!port) throw new Error("could not allocate a free port");
-    return port;
-}
 
 /**
  * Create isolated config/data/cache dirs under a unique temp subdir.
@@ -565,7 +555,10 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     // Reuse a caller-provided env for the Rust-mode harness (connection file
     // pre-placed, data dir shared across a serve restart); otherwise allocate.
     const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
-    const port = resolvedOpts.port ?? (await pickFreePort());
+    // Let OpenCode keep the listening socket it obtains from port 0. Selecting a
+    // free port in a separate process creates a release/rebind race with sibling
+    // test workers, which surfaces as an opaque ServeError under full-leg load.
+    let port = resolvedOpts.port ?? 0;
 
     if (resolvedOpts.prepareContextDatabase !== false) prepareContextDatabase(env.dataDir);
     writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
@@ -655,8 +648,26 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         stderrBuf += chunk.toString();
     });
 
-    const url = `http://127.0.0.1:${port}`;
+    let url = "";
     try {
+        if (port === 0) {
+            const portDeadline = Date.now() + 30_000;
+            while (Date.now() < portDeadline) {
+                const match = stdoutBuf.match(/opencode server listening on https?:\/\/[^:\s]+:(\d+)/);
+                if (match) {
+                    port = Number(match[1]);
+                    break;
+                }
+                if (child.exitCode !== null || child.signalCode !== null) {
+                    throw new Error(`opencode serve exited before reporting its bound port`);
+                }
+                await Bun.sleep(20);
+            }
+            if (port === 0) {
+                throw new Error(`opencode serve did not report its bound port within 30000ms`);
+            }
+        }
+        url = `http://127.0.0.1:${port}`;
         await waitForReady(url, env.workdir, 300_000, {
             expectedMagicContextState: resolvedOpts.expectedMagicContextState,
             pluginLogPath,
