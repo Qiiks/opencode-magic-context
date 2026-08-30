@@ -389,16 +389,26 @@ describe("message-index-async", () => {
         scheduleClearAndReindex(db, sessionId, readSurviving);
         expect(isSessionReconciled(sessionId)).toBe(false);
 
-        // Wait for the observable outcome rather than a fixed wall-clock budget.
-        // Both the boot-quiet reconciliation and the clear-and-reindex must have
-        // run (reads === 2) and the rebuild must have re-marked the session
-        // reconciled. A fixed `await wait(80)` made the verdict a function of
-        // how fast the runner closed two scheduling hops plus two DB cycles
-        // inside one window, which flips under CI load. Waiting for the state
-        // (with a generous ceiling) makes a slow runner slow rather than red.
-        await waitUntil(() => reads === 2 && isSessionReconciled(sessionId));
+        // Wait for the observable outcome, not a scheduling order. Both queued
+        // callbacks fire after the same boot-quiet deadline and may run in
+        // either order, and both interleaves are correct by design:
+        //   reconcile -> clear+rebuild: the clear invalidates the finished
+        //     reconciliation under the session lock and rebuilds (reads = 2);
+        //   clear+rebuild -> reconcile: the rebuild marks the session
+        //     reconciled and the stale reconciliation hits the idempotency
+        //     guard and skips (reads = 1).
+        // Pinning reads === 2 encoded the first order only, so the second
+        // (legal) interleave timed out with a perfectly correct index. The
+        // contract is the end state: the survivor row is indexed and the
+        // session is re-marked reconciled.
+        await waitUntil(
+            () =>
+                isSessionReconciled(sessionId) &&
+                countMessageRows(db, sessionId, "m-survivor") === 1,
+        );
 
-        expect(reads).toBe(2);
+        expect(reads).toBeGreaterThanOrEqual(1);
+        expect(reads).toBeLessThanOrEqual(2);
         expect(countMessageRows(db, sessionId, "m-survivor")).toBe(1);
         expect(isSessionReconciled(sessionId)).toBe(true);
     });
