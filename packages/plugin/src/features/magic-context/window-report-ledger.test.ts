@@ -29,7 +29,8 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {
     closeDatabase();
     __resetWindowReportLedgerDiagnosticsForTests();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const temporaryPath of temporaryPaths.splice(0)) {
         rmSync(temporaryPath, { recursive: true, force: true });
     }

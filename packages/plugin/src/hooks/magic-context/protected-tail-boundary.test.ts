@@ -66,7 +66,8 @@ const boundaryTempDirs: string[] = [];
 const originalBoundaryXdg = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
-    process.env.XDG_DATA_HOME = originalBoundaryXdg;
+    if (originalBoundaryXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalBoundaryXdg;
     for (const dir of boundaryTempDirs) rmSync(dir, { recursive: true, force: true });
     boundaryTempDirs.length = 0;
 });

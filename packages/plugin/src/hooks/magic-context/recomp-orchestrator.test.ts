@@ -33,7 +33,8 @@ function useTempDataHome(prefix: string): void {
 
 afterEach(() => {
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdg;
+    if (originalXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdg;
     for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
     tempDirs.length = 0;
 });

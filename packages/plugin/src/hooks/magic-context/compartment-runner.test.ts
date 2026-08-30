@@ -64,7 +64,8 @@ async function runCompartmentAgentWithLease(
 
 afterEach(() => {
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
     for (const dir of tempDirs) {
         try {

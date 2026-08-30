@@ -110,7 +110,8 @@ afterEach(() => {
     __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     if (originalStorageDir === undefined) delete process.env.MAGIC_CONTEXT_STORAGE_DIR;
     else process.env.MAGIC_CONTEXT_STORAGE_DIR = originalStorageDir;
     if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
@@ -1180,7 +1181,8 @@ describe("storage-db", () => {
                 expect(dbPath.startsWith(realStorageRoot)).toBe(false);
                 expect(dbPath.includes("mc-test-db-backstop-")).toBe(true);
             } finally {
-                if (savedXdg !== undefined) process.env.XDG_DATA_HOME = savedXdg;
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
                 if (savedTestDir !== undefined)
                     process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
             }

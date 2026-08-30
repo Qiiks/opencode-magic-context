@@ -83,7 +83,8 @@ beforeEach(() => {
 
 afterEach(() => {
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     if (tempDir)
         try {
             rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

@@ -15,7 +15,8 @@ describe("embedding measurement corpus", () => {
 
     afterEach(() => {
         closeDatabase();
-        process.env.XDG_DATA_HOME = original;
+        if (original === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = original;
         for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
     });
 

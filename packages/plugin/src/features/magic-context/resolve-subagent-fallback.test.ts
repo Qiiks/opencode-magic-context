@@ -49,7 +49,8 @@ describe("resolveIsSubagentFromOpenCodeDb", () => {
         if (originalXdg === undefined) {
             process.env.XDG_DATA_HOME = undefined;
         } else {
-            process.env.XDG_DATA_HOME = originalXdg;
+            if (originalXdg === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = originalXdg;
         }
         try {
             rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

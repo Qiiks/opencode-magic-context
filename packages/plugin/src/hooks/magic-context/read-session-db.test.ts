@@ -19,7 +19,8 @@ afterEach(() => {
     // Close any cached OpenCode read-only DB handle so the new XDG_DATA_HOME
     // points to a fresh DB on the next test case.
     closeReadOnlySessionDb();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

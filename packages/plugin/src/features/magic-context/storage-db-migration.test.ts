@@ -33,7 +33,8 @@ describe("storage-db legacy migration", () => {
     afterEach(() => {
         closeDatabase();
         if (savedXdg !== undefined) {
-            process.env.XDG_DATA_HOME = savedXdg;
+            if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = savedXdg;
         } else {
             delete process.env.XDG_DATA_HOME;
         }
