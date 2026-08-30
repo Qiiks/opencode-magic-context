@@ -391,12 +391,16 @@ jobs:
           owner: cortexkit
           repositories: subconscious,commons
 
+      # actions/checkout refuses paths outside $GITHUB_WORKSPACE, so the private
+      # siblings land in .siblings/ and symlinks recreate the ../commons and
+      # ../subconscious layout the harness and later steps expect. First live
+      # run of this leg caught this: the preflight only proves secrets exist.
       - name: Check out commons
         uses: actions/checkout@v5
         with:
           repository: cortexkit/commons
           token: ${{ steps.cortexkit-ci-token.outputs.token }}
-          path: ../commons
+          path: .siblings/commons
           persist-credentials: false
 
       - name: Check out subconscious
@@ -404,8 +408,17 @@ jobs:
         with:
           repository: cortexkit/subconscious
           token: ${{ steps.cortexkit-ci-token.outputs.token }}
-          path: ../subconscious
+          path: .siblings/subconscious
           persist-credentials: false
+
+      - name: Link siblings at the expected relative paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
+          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
+          test -f "$GITHUB_WORKSPACE/../commons/Cargo.lock"
+          test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
 
       - name: Record private sibling revisions
         shell: bash
