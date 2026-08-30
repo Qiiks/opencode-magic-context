@@ -172,7 +172,17 @@ function processCwd(pid: number): string | null {
  * previously killed runner. Runs once per test process, before the first spawn.
  */
 export function sweepOrphanedServes(): number {
-    const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]);
+    // Best-effort hygiene: minimal container images (the Docker e2e host) ship
+    // no `ps`, and a fresh PID-namespaced container has no orphans to reap by
+    // construction. Missing tooling must degrade to "nothing swept", never
+    // throw ENOENT into the first spawn of every test file.
+    if (!Bun.which("ps")) return 0;
+    let ps: ReturnType<typeof Bun.spawnSync>;
+    try {
+        ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]);
+    } catch {
+        return 0;
+    }
     if (ps.exitCode !== 0) return 0;
     let reaped = 0;
     for (const line of ps.stdout.toString().split("\n")) {
