@@ -9,7 +9,11 @@ import {
     canonicalizeInMemoryChunkTextForEmbedding,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
+    countSessionCompartmentEmbedCoverage,
+    countUnembeddedSessionCompartments,
     loadCompartmentChunkEmbeddingsForSearch,
+    loadUnembeddedCompartmentChunkCandidates,
+    loadUnembeddedSessionChunkCandidates,
     replaceCompartmentChunkEmbeddings,
 } from "./compartment-chunk-embedding";
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
@@ -22,6 +26,7 @@ import {
     getProjectEmbeddingSnapshot,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
+import { recordSessionProjectIdentity } from "./session-project-storage";
 import { initializeDatabase } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
 
@@ -437,6 +442,185 @@ describe("compartment chunk embedding core", () => {
             ).toHaveLength(1);
         } finally {
             _resetProjectEmbeddingRegistryForTests();
+            closeQuietly(db);
+        }
+    });
+
+    test("hash-complete drain cannot report vacuous coverage for missing-window or stale-hash rows", () => {
+        const db = createDb();
+        const projectPath = "/repo/hash-complete";
+        const sessionId = "ses-hash-complete";
+        const modelId = "mock:hash-complete";
+        const maxInputTokens = 9;
+        try {
+            recordSessionProjectIdentity(db, sessionId, projectPath);
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 2,
+                    startMessageId: "u1",
+                    endMessageId: "a2",
+                    title: "Missing one expected window",
+                    content: "missing",
+                    p1: "missing",
+                },
+                {
+                    sequence: 1,
+                    startMessage: 3,
+                    endMessage: 3,
+                    startMessageId: "u3",
+                    endMessageId: "u3",
+                    title: "Clean current row",
+                    content: "clean",
+                    p1: "clean",
+                },
+                {
+                    sequence: 2,
+                    startMessage: 4,
+                    endMessage: 4,
+                    startMessageId: "u4",
+                    endMessageId: "u4",
+                    title: "Stale hash row",
+                    content: "stale",
+                    p1: "stale",
+                },
+            ]);
+            insertFtsRow(db, sessionId, 1, "user", "alpha beta gamma");
+            insertFtsRow(db, sessionId, 2, "assistant", "delta epsilon zeta");
+            insertFtsRow(db, sessionId, 3, "user", "clean");
+            insertFtsRow(db, sessionId, 4, "user", "stale");
+
+            const [missing, clean, stale] = getCompartments(db, sessionId);
+            const expectedWindows = (compartment: typeof missing) =>
+                chunkCanonicalText(
+                    buildCanonicalChunkTextFromFts(
+                        db,
+                        sessionId,
+                        compartment.startMessage,
+                        compartment.endMessage,
+                    ),
+                    compartment.startMessage,
+                    compartment.endMessage,
+                    maxInputTokens,
+                );
+            const write = (
+                compartment: typeof missing,
+                windows: ReturnType<typeof chunkCanonicalText>,
+            ) =>
+                replaceCompartmentChunkEmbeddings(
+                    db,
+                    windows.map((window) => ({
+                        compartmentId: compartment.id,
+                        sessionId,
+                        projectPath,
+                        window,
+                        modelId,
+                        vector: new Float32Array([1, 0]),
+                    })),
+                );
+
+            const missingWindows = expectedWindows(missing);
+            const cleanWindows = expectedWindows(clean);
+            const staleWindows = expectedWindows(stale);
+            expect(missingWindows.length).toBeGreaterThan(1);
+            write(missing, missingWindows.slice(0, 1));
+            write(clean, cleanWindows);
+            write(
+                stale,
+                staleWindows.map((window) => ({
+                    ...window,
+                    chunkHash: `stale-${window.chunkHash}`,
+                })),
+            );
+
+            // Although the stale row sorts first, a result limited to one item
+            // must select the missing window instead of the stale replacement.
+            expect(
+                loadUnembeddedCompartmentChunkCandidates(
+                    db,
+                    projectPath,
+                    modelId,
+                    1,
+                    maxInputTokens,
+                ).map((candidate) => candidate.id),
+            ).toEqual([missing.id]);
+            expect(
+                loadUnembeddedSessionChunkCandidates(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    3,
+                    undefined,
+                    maxInputTokens,
+                ).map((candidate) => candidate.id),
+            ).toEqual([missing.id, stale.id]);
+            expect(
+                countUnembeddedSessionCompartments(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    maxInputTokens,
+                ),
+            ).toBe(2);
+            expect(
+                countSessionCompartmentEmbedCoverage(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    maxInputTokens,
+                ),
+            ).toEqual({ embedded: 1, total: 3 });
+
+            // Test each condition independently: repairing the missing windows
+            // must leave the stale hash outstanding, and repairing the stale hash
+            // must leave the missing window outstanding. Checking only whether a
+            // model row exists would fail both assertions.
+            write(missing, missingWindows);
+            expect(
+                countUnembeddedSessionCompartments(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    maxInputTokens,
+                ),
+            ).toBe(1);
+            write(missing, missingWindows.slice(0, 1));
+            write(stale, staleWindows);
+            expect(
+                countUnembeddedSessionCompartments(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    maxInputTokens,
+                ),
+            ).toBe(1);
+
+            write(missing, missingWindows);
+            expect(
+                countUnembeddedSessionCompartments(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    maxInputTokens,
+                ),
+            ).toBe(0);
+            expect(
+                countSessionCompartmentEmbedCoverage(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    maxInputTokens,
+                ),
+            ).toEqual({ embedded: 3, total: 3 });
+        } finally {
             closeQuietly(db);
         }
     });

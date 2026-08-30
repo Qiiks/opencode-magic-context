@@ -243,15 +243,7 @@ function getBackfillCandidateStatement(db: Database): PreparedStatement {
               AND sp.project_path = ?
              WHERE c.start_message IS NOT NULL
                AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
-             ORDER BY c.created_at DESC, c.id DESC
-             LIMIT ?`,
+             ORDER BY c.created_at DESC, c.id DESC`,
         );
         backfillCandidateStatements.set(db, stmt);
     }
@@ -869,14 +861,17 @@ export function loadUnembeddedCompartmentChunkCandidates(
     projectPath: string,
     modelId: string,
     limit: number,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
 ): CompartmentChunkBackfillCandidate[] {
-    const rows = getBackfillCandidateStatement(db).all(
-        projectPath,
+    const rows = getBackfillCandidateStatement(db).all(projectPath) as unknown[];
+    return selectHashIncompleteChunkCandidates(
+        db,
         projectPath,
         modelId,
+        mapBackfillCandidateRows(rows),
         Math.max(1, limit),
-    ) as unknown[];
-    return mapBackfillCandidateRows(rows);
+        maxInputTokens,
+    );
 }
 
 function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCandidate[] {
@@ -901,18 +896,79 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
         }));
 }
 
+type ChunkCoverageDefect = "missing" | "stale" | null;
+
+/** Classify one compartment against the transcript bytes the current model would embed. */
+function classifyChunkCoverageDefect(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+    candidate: CompartmentChunkBackfillCandidate,
+    maxInputTokens: number,
+): ChunkCoverageDefect {
+    const canonicalText =
+        buildCanonicalChunkTextFromFts(
+            db,
+            candidate.sessionId,
+            candidate.startMessage,
+            candidate.endMessage,
+        ) || buildCompartmentSummaryFallbackText(db, candidate.id);
+    const windows = chunkCanonicalText(
+        canonicalText,
+        candidate.startMessage,
+        candidate.endMessage,
+        maxInputTokens,
+    );
+    const existing = getExistingChunkHashes(db, candidate.id, modelId, projectPath);
+
+    if (windows.some((window) => !existing.has(window.windowIndex))) return "missing";
+    if (
+        existing.size !== windows.length ||
+        windows.some((window) => existing.get(window.windowIndex) !== window.chunkHash)
+    ) {
+        return "stale";
+    }
+    return null;
+}
+
+/**
+ * Return only key/hash-incomplete compartments. Missing expected window keys are
+ * ordered ahead of stale-hash replacements so a bounded sweep fills holes before
+ * spending provider capacity refreshing rows that remain searchable.
+ */
+function selectHashIncompleteChunkCandidates(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+    candidates: readonly CompartmentChunkBackfillCandidate[],
+    limit: number,
+    maxInputTokens: number,
+): CompartmentChunkBackfillCandidate[] {
+    const missing: CompartmentChunkBackfillCandidate[] = [];
+    const stale: CompartmentChunkBackfillCandidate[] = [];
+    for (const candidate of candidates) {
+        const defect = classifyChunkCoverageDefect(
+            db,
+            projectPath,
+            modelId,
+            candidate,
+            maxInputTokens,
+        );
+        if (defect === "missing") missing.push(candidate);
+        else if (defect === "stale") stale.push(candidate);
+    }
+    return [...missing, ...stale].slice(0, limit);
+}
+
 const sessionBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
 /** Session-scoped variant of {@link loadUnembeddedCompartmentChunkCandidates}.
  *  Used by the on-demand `/ctx-embed-history` command, which backfills ONE
- *  session at a time (oldest-first so the user watches it fill chronologically),
- *  unlike the project-wide passive drain. A compartment is a candidate when it
- *  has no chunk-embedding row for `modelId` yet.
+ *  session at a time. Missing expected windows precede stale-hash replacements;
+ *  each defect class remains oldest-first so progress is deterministic.
  *
  *  `excludeIds` lets the drain loop advance past compartments that produced no
- *  embeddable work this run (empty canonical text / windows already current) so
- *  one un-embeddable old compartment can't block every newer one — without it
- *  the oldest-first query would re-select the same stuck prefix forever. */
+ *  embeddable work or provider failures this run. */
 export function loadUnembeddedSessionChunkCandidates(
     db: Database,
     projectPath: string,
@@ -920,95 +976,101 @@ export function loadUnembeddedSessionChunkCandidates(
     modelId: string,
     limit: number,
     excludeIds?: readonly number[],
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
 ): CompartmentChunkBackfillCandidate[] {
-    if (excludeIds && excludeIds.length > 0) {
-        // Exclusion sets are per-run and unbounded in shape, so this statement
-        // is built ad hoc (not cached) with an inline placeholder list.
-        const placeholders = excludeIds.map(() => "?").join(", ");
-        const stmt = db.prepare(
-            `SELECT c.id AS id,
-                    c.session_id AS sessionId,
-                    c.start_message AS startMessage,
-                    c.end_message AS endMessage,
-                    c.title AS title
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND c.id NOT IN (${placeholders})
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
-             ORDER BY c.start_message ASC, c.id ASC
-             LIMIT ?`,
-        );
-        const rows = stmt.all(
-            projectPath,
-            sessionId,
-            ...excludeIds,
-            projectPath,
-            modelId,
-            Math.max(1, limit),
-        ) as unknown[];
-        return mapBackfillCandidateRows(rows);
-    }
-    let stmt = sessionBackfillCandidateStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `SELECT c.id AS id,
-                    c.session_id AS sessionId,
-                    c.start_message AS startMessage,
-                    c.end_message AS endMessage,
-                    c.title AS title
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
-             ORDER BY c.start_message ASC, c.id ASC
-             LIMIT ?`,
-        );
-        sessionBackfillCandidateStatements.set(db, stmt);
-    }
-    const rows = stmt.all(
-        projectPath,
-        sessionId,
+    const exclusions = excludeIds && excludeIds.length > 0 ? excludeIds : [];
+    const exclusionSql =
+        exclusions.length > 0 ? `AND c.id NOT IN (${exclusions.map(() => "?").join(", ")})` : "";
+    const stmt =
+        exclusions.length > 0
+            ? db.prepare(
+                  `SELECT c.id AS id,
+                          c.session_id AS sessionId,
+                          c.start_message AS startMessage,
+                          c.end_message AS endMessage,
+                          c.title AS title
+                   FROM compartments c
+                   JOIN session_projects sp
+                     ON sp.session_id = c.session_id
+                    AND sp.harness = c.harness
+                    AND sp.project_path = ?
+                   WHERE c.session_id = ?
+                     AND c.start_message IS NOT NULL
+                     AND c.end_message IS NOT NULL
+                     ${exclusionSql}
+                   ORDER BY c.start_message ASC, c.id ASC`,
+              )
+            : (() => {
+                  let cached = sessionBackfillCandidateStatements.get(db);
+                  if (!cached) {
+                      cached = db.prepare(
+                          `SELECT c.id AS id,
+                                  c.session_id AS sessionId,
+                                  c.start_message AS startMessage,
+                                  c.end_message AS endMessage,
+                                  c.title AS title
+                           FROM compartments c
+                           JOIN session_projects sp
+                             ON sp.session_id = c.session_id
+                            AND sp.harness = c.harness
+                            AND sp.project_path = ?
+                           WHERE c.session_id = ?
+                             AND c.start_message IS NOT NULL
+                             AND c.end_message IS NOT NULL
+                           ORDER BY c.start_message ASC, c.id ASC`,
+                      );
+                      sessionBackfillCandidateStatements.set(db, cached);
+                  }
+                  return cached;
+              })();
+    const rows = stmt.all(projectPath, sessionId, ...exclusions) as unknown[];
+    return selectHashIncompleteChunkCandidates(
+        db,
         projectPath,
         modelId,
+        mapBackfillCandidateRows(rows),
         Math.max(1, limit),
-    ) as unknown[];
-    return mapBackfillCandidateRows(rows);
+        maxInputTokens,
+    );
 }
 
-/** Count compartments in this session that still lack a chunk embedding for
- *  `modelId` — drives the `/ctx-embed-history` progress total. */
+/** Count session compartments whose current transcript windows are missing or stale. */
 export function countUnembeddedSessionCompartments(
     db: Database,
     projectPath: string,
     sessionId: string,
     modelId: string,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
 ): number {
-    const row = db
+    return loadUnembeddedSessionChunkCandidates(
+        db,
+        projectPath,
+        sessionId,
+        modelId,
+        Number.MAX_SAFE_INTEGER,
+        undefined,
+        maxInputTokens,
+    ).length;
+}
+
+/**
+ * Count total embeddable compartments and key/hash-complete compartments for
+ * `/ctx-embed`. A row's mere existence never contributes to `embedded`.
+ */
+export function countSessionCompartmentEmbedCoverage(
+    db: Database,
+    projectPath: string,
+    sessionId: string,
+    modelId: string,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+): { embedded: number; total: number } {
+    const rows = db
         .prepare(
-            `SELECT COUNT(*) AS n
+            `SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
              FROM compartments c
              JOIN session_projects sp
                ON sp.session_id = c.session_id
@@ -1017,52 +1079,18 @@ export function countUnembeddedSessionCompartments(
              WHERE c.session_id = ?
                AND c.start_message IS NOT NULL
                AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )`,
+             ORDER BY c.start_message ASC, c.id ASC`,
         )
-        .get(projectPath, sessionId, projectPath, modelId) as { n?: number } | undefined;
-    return typeof row?.n === "number" ? row.n : 0;
-}
-
-/** Total embeddable compartments in this session (have a message range), and how
- *  many are currently embedded under `modelId`. Drives the `/ctx-embed` status
- *  line: `embedded / total`. Counts the project's OWN compartments for the
- *  session (same `session_projects` scoping as the unembedded counter). */
-export function countSessionCompartmentEmbedCoverage(
-    db: Database,
-    projectPath: string,
-    sessionId: string,
-    modelId: string,
-): { embedded: number; total: number } {
-    const row = db
-        .prepare(
-            `SELECT
-               COUNT(*) AS total,
-               SUM(CASE WHEN EXISTS (
-                   SELECT 1 FROM compartment_chunk_embeddings e
-                   WHERE e.compartment_id = c.id
-                     AND e.project_path = ?
-                     AND e.model_id = ?
-               ) THEN 1 ELSE 0 END) AS embedded
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL`,
-        )
-        .get(projectPath, modelId, projectPath, sessionId) as
-        | { total?: number; embedded?: number }
-        | undefined;
-    return {
-        total: typeof row?.total === "number" ? row.total : 0,
-        embedded: typeof row?.embedded === "number" ? row.embedded : 0,
-    };
+        .all(projectPath, sessionId) as unknown[];
+    const candidates = mapBackfillCandidateRows(rows);
+    let embedded = 0;
+    for (const candidate of candidates) {
+        if (
+            classifyChunkCoverageDefect(db, projectPath, modelId, candidate, maxInputTokens) ===
+            null
+        ) {
+            embedded += 1;
+        }
+    }
+    return { embedded, total: candidates.length };
 }
