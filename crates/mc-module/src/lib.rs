@@ -15042,6 +15042,12 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         // declarations. MC requests nothing beyond its role grants, so None keeps
         // the HELLO identical to the pre-field wire shape (serde skips None).
         capabilities: None,
+        // Introduced by subc-protocol 0.14: optional self-signal manifest registry.
+        // Some(vec![]) is deliberate over None per the falsy-value discrimination
+        // rule: it declares "examined, none to register" (MC emits no self-signals
+        // today), while None would read as "never examined". Serde still emits the
+        // field, which is the examined marker the daemon census reads.
+        self_signals: Some(vec![]),
         // Introduced by subc-protocol 0.13: build provenance for the deploy ladder.
         // The git sha is stamped by the release build command (MC_BUILD_SHA env at
         // compile time); a bare `cargo build` leaves it absent rather than wrong.
