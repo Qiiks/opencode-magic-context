@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
 import { detectConflicts, resolveCompactionForBoot } from "./conflict-detector";
+import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
 /**
  * Regression tests for plugin-conflict detection. The previous substring-
@@ -13,13 +14,14 @@ import { detectConflicts, resolveCompactionForBoot } from "./conflict-detector";
  * a false-positive conflict warning. See issue #43.
  */
 describe("detectConflicts", () => {
+    let root: string;
     let projectDir: string;
     let userConfigDir: string;
     let homeDir: string;
     let originalEnv: Record<string, string | undefined>;
 
     beforeEach(() => {
-        const root = mkdtempSync(join(tmpdir(), "mc-conflict-"));
+        root = createTestTempDir("mc-conflict-").dir;
         projectDir = join(root, "project");
         mkdirSync(projectDir, { recursive: true });
         userConfigDir = join(root, "user-config", "opencode");
@@ -50,22 +52,7 @@ describe("detectConflicts", () => {
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
-        // Test directories live under tmpdir(); cleanup is best-effort.
-        try {
-            rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-        } catch {
-            /* Ignore EBUSY on Windows */
-        }
-        try {
-            rmSync(userConfigDir, {
-                recursive: true,
-                force: true,
-                maxRetries: 10,
-                retryDelay: 100,
-            });
-        } catch {
-            /* Ignore EBUSY on Windows */
-        }
+        cleanupTestTempDir(root);
     });
 
     function writeProjectConfig(plugins: Array<string | [string, unknown]>): void {

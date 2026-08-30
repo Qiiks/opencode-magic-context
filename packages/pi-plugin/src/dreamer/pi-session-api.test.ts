@@ -1,15 +1,10 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
-import {
-	mkdirSync,
-	mkdtempSync,
-	realpathSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
+
 import {
 	clearCachedModule,
 	defaultLoaders,
@@ -112,7 +107,7 @@ describe("loadDefaultPiSessionApi", () => {
 	it("parses JSONL session entries through the resolved loader", async () => {
 		const api = await loadDefaultPiSessionApi();
 
-		const dir = mkdtempSync(join(tmpdir(), "pi-session-api-test-"));
+		const dir = createTestTempDir("pi-session-api-test-").dir;
 		const file = join(dir, "session.jsonl");
 		const entry = {
 			type: "message",
@@ -138,7 +133,7 @@ describe("loadDefaultPiSessionApi", () => {
 		});
 
 		it("resolves through a bin-shim symlink when argv[1] is the shim path", async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pi-symlink-test-"));
+			const dir = createTestTempDir("pi-symlink-test-").dir;
 			const pkgRoot = join(
 				dir,
 				"node_modules",
@@ -186,7 +181,7 @@ describe("loadDefaultPiSessionApi", () => {
 
 	describe("running-Pi resolver layouts", () => {
 		it("prefers the running Pi over a stale extension-tree copy", async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pi-running-vs-stale-"));
+			const dir = createTestTempDir("pi-running-vs-stale-").dir;
 			const pkgRoot = join(
 				dir,
 				"node_modules",
@@ -218,7 +213,7 @@ describe("loadDefaultPiSessionApi", () => {
 		}, 30000);
 
 		it("skips Pi's copied dist/package.json and resolves the parent package root", async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pi-dist-metadata-"));
+			const dir = createTestTempDir("pi-dist-metadata-").dir;
 			const pkgRoot = join(dir, "pi-coding-agent");
 			writeFixturePackage(pkgRoot, {
 				entry: "./dist/index.js",
@@ -243,7 +238,7 @@ describe("loadDefaultPiSessionApi", () => {
 		}, 30000);
 
 		it("rejects a manifest entry that escapes the package root", async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pi-traversal-"));
+			const dir = createTestTempDir("pi-traversal-").dir;
 			const pkgRoot = join(dir, "pi-coding-agent");
 			writeFixturePackage(pkgRoot, {
 				entry: "./../../outside.js",
@@ -268,7 +263,7 @@ describe("loadDefaultPiSessionApi", () => {
 		}, 30000);
 
 		it("running from a TypeScript source checkout loads the source entry, not stale dist output", async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pi-source-mode-"));
+			const dir = createTestTempDir("pi-source-mode-").dir;
 			const pkgRoot = join(dir, "pi-coding-agent");
 			writeFixturePackage(pkgRoot, {
 				entry: "./dist/index.js",
@@ -287,7 +282,7 @@ describe("loadDefaultPiSessionApi", () => {
 		}, 30000);
 
 		it("source mode without a source counterpart falls through instead of loading stale dist", async () => {
-			const dir = mkdtempSync(join(tmpdir(), "pi-source-missing-"));
+			const dir = createTestTempDir("pi-source-missing-").dir;
 			const pkgRoot = join(dir, "pi-coding-agent");
 			writeFixturePackage(pkgRoot, {
 				entry: "./dist/index.js",
@@ -339,7 +334,7 @@ describe("loadDefaultPiSessionApi", () => {
 			];
 			for (const { label, manifest } of nonPrefixedCases) {
 				it(`rejects a non-prefixed entry in ${label}`, async () => {
-					const dir = mkdtempSync(join(tmpdir(), "pi-nonprefixed-"));
+					const dir = createTestTempDir("pi-nonprefixed-").dir;
 					const pkgRoot = join(dir, "pi-coding-agent");
 					writeFixturePackage(pkgRoot, {
 						manifest,
@@ -360,7 +355,7 @@ describe("loadDefaultPiSessionApi", () => {
 			}
 
 			it("resolves the default condition when no import condition exists", async () => {
-				const dir = mkdtempSync(join(tmpdir(), "pi-default-cond-"));
+				const dir = createTestTempDir("pi-default-cond-").dir;
 				const pkgRoot = join(dir, "pi-coding-agent");
 				writeFixturePackage(pkgRoot, {
 					manifest: {
@@ -382,7 +377,7 @@ describe("loadDefaultPiSessionApi", () => {
 			}, 30000);
 
 			it("resolves array exports by falling back to the first resolvable target", async () => {
-				const dir = mkdtempSync(join(tmpdir(), "pi-array-exports-"));
+				const dir = createTestTempDir("pi-array-exports-").dir;
 				const pkgRoot = join(dir, "pi-coding-agent");
 				writeFixturePackage(pkgRoot, {
 					manifest: {
@@ -406,7 +401,7 @@ describe("loadDefaultPiSessionApi", () => {
 
 		describe("script entry whitelist", () => {
 			it("accepts an extensionless bin-style entry script", async () => {
-				const dir = mkdtempSync(join(tmpdir(), "pi-extensionless-"));
+				const dir = createTestTempDir("pi-extensionless-").dir;
 				const pkgRoot = join(dir, "pi-coding-agent");
 				writeFixturePackage(pkgRoot, {
 					files: {
@@ -423,7 +418,7 @@ describe("loadDefaultPiSessionApi", () => {
 			}, 30000);
 
 			it("running from a .tsx source checkout loads the source entry, not stale dist", async () => {
-				const dir = mkdtempSync(join(tmpdir(), "pi-tsx-source-"));
+				const dir = createTestTempDir("pi-tsx-source-").dir;
 				const pkgRoot = join(dir, "pi-coding-agent");
 				writeFixturePackage(pkgRoot, {
 					entry: "./dist/index.jsx",

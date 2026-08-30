@@ -1,12 +1,13 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseJsonc } from "comment-json";
+
 import { detectConflicts } from "./conflict-detector";
 import { fixConflicts } from "./conflict-fixer";
+import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
 const noOmoConflicts = {
     omoPreemptiveCompaction: false,
@@ -22,7 +23,7 @@ describe("fixConflicts", () => {
     let originalEnv: Record<string, string | undefined>;
 
     beforeEach(() => {
-        root = mkdtempSync(join(tmpdir(), "mc-conflict-fixer-"));
+        root = createTestTempDir("mc-conflict-fixer-").dir;
         projectDir = join(root, "project");
         userConfigDir = join(root, "user-config", "opencode");
         homeDir = join(root, "home");
@@ -44,11 +45,7 @@ describe("fixConflicts", () => {
             if (value === undefined) delete process.env[key];
             else process.env[key] = value;
         }
-        try {
-            rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-        } catch {
-            /* Ignore EBUSY on Windows */
-        }
+        cleanupTestTempDir(root);
     });
 
     it("preserves JSONC comments and tuple plugin entries while removing canonical DCP", () => {

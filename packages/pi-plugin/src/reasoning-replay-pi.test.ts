@@ -1,6 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	getOrCreateSessionMeta,
@@ -8,6 +6,8 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { setHarness } from "@magic-context/core/shared/harness";
+import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
+
 import {
 	buildMessageIdToMaxTag,
 	clearOldReasoningPi,
@@ -20,7 +20,7 @@ import {
 setHarness("pi");
 
 function makeDb() {
-	const dir = mkdtempSync(join(tmpdir(), "pi-reasoning-replay-"));
+	const dir = createTestTempDir("pi-reasoning-replay-").dir;
 	const path = join(dir, "context.db");
 	return openDatabase(path);
 }

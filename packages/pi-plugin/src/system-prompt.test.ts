@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { insertUserMemory } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
@@ -10,6 +9,11 @@ import {
 	createPromptSurfaceRuntime,
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import {
+	createTestTempDir,
+	type TestTempDirPrefix,
+} from "@magic-context/core/shared/test-temp-dir";
+
 import {
 	buildMagicContextBlock,
 	clearPiSystemPromptSession,
@@ -20,8 +24,8 @@ import {
 } from "./system-prompt";
 import { createTestDb } from "./test-utils.test";
 
-function tempDir(prefix: string): string {
-	return mkdtempSync(join(tmpdir(), prefix));
+function tempDir(prefix: TestTempDirPrefix): string {
+	return createTestTempDir(prefix).dir;
 }
 
 describe("Pi single system-prompt serialization parity", () => {
