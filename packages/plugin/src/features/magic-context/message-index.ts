@@ -10,7 +10,7 @@ import type { Database, Statement as PreparedStatement } from "../../shared/sqli
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { removeSystemReminders } from "../../shared/system-directive";
 import { clearCompressionDepth } from "./compression-depth-storage";
-import { deleteSessionScopedRows } from "./storage-session-tables";
+import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 interface MessageHistoryIndexRow {
     last_indexed_ordinal?: number;
@@ -666,6 +666,20 @@ function persistMessageHistoryOrphanSweepState(
     ).run(cursor, lastSweptAt);
 }
 
+function getOpenCodeSessionScopedCandidateSourceSql(): string {
+    // A table without harness provenance cannot safely nominate a session for an
+    // OpenCode sweep: the same shared row could belong to Pi. Once an
+    // OpenCode-scoped table is listed for deletion, it automatically becomes a
+    // discovery source too; storage-db.test.ts fences that list to the schema.
+    return SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
+        .map((definition) => {
+            const predicates = ["session_id IS NOT NULL", "harness = 'opencode'"];
+            if (definition.extraPredicate) predicates.push(definition.extraPredicate);
+            return `SELECT session_id FROM ${definition.table} WHERE ${predicates.join(" AND ")}`;
+        })
+        .join("\nUNION\n");
+}
+
 /**
  * Delete old OpenCode session state that no longer exists in OpenCode's
  * authoritative session table. One bounded keyset page is processed per call;
@@ -709,17 +723,23 @@ export function sweepOrphanedOpenCodeMessageIndexes(
 
     try {
         const cutoff = now - safetyAgeMs;
+        const candidateSourceSql = getOpenCodeSessionScopedCandidateSourceSql();
         const candidates = db
             .prepare(
                 `SELECT session_id
-                 FROM message_history_index
-                 WHERE harness = 'opencode'
-                   AND updated_at <= ?
-                   AND session_id > ?
+                 FROM (${candidateSourceSql}) AS session_candidates
+                 WHERE session_id > ?
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM message_history_index
+                       WHERE message_history_index.session_id = session_candidates.session_id
+                         AND message_history_index.harness = 'opencode'
+                         AND message_history_index.updated_at > ?
+                   )
                  ORDER BY session_id ASC
                  LIMIT ?`,
             )
-            .all(cutoff, cursor, batchSize) as Array<{ session_id: string }>;
+            .all(cursor, cutoff, batchSize) as Array<{ session_id: string }>;
         const sessionExists = openCodeDb.prepare("SELECT 1 FROM session WHERE id = ? LIMIT 1");
         const missingSessionIds = candidates
             .filter((candidate) => !sessionExists.get(candidate.session_id))
@@ -735,7 +755,17 @@ export function sweepOrphanedOpenCodeMessageIndexes(
         let deleted = 0;
         try {
             const stillEligible = db.prepare(
-                "SELECT 1 FROM message_history_index WHERE session_id = ? AND harness = 'opencode' AND updated_at <= ?",
+                `SELECT 1
+                 FROM (${candidateSourceSql}) AS session_candidates
+                 WHERE session_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM message_history_index
+                       WHERE message_history_index.session_id = session_candidates.session_id
+                         AND message_history_index.harness = 'opencode'
+                         AND message_history_index.updated_at > ?
+                   )
+                 LIMIT 1`,
             );
             const eligibleSessionIds = missingSessionIds.filter((sessionId) =>
                 stillEligible.get(sessionId, cutoff),

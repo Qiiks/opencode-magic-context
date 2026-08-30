@@ -125,6 +125,36 @@ describe("message history orphan maintenance", () => {
         }
     });
 
+    test("discovers an orphan whose index rows were already purged", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const orphanSessionId = "ses-indexless-orphan";
+        const liveSessionId = "ses-indexless-live";
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')",
+        ).run(orphanSessionId);
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')",
+        ).run(liveSessionId);
+        const openCodePath = createOpenCodeDb([liveSessionId]);
+
+        try {
+            expect(countRows(db, "message_history_index", orphanSessionId)).toBe(0);
+
+            const result = sweepOrphanedOpenCodeMessageIndexes(
+                db,
+                () => new Database(openCodePath, { readonly: true }),
+                { now },
+            );
+
+            expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
+            expect(countRows(db, "tags", orphanSessionId)).toBe(0);
+            expect(countRows(db, "tags", liveSessionId)).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("persists a keyset cursor and resumes within the configured batch bound", () => {
         const db = createStoreDb();
         const now = 2_000_000_000_000;
