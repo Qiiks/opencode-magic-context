@@ -3,7 +3,9 @@ export type EmbeddingFailureClass =
     | "http_error"
     | "transport_error"
     | "invalid_envelope"
-    | "empty_result";
+    | "empty_result"
+    | "certification_refusal"
+    | "credential_required";
 
 /** A classified remote-provider failure that can be surfaced to a caller safely. */
 export interface EmbeddingFailure {

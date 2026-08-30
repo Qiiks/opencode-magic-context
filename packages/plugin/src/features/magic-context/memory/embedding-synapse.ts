@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { connectionFileExists, SubcCallError, SubcClient } from "@cortexkit/subc-client";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
+import type { EmbeddingFailure } from "./embedding-failure";
 import type { EmbeddingProvider } from "./embedding-provider";
 
 export const SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
@@ -20,7 +21,40 @@ export type SynapseErrorCode =
     | "probe_required"
     | "idempotency_conflict"
     | "schema_violation"
-    | "module_restarted";
+    | "module_restarted"
+    | "certification_refused"
+    | "needs_reauth";
+
+// Synapse's drift-guarded error vocabulary was mechanically extracted from
+// synapse@c43cd33 crates/synapse-core/src/error_contract.rs (Errors). Keep this
+// snapshot together so a newly documented refusal is an explicit review diff.
+export const SYNAPSE_ERROR_VOCABULARY = [
+    "deadline_exceeded",
+    "not_certified",
+    "substitution_rejected",
+    "artifact_invalid",
+    "owned_cuda_unsupported",
+    "probe_required",
+    "migration_required",
+    "module_restarted",
+    "invalid_request",
+    "declared_identity_not_accepted",
+    "remote_identity_drift",
+    "provider_protocol_violation",
+    "idempotency_conflict",
+    "needs_reauth",
+    "needs_reauth_expired",
+    "remote_deployment_changed",
+    "credential_config_invalid",
+    "op_not_supported_for_remote",
+    "sentinel_calibration_refused",
+] as const;
+
+const SYNAPSE_CERTIFICATION_REFUSAL_REASONS = new Set([
+    "not_certified",
+    "probe_required",
+    "migration_required",
+]);
 
 export interface SynapseCatalogEntry {
     model: string;
@@ -76,17 +110,25 @@ export class SynapseEmbeddingError extends Error {
     readonly code: SynapseErrorCode;
     readonly retryAfterMs?: number;
     readonly permanent: boolean;
+    /** Typed SYNAPSE reason carried by a certification_refused Error-frame detail. */
+    readonly refusalReason?: string;
 
     constructor(
         code: SynapseErrorCode,
         message: string,
-        options?: { retryAfterMs?: number; permanent?: boolean; cause?: unknown },
+        options?: {
+            retryAfterMs?: number;
+            permanent?: boolean;
+            cause?: unknown;
+            refusalReason?: string;
+        },
     ) {
         super(message, options?.cause === undefined ? undefined : { cause: options.cause });
         this.name = "SynapseEmbeddingError";
         this.code = code;
         this.permanent = options?.permanent ?? isPermanentSynapseCode(code);
         this.retryAfterMs = options?.retryAfterMs ?? (this.permanent ? undefined : 100);
+        this.refusalReason = options?.refusalReason;
     }
 }
 
@@ -97,7 +139,9 @@ function isPermanentSynapseCode(code: string): boolean {
         code === "not_certified" ||
         code === "probe_required" ||
         code === "idempotency_conflict" ||
-        code === "schema_violation"
+        code === "schema_violation" ||
+        code === "certification_refused" ||
+        code === "needs_reauth"
     );
 }
 
@@ -128,19 +172,33 @@ function readErrorCode(value: unknown): string | undefined {
     return undefined;
 }
 
+function readCertificationRefusalReason(value: unknown): string | undefined {
+    // subc-client >=0.10.0 retains ErrorBody.detail on the managed-call error.
+    // Do not recover a typed reason from `code`: SYNAPSE keeps that field as the
+    // coarse class, and older clients have no detail to recover.
+    if (!(value instanceof SubcCallError)) return undefined;
+    const detail = (value as SubcCallError & { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    const record = asRecord(detail);
+    return typeof record?.reason === "string" ? record.reason : undefined;
+}
+
 function classifyError(value: unknown): SynapseEmbeddingError {
     if (value instanceof SynapseEmbeddingError) return value;
     const code = readErrorCode(value) ?? (value instanceof Error ? value.name : "transport");
     const normalized = code.toLowerCase();
+    const refusalReason = readCertificationRefusalReason(value);
     let mapped: SynapseErrorCode = "transport";
     if (normalized.includes("queue_full")) mapped = "queue_full";
     else if (normalized.includes("model_loading")) mapped = "model_loading";
     else if (normalized.includes("timeout") || normalized.includes("deadline")) mapped = "timeout";
     else if (normalized.includes("artifact_invalid")) mapped = "artifact_invalid";
     else if (normalized.includes("substitution")) mapped = "substitution_rejected";
+    else if (normalized === "certification_refused") mapped = "certification_refused";
     else if (normalized.includes("not_certified")) mapped = "not_certified";
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
+    else if (normalized.includes("needs_reauth")) mapped = "needs_reauth";
     else if (normalized.includes("schema")) mapped = "schema_violation";
     else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
         mapped = "module_restarted";
@@ -148,7 +206,47 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     return new SynapseEmbeddingError(mapped, message, {
         retryAfterMs: readRetryAfter(value) ?? (isPermanentSynapseCode(mapped) ? undefined : 100),
         cause: value,
+        refusalReason,
     });
+}
+
+function embeddingFailureFor(error: SynapseEmbeddingError): EmbeddingFailure {
+    const typedReason = error.refusalReason;
+    if (
+        (typedReason !== undefined && SYNAPSE_CERTIFICATION_REFUSAL_REASONS.has(typedReason)) ||
+        error.code === "not_certified" ||
+        error.code === "probe_required"
+    ) {
+        return {
+            class: "certification_refusal",
+            reason: `SYNAPSE certification refused embedding: ${typedReason ?? error.code}`,
+            retryable: false,
+        };
+    }
+    // A coarse certification_refused code without a recognized detail means the
+    // service is newer than this checked-in vocabulary snapshot. It is still a
+    // refusal, never a transport failure, and preserves the raw new detail.
+    if (error.code === "certification_refused") {
+        return {
+            class: "certification_refusal",
+            reason: `SYNAPSE certification refused embedding: ${typedReason ?? "unknown reason"}`,
+            retryable: false,
+        };
+    }
+    if (typedReason === "needs_reauth" || typedReason === "needs_reauth_expired") {
+        return {
+            class: "credential_required",
+            reason: "SYNAPSE requires reauthentication",
+            retryable: false,
+        };
+    }
+    if (error.code === "substitution_rejected") {
+        return { class: "substitution_rejected", reason: error.message, retryable: false };
+    }
+    if (error.code === "schema_violation" || error.code === "artifact_invalid") {
+        return { class: "invalid_envelope", reason: error.message, retryable: false };
+    }
+    return { class: "transport_error", reason: error.message, retryable: !error.permanent };
 }
 
 function wait(ms: number): Promise<void> {
@@ -354,6 +452,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
     private permanentFailure = false;
+    private lastFailureReason: EmbeddingFailure | null = null;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
 
@@ -466,9 +565,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.tokenBudget = metadata.recommended_token_budget ?? this.tokenBudget;
                 }
                 this.initialized = true;
+                this.recordSuccess();
                 return true;
             } catch (error) {
                 const classified = classifyError(error);
+                this.recordFailure(classified);
                 if (classified.permanent) {
                     this.permanentFailure = true;
                     log(
@@ -506,6 +607,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     "Synapse query returned no vector",
                 );
             this.validateResponse(extracted.metadata, extracted.vector.length);
+            this.recordSuccess();
             return extracted.vector;
         } catch (error) {
             this.logCallFailure(error, "embed.query");
@@ -588,6 +690,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     const vectorArray = Float32Array.from(vector as number[]);
                     this.validateResponse({ ...batchEnvelope, ...item }, vectorArray.length);
                     output.set(id, vectorArray);
+                    this.recordSuccess();
                 }
             } catch (error) {
                 const classified = classifyError(error);
@@ -610,6 +713,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     isLoaded(): boolean {
         return this.initialized;
+    }
+
+    getLastFailureReason(): EmbeddingFailure | null {
+        return this.lastFailureReason;
     }
 
     private requestConstraints(extra: Record<string, unknown>): Record<string, unknown> {
@@ -784,6 +891,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private logCallFailure(error: unknown, operation: string): void {
         const classified = classifyError(error);
+        this.recordFailure(classified);
         if (classified.permanent) this.permanentFailure = true;
         const suffix =
             classified.retryAfterMs === undefined
@@ -792,6 +900,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         log(
             `[magic-context] Synapse ${operation} failed: ${classified.code}${suffix}: ${classified.message}`,
         );
+    }
+
+    private recordFailure(error: SynapseEmbeddingError): void {
+        this.lastFailureReason = embeddingFailureFor(error);
+    }
+
+    private recordSuccess(): void {
+        this.lastFailureReason = null;
     }
 }
 

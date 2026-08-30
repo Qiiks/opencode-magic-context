@@ -29,6 +29,10 @@ export function formatEmbedFailureSummary(
         }
         case "invalid_envelope":
             return `Embedded ${embedded} ${compartment}; ${remaining} failed: ${failure.reason}. Fix: configure an OpenAI-compatible embedding endpoint that returns data[].embedding.`;
+        case "certification_refusal":
+            return `Embedded ${embedded} ${compartment}; ${remaining} rejected: ${failure.reason}. Fix: recertify SYNAPSE or configure embedding.fallback_provider, then run /ctx-embed start again.`;
+        case "credential_required":
+            return `Embedded ${embedded} ${compartment}; ${remaining} rejected: ${failure.reason}. Fix: reauthenticate SYNAPSE, then run /ctx-embed start again.`;
         case "empty_result":
         case "transport_error":
             return `Embedded ${embedded} ${compartment}; ${remaining} failed: ${failure.reason}.${failure.retryable ? retry : ""}`;
