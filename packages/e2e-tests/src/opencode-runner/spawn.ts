@@ -183,7 +183,7 @@ export function sweepOrphanedServes(): number {
     } catch {
         return 0;
     }
-    if (ps.exitCode !== 0) return 0;
+    if (ps.exitCode !== 0 || !ps.stdout) return 0;
     let reaped = 0;
     for (const line of ps.stdout.toString().split("\n")) {
         const m = line.match(/^\s*(\d+)\s+1\s+(.*opencode serve .*)$/);
@@ -551,6 +551,10 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
               ...opts,
               existingEnv: resources.env,
               userSubcConnectionFile: resources.connectionFile,
+              magicContextConfig: {
+                  historian: { opencode: { model: "mock-anthropic/mock-sonnet" } },
+                  ...(opts.magicContextConfig ?? {}),
+              },
               projectMagicContextConfig: {
                   ...(opts.projectMagicContextConfig ?? {}),
                   transform_mode: "rust",
