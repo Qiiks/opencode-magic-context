@@ -417,7 +417,11 @@ jobs:
           set -euo pipefail
           ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
           ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
-          test -f "$GITHUB_WORKSPACE/../commons/Cargo.lock"
+          # commons does not commit a Cargo.lock (library workspace); the harness
+          # prerequisite detector requires only its Cargo.toml. Asserting the lock
+          # here failed the first live run: local checkouts carry a build-generated
+          # lock that fresh CI checkouts never have.
+          test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
           test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
 
       - name: Record private sibling revisions
@@ -435,7 +439,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(sha256sum Cargo.lock ../commons/Cargo.lock ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
+          digest="$(sha256sum Cargo.lock ../commons/Cargo.toml ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
