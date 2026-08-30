@@ -565,6 +565,8 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                                     args.projectPath,
                                     identity.moduleRowId,
                                     identity.sourceRowId,
+                                    undefined,
+                                    true,
                                 );
                             }
                         })
@@ -1524,20 +1526,30 @@ function rememberIdentity(
     moduleRowId: number,
     contextRowId: number,
     statements?: MirrorPageStatements,
+    replaceContextIdentity = domain === "notes",
 ): void {
     const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
-    if (existing) return;
-    // A note can be re-minted with a new module row id when authority is prepared
-    // again. Replace its stale canonical identity so note evaluation joins the live
-    // revision instead of retaining an id that the module no longer recognizes.
-    if (domain === "notes") {
+    if (existing?.context_row_id === contextRowId) return;
+    if (existing) {
+        if (!replaceContextIdentity) return;
+        (
+            statements?.deleteIdentity ??
+            db.prepare(
+                "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
+            )
+        ).run(domain, moduleProject, moduleRowId);
+    }
+    // Stable source identity is authoritative when a module row is re-minted. Replace
+    // the stale backlink before inserting the new module id; INSERT OR IGNORE alone
+    // would lose to UNIQUE(domain, context_row_id) and leave the tombstoned id canonical.
+    if (replaceContextIdentity) {
         (
             statements?.deleteIdentityByContext ??
             db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?")
         ).run(domain, contextRowId);
     }
-    // A context row has one canonical module identity. A duplicate memory feed row
-    // may still update that row, but it must not claim a second identity for it.
+    // A natural-key-only duplicate memory feed row may update the canonical context row,
+    // but it must not claim a second identity without stable source identity.
     (
         statements?.insertIdentity ??
         db.prepare(
@@ -1567,7 +1579,7 @@ function contextMemoryId(
             db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")
         ).get(sourceId, moduleProject) as { id?: number } | undefined;
         if (existing?.id !== undefined) {
-            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements);
+            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements, true);
             return existing.id;
         }
     }
@@ -2098,6 +2110,46 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 // Upgrade cursors can start after a canonical insert. Never delete through a
                 // tombstone until the module's current live identities have been captured.
                 throw new Error("memory mirror resnapshot must complete before tombstones");
+            }
+            if (page.domain === "memories") {
+                // A module transaction can retire one row id and mint its replacement before
+                // this page is consumed. Bind every replacement carrying local source identity
+                // first, so an earlier tombstone cannot delete the durable host row or its
+                // id-keyed satellites before the replacement updates it in place.
+                for (const feed of page.rows) {
+                    if (
+                        feed.domain !== "memories" ||
+                        feed.op === "tombstone" ||
+                        feed.feed_seq <= durableCursor
+                    ) {
+                        continue;
+                    }
+                    const row = feed.full_row_snapshot;
+                    const moduleProject = rowString(row, "project_path");
+                    const sourceUuid = rowNullableString(row, "context_store_uuid");
+                    const sourceId = rowNumber(row, "context_row_id", -1);
+                    if (
+                        !moduleProject ||
+                        !sourceUuid ||
+                        sourceUuid !== statements.contextStoreUuid ||
+                        sourceId < 0
+                    ) {
+                        continue;
+                    }
+                    const existing = statements.memoryIdByStoreId.get(sourceId, moduleProject) as
+                        | { id?: number }
+                        | undefined;
+                    if (existing?.id === undefined) continue;
+                    rememberIdentity(
+                        db,
+                        "memories",
+                        moduleProject,
+                        feed.module_row_id,
+                        existing.id,
+                        statements,
+                        true,
+                    );
+                }
             }
             const touchedProjects = new Set<string>();
             for (const feed of page.rows) {
