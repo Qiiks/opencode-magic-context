@@ -4,6 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
+import {
+    buildCanonicalChunkTextFromFts,
+    chunkCanonicalText,
+    chunkEmbeddingWindowsAreCurrent,
+    replaceCompartmentChunkEmbeddings,
+} from "./compartment-chunk-embedding";
+import { appendCompartments, getCompartments } from "./compartment-storage";
 import type { GitCommit } from "./git-commits/git-log-reader";
 import {
     countEmbeddedCommits,
@@ -19,6 +26,7 @@ import {
     flushShadowEmbeddingBacklog,
     getProjectEmbeddingSnapshot,
     getShadowBackfillRemaining,
+    getShadowBackfillStopReason,
     getShadowEmbeddingMeasurementCohort,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
@@ -91,9 +99,17 @@ function primaryModelId(projectIdentity: string): string {
     return getProjectEmbeddingSnapshot(projectIdentity)?.modelId ?? "off";
 }
 
+function primaryChunkModelId(projectIdentity: string): string {
+    return getProjectEmbeddingSnapshot(projectIdentity)?.chunkModelId ?? "off";
+}
+
 /** The shadow lane's current modelId (a Synapse identity), distinct from primary. */
 function shadowModelId(projectIdentity: string): string {
     return getShadowEmbeddingMeasurementCohort(projectIdentity)?.modelId ?? "off";
+}
+
+function shadowChunkModelId(projectIdentity: string): string {
+    return getShadowEmbeddingMeasurementCohort(projectIdentity)?.chunkModelId ?? "off";
 }
 
 function countShadowMemoryRows(
@@ -452,5 +468,165 @@ describe("shadow embedding historical backfill", () => {
         // Old identity aged out; new identity (current shadow) is protected.
         expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(0);
         expect(countShadowMemoryRows(db, projectIdentity, shadowB)).toBe(3);
+    });
+
+    it("declares shadow chunks drained only after missing keys and stale hashes are repaired", async () => {
+        useFakeProviders();
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-hash-complete";
+        const sessionId = "ses-shadow-hash-complete";
+        const shadowConfig = synapseConfig("fp-hash-complete");
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-hash-complete",
+        );
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shadow-hash-complete",
+        );
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "u1",
+                endMessageId: "u1",
+                title: "Missing shadow window",
+                content: "missing",
+                p1: "missing",
+            },
+            {
+                sequence: 1,
+                startMessage: 2,
+                endMessage: 2,
+                startMessageId: "u2",
+                endMessageId: "u2",
+                title: "Stale shadow hash",
+                content: "stale",
+                p1: "stale",
+            },
+            {
+                sequence: 2,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "u3",
+                endMessageId: "u3",
+                title: "Clean shadow row",
+                content: "clean",
+                p1: "clean",
+            },
+        ]);
+        for (const [ordinal, content] of [
+            [1, "missing shadow transcript"],
+            [2, "stale shadow transcript"],
+            [3, "clean shadow transcript"],
+        ] as const) {
+            db.prepare(
+                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, 'user', ?)",
+            ).run(sessionId, ordinal, `u${ordinal}`, content);
+        }
+
+        const compartments = getCompartments(db, sessionId);
+        const primaryChunk = primaryChunkModelId(projectIdentity);
+        const shadowChunk = shadowChunkModelId(projectIdentity);
+        const windows = new Map(
+            compartments.map((compartment) => [
+                compartment.id,
+                chunkCanonicalText(
+                    buildCanonicalChunkTextFromFts(
+                        db,
+                        sessionId,
+                        compartment.startMessage,
+                        compartment.endMessage,
+                    ),
+                    compartment.startMessage,
+                    compartment.endMessage,
+                    10_000,
+                ),
+            ]),
+        );
+        const write = (
+            compartmentId: number,
+            modelId: string,
+            rows: ReturnType<typeof chunkCanonicalText>,
+        ) =>
+            replaceCompartmentChunkEmbeddings(
+                db,
+                rows.map((window) => ({
+                    compartmentId,
+                    sessionId,
+                    projectPath: projectIdentity,
+                    window,
+                    modelId,
+                    vector: new Float32Array([1, 0]),
+                })),
+            );
+        for (const compartment of compartments) {
+            write(compartment.id, primaryChunk, windows.get(compartment.id) ?? []);
+        }
+        const [missing, stale, clean] = compartments;
+        write(
+            stale.id,
+            shadowChunk,
+            (windows.get(stale.id) ?? []).map((window) => ({
+                ...window,
+                chunkHash: `old-${window.chunkHash}`,
+            })),
+        );
+        write(clean.id, shadowChunk, windows.get(clean.id) ?? []);
+
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(2);
+        expect(getShadowBackfillStopReason(projectIdentity, "chunk")).toBeUndefined();
+
+        // Verify both predicates independently: a stale hash remains outstanding
+        // after the missing row is repaired, and the missing row remains outstanding
+        // after the stale hash is repaired. An existence-only predicate would
+        // incorrectly report no remaining work in the stale-only state.
+        write(missing.id, shadowChunk, windows.get(missing.id) ?? []);
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(1);
+        db.prepare(
+            "DELETE FROM compartment_chunk_embeddings WHERE compartment_id = ? AND model_id = ?",
+        ).run(missing.id, shadowChunk);
+        write(stale.id, shadowChunk, windows.get(stale.id) ?? []);
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(1);
+
+        // Restore both defects, then verify that the normal bounded worker uses
+        // its rotation-aware selection to discover and replace both rows during
+        // routine backfill.
+        write(
+            stale.id,
+            shadowChunk,
+            (windows.get(stale.id) ?? []).map((window) => ({
+                ...window,
+                chunkHash: `old-again-${window.chunkHash}`,
+            })),
+        );
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shadow-hash-complete",
+        );
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(2);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(0);
+        expect(getShadowBackfillStopReason(projectIdentity, "chunk")).toBe("drained");
+        for (const compartment of compartments) {
+            expect(
+                chunkEmbeddingWindowsAreCurrent(
+                    db,
+                    compartment.id,
+                    shadowChunk,
+                    windows.get(compartment.id) ?? [],
+                    projectIdentity,
+                ),
+            ).toBe(true);
+        }
     });
 });

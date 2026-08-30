@@ -1209,11 +1209,12 @@ export function enqueueShadowEmbeddingItems(
 }
 
 /**
- * Base missing-set query for one shadow scope: the items the PRIMARY lane has
- * already embedded (row under the primary modelId) that have NO row under the
- * shadow modelId yet. Mirrors the primary backfill's LEFT JOIN ... WHERE NULL
- * shape. Returned without ORDER BY/LIMIT so callers can append a bounded LIMIT
- * (id listing) or wrap it in a COUNT(*).
+ * Base key/hash-incomplete query for one shadow scope. Memory content updates
+ * invalidate all model rows and commit SHAs are content identities, so their
+ * current-content predicate reduces to row existence. Chunk coverage is stricter:
+ * every primary `(compartment_id, window_index, chunk_hash)` must have an exact
+ * row under the current shadow identity. A same-key row with an old hash remains
+ * a candidate and is replaced by the bounded drain.
  */
 function shadowBackfillMissingBase(
     scope: ShadowScope,
@@ -1244,15 +1245,25 @@ function shadowBackfillMissingBase(
         };
     }
     return {
-        sql: `SELECT DISTINCT cp.compartment_id AS id
+        sql: `SELECT cp.compartment_id AS id,
+                     MIN(CASE WHEN NOT EXISTS (
+                         SELECT 1 FROM compartment_chunk_embeddings same_key
+                         WHERE same_key.compartment_id = cp.compartment_id
+                           AND same_key.window_index = cp.window_index
+                           AND same_key.model_id = ?
+                     ) THEN 0 ELSE 1 END) AS defect_order
               FROM compartment_chunk_embeddings cp
               WHERE cp.project_path = ? AND cp.model_id = ?
                 AND NOT EXISTS (
-                    SELECT 1 FROM compartment_chunk_embeddings cs
-                    WHERE cs.compartment_id = cp.compartment_id AND cs.model_id = ?
-                )`,
-        params: [projectIdentity, primaryModelId, shadowModelId],
-        orderBy: " ORDER BY cp.compartment_id",
+                    SELECT 1 FROM compartment_chunk_embeddings current
+                    WHERE current.compartment_id = cp.compartment_id
+                      AND current.window_index = cp.window_index
+                      AND current.chunk_hash = cp.chunk_hash
+                      AND current.model_id = ?
+                )
+              GROUP BY cp.compartment_id`,
+        params: [shadowModelId, projectIdentity, primaryModelId, shadowModelId],
+        orderBy: " ORDER BY defect_order ASC, cp.compartment_id ASC",
     };
 }
 
@@ -2159,6 +2170,7 @@ async function embedCompartmentChunkBatch(
         projectIdentity,
         snapshot.chunkModelId,
         batchSize,
+        getProjectEmbeddingMaxInputTokens(projectIdentity),
     );
     if (candidates.length === 0) return 0;
     // Passive sweep ignores `failed`/`noWork` — it's bounded per tick and re-runs
@@ -2482,11 +2494,13 @@ export async function embedSessionCompartmentChunks(
     // persist it before counting so stale rows under another project cannot make
     // this session look already embedded forever.
     recordSessionProjectIdentity(db, sessionId, projectIdentity);
+    const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
     const total = countUnembeddedSessionCompartments(
         db,
         projectIdentity,
         sessionId,
         snapshot.chunkModelId,
+        maxInputTokens,
     );
     if (total === 0) return { status: "nothing", embedded: 0, total: 0 };
 
@@ -2548,6 +2562,7 @@ export async function embedSessionCompartmentChunks(
                 snapshot.chunkModelId,
                 batchSize,
                 [...skipIds, ...failedIds],
+                maxInputTokens,
             );
             if (candidates.length === 0) break;
             const {
@@ -2621,6 +2636,7 @@ export async function embedSessionCompartmentChunks(
                 projectIdentity,
                 sessionId,
                 snapshot.chunkModelId,
+                maxInputTokens,
             ) - skipIds.length,
         );
         if (remaining > 0) {
@@ -2678,6 +2694,7 @@ export function getEmbeddingCoverageStatus(
         projectIdentity,
         sessionId,
         snapshot.chunkModelId,
+        getProjectEmbeddingMaxInputTokens(projectIdentity),
     );
     const memories = getMemoryEmbedCoverage(db, projectIdentity, snapshot.modelId);
     const gitEnabled = snapshot.gitCommitEnabled;
