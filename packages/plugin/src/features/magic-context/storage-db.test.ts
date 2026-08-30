@@ -401,6 +401,21 @@ describe("storage-db", () => {
             expect(SESSION_SCOPED_TABLES.map((definition) => definition.table).sort()).toEqual(
                 schemaTables,
             );
+
+            // The orphan sweep derives candidates from this harness-provenanced
+            // subset. Tables without harness remain cleanup-only because their
+            // rows cannot safely be attributed to OpenCode instead of Pi.
+            const harnessScopedSchemaTables = schemaTables.filter((table) => {
+                const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                    name: string;
+                }>;
+                return columns.some((column) => column.name === "harness");
+            });
+            expect(
+                SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
+                    .map((definition) => definition.table)
+                    .sort(),
+            ).toEqual(harnessScopedSchemaTables.sort());
         });
 
         it("#when clearSession runs #then every session-scoped table is emptied", () => {
