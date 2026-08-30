@@ -9,11 +9,16 @@
 // endpoint and model through the user config tier. Per-test XDG_DATA_HOME or XDG_CONFIG_HOME
 // fixtures may replace this root, while MAGIC_CONTEXT_STORAGE_DIR can never
 // escape test isolation. Do not remove.
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll } from "bun:test";
+import {
+	createTestTempDir,
+	installTestTempDirCleanup,
+	sweepStaleTestTempDirs,
+} from "@magic-context/core/shared/test-temp-dir";
 
-const isolatedDataHome = mkdtempSync(join(tmpdir(), "mc-pi-test-xdg-"));
+sweepStaleTestTempDirs();
+installTestTempDirCleanup(afterAll);
+const { dir: isolatedDataHome } = createTestTempDir("mc-pi-test-xdg-");
 
 // Bulletproof DB guard (see @magic-context/core resolveDatabasePath): never
 // mutated by any test, so a bare openDatabase() can never reach the real DB.

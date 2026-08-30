@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	cleanupTestTempDir,
+	createTestTempDir,
+} from "@magic-context/core/shared/test-temp-dir";
+
 import { awaitInFlightHistorians } from "./context-handler";
 import { __test as dreamerTest } from "./dreamer";
 import magicContextPiExtension, { __test } from "./index";
@@ -25,8 +29,11 @@ function restoreEnv() {
 	}
 }
 
+const tempRoots: string[] = [];
+
 function isolateXdgEnv(): string {
-	const root = mkdtempSync(join(tmpdir(), "magic-context-pi-latch-test-"));
+	const root = createTestTempDir("magic-context-pi-latch-test-").dir;
+	tempRoots.push(root);
 	const configHome = join(root, "config");
 	process.env.XDG_CONFIG_HOME = configHome;
 	// Use the preload's migration-safe test database; isolate only configuration.
@@ -122,6 +129,7 @@ function createCountingPi() {
 
 afterEach(() => {
 	restoreEnv();
+	for (const root of tempRoots.splice(0)) cleanupTestTempDir(root);
 	// The marker context lives on globalThis (process-global by design), so clear it
 	// between tests or one test's child state could suppress the next.
 	__test.clearPiInProcessSubagentInitContext();

@@ -2,7 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { resolveHistorianModel } from "../shared/model-resolution";
+import { createTestTempDir } from "../shared/test-temp-dir";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
 import { resolveConfigProfile } from "./profiles";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "./schema/magic-context";
@@ -693,7 +695,8 @@ describe("loadPluginConfig — legacy agent enabled migration", () => {
 
 describe("loadPluginConfig — variable expansion scope", () => {
     it("keeps {env:} and {file:} expansion enabled for user config", () => {
-        const secretFile = join(mkdtempSync(join(tmpdir(), "mc-config-secret-")), "secret.txt");
+        const { dir: secretDir, cleanup } = createTestTempDir("mc-config-secret-");
+        const secretFile = join(secretDir, "secret.txt");
         writeFileSync(secretFile, "file-secret", "utf-8");
 
         try {
@@ -715,12 +718,13 @@ describe("loadPluginConfig — variable expansion scope", () => {
             }
             expect(result.configWarnings).toBeUndefined();
         } finally {
-            rmSync(secretFile, { force: true });
+            cleanup();
         }
     });
 
     it("leaves {env:} and {file:} tokens literal in project config and warns", () => {
-        const secretFile = join(mkdtempSync(join(tmpdir(), "mc-config-secret-")), "secret.txt");
+        const { dir: secretDir, cleanup } = createTestTempDir("mc-config-secret-");
+        const secretFile = join(secretDir, "secret.txt");
         writeFileSync(secretFile, "project-file-secret", "utf-8");
 
         try {
@@ -743,7 +747,7 @@ describe("loadPluginConfig — variable expansion scope", () => {
             expect(warnings).toContain("security reasons");
             expect(warnings).toContain("embedding.endpoint/provider");
         } finally {
-            rmSync(secretFile, { force: true });
+            cleanup();
         }
     });
 

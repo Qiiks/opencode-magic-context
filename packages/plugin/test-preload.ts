@@ -19,14 +19,19 @@
 // current or future, isolated or not — to read production storage or user-tier
 // config. Tests that set their own XDG_DATA_HOME or XDG_CONFIG_HOME still work
 // because they override the preload root per test.
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterAll } from "bun:test";
+import {
+    createTestTempDir,
+    installTestTempDirCleanup,
+    sweepStaleTestTempDirs,
+} from "./src/shared/test-temp-dir";
 
-// `bun test --parallel` launches separate worker processes. Include the PID so the
-// storage root remains visibly process-scoped even if a future Bun version changes
-// preload timing or environment inheritance.
-const isolatedDataHome = mkdtempSync(join(tmpdir(), `mc-plugin-test-xdg-pid-${process.pid}-`));
+// Retry cleanup from interrupted earlier runs before creating this process's root.
+// `bun test --parallel` launches separate worker processes, so include the PID to
+// keep each live storage root visibly process-scoped.
+sweepStaleTestTempDirs();
+installTestTempDirCleanup(afterAll);
+const { dir: isolatedDataHome } = createTestTempDir("mc-plugin-test-xdg-pid-", `${process.pid}-`);
 
 // MAGIC_CONTEXT_TEST_DATA_DIR is the BULLETPROOF guard: resolveDatabasePath()
 // (storage-db.ts) resolves the DB inside it with top priority. Unlike
