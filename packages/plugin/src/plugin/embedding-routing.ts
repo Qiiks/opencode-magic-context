@@ -72,6 +72,10 @@ function fallbackConfig(
     return {
         provider: "local",
         model: model || DEFAULT_LOCAL_EMBEDDING_MODEL,
+        local_runtime:
+            raw.local_runtime === "native" || raw.local_runtime === "wasm"
+                ? raw.local_runtime
+                : "auto",
         ...(maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}),
     };
 }

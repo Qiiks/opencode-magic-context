@@ -42,6 +42,7 @@ export {
 const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
     provider: "local",
     model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+    local_runtime: "auto",
 };
 
 let embeddingConfig: EmbeddingConfig = DEFAULT_EMBEDDING_CONFIG;
@@ -52,6 +53,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
         return {
             provider: "local",
             model: config?.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
+            local_runtime: config?.local_runtime ?? "auto",
             ...(config?.max_input_tokens
                 ? {
                       max_input_tokens: normalizeCompartmentChunkMaxInputTokens(
@@ -125,6 +127,7 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             config.model,
             config.max_input_tokens,
             config.local_dtype,
+            config.local_runtime,
         );
     }
 

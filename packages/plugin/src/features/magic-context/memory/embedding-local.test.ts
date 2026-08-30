@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import {
     __resetLocalEmbeddingForTests,
@@ -9,6 +10,7 @@ import {
     isNativeRuntimeMissingError,
     type LocalEmbeddingDtype,
     LocalEmbeddingProvider,
+    resolveLocalEmbeddingRuntime,
 } from "./embedding-local";
 
 afterEach(() => {
@@ -179,7 +181,79 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
     });
 });
 
+describe("local embedding runtime selection", () => {
+    test("auto selects WASM for Bun before the NAPI teardown fix and native at 1.4.0", () => {
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: false,
+                isBun: true,
+                bunVersion: "1.3.14",
+            }),
+        ).toBe("wasm");
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: false,
+                isBun: true,
+                bunVersion: "1.4.0",
+            }),
+        ).toBe("native");
+        // This catches a lexical version comparison: 1.10.0 is newer than 1.4.0.
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: false,
+                isBun: true,
+                bunVersion: "1.10.0",
+            }),
+        ).toBe("native");
+    });
+
+    test("auto stays native in Node and explicit native/WASM override the host default", () => {
+        const oldBun = { isElectron: false, isBun: true, bunVersion: "1.3.14" };
+        expect(resolveLocalEmbeddingRuntime("auto", { isElectron: false, isBun: false })).toBe(
+            "native",
+        );
+        expect(resolveLocalEmbeddingRuntime("native", oldBun)).toBe("native");
+        expect(resolveLocalEmbeddingRuntime("wasm", oldBun)).toBe("wasm");
+    });
+
+    test("auto preserves Electron's existing early WASM injection path", () => {
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: true,
+                isBun: false,
+            }),
+        ).toBe("electron");
+    });
+});
+
 describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
+    test("a vulnerable Bun host loads the web bundle without importing the native addon", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-bun-wasm-default-"));
+        let nativeImports = 0;
+        let wasmImports = 0;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: true, bunVersion: "1.3.14" }),
+                importTransformers: async () => {
+                    nativeImports++;
+                    throw new Error("native import must not run");
+                },
+                injectWasmOrt: async () => true,
+                importTransformersWasmFallback: async () => {
+                    wasmImports++;
+                    return fakeTransformersModule();
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(nativeImports).toBe(0);
+            expect(wasmImports).toBe(1);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
     test("retries a classified native load failure once with WASM and keeps that decision process-sticky", async () => {
         const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-fallback-"));
         const logs: string[] = [];
@@ -273,7 +347,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
         let wasmInjections = 0;
         try {
             __setLocalEmbeddingTestHooks({
-                isElectron: () => true,
+                host: () => ({ isElectron: true, isBun: false }),
                 injectWasmOrt: async () => {
                     wasmInjections++;
                     return true;

@@ -2,6 +2,11 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
+import {
+    type LocalEmbeddingHost,
+    type LocalEmbeddingRuntime,
+    resolveLocalEmbeddingRuntime,
+} from "@magic-context/core/features/magic-context/memory/embedding-local";
 
 /**
  * Detects whether the local-embedding runtime can use native ONNX or its WASM
@@ -15,6 +20,8 @@ import { dirname, join, sep } from "node:path";
 
 export type LocalEmbeddingRuntimeStatus =
     | { state: "ok"; binaryPath: string }
+    | { state: "wasm-selected"; wasmPath: string }
+    | { state: "wasm-broken"; wasmReason: string }
     | { state: "package-missing"; packageDir: string }
     | { state: "binary-missing"; packageDir: string; expectedBinary: string }
     | { state: "load-failed"; packageDir: string; reason: string }
@@ -37,7 +44,7 @@ export type NativeLocalEmbeddingRuntimeFailure = Extract<
 
 export type BrokenLocalEmbeddingRuntimeStatus =
     | NativeLocalEmbeddingRuntimeFailure
-    | Extract<LocalEmbeddingRuntimeStatus, { state: "both-broken" }>;
+    | Extract<LocalEmbeddingRuntimeStatus, { state: "both-broken" | "wasm-broken" }>;
 
 function describeError(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error ?? "unknown error");
@@ -210,12 +217,23 @@ function describeNativeFailure(status: NativeLocalEmbeddingRuntimeFailure): stri
 export function isLocalEmbeddingRuntimeBroken(
     status: LocalEmbeddingRuntimeStatus,
 ): status is BrokenLocalEmbeddingRuntimeStatus {
-    return status.state === "both-broken" || isNativeLocalEmbeddingRuntimeFailure(status);
+    return (
+        status.state === "both-broken" ||
+        status.state === "wasm-broken" ||
+        isNativeLocalEmbeddingRuntimeFailure(status)
+    );
 }
 
 export function formatLocalEmbeddingRuntimeDoctorWarning(
     status: BrokenLocalEmbeddingRuntimeStatus,
 ): string {
+    if (status.state === "wasm-broken") {
+        return (
+            "Embedding provider: local — configured/selected onnxruntime-web (WASM) is unavailable — " +
+            `${status.wasmReason}. Reinstall the plugin package or select embedding.local_runtime: native ` +
+            "only on a host where its native runtime is safe."
+        );
+    }
     if (status.state !== "both-broken") {
         return (
             "Embedding provider: local — onnxruntime-node native binding missing — " +
@@ -287,6 +305,15 @@ function withWasmFallback(
     return { state: "both-broken", nativeFailure: native, wasmReason: wasm.reason };
 }
 
+export function formatLocalEmbeddingRuntimeWasmSelected(
+    status: Extract<LocalEmbeddingRuntimeStatus, { state: "wasm-selected" }>,
+): string {
+    return (
+        "Embedding provider: local — onnxruntime-web (WASM) selected by embedding.local_runtime/host at " +
+        `${status.wasmPath}. The native addon was not probed or loaded. WASM inference is slower than native.`
+    );
+}
+
 function probeWasmRuntimeAt(installRoot: string): WasmRuntimeProbe {
     const requireFn = createRequire(join(installRoot, "package.json"));
     return probeWasmRuntimeFromRequire(requireFn);
@@ -301,7 +328,17 @@ export function checkLocalEmbeddingRuntimeAt(
     installRoot: string,
     platform: NodeJS.Platform = process.platform,
     arch: string = process.arch,
+    runtimePreference: LocalEmbeddingRuntime = "auto",
+    host?: LocalEmbeddingHost,
 ): LocalEmbeddingRuntimeStatus {
+    const selectedRuntime = resolveLocalEmbeddingRuntime(runtimePreference, host);
+    if (selectedRuntime !== "native") {
+        const wasm = probeWasmRuntimeAt(installRoot);
+        return wasm.state === "ok"
+            ? { state: "wasm-selected", wasmPath: wasm.wasmPath }
+            : { state: "wasm-broken", wasmReason: wasm.reason };
+    }
+
     const packageDir = join(installRoot, "node_modules", "onnxruntime-node");
     let native: LocalEmbeddingRuntimeStatus;
     if (!existsSync(join(packageDir, "package.json"))) {
@@ -335,6 +372,8 @@ export function checkLocalEmbeddingRuntime(
     installRoots: string[],
     platform: NodeJS.Platform = process.platform,
     arch: string = process.arch,
+    runtimePreference: LocalEmbeddingRuntime = "auto",
+    host?: LocalEmbeddingHost,
 ): LocalEmbeddingRuntimeStatus {
     const existing = installRoots.filter((root) => existsSync(root));
     if (existing.length === 0) {
@@ -347,7 +386,7 @@ export function checkLocalEmbeddingRuntime(
         null;
     let firstFailure: LocalEmbeddingRuntimeStatus | null = null;
     for (const root of existing) {
-        const status = checkLocalEmbeddingRuntimeAt(root, platform, arch);
+        const status = checkLocalEmbeddingRuntimeAt(root, platform, arch, runtimePreference, host);
         if (status.state === "ok") return status;
         if (status.state === "wasm-fallback") {
             if (firstFallback === null) firstFallback = status;
@@ -414,9 +453,19 @@ export function checkLocalEmbeddingRuntimeByResolution(
     pluginDir: string,
     platform: NodeJS.Platform = process.platform,
     arch: string = process.arch,
+    runtimePreference: LocalEmbeddingRuntime = "auto",
+    host?: LocalEmbeddingHost,
 ): LocalEmbeddingRuntimeStatus {
     if (!existsSync(join(pluginDir, "package.json"))) {
         return { state: "unknown", reason: "plugin package dir not found" };
+    }
+
+    const selectedRuntime = resolveLocalEmbeddingRuntime(runtimePreference, host);
+    if (selectedRuntime !== "native") {
+        const wasm = probeWasmRuntimeByResolution(pluginDir);
+        return wasm.state === "ok"
+            ? { state: "wasm-selected", wasmPath: wasm.wasmPath }
+            : { state: "wasm-broken", wasmReason: wasm.reason };
     }
 
     let onnxDir: string | null = null;

@@ -121,6 +121,7 @@ describe("loadPluginConfig — preload user-config isolation", () => {
             expect(loadPluginConfig(projectDir).embedding).toEqual({
                 provider: "local",
                 model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                local_runtime: "auto",
             });
         } finally {
             rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

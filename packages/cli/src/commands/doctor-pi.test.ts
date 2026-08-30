@@ -338,7 +338,7 @@ describe("Pi doctor", () => {
 
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
-        expect(output).toContain("PASS Embedding provider: local (native runtime OK)");
+        expect(output).toContain("PASS Embedding provider: local (native runtime selected and OK)");
     });
 
     it("repairs missing package entry and missing user config in --force mode", async () => {
