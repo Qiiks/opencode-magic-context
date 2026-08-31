@@ -9,9 +9,8 @@ import {
 } from "./model-resolution";
 
 describe("model-resolution", () => {
-    test("pins the historian calibration defaults while preserving explicit overrides", () => {
+    test("keeps historian temperature opt-in while preserving explicit overrides", () => {
         expect(resolveHistorianAgentOverrides(undefined)).toEqual({
-            temperature: 0.1,
             maxTokens: 32_000,
         });
         expect(
@@ -56,7 +55,7 @@ describe("model-resolution", () => {
         ]);
     });
 
-    test("applies the flash-calibrated historian generation triple while preserving overrides", () => {
+    test("keeps the flash calibration available only as an explicit override", () => {
         expect(
             resolveHistorianAgentOverrides({
                 opencode: { model: { model: "google/flash", variant: "fast" } },
@@ -64,15 +63,14 @@ describe("model-resolution", () => {
                 two_pass: true,
             }),
         ).toEqual({
-            temperature: 0.1,
             maxTokens: 32_000,
             two_pass: true,
             model: "google/flash",
             variant: "fast",
         });
         expect(
-            resolveHistorianAgentOverrides({ temperature: 0.2, maxTokens: 12_000 }),
-        ).toMatchObject({ temperature: 0.2, maxTokens: 12_000 });
+            resolveHistorianAgentOverrides({ temperature: 0.1, maxTokens: 12_000 }),
+        ).toMatchObject({ temperature: 0.1, maxTokens: 12_000 });
     });
 
     test("does not inherit a block qualifier into unqualified fallbacks", () => {

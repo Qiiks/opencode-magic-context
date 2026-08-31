@@ -34,6 +34,7 @@ import {
 import { SIDEKICK_AGENT } from "./agents/sidekick";
 import { SMART_NOTE_COMPILER_AGENT } from "./agents/smart-note-compiler";
 import { permissionDisabled } from "./hooks/magic-context/ctx-reduce-availability";
+import { resolveHistorianAgentOverrides } from "./shared/model-resolution";
 
 function taskRules(task: Record<string, string>) {
     return Object.entries(task).map(([pattern, action]) => ({
@@ -83,6 +84,32 @@ describe("hidden-agent registration drift guard", () => {
                 SIDEKICK_AGENT,
             ].sort(),
         );
+    });
+
+    test("registers opt-in historian temperature on every historian agent", () => {
+        const registrationsFor = (historianConfig: unknown) =>
+            buildHiddenAgentRegistrations({
+                dreamerPrompt: "dreamer-prompt",
+                historianPrompt: "historian-prompt",
+                historianRecompPrompt: "historian-recomp-prompt",
+                historianEditorPrompt: "historian-editor-prompt",
+                sidekickPrompt: "sidekick-prompt",
+                historianOverrides: resolveHistorianAgentOverrides(historianConfig),
+                historianDisallowed: [],
+            }).filter((registration) =>
+                [HISTORIAN_AGENT, HISTORIAN_RECOMP_AGENT, HISTORIAN_EDITOR_AGENT].includes(
+                    registration.id,
+                ),
+            );
+
+        for (const registration of registrationsFor(undefined)) {
+            expect(registration.overrides).toEqual({ maxTokens: 32_000 });
+            expect("temperature" in (registration.overrides ?? {})).toBe(false);
+        }
+
+        for (const registration of registrationsFor({ temperature: 0.1 })) {
+            expect(registration.overrides).toEqual({ maxTokens: 32_000, temperature: 0.1 });
+        }
     });
 
     test("all Magic Context worker ids are denied through Task routing", () => {

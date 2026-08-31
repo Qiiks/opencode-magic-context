@@ -82,6 +82,8 @@ impl Default for CavemanConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
+    /// Optional trusted user-configured sampling temperature for historian requests.
+    pub historian_temperature: Option<f64>,
     /// Trusted user-configured language for hidden-agent prose. Project config is deliberately
     /// excluded because the language directive becomes provider-visible prompt text.
     pub language: Option<String>,
@@ -122,6 +124,7 @@ impl Default for McModuleConfig {
     fn default() -> Self {
         Self {
             model_chain: Vec::new(),
+            historian_temperature: None,
             language: None,
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             compaction_enabled: true,
@@ -430,6 +433,9 @@ fn merge_tiers_with_warnings(
                         .map(ToOwned::to_owned),
                 );
             }
+        }
+        if let Some(temperature) = number_at(user, "/historian/temperature") {
+            cfg.historian_temperature = Some(temperature);
         }
         if let Some(language) = user
             .pointer("/language")
@@ -1203,6 +1209,15 @@ mod tests {
         });
         let cfg = merge_tiers(Some(&user), Some(&project));
         assert_eq!(cfg.model_chain, vec!["google/gemini-3.5-flash"]);
+    }
+
+    #[test]
+    fn historian_temperature_is_optional_and_user_tier_only() {
+        let user = serde_json::json!({ "historian": { "temperature": 0.1 } });
+        let project = serde_json::json!({ "historian": { "temperature": 0.9 } });
+        assert_eq!(merge_tiers(None, None).historian_temperature, None);
+        assert_eq!(merge_tiers(Some(&user), Some(&project)).historian_temperature, Some(0.1));
+        assert_eq!(merge_tiers(None, Some(&project)).historian_temperature, None);
     }
 
     #[test]

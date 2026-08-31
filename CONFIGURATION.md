@@ -663,7 +663,7 @@ It is useful when starting a new session. It's better to choose a fast and cheap
 |-------|------|-------------|
 | `model` | `string` | Primary model. |
 | `fallback_models` | `string` or `string[]` | Fallback models. |
-| `temperature` | `number` (0–2) | Sampling temperature. Omitted by default: no `temperature` is sent to the provider unless you set one. Reasoning models reject the parameter outright, so only set it for models that accept it. |
+| `temperature` | `number` (0–2) | Sampling temperature. Opt-in across every harness: omission sends no `temperature` instruction to the provider; set it explicitly for flash-class calibration. Some reasoning models reject or constrain temperature, so only set it for models that accept it. |
 | `variant` | `string` | **OpenCode only.** Agent variant — selects a thinking/reasoning preset. Pi uses `thinking_level` instead. |
 | `thinking_level` | `string` | **Pi only.** Explicit reasoning level (`off`/`low`/`medium`/`high`) passed to Pi for sidekick subagent runs. See `historian.thinking_level`. |
 | `prompt` | `string` | Persistent agent-level system prompt override. Applies to every sidekick run. |

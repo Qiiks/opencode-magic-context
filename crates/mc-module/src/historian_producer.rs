@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::{
@@ -36,13 +37,12 @@ const DEFAULT_RUNNER_MODULE_ID: &str = "broca";
 /// generous request costs nothing unless the model actually generates that much.
 const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
-/// Sampling temperature for historian runs. The prompt and this value were calibrated
-/// TOGETHER: at provider-default temperature (1.0) flash-class models drift past the
-/// prompt's exclusion rules and copy the format template and rotating-seed reference
-/// compartments into their output (observed live on the rig with the calibration model
-/// itself), while at 0.1 the same prompt extracts cleanly. Sending the prompt without
-/// the temperature is running half the calibration.
-const HISTORIAN_TEMPERATURE: f64 = 0.1;
+#[derive(Serialize)]
+struct GenerationRequest {
+    max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+}
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a summarization run to finish. A historian pass legitimately
@@ -585,7 +585,26 @@ impl HistorianProducer {
             prompt,
             model,
             HISTORIAN_MAX_OUTPUT_TOKENS,
-            HISTORIAN_TEMPERATURE,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_temperature(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.start_with_generation(
+            session_id,
+            system,
+            prompt,
+            model,
+            HISTORIAN_MAX_OUTPUT_TOKENS,
+            temperature,
         )
         .await
     }
@@ -597,7 +616,7 @@ impl HistorianProducer {
         prompt: &str,
         model: &str,
         max_output_tokens: u32,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
@@ -631,9 +650,9 @@ impl HistorianProducer {
         params.insert("tools".into(), json!([]));
         params.insert(
             "generation".into(),
-            json!({
-                "max_output_tokens": max_output_tokens,
-                "temperature": temperature,
+            json!(GenerationRequest {
+                max_output_tokens,
+                temperature,
             }),
         );
         if !system.is_empty() {
@@ -1580,10 +1599,9 @@ mod tests {
             json!(HISTORIAN_MAX_OUTPUT_TOKENS),
             "an explicit output budget rides every send: llm-runner's default truncated a real summarization pass"
         );
-        assert_eq!(
-            log.sends[0]["generation"]["temperature"],
-            json!(HISTORIAN_TEMPERATURE),
-            "the calibrated temperature rides every send: prompt and sampling were calibrated together"
+        assert!(
+            log.sends[0]["generation"].get("temperature").is_none(),
+            "an omitted historian temperature must not become a provider instruction"
         );
         assert_eq!(
             log.sends[0]["system"],
@@ -1591,6 +1609,27 @@ mod tests {
             "system rides the role-scoped SendParams field, byte-exact"
         );
         assert_eq!(log.goodbyes, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn start_with_explicit_temperature_serializes_it() {
+        let server = fake_server(json!({"state":"active","run_id":"run-temperature"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start_with_temperature(
+                "mc-historian:proj:1",
+                "role guidance",
+                "prompt",
+                "prov/model-a",
+                Some(0.1),
+            )
+            .await
+            .unwrap();
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.sends[0]["generation"]["temperature"], json!(0.1));
     }
 
     #[tokio::test]

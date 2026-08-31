@@ -1252,6 +1252,38 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("omits historian temperature from the spawned child environment when unspecified", async () => {
+		const previousTemperature = process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+		delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+		try {
+			const child = createMockChild();
+			const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
+			const resultPromise = runner.run({ ...baseOptions, model: "test/historian" });
+			child.writeStdoutLine({ type: "session", id: "s1" });
+			child.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "ok" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			child.emitClose(0);
+			await resultPromise;
+
+			const [, , spawnOptions] = (spawnImpl.mock.calls as unknown[][])[0] as [
+				string,
+				string[],
+				{ env: NodeJS.ProcessEnv },
+			];
+			expect(spawnOptions.env).not.toHaveProperty("MAGIC_CONTEXT_HISTORIAN_TEMPERATURE");
+		} finally {
+			if (previousTemperature === undefined) delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+			else process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = previousTemperature;
+		}
+	});
+
 	it("with no piBinary override, spawns the host runtime + cli.js (Windows-safe, #177)", async () => {
 		// Default resolution must NOT spawn a bare "pi" (which ENOENTs on Windows
 		// because npm installs a pi.cmd shim, not a literal pi). It re-invokes the
