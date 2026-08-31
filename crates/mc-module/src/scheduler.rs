@@ -225,13 +225,38 @@ impl PassDecision {
         matches!(self, PassDecision::Force85 | PassDecision::Emergency95)
     }
 
-    /// Stable diagnostic label persisted with accepted pass telemetry.
+    /// Stable pass-band label persisted with accepted pass telemetry.
     pub const fn as_str(self) -> &'static str {
         match self {
             PassDecision::Defer => "Defer",
             PassDecision::Execute => "Execute",
             PassDecision::Force85 => "Force85",
             PassDecision::Emergency95 => "Emergency95",
+        }
+    }
+
+    /// Canonical execute/defer class shared with TypeScript transform telemetry.
+    pub const fn canonical_decision(self) -> &'static str {
+        match self {
+            PassDecision::Defer => "defer",
+            PassDecision::Execute | PassDecision::Force85 | PassDecision::Emergency95 => "execute",
+        }
+    }
+}
+
+/// Why a final defer decision did not execute scheduled work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerDeferReason {
+    SchedulerDefer,
+    MidTurnBoundary,
+}
+
+impl SchedulerDeferReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SchedulerDefer => "scheduler_defer",
+            Self::MidTurnBoundary => "mid_turn_boundary",
         }
     }
 }
@@ -365,6 +390,8 @@ pub struct SchedulerOutcome {
     pub drain_latch: LatchState,
     /// Updated deferred execute intent for the caller to persist.
     pub deferred_execute: Option<DeferredExecute>,
+    /// Canonical reason for a final defer, matching TypeScript boundary diagnostics.
+    pub defer_reason: Option<SchedulerDeferReason>,
     /// Detected provider context limit in tokens, when overflow text reports one.
     pub detected_limit: Option<u64>,
     /// Accounting convention attached to `detected_limit`.
@@ -762,12 +789,18 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         pass = PassDecision::Emergency95;
     }
 
+    let pass_before_boundary = pass;
     let (pass, deferred_execute) = apply_boundary_deferral(
         pass,
         inputs.tail_state,
         inputs.deferred_execute.clone(),
         inputs.boundary_bypass,
     );
+    let defer_reason = match (pass_before_boundary, pass) {
+        (PassDecision::Defer, PassDecision::Defer) => Some(SchedulerDeferReason::SchedulerDefer),
+        (_, PassDecision::Defer) => Some(SchedulerDeferReason::MidTurnBoundary),
+        _ => None,
+    };
     let pressure_execute = pressure_execute_requested && pass != PassDecision::Defer;
     let drain_latch = advance_drain_latch(
         inputs.drain_latch,
@@ -793,6 +826,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         idle_ttl_fired,
         drain_latch,
         deferred_execute,
+        defer_reason,
         detected_limit,
         detected_limit_provenance,
     }
@@ -1308,6 +1342,28 @@ mod tests {
 
         let failed = drain_deferred_after_work(Some(DeferredExecute::pending_execute()), false);
         assert!(failed.is_some(), "failed work keeps the retry intent");
+    }
+
+    #[test]
+    fn canonical_defer_classes_preserve_the_typescript_reason_vocabulary() {
+        let mut genuine_defer = base_inputs();
+        genuine_defer.tail_state.mid_tool_use = true;
+        let genuine = decide(&genuine_defer);
+        assert_eq!(genuine.pass.canonical_decision(), "defer");
+        assert_eq!(
+            genuine.defer_reason,
+            Some(SchedulerDeferReason::SchedulerDefer)
+        );
+
+        let mut boundary_downgrade = base_inputs();
+        boundary_downgrade.usage.percentage = 70.0;
+        boundary_downgrade.tail_state.mid_tool_use = true;
+        let downgraded = decide(&boundary_downgrade);
+        assert_eq!(downgraded.pass.canonical_decision(), "defer");
+        assert_eq!(
+            downgraded.defer_reason,
+            Some(SchedulerDeferReason::MidTurnBoundary)
+        );
     }
 
     #[test]

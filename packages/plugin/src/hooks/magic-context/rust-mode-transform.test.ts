@@ -587,11 +587,14 @@ describe("Rust mode authority adapter", () => {
             {
                 decision: "HARD",
                 materialize_reason: "first_render",
+                scheduler_decision: "execute",
                 served_from: "transform",
                 timings: { handler_total: 5, total: 4, native_cache_encoded_messages: 1 },
             },
             {
                 decision: "SOFT+",
+                scheduler_decision: "defer",
+                scheduler_defer_reason: "scheduler_defer",
                 served_from: "lkg",
                 timings: { handler_total: 3, total: 2, native_cache_reused_messages: 1 },
             },
@@ -621,8 +624,12 @@ describe("Rust mode authority adapter", () => {
             const passLines = logged.filter((message) => message.startsWith("rust pass:"));
             expect(passLines).toHaveLength(2);
             expect(passLines[0]).toContain("decision=HARD");
+            expect(passLines[0]).toContain("scheduler=execute");
             expect(passLines[0]).toContain("served_from=transform");
             expect(passLines[1]).toContain("decision=SOFT+");
+            expect(passLines[1]).toContain(
+                "scheduler=defer defer_reason=scheduler_defer",
+            );
             expect(passLines[1]).toContain("served_from=lkg");
             expect(passLines[0]).not.toBe(passLines[1]);
             expect(logged.some((message) => message.startsWith("rust module stages:"))).toBe(true);

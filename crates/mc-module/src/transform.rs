@@ -1457,6 +1457,12 @@ pub struct TransformResponse {
     /// need to interpret the legacy action field.
     #[serde(default)]
     pub decision: String,
+    /// Canonical execute/defer class shared with TypeScript transform telemetry.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scheduler_decision: Option<String>,
+    /// Canonical TypeScript refusal reason when the scheduler class is defer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scheduler_defer_reason: Option<String>,
     /// The classifier's raw cause for a HARD/SOFT decision. Unknown future causes are retained.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub materialize_reason: Option<String>,
@@ -1543,6 +1549,8 @@ impl TransformResponse {
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
             decision: "NEED_FULL_SYNC".to_string(),
+            scheduler_decision: None,
+            scheduler_defer_reason: None,
             materialize_reason: None,
             first_divergence: None,
             timings: None,
@@ -1578,6 +1586,8 @@ impl TransformResponse {
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
             decision: "PASSTHROUGH".to_string(),
+            scheduler_decision: None,
+            scheduler_defer_reason: None,
             materialize_reason: None,
             first_divergence: None,
             timings: None,
@@ -1650,6 +1660,7 @@ pub struct TransformWithProjection {
     /// second numbers-only table scan after the response has been built.
     pub tag_numbers: BTreeMap<String, u64>,
     pub scheduler_pass: scheduler::PassDecision,
+    pub scheduler_defer_reason: Option<scheduler::SchedulerDeferReason>,
     pub scheduler_drain_latch_active: bool,
     pub boundary_state: BoundaryState,
     pub trim_mismatch: Option<TrimMismatch>,
@@ -1992,6 +2003,7 @@ fn record_stable_pass_trace(
     }) {
         let observation = pass_scheduler_observation(
             pass.scheduler_pass,
+            pass.scheduler_defer_reason,
             pass.scheduler_drain_latch_active,
             ctx.now_ms,
         );
@@ -2006,12 +2018,15 @@ fn record_stable_pass_trace(
 
 fn pass_scheduler_observation(
     pass: scheduler::PassDecision,
+    defer_reason: Option<scheduler::SchedulerDeferReason>,
     drain_latch_active: bool,
     timestamp_ms: i64,
 ) -> PassSchedulerObservation {
     PassSchedulerObservation {
         timestamp_ms,
         scheduler_decision: pass.as_str().to_string(),
+        canonical_decision: Some(pass.canonical_decision().to_string()),
+        defer_reason: defer_reason.map(|reason| reason.as_str().to_string()),
         drain_latch_active,
     }
 }
@@ -2453,6 +2468,7 @@ fn lineage_protocol_passthrough(
         tag_numbers: BTreeMap::new(),
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
         scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
@@ -2702,6 +2718,7 @@ fn apply_additive_only(
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
     {
         scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.defer_reason = None;
         scheduler_outcome.deferred_execute = None;
     }
     timings.decide = elapsed_ms(decide_scheduler_started_at);
@@ -2984,6 +3001,7 @@ fn apply_additive_only(
                 first_divergence: None,
                 scheduler_observation: Some(&pass_scheduler_observation(
                     scheduler_outcome.pass,
+                    scheduler_outcome.defer_reason,
                     scheduler_outcome.drain_latch.is_active(),
                     ctx.now_ms,
                 )),
@@ -3032,6 +3050,7 @@ fn apply_additive_only(
         tag_numbers: BTreeMap::new(),
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        scheduler_defer_reason: scheduler_outcome.defer_reason,
         scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
@@ -3048,6 +3067,10 @@ fn apply_additive_only(
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: action.clone(),
             decision: action,
+            scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
+            scheduler_defer_reason: scheduler_outcome
+                .defer_reason
+                .map(|reason| reason.as_str().to_string()),
             materialize_reason,
             first_divergence: None,
             timings: Some(timings),
@@ -3497,6 +3520,7 @@ fn apply_once(
                         first_divergence: first_divergence_json.as_deref(),
                         scheduler_observation: Some(&pass_scheduler_observation(
                             scheduler::PassDecision::Defer,
+                            Some(scheduler::SchedulerDeferReason::SchedulerDefer),
                             false,
                             ctx.now_ms,
                         )),
@@ -3607,6 +3631,7 @@ fn apply_once(
                 first_divergence: first_divergence_json.as_deref(),
                 scheduler_observation: Some(&pass_scheduler_observation(
                     scheduler::PassDecision::Defer,
+                    Some(scheduler::SchedulerDeferReason::SchedulerDefer),
                     false,
                     ctx.now_ms,
                 )),
@@ -3912,6 +3937,7 @@ fn apply_once(
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
     {
         scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.defer_reason = None;
         scheduler_outcome.deferred_execute = None;
     }
     // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
@@ -5530,6 +5556,7 @@ fn apply_once(
                 first_divergence: first_divergence_json.as_deref(),
                 scheduler_observation: Some(&pass_scheduler_observation(
                     scheduler_outcome.pass,
+                    scheduler_outcome.defer_reason,
                     scheduler_outcome.drain_latch.is_active(),
                     ctx.now_ms,
                 )),
@@ -5611,6 +5638,7 @@ fn apply_once(
         tag_numbers,
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        scheduler_defer_reason: scheduler_outcome.defer_reason,
         scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state,
         trim_mismatch,
@@ -5627,6 +5655,10 @@ fn apply_once(
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action.clone(),
             decision: result_action,
+            scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
+            scheduler_defer_reason: scheduler_outcome
+                .defer_reason
+                .map(|reason| reason.as_str().to_string()),
             materialize_reason,
             first_divergence,
             timings: Some(timings),
@@ -7426,6 +7458,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         tag_numbers,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
         scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch,
@@ -15256,10 +15289,16 @@ pub(crate) mod tests {
             vec![101, 102, 103]
         );
         assert_eq!(history[0].scheduler_decision, "Defer");
+        assert_eq!(history[0].canonical_decision.as_deref(), Some("defer"));
+        assert_eq!(history[0].defer_reason.as_deref(), Some("scheduler_defer"));
         assert!(!history[0].drain_latch_active);
         assert_eq!(history[1].scheduler_decision, "Defer");
+        assert_eq!(history[1].canonical_decision.as_deref(), Some("defer"));
+        assert_eq!(history[1].defer_reason.as_deref(), Some("scheduler_defer"));
         assert!(!history[1].drain_latch_active);
         assert_eq!(history[2].scheduler_decision, "Force85");
+        assert_eq!(history[2].canonical_decision.as_deref(), Some("execute"));
+        assert_eq!(history[2].defer_reason, None);
         assert!(history[2].drain_latch_active);
         assert_ne!(
             history[0].scheduler_decision, history[2].scheduler_decision,
@@ -15275,6 +15314,35 @@ pub(crate) mod tests {
         assert!(
             correlated.is_empty(),
             "a scheduler arm without a reduction or divergence is not interesting"
+        );
+    }
+
+    #[test]
+    fn scheduler_trace_keeps_mid_turn_downgrades_in_the_defer_pass_class() {
+        let genuine_defer = pass_scheduler_observation(
+            scheduler::PassDecision::Defer,
+            Some(scheduler::SchedulerDeferReason::SchedulerDefer),
+            false,
+            201,
+        );
+        let boundary_defer = pass_scheduler_observation(
+            scheduler::PassDecision::Defer,
+            Some(scheduler::SchedulerDeferReason::MidTurnBoundary),
+            false,
+            202,
+        );
+
+        for observation in [&genuine_defer, &boundary_defer] {
+            assert_eq!(observation.scheduler_decision, "Defer");
+            assert_eq!(observation.canonical_decision.as_deref(), Some("defer"));
+        }
+        assert_eq!(
+            genuine_defer.defer_reason.as_deref(),
+            Some("scheduler_defer")
+        );
+        assert_eq!(
+            boundary_defer.defer_reason.as_deref(),
+            Some("mid_turn_boundary")
         );
     }
 

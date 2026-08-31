@@ -416,8 +416,8 @@ const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
 const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
 /// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
 /// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
-const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
-const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
+const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 157;
+const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_964;
 /// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
 pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
@@ -2823,7 +2823,14 @@ impl Default for HistorianDurableState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSchedulerObservation {
     pub timestamp_ms: i64,
+    /// Detailed Rust pass band retained for existing incident tooling.
     pub scheduler_decision: String,
+    /// Execute/defer class shared with TypeScript `transform_decisions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_decision: Option<String>,
+    /// Canonical TypeScript refusal reason when the final class is defer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_reason: Option<String>,
     pub drain_latch_active: bool,
 }
 
@@ -2832,6 +2839,10 @@ pub struct PassSchedulerObservation {
 pub struct InterestingPassSchedulerObservation {
     pub timestamp_ms: i64,
     pub scheduler_decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_reason: Option<String>,
     pub drain_latch_active: bool,
     /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
     /// module clock because the two clocks are not interchangeable correlation keys.
@@ -2869,6 +2880,8 @@ impl InterestingPassSchedulerObservation {
         Self {
             timestamp_ms: observation.timestamp_ms,
             scheduler_decision: observation.scheduler_decision.clone(),
+            canonical_decision: observation.canonical_decision.clone(),
+            defer_reason: observation.defer_reason.clone(),
             drain_latch_active: observation.drain_latch_active,
             request_observed_at_ms,
             full_array_fingerprint: full_array_fingerprint
@@ -2893,6 +2906,29 @@ fn serialize_scheduler_observation(
             "unknown scheduler decision {:?}",
             observation.scheduler_decision
         )));
+    }
+    if let Some(canonical_decision) = observation.canonical_decision.as_deref() {
+        let expected = if observation.scheduler_decision == "Defer" {
+            "defer"
+        } else {
+            "execute"
+        };
+        if canonical_decision != expected {
+            return Err(McStoreError::Serde(format!(
+                "scheduler pass {} requires canonical decision {expected}, got {canonical_decision}",
+                observation.scheduler_decision
+            )));
+        }
+    }
+    if let Some(defer_reason) = observation.defer_reason.as_deref() {
+        if observation.scheduler_decision != "Defer"
+            || !matches!(defer_reason, "scheduler_defer" | "mid_turn_boundary")
+        {
+            return Err(McStoreError::Serde(format!(
+                "invalid scheduler defer reason {defer_reason} for pass {}",
+                observation.scheduler_decision
+            )));
+        }
     }
     serde_json::to_string(observation).map_err(|error| McStoreError::Serde(error.to_string()))
 }
@@ -19238,11 +19274,15 @@ mod tests {
         let defer = PassSchedulerObservation {
             timestamp_ms: 32,
             scheduler_decision: "Defer".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
         let force = PassSchedulerObservation {
             timestamp_ms: 33,
             scheduler_decision: "Force85".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
         store
@@ -19270,6 +19310,8 @@ mod tests {
                     &PassSchedulerObservation {
                         timestamp_ms,
                         scheduler_decision: "Execute".to_string(),
+                        canonical_decision: None,
+                        defer_reason: None,
                         drain_latch_active: false,
                     },
                     None,
@@ -19303,6 +19345,8 @@ mod tests {
         let interesting = PassSchedulerObservation {
             timestamp_ms: 1,
             scheduler_decision: "Force85".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
 
@@ -19322,6 +19366,8 @@ mod tests {
                     &PassSchedulerObservation {
                         timestamp_ms,
                         scheduler_decision: "Execute".to_string(),
+                        canonical_decision: None,
+                        defer_reason: None,
                         drain_latch_active: true,
                     },
                     Some(10_000 + timestamp_ms as u64),
@@ -19388,6 +19434,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: scheduler_decision.to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active,
                 },
                 (
@@ -19435,11 +19483,15 @@ mod tests {
         let reduction = PassSchedulerObservation {
             timestamp_ms: 700,
             scheduler_decision: "Execute".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
         let divergence = PassSchedulerObservation {
             timestamp_ms: 701,
             scheduler_decision: "Emergency95".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
 
@@ -19515,7 +19567,9 @@ mod tests {
     fn scheduler_interesting_history_is_oldest_first_bounded_and_byte_bounded() {
         let worst_observation = PassSchedulerObservation {
             timestamp_ms: i64::MIN,
-            scheduler_decision: "Emergency95".to_string(),
+            scheduler_decision: "Defer".to_string(),
+            canonical_decision: Some("defer".to_string()),
+            defer_reason: Some("mid_turn_boundary".to_string()),
             drain_latch_active: false,
         };
         assert_eq!(
@@ -19551,6 +19605,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: "Emergency95".to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active: true,
                 },
                 (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19598,6 +19654,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: decision.to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active: decision == "Execute",
                 },
                 (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19648,6 +19706,8 @@ mod tests {
             &PassSchedulerObservation {
                 timestamp_ms: 400,
                 scheduler_decision: "Force85".to_string(),
+                canonical_decision: None,
+                defer_reason: None,
                 drain_latch_active: false,
             },
             (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19673,6 +19733,8 @@ mod tests {
         let observation = PassSchedulerObservation {
             timestamp_ms: 500,
             scheduler_decision: "Defer".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
 

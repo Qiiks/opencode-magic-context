@@ -10,21 +10,27 @@ import {
 
 describe("model-resolution", () => {
     test("keeps historian temperature opt-in while preserving explicit overrides", () => {
-        expect(resolveHistorianAgentOverrides(undefined)).toEqual({
-            maxTokens: 32_000,
-        });
-        expect(
-            resolveHistorianAgentOverrides({
-                temperature: 0.2,
+        const fixtures = [
+            { temperature: undefined, expected: undefined },
+            { temperature: 0.1, expected: 0.1 },
+            { temperature: 0, expected: 0 },
+        ] as const;
+        for (const fixture of fixtures) {
+            const resolved = resolveHistorianAgentOverrides({
+                ...(fixture.temperature !== undefined
+                    ? { temperature: fixture.temperature }
+                    : {}),
                 maxTokens: 16_000,
                 opencode: { model: "google/flash", variant: "low" },
-            }),
-        ).toEqual({
-            temperature: 0.2,
-            maxTokens: 16_000,
-            model: "google/flash",
-            variant: "low",
-        });
+                pi: { model: "pi/must-not-leak", thinking_level: "high" },
+            });
+            expect(resolved).toEqual({
+                maxTokens: 16_000,
+                ...(fixture.expected !== undefined ? { temperature: fixture.expected } : {}),
+                model: "google/flash",
+                variant: "low",
+            });
+        }
     });
 
     test("normalizes string and object entries to the same model identity", () => {

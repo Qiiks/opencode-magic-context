@@ -107,8 +107,10 @@ describe("hidden-agent registration drift guard", () => {
             expect("temperature" in (registration.overrides ?? {})).toBe(false);
         }
 
-        for (const registration of registrationsFor({ temperature: 0.1 })) {
-            expect(registration.overrides).toEqual({ maxTokens: 32_000, temperature: 0.1 });
+        for (const temperature of [0.1, 0]) {
+            for (const registration of registrationsFor({ temperature })) {
+                expect(registration.overrides).toEqual({ maxTokens: 32_000, temperature });
+            }
         }
     });
 
