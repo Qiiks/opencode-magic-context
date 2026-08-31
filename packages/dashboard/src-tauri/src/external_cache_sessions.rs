@@ -746,7 +746,17 @@ mod tests {
 
         let detail = read_claude_code_session_detail(&path).unwrap();
         assert_eq!(detail.meta.session_id, "cc-session");
+        // Keep request dedup keyed by message.id: the fixture has two content-block rows
+        // for msg-shared plus one bystander, so removing dedup raises the count to three.
         assert_eq!(detail.events.len(), 2);
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .map(|event| event.message_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["msg-shared", "msg-bystander"])
+        );
 
         let shared = &detail.events[0];
         assert_eq!(shared.message_id, "msg-shared");

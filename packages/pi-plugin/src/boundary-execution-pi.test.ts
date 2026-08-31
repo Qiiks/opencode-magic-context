@@ -51,6 +51,58 @@ function flag(): DeferredExecutePayload {
 	};
 }
 
+describe("Pi mid-turn shape matrix", () => {
+	it("pairs only matching tool results and releases only for genuine branch users", () => {
+		const assistant = {
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "toolCall", id: "call-live" }],
+		};
+		const unrelatedResult = { role: "toolResult", toolCallId: "call-other" };
+		expect(isMidTurnPi({ messages: [assistant, unrelatedResult] }, "s1")).toBe(
+			true,
+		);
+		expect(
+			isMidTurnPi(
+				{
+					messages: [
+						assistant,
+						unrelatedResult,
+						{ role: "toolResult", toolCallId: "call-live" },
+					],
+				},
+				"s1",
+			),
+		).toBe(false);
+
+		const syntheticNextTurn = {
+			role: "user",
+			content: "hidden Channel-2 delivery",
+		};
+		expect(
+			isMidTurnPi(
+				{
+					messages: [
+						{ ...assistant, stopReason: "toolUse" },
+						syntheticNextTurn,
+					],
+				},
+				"s1",
+				[{ type: "custom", message: syntheticNextTurn }],
+			),
+		).toBe(true);
+
+		const genuineUser = { role: "user", content: "queued operator prompt" };
+		expect(
+			isMidTurnPi(
+				{ messages: [{ ...assistant, stopReason: "toolUse" }, genuineUser] },
+				"s1",
+				[{ type: "message", id: "user-1", message: genuineUser }],
+			),
+		).toBe(false);
+	});
+});
+
 describe("boundary execution Pi integration", () => {
 	it("12. Pi mid-turn execute defers and sets a flag", () => {
 		const db = createDb();

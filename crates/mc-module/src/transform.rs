@@ -15933,6 +15933,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tail_state_requires_a_result_paired_to_the_newest_assistant_call() {
+        let mut messages = vec![
+            assistant_tool_call("older_call", 1, "call-old"),
+            tool_result("older_result", 2, "call-old", "done"),
+            assistant_tool_call("newest_call", 3, "call-new"),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        assert!(
+            tail_state_from_live(&live).mid_tool_use,
+            "an unrelated result must not end the newest unpaired tool arc"
+        );
+
+        messages.push(tool_result("newest_result", 4, "call-new", "done"));
+        let projection = project_messages(&messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        assert!(!tail_state_from_live(&live).mid_tool_use);
+    }
+
+    #[test]
     fn arc_identity_is_session_injective_for_reused_tool_ids() {
         let messages = vec![
             assistant_tool_call("turn1_call", 1, "call_0"),
