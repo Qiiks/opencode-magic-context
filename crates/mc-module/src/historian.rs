@@ -758,6 +758,16 @@ pub trait HistorianProducerDriver: Send {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
+    async fn start_with_temperature(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.start(session_id, system, prompt, model).await
+    }
     async fn start_with_generation(
         &mut self,
         session_id: &str,
@@ -821,6 +831,17 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::start(self, session_id, system, prompt, model).await
     }
 
+    async fn start_with_temperature(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        HistorianProducer::start_with_temperature(self, session_id, system, prompt, model, temperature).await
+    }
+
     async fn start_with_generation(
         &mut self,
         session_id: &str,
@@ -837,7 +858,7 @@ impl HistorianProducerDriver for HistorianProducer {
             prompt,
             model,
             max_output_tokens,
-            temperature,
+            Some(temperature),
         )
         .await
     }
@@ -907,6 +928,7 @@ pub struct HistorianFireRequest<'a> {
     pub content_language: Option<&'a str>,
     pub prompt: &'a str,
     pub model_chain: &'a [String],
+    pub temperature: Option<f64>,
     pub from_ordinal: u64,
     pub to_ordinal: u64,
     pub chunk_fingerprint: &'a str,
@@ -1248,11 +1270,12 @@ where
             fired.firing_seq,
         );
         let handle = match producer
-            .start(
+            .start_with_temperature(
                 &producer_session_id,
                 request.system.as_ref(),
                 &prompt,
                 model,
+                request.temperature,
             )
             .await
         {
@@ -2226,6 +2249,7 @@ mod tests {
             content_language: None,
             prompt,
             model_chain: models,
+            temperature: None,
             from_ordinal: 2,
             to_ordinal: 4,
             chunk_fingerprint: "fp",

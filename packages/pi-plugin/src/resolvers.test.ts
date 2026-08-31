@@ -20,6 +20,18 @@ describe("Pi config resolvers", () => {
 		).toBe("60m");
 	});
 
+	it("keeps historian temperature absent unless configuration explicitly sets it", () => {
+		const omitted = MagicContextConfigSchema.parse({
+			historian: { pi: { model: "test/historian" } },
+		});
+		const explicit = MagicContextConfigSchema.parse({
+			historian: { temperature: 0.1, pi: { model: "test/historian" } },
+		});
+
+		expect(resolveHistorianFromConfig(omitted)?.temperature).toBeUndefined();
+		expect(resolveHistorianFromConfig(explicit)?.temperature).toBe(0.1);
+	});
+
 	it("returns undefined for historian, dreamer, and sidekick when disabled", () => {
 		const config = MagicContextConfigSchema.parse({
 			historian: { disable: true, model: "test/historian" },

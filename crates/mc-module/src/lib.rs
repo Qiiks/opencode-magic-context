@@ -3386,6 +3386,7 @@ struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
     language: Option<String>,
+    historian_temperature: Option<f64>,
     project_path: String,
     project_root: PathBuf,
     project_slug: String,
@@ -3656,6 +3657,7 @@ impl McHandler {
             McModuleConfig {
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 model_chain: vec!["test/model".to_string()],
+                historian_temperature: None,
                 language: None,
                 execute_threshold_percentage: 65.0,
                 compaction_enabled: true,
@@ -5007,6 +5009,7 @@ impl McHandler {
                 store,
                 session_id: parsed.session_id.clone(),
                 language: cfg.language.clone(),
+                historian_temperature: cfg.historian_temperature,
                 project_path: project_path.to_string(),
                 project_root: binding.project_root.clone(),
                 project_slug,
@@ -5125,6 +5128,7 @@ impl McHandler {
             store,
             session_id: parsed.session_id.clone(),
             language,
+            historian_temperature: binding.config.historian_temperature,
             project_path,
             project_root: binding.project_root.clone(),
             project_slug,
@@ -5176,6 +5180,7 @@ impl McHandler {
             store,
             session_id,
             language,
+            historian_temperature,
             project_path,
             project_root,
             project_slug,
@@ -5196,6 +5201,7 @@ impl McHandler {
                     &project_slug,
                     language.as_deref(),
                 );
+                request.temperature = historian_temperature;
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing(&mut *producer, request).await
             }
@@ -16836,6 +16842,7 @@ mod tests {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
+            historian_temperature: None,
             language: None,
             execute_threshold_percentage: 65.0,
             compaction_enabled: true,

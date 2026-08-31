@@ -534,6 +534,7 @@ impl AssembledHistorianFiring {
             content_language,
             prompt: &self.prompt,
             model_chain: &self.model_chain,
+            temperature: None,
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
             chunk_fingerprint: &self.chunk_fingerprint,
