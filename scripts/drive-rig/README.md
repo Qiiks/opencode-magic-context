@@ -45,6 +45,26 @@ No host bridge process or Unix socket is created. The host daemon remains the ow
 
 `verify.sh` checks the container and tmux session, proves that Docker has exactly two mounts with the snapshot writable and the connection file read only, compares the host and container OpenCode versions, probes the forwarded subc port, launches `opencode -s ses_OqknfoW2O3LTOcjLvOMQoREVPtz1` inside tmux, waits for the TUI to boot, sends `reply with exactly OK`, and waits for the internal `rust pass:` log line. It prints the mount JSON and the observed rust log line.
 
+## Mid-turn prefix A/B instrument
+
+After `run.sh` starts the isolated container, run the deterministic byte-level arm against the existing Anthropic-shaped mock:
+
+```sh
+scripts/drive-rig/run-mid-turn-ab.sh
+```
+
+The hold arm keeps a large served message while a tool-shaped turn grows. The apply arm replaces that message at a configured step. Both arms emit per-step cache-read/cache-creation tokens plus exact recached bytes. The mock assertion proves that the mutation rewrites the suffix once and that the next append reuses the revised prefix.
+
+A live Anthropic billing arm is explicit and never reads the copied OpenCode auth file:
+
+```sh
+ANTHROPIC_API_KEY=... scripts/drive-rig/run-mid-turn-ab.sh --live
+```
+
+`ANTHROPIC_AUTH_TOKEN` is also accepted. Tune the fixture with `MC_MIDTURN_AB_STEPS`, `MC_MIDTURN_AB_APPLY_AT`, `MC_MIDTURN_AB_DROP_CHARS`, `MC_MIDTURN_AB_TTL=5m|1h`, and `MC_MIDTURN_AB_MODEL`. Run the same instrument without Docker from `packages/e2e-tests` via `bun run measure:mid-turn-ab`.
+
+This is measurement-only: it controls the two fixture wires directly and does not add a boundary-lock bypass or any product runtime flag.
+
 ## Cleanup
 
 The next `run.sh` invocation removes the existing container. To remove it manually:
