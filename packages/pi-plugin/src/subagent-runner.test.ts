@@ -13,11 +13,13 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
 	closeDatabase,
@@ -151,11 +153,17 @@ function runnerWith(
 	childOrChildren: MockChild | MockChild[],
 	{
 		piBinary = "pi-test",
+		invocation,
 		platform,
 		extraArgs,
 		subagentExtensions,
 	}: {
 		piBinary?: string;
+		invocation?: {
+			command: string;
+			prefixArgs: string[];
+			fallbackDiagnostic?: string;
+		};
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
 		subagentExtensions?: readonly string[];
@@ -172,6 +180,7 @@ function runnerWith(
 	});
 	const runner = new PiSubagentRunner({
 		piBinary,
+		invocation,
 		platform,
 		extraArgs,
 		subagentExtensions,
@@ -202,6 +211,33 @@ function agentEnd(messages: unknown[]) {
 
 function nextTick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function writePiCliFixture(bin: string, useBinShim = false) {
+	const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-layout-"));
+	const packageRoot = join(
+		root,
+		"node_modules",
+		"@earendil-works",
+		"pi-coding-agent",
+	);
+	const cliPath = join(packageRoot, bin);
+	mkdirSync(packageRoot, { recursive: true });
+	mkdirSync(dirname(cliPath), { recursive: true });
+	writeFileSync(
+		join(packageRoot, "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			bin: { pi: bin },
+		}),
+	);
+	writeFileSync(cliPath, "#!/usr/bin/env node\n");
+	if (!useBinShim) return { root, packageRoot, cliPath, entry: cliPath };
+
+	const shim = join(root, "bin", "pi");
+	mkdirSync(dirname(shim), { recursive: true });
+	symlinkSync(cliPath, shim);
+	return { root, packageRoot, cliPath, entry: shim };
 }
 
 const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
@@ -237,14 +273,119 @@ describe("subagent-runner pure helpers", () => {
 		).toEqual({ text: null, stopReason: null, errorMessage: null });
 	});
 
-	it("distinguishes Pi from embedded Node hosts", () => {
-		expect(__test.isGenericRuntimeExecutable("/usr/bin/node24")).toBe(true);
-		expect(__test.isPiCliScript("/app/node_modules/.bin/next")).toBe(false);
-		expect(
-			__test.isPiCliScript(
-				"/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-			),
-		).toBe(true);
+	it.each([
+		["legacy dist layout", "dist/cli.js"],
+		["bundled dist layout", "dist/bundle/cli.js"],
+	])("resolves the %s through package.json bin", (_label, bin) => {
+		const fixture = writePiCliFixture(bin);
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node.exe",
+				argv1: fixture.entry,
+				platform: "win32",
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node.exe",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+			});
+			expect(__test.isPiCliScript(fixture.entry)).toBe(true);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a bundled CLI from the running module paths' package.json", () => {
+		const fixture = writePiCliFixture("dist/bundle/cli.js");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: "/embedded-host/start.js",
+				resolvePackageJson: () => join(fixture.packageRoot, "package.json"),
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a bin-shim symlink to the package-declared Pi CLI", () => {
+		const fixture = writePiCliFixture("dist/bundle/cli.js", true);
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back with a self-diagnosing miss when no Pi package resolves", () => {
+		const invocation = __test.resolvePiInvocation({
+			execPath: "/runtime/node",
+			argv1: "/not-a-pi-host/cli.js",
+			resolvePackageJson: () => null,
+		});
+		expect(invocation.command).toBe("pi");
+		expect(invocation.fallbackDiagnostic).toContain(
+			"script-detection miss on /not-a-pi-host/cli.js",
+		);
+	});
+
+	it("rejects a package bin that escapes its package root", () => {
+		const fixture = writePiCliFixture("../outside-cli.js");
+		try {
+			writeFileSync(
+				join(fixture.root, "node_modules", "@earendil-works", "outside-cli.js"),
+				"",
+			);
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation.command).toBe("pi");
+			expect(invocation.fallbackDiagnostic).toContain("outside-cli.js");
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		[".EXE", "/Pi/pi.exe", "/Pi/pi.exe", []],
+		[".CMD", "/Pi/pi.cmd", "cmd.exe", ["/d", "/s", "/c", "/Pi/pi.cmd"]],
+		[
+			".PS1",
+			"/Pi/pi.ps1",
+			"powershell.exe",
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-File", "/Pi/pi.ps1"],
+		],
+	])("uses the PATHEXT-resolved %s Pi command without shell:true", (extension, expectedPath, command, prefixArgs) => {
+		const invocation = __test.resolvePiInvocation({
+			execPath: "/runtime/node.exe",
+			argv1: "/not-a-pi-host/cli.js",
+			platform: "win32",
+			env: { PATH: "/Pi", PATHEXT: extension },
+			resolvePackageJson: () => null,
+			fs: {
+				existsSync: (path) => path === expectedPath,
+				statSync: () => ({ isFile: () => true }),
+			},
+		});
+		expect(invocation.command).toBe(command);
+		expect(invocation.prefixArgs).toEqual(prefixArgs);
+		expect(invocation.fallbackDiagnostic).toContain(
+			`Windows PATHEXT resolved ${expectedPath}`,
+		);
 	});
 	it("builds argv with system prompt, primary model, and prompt last", () => {
 		expect(
@@ -964,6 +1105,29 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl).not.toHaveBeenCalled();
 	});
 
+	it("surfaces the checked paths when the bare Pi fallback ENOENTs", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: {
+				command: "pi",
+				prefixArgs: [],
+				fallbackDiagnostic:
+					"script-detection miss on /host/cli.js, /host/node_modules/@earendil-works/pi-coding-agent/package.json",
+			},
+		});
+
+		const resultPromise = runner.run(baseOptions);
+		child.emitError(new Error("spawn pi ENOENT"));
+
+		expect(await resultPromise).toEqual({
+			ok: false,
+			reason: "spawn_failed",
+			error:
+				"spawn pi ENOENT after script-detection miss on /host/cli.js, /host/node_modules/@earendil-works/pi-coding-agent/package.json",
+			durationMs: expect.any(Number),
+		});
+	});
+
 	it("treats a terminal stop turn as success even when drain SIGTERM closes the child", async () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
@@ -1102,6 +1266,13 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		);
 		const cliPath = join(distDir, "cli.js");
 		mkdirSync(distDir, { recursive: true });
+		writeFileSync(
+			join(dirname(distDir), "package.json"),
+			JSON.stringify({
+				name: "@earendil-works/pi-coding-agent",
+				bin: { pi: "dist/cli.js" },
+			}),
+		);
 		writeFileSync(cliPath, "");
 		const previousScript = process.argv[1];
 		process.argv[1] = cliPath;
@@ -1128,7 +1299,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				spawnImpl.mock.calls as unknown[][]
 			)[0] as [string, string[], { shell?: boolean }];
 			expect(command).toBe(process.execPath);
-			expect(spawnArgs[0]).toBe(cliPath);
+			expect(spawnArgs[0]).toBe(realpathSync(cliPath));
 			// Crucially, never a bare "pi".
 			expect(command).not.toBe("pi");
 			expect(opts.shell).toBeFalsy();
@@ -1278,7 +1449,10 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const spawnImpl = mock(() => {
 			throw new Error("ENOENT pi");
 		});
-		const runner = new PiSubagentRunner({ spawnImpl: spawnImpl as never });
+		const runner = new PiSubagentRunner({
+			piBinary: "pi-test",
+			spawnImpl: spawnImpl as never,
+		});
 
 		expect(await runner.run(baseOptions)).toEqual({
 			ok: false,
