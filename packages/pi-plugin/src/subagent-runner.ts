@@ -3,7 +3,9 @@ import {
 	existsSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -14,6 +16,7 @@ import {
 	isAbsolute,
 	join,
 	resolve as resolvePath,
+	sep,
 } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -36,41 +39,36 @@ import type {
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
 
-/**
- * Resolve the Pi CLI entry that should be spawned for historian/dreamer/
- * sidekick subagents.
- *
- * Why this isn't just "pi": when the Pi plugin runs inside an interactive
- * `pi` session, that user has the `pi` binary on PATH and `spawn("pi", ...)`
- * works. But in other deployment shapes the plugin runs without that:
- *   - CI runners and e2e harnesses: Pi is installed only into node_modules
- *     via `bun install` / `npm install`. No `pi` symlink on PATH.
- *   - npm-only user installs: same shape — `@earendil-works/pi-coding-agent`
- *     is in node_modules but its bin entry isn't globally linked.
- *   - Any environment where the user uses `npx` rather than the
- *     globally-installed Pi CLI.
- *
- * Strategy: try to resolve `@earendil-works/pi-coding-agent`'s package.json
- * via Node's `require.resolve` rooted at this module, then spawn the
- * package's `dist/cli.js` directly. Pi's CLI ships with `#!/usr/bin/env node`
- * and npm sets the exec bit during install, so the OS spawns it under Node
- * with no extra runtime needed. Fall back to plain `pi` on PATH so the
- * happy path for interactive Pi users is unchanged.
- *
- * Returns null when resolution fails — caller falls back to "pi" on PATH.
- */
-function resolveBundledPiCli(): string | null {
-	try {
-		const require_ = createRequire(import.meta.url);
-		const pkgJson = require_.resolve(
-			"@earendil-works/pi-coding-agent/package.json",
-		);
-		const cliPath = join(dirname(pkgJson), "dist/cli.js");
-		if (existsSync(cliPath)) return cliPath;
-		return null;
-	} catch {
-		return null;
-	}
+const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
+const PI_CODING_AGENT_PACKAGE_NAMES = new Set([
+	PI_CODING_AGENT_MODULE,
+	"@oh-my-pi/pi-coding-agent",
+]);
+const BUN_VIRTUAL_SCRIPT_PREFIX = "/$bunfs/root/";
+const WINDOWS_PI_EXTENSIONS = [".EXE", ".COM", ".CMD", ".BAT", ".PS1"];
+
+interface PiResolutionFs {
+	existsSync: (path: string) => boolean;
+	statSync: (path: string) => { isFile: () => boolean };
+	realpathSync: (path: string) => string;
+	readFileSync: (path: string, encoding: "utf8") => string;
+}
+
+const DEFAULT_PI_RESOLUTION_FS: PiResolutionFs = {
+	existsSync,
+	statSync,
+	realpathSync,
+	readFileSync,
+};
+
+interface FoundPiPackage {
+	dir: string;
+	manifest: Record<string, unknown>;
+}
+
+interface PiCliResolution {
+	cliPath: string | null;
+	checkedPaths: string[];
 }
 
 /** How to spawn a Pi child: the binary plus any fixed leading args. Always
@@ -78,48 +76,246 @@ function resolveBundledPiCli(): string | null {
 interface PiInvocation {
 	command: string;
 	prefixArgs: string[];
+	/** Present only after the resolver fell through to a PATH-based invocation. */
+	fallbackDiagnostic?: string;
+}
+
+interface ResolvePiInvocationOptions {
+	execPath?: string;
+	argv1?: string;
+	platform?: NodeJS.Platform;
+	env?: NodeJS.ProcessEnv;
+	fs?: Partial<PiResolutionFs>;
+	/** Override used by tests to control package.json resolution from the running entry's Node module paths. */
+	resolvePackageJson?: (from: string | undefined) => string | null;
+}
+
+function readPiManifest(
+	packageJsonPath: string,
+	fs: PiResolutionFs,
+): Record<string, unknown> | null {
+	try {
+		const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+		return manifest && typeof manifest === "object"
+			? (manifest as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
+	}
 }
 
 /**
- * Resolve how to spawn a Pi subagent, robust across POSIX and Windows.
- *
- * The key fix (#177): never depend on a bare `pi` on PATH or on a POSIX
- * shebang. On Windows a global npm install puts `pi.cmd` / `pi.ps1` on PATH (not
- * a literal `pi`), and Node's `spawn("pi")` without a shell looks for a file
- * named exactly `pi`, so it ENOENTs; and Windows ignores the `#!/usr/bin/env
- * node` shebang entirely, so spawning `dist/cli.js` "directly" only works on
- * POSIX. When the host itself is Pi, the reliable, cross-platform approach is
- * to re-invoke the EXACT host CLI the user is already running:
- * `process.execPath` (the node/bun binary) plus `process.argv[1]` (the absolute
- * path to the running `cli.js`). That sidesteps shim resolution completely and
- * pins the child to the same Pi version/runtime. Embedded hosts such as pi-web
- * must not reuse their unrelated `argv[1]`.
- *
- * Mirrors Pi's own `getPiInvocation` reference. MUST be evaluated in the host
- * process: a Pi host has its `cli.js` in `argv[1]`; embedded hosts fall through
- * to bundled-Pi or PATH resolution.
- *
- * Resolution order:
- *   1. argv[1] belongs to an on-disk Pi package (and is not a bun-compiled
- *      `/$bunfs/root/` virtual path) -> `execPath cli.js ...`.
- *   2. execPath is a packaged binary (basename not node/bun) -> `execPath ...`
- *      (the compiled binary IS pi; no script arg).
- *   3. A bundled `@earendil-works/pi-coding-agent/dist/cli.js` resolves ->
- *      `execPath cli.js ...` (node + resolved cli.js).
- *   4. Last resort: bare `pi` on PATH.
- *
- * Everything is spawned WITHOUT a shell. The primary path (execPath + argv[1])
- * covers every real Pi CLI runtime; embedded hosts fall through rather than
- * accidentally re-running themselves. We do
- * NOT fall back to a shell for it (which on Windows would resolve the .cmd shim
- * but pass the prompt/task text through cmd.exe, exposing arg-escaping and
- * injection), and we don't pull in cross-spawn just for a dead path.
+ * Find the containing Pi package for a running entry. The dist/package.json
+ * copied by Pi's binary build has the same name as the package root, so retain
+ * the parent-root correction instead of resolving `dist/dist/...`.
  */
-function isPiCliScript(scriptPath: string): boolean {
-	const normalized = scriptPath.replaceAll("\\", "/");
-	return /\/@(?:earendil-works|oh-my-pi)\/pi-coding-agent\/dist\/cli\.js$/.test(
-		normalized,
+function findPiPackageRoot(
+	startDir: string,
+	fs: PiResolutionFs,
+): FoundPiPackage | null {
+	let dir = startDir;
+	while (dir !== dirname(dir)) {
+		const manifest = readPiManifest(join(dir, "package.json"), fs);
+		if (
+			manifest?.name &&
+			typeof manifest.name === "string" &&
+			PI_CODING_AGENT_PACKAGE_NAMES.has(manifest.name)
+		) {
+			if (basename(dir) === "dist") {
+				const parentDir = dirname(dir);
+				const parentManifest = readPiManifest(
+					join(parentDir, "package.json"),
+					fs,
+				);
+				if (
+					typeof parentManifest?.name === "string" &&
+					parentManifest.name === manifest.name
+				) {
+					return { dir: parentDir, manifest: parentManifest };
+				}
+			}
+			return { dir, manifest };
+		}
+		dir = dirname(dir);
+	}
+	return null;
+}
+
+function pathIsInside(root: string, candidate: string): boolean {
+	return candidate !== root && candidate.startsWith(`${root}${sep}`);
+}
+
+/**
+ * Resolve the package's declared `pi` bin rather than assuming a dist layout.
+ * Keep the containment guard: a package manifest may select only a
+ * file below its own root, including after symlinks are canonicalized.
+ */
+function resolvePiBin(
+	found: FoundPiPackage,
+	fs: PiResolutionFs,
+	checkedPaths: string[],
+): string | null {
+	const bin = found.manifest.bin;
+	const binEntry =
+		typeof bin === "string"
+			? bin
+			: bin &&
+					typeof bin === "object" &&
+					typeof (bin as Record<string, unknown>).pi === "string"
+				? (bin as Record<string, string>).pi
+				: undefined;
+	if (!binEntry) return null;
+
+	const packageRoot = resolvePath(found.dir);
+	const candidate = resolvePath(packageRoot, binEntry);
+	checkedPaths.push(candidate);
+	if (isAbsolute(binEntry) || !pathIsInside(packageRoot, candidate)) {
+		return null;
+	}
+	try {
+		if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+			return null;
+		}
+		const realRoot = fs.realpathSync(packageRoot);
+		const realCandidate = fs.realpathSync(candidate);
+		return pathIsInside(realRoot, realCandidate) ? realCandidate : null;
+	} catch {
+		return null;
+	}
+}
+
+function resolvePiCliFromPackageJson(
+	packageJsonPath: string,
+	fs: PiResolutionFs,
+	checkedPaths: string[],
+): string | null {
+	checkedPaths.push(packageJsonPath);
+	const manifest = readPiManifest(packageJsonPath, fs);
+	if (
+		typeof manifest?.name !== "string" ||
+		!PI_CODING_AGENT_PACKAGE_NAMES.has(manifest.name)
+	) {
+		return null;
+	}
+	return resolvePiBin(
+		{ dir: dirname(packageJsonPath), manifest },
+		fs,
+		checkedPaths,
 	);
+}
+
+/**
+ * Positively identify a running Pi entry by its containing package manifest.
+ * This recognizes dist/cli.js, dist/bundle/cli.js, and bin-shim symlinks without
+ * encoding any of those layouts in the predicate.
+ */
+function resolvePiCliFromRunningEntry(
+	entry: string | undefined,
+	fs: PiResolutionFs,
+): PiCliResolution {
+	const checkedPaths = [entry ?? "process.argv[1] (missing)"];
+	if (!entry || entry.startsWith(BUN_VIRTUAL_SCRIPT_PREFIX)) {
+		return { cliPath: null, checkedPaths };
+	}
+	try {
+		if (!fs.existsSync(entry) || !fs.statSync(entry).isFile()) {
+			return { cliPath: null, checkedPaths };
+		}
+		const realEntry = fs.realpathSync(entry);
+		if (realEntry !== entry) checkedPaths.push(realEntry);
+		const found = findPiPackageRoot(dirname(realEntry), fs);
+		if (!found) return { cliPath: null, checkedPaths };
+		return {
+			cliPath: resolvePiBin(found, fs, checkedPaths),
+			checkedPaths,
+		};
+	} catch {
+		return { cliPath: null, checkedPaths };
+	}
+}
+
+function defaultResolvePiPackageJson(from: string | undefined): string | null {
+	const requesters = [from, import.meta.url];
+	for (const requester of requesters) {
+		try {
+			const require_ = requester
+				? createRequire(
+						requester.startsWith("file:") ? requester : resolvePath(requester),
+					)
+				: createRequire(import.meta.url);
+			return require_.resolve(`${PI_CODING_AGENT_MODULE}/package.json`);
+		} catch {
+			// If the package is absent from the running entry's module paths, try this plugin's module paths.
+		}
+	}
+	return null;
+}
+
+function resolveBundledPiCli(
+	from: string | undefined,
+	fs: PiResolutionFs,
+	resolvePackageJson: (from: string | undefined) => string | null,
+	checkedPaths: string[],
+): string | null {
+	const packageJsonPath = resolvePackageJson(from);
+	if (!packageJsonPath) {
+		checkedPaths.push(
+			`${PI_CODING_AGENT_MODULE}/package.json (unresolvable from running module paths)`,
+		);
+		return null;
+	}
+	return resolvePiCliFromPackageJson(packageJsonPath, fs, checkedPaths);
+}
+
+interface WindowsPiCommandResolution {
+	path: string | null;
+	extension: string | null;
+	checkedPaths: string[];
+}
+
+/**
+ * Resolve a Windows command without `shell: true`. PATHEXT is respected first,
+ * then the Pi shims npm commonly writes are appended so a PowerShell-only Pi
+ * install remains discoverable even when PATHEXT omits .PS1.
+ */
+function resolveWindowsPiCommand(
+	env: NodeJS.ProcessEnv,
+	fs: PiResolutionFs,
+): WindowsPiCommandResolution {
+	const pathValue = env.PATH ?? env.Path;
+	if (!pathValue) return { path: null, extension: null, checkedPaths: [] };
+	const pathExt = env.PATHEXT ?? env.PathExt ?? "";
+	const extensions: string[] = [];
+	for (const value of pathExt.split(";")) {
+		const extension = value.trim().toUpperCase();
+		if (
+			WINDOWS_PI_EXTENSIONS.includes(extension) &&
+			!extensions.includes(extension)
+		) {
+			extensions.push(extension);
+		}
+	}
+	for (const extension of WINDOWS_PI_EXTENSIONS) {
+		if (!extensions.includes(extension)) extensions.push(extension);
+	}
+
+	const checkedPaths: string[] = [];
+	for (const rawDir of pathValue.split(";")) {
+		const dir = rawDir.trim().replace(/^"(.*)"$/, "$1");
+		if (!dir) continue;
+		for (const extension of extensions) {
+			const candidate = join(dir, `pi${extension.toLowerCase()}`);
+			checkedPaths.push(candidate);
+			try {
+				if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+					return { path: candidate, extension, checkedPaths };
+				}
+			} catch {
+				// A bad PATH entry must not stop the remaining PATHEXT walk.
+			}
+		}
+	}
+	return { path: null, extension: null, checkedPaths };
 }
 
 function isGenericRuntimeExecutable(execPath: string): boolean {
@@ -128,32 +324,112 @@ function isGenericRuntimeExecutable(execPath: string): boolean {
 	);
 }
 
-function resolvePiInvocation(): PiInvocation {
-	const execPath = process.execPath;
-	const currentScript = process.argv[1];
-	const isBunVirtualScript =
-		currentScript?.startsWith("/$bunfs/root/") ?? false;
+function formatCheckedPaths(checkedPaths: readonly string[]): string {
+	const unique = [...new Set(checkedPaths)];
+	const visible = unique.slice(0, 12);
+	return unique.length > visible.length
+		? `${visible.join(", ")} (+${unique.length - visible.length} more)`
+		: visible.join(", ");
+}
 
-	if (
-		currentScript &&
-		!isBunVirtualScript &&
-		existsSync(currentScript) &&
-		isPiCliScript(currentScript)
-	) {
-		return { command: execPath, prefixArgs: [currentScript] };
+function resolvePiInvocation(
+	options: ResolvePiInvocationOptions = {},
+): PiInvocation {
+	const fs = { ...DEFAULT_PI_RESOLUTION_FS, ...options.fs } as PiResolutionFs;
+	const execPath = options.execPath ?? process.execPath;
+	const currentScript = options.argv1 ?? process.argv[1];
+	const platform = options.platform ?? process.platform;
+	const env = options.env ?? process.env;
+	const resolvePackageJson =
+		options.resolvePackageJson ?? defaultResolvePiPackageJson;
+	const running = resolvePiCliFromRunningEntry(currentScript, fs);
+	const checkedPaths = [...running.checkedPaths];
+
+	if (running.cliPath) {
+		return { command: execPath, prefixArgs: [running.cliPath] };
 	}
 
 	if (!isGenericRuntimeExecutable(execPath)) {
-		// A packaged single-file binary: execPath itself is pi.
+		// A packaged single-file binary: execPath itself is Pi.
 		return { command: execPath, prefixArgs: [] };
 	}
 
-	const bundled = resolveBundledPiCli();
+	const bundled = resolveBundledPiCli(
+		currentScript,
+		fs,
+		resolvePackageJson,
+		checkedPaths,
+	);
 	if (bundled) {
 		return { command: execPath, prefixArgs: [bundled] };
 	}
 
-	return { command: "pi", prefixArgs: [] };
+	const detectionMiss = `script-detection miss on ${formatCheckedPaths(checkedPaths)}`;
+	if (platform === "win32") {
+		const resolved = resolveWindowsPiCommand(env, fs);
+		if (resolved.path && resolved.extension) {
+			const diagnostic = `${detectionMiss}; Windows PATHEXT resolved ${resolved.path}`;
+			if (resolved.extension === ".CMD" || resolved.extension === ".BAT") {
+				const command = env.ComSpec?.trim() || env.COMSPEC?.trim() || "cmd.exe";
+				return {
+					command,
+					prefixArgs: ["/d", "/s", "/c", resolved.path],
+					fallbackDiagnostic: diagnostic,
+				};
+			}
+			if (resolved.extension === ".PS1") {
+				const command = env.SystemRoot
+					? join(
+							env.SystemRoot,
+							"System32",
+							"WindowsPowerShell",
+							"v1.0",
+							"powershell.exe",
+						)
+					: "powershell.exe";
+				return {
+					command,
+					prefixArgs: [
+						"-NoLogo",
+						"-NoProfile",
+						"-NonInteractive",
+						"-File",
+						resolved.path,
+					],
+					fallbackDiagnostic: diagnostic,
+				};
+			}
+			return {
+				command: resolved.path,
+				prefixArgs: [],
+				fallbackDiagnostic: diagnostic,
+			};
+		}
+		checkedPaths.push(...resolved.checkedPaths);
+	}
+
+	return {
+		command: "pi",
+		prefixArgs: [],
+		fallbackDiagnostic: `script-detection miss on ${formatCheckedPaths(checkedPaths)}`,
+	};
+}
+
+function isPiCliScript(scriptPath: string): boolean {
+	return (
+		resolvePiCliFromRunningEntry(scriptPath, DEFAULT_PI_RESOLUTION_FS)
+			.cliPath !== null
+	);
+}
+
+function describeSpawnFailure(
+	error: unknown,
+	invocation: PiInvocation,
+): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return invocation.fallbackDiagnostic
+		? `${message} after ${invocation.fallbackDiagnostic}`
+		: message;
 }
 
 /** Resolve an optional child extension bundled beside the Pi plugin entry. */
@@ -595,6 +871,8 @@ export class PiSubagentRunner implements SubagentRunner {
 	constructor(
 		options: {
 			piBinary?: string;
+			/** Override used by tests to provide command and prefix arguments instead of resolving them. */
+			invocation?: PiInvocation;
 			platform?: NodeJS.Platform;
 			extraArgs?: readonly string[];
 			/** User-tier explicit extension allowlist; an empty list disables all discovered extensions. */
@@ -603,9 +881,11 @@ export class PiSubagentRunner implements SubagentRunner {
 			spawnImpl?: typeof childProcess.spawn;
 		} = {},
 	) {
-		this.invocation = options.piBinary
-			? { command: options.piBinary, prefixArgs: [] }
-			: resolvePiInvocation();
+		this.invocation =
+			options.invocation ??
+			(options.piBinary
+				? { command: options.piBinary, prefixArgs: [] }
+				: resolvePiInvocation({ platform: options.platform }));
 		this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
 		this.platform = options.platform ?? process.platform;
 		this.extraArgs = options.extraArgs ?? [];
@@ -1016,7 +1296,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				settle({
 					ok: false,
 					reason: "spawn_failed",
-					error: error instanceof Error ? error.message : String(error),
+					error: describeSpawnFailure(error, this.invocation),
 					durationMs: Date.now() - startTime,
 				});
 				return;
@@ -1350,7 +1630,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				settle({
 					ok: false,
 					reason: "spawn_failed",
-					error: error instanceof Error ? error.message : String(error),
+					error: describeSpawnFailure(error, this.invocation),
 					durationMs: Date.now() - startTime,
 				});
 			});
@@ -1957,6 +2237,8 @@ export const __test = {
 	isGenericRuntimeExecutable,
 	isPiCliScript,
 	parsePiEventLine,
+	resolvePiInvocation,
+	resolveWindowsPiCommand,
 	terminateChild,
 	DREAMER_ACTION_AGENTS,
 	KNOWN_PI_SUBAGENT_AGENTS,
