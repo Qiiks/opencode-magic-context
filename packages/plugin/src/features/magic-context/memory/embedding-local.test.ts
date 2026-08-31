@@ -24,6 +24,12 @@ function nativeBindingLoadError(): Error & { code: string } {
     );
 }
 
+function missingNativeRuntimeError(): Error & { code: string } {
+    return Object.assign(new Error("Cannot find package 'onnxruntime-node'"), {
+        code: "ERR_MODULE_NOT_FOUND",
+    });
+}
+
 function fakeTransformersModule(options?: {
     onPipeline?: (pipelineOptions: { dtype: string; device?: string }) => void;
 }): Record<string, unknown> {
@@ -122,6 +128,14 @@ describe("isNativeRuntimeMissingError", () => {
             code: "ERR_DLOPEN_FAILED",
         });
         expect(isNativeRuntimeMissingError(err)).toBe(false);
+    });
+
+    test("the known optional Sharp loader failure falls back to WASM", () => {
+        expect(
+            isNativeRuntimeMissingError(
+                new Error('Could not load the "sharp" module using the darwin-arm64 runtime'),
+            ),
+        ).toBe(true);
     });
 });
 
@@ -276,6 +290,35 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
 
             expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
             expect(pipelineOptions).toEqual([{ dtype: "fp32" }]);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("retries a fully absent native module with WASM", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-absent-native-"));
+        const logs: string[] = [];
+        let nativeImports = 0;
+        let wasmImports = 0;
+        try {
+            __setLocalEmbeddingTestHooks({
+                importTransformers: async () => {
+                    nativeImports++;
+                    throw missingNativeRuntimeError();
+                },
+                injectWasmOrt: async () => true,
+                importTransformersWasmFallback: async () => {
+                    wasmImports++;
+                    return fakeTransformersModule();
+                },
+                modelCacheDir: () => cacheDir,
+                log: (message) => logs.push(message),
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(nativeImports).toBe(1);
+            expect(wasmImports).toBe(1);
+            expect(logs).toContainEqual(expect.stringContaining("using onnxruntime-web (WASM)"));
         } finally {
             rmSync(cacheDir, { recursive: true, force: true });
         }
