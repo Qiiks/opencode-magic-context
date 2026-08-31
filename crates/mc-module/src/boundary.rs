@@ -16,6 +16,7 @@ use mc_tokenizer::estimate_tokens;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::historian::HistorianNoFireCause;
 use crate::scheduler::escalation_bands;
 use crate::selection::SelKind;
 
@@ -309,6 +310,8 @@ pub struct TriggerDecision {
     pub fire: bool,
     /// Fire reason, absent when `fire` is false.
     pub reason: Option<TriggerReason>,
+    /// Concrete refusal cause, absent when `fire` is true.
+    pub no_fire_cause: Option<HistorianNoFireCause>,
     /// Last raw-message ordinal the run may consume, always before the protected tail.
     pub consume_through_ordinal: Option<u64>,
     /// The exact boundary snapshot that produced a fire decision. The assembler consumes
@@ -715,7 +718,7 @@ pub fn check_compartment_trigger(
     ctx: &TriggerContext,
 ) -> TriggerDecision {
     if ctx.compartment_in_progress {
-        return no_fire();
+        return no_fire(HistorianNoFireCause::HistorianAlreadyInProgress);
     }
     let index = TokenIndex::new(messages);
     let mut token_estimator = estimate_tokens;
@@ -728,7 +731,7 @@ pub(crate) fn check_compartment_trigger_with_token_estimator(
     token_estimator: &mut dyn FnMut(&str) -> usize,
 ) -> TriggerDecision {
     if ctx.compartment_in_progress {
-        return no_fire();
+        return no_fire(HistorianNoFireCause::HistorianAlreadyInProgress);
     }
     let index = TokenIndex::new(messages);
     check_compartment_trigger_with_index(messages, ctx, &index, token_estimator)
@@ -740,7 +743,7 @@ pub(crate) fn check_compartment_trigger_retokenized_reference(
     ctx: &TriggerContext,
 ) -> TriggerDecision {
     if ctx.compartment_in_progress {
-        return no_fire();
+        return no_fire(HistorianNoFireCause::HistorianAlreadyInProgress);
     }
     let index = TokenIndex::new_retokenized(messages);
     let mut token_estimator = estimate_tokens;
@@ -767,7 +770,7 @@ fn check_compartment_trigger_with_index(
         .max()
         .is_some_and(|max_ordinal| max_ordinal >= offset);
     if !has_live_at_or_after_offset {
-        return no_fire();
+        return no_fire(HistorianNoFireCause::NoLiveMessageAtOrAfterOffset);
     }
 
     let mut primary_ctx = ctx.boundary.clone();
@@ -817,7 +820,10 @@ fn check_compartment_trigger_with_index(
             .projected_post_drop_percentage
             .is_some_and(|pct| pct <= relative_post_drop_target)
         {
-            return no_fire_with_progress(progress);
+            return no_fire_with_progress(
+                HistorianNoFireCause::ProjectedPostDropSatisfied,
+                progress,
+            );
         }
         if has_runnable_compartment_window(
             &boundary,
@@ -844,7 +850,7 @@ fn check_compartment_trigger_with_index(
         ) {
             return fire_with_progress(TriggerReason::ForceBand, &scaled_boundary, progress);
         }
-        return no_fire_with_progress(progress);
+        return no_fire_with_progress(HistorianNoFireCause::ProtectedTailWindowEmpty, progress);
     }
 
     if ctx.commit_cluster_trigger_enabled
@@ -863,37 +869,44 @@ fn check_compartment_trigger_with_index(
     let proactive_trigger_percentage =
         get_proactive_compartment_trigger_percentage(ctx.boundary.execute_threshold_percentage);
     if ctx.boundary.usage_percentage < proactive_trigger_percentage {
-        return no_fire_with_progress(progress);
+        return no_fire_with_progress(HistorianNoFireCause::BelowProactiveFloor, progress);
     }
 
     if ctx
         .projected_post_drop_percentage
         .is_some_and(|pct| pct <= relative_post_drop_target)
     {
-        return no_fire_with_progress(progress);
+        return no_fire_with_progress(HistorianNoFireCause::ProjectedPostDropSatisfied, progress);
     }
 
-    if !has_protected_eligible_head || !is_meaningful {
-        return no_fire_with_progress(progress);
+    if !has_protected_eligible_head {
+        return no_fire_with_progress(HistorianNoFireCause::ProtectedTailWindowEmpty, progress);
+    }
+    if !is_meaningful {
+        return no_fire_with_progress(HistorianNoFireCause::BelowMinimumEligibleContent, progress);
     }
 
     fire_with_progress(TriggerReason::ProjectedHeadroom, &boundary, progress)
 }
 
-fn no_fire() -> TriggerDecision {
+fn no_fire(cause: HistorianNoFireCause) -> TriggerDecision {
     TriggerDecision {
         fire: false,
         reason: None,
+        no_fire_cause: Some(cause),
         consume_through_ordinal: None,
         boundary: None,
         progress: None,
     }
 }
 
-fn no_fire_with_progress(progress: TriggerProgress) -> TriggerDecision {
+fn no_fire_with_progress(
+    cause: HistorianNoFireCause,
+    progress: TriggerProgress,
+) -> TriggerDecision {
     TriggerDecision {
         progress: Some(progress),
-        ..no_fire()
+        ..no_fire(cause)
     }
 }
 
@@ -906,6 +919,7 @@ fn fire(reason: TriggerReason, boundary: &BoundaryResolution) -> TriggerDecision
     TriggerDecision {
         fire: true,
         reason: Some(reason),
+        no_fire_cause: None,
         consume_through_ordinal,
         boundary: Some(boundary.clone()),
         progress: None,
@@ -2511,6 +2525,123 @@ mod tests {
         ctx.usage_input_tokens = 77_600.0;
         ctx.fold_is_only_reclaim = true;
         ctx
+    }
+
+    #[test]
+    fn no_fire_cause_taxonomy_discriminates_trigger_decision_sites() {
+        let mut in_flight = TriggerContext::default();
+        in_flight.compartment_in_progress = true;
+        let in_flight_decision = check_compartment_trigger(&[], &in_flight);
+        assert_eq!(
+            in_flight_decision.no_fire_cause,
+            Some(HistorianNoFireCause::HistorianAlreadyInProgress)
+        );
+        assert_eq!(
+            in_flight_decision.no_fire_cause.unwrap().canonical_cause(),
+            "in_flight"
+        );
+
+        let no_new = check_compartment_trigger(&[], &TriggerContext::default());
+        assert_eq!(
+            no_new.no_fire_cause,
+            Some(HistorianNoFireCause::NoLiveMessageAtOrAfterOffset)
+        );
+        assert_eq!(
+            no_new.no_fire_cause.unwrap().canonical_cause(),
+            "no_new_raw_history"
+        );
+
+        let mut redundancy = TriggerContext::default();
+        redundancy.boundary = ctx_for_tests();
+        redundancy.projected_post_drop_percentage = Some(20.0);
+        let redundancy_decision = check_compartment_trigger(
+            &[text_msg(1, Role::Assistant, "queued drops cover this tail")],
+            &redundancy,
+        );
+        assert_eq!(
+            redundancy_decision.no_fire_cause,
+            Some(HistorianNoFireCause::ProjectedPostDropSatisfied)
+        );
+        assert_eq!(
+            redundancy_decision.no_fire_cause.unwrap().canonical_cause(),
+            "redundancy_skip"
+        );
+
+        let mut protected = TriggerContext::default();
+        protected.boundary = ctx_for_tests();
+        let protected_decision = check_compartment_trigger(
+            &[text_msg(1, Role::Assistant, "only protected live tail")],
+            &protected,
+        );
+        assert_eq!(
+            protected_decision.no_fire_cause,
+            Some(HistorianNoFireCause::ProtectedTailWindowEmpty)
+        );
+        assert_eq!(
+            protected_decision.no_fire_cause.unwrap().canonical_cause(),
+            "protected_tail"
+        );
+
+        let below_floor = check_compartment_trigger(
+            &[text_msg(1, Role::Assistant, "small low-pressure tail")],
+            &TriggerContext::default(),
+        );
+        assert_eq!(
+            below_floor.no_fire_cause,
+            Some(HistorianNoFireCause::BelowProactiveFloor)
+        );
+        assert_eq!(
+            below_floor.no_fire_cause.unwrap().canonical_cause(),
+            "below_proactive_floor"
+        );
+
+        let mut below_minimum = TriggerContext::default();
+        below_minimum.boundary.usage_percentage = 64.0;
+        below_minimum.boundary.usage_input_tokens = 81_920.0;
+        let thin_head = vec![
+            text_msg(1, Role::Assistant, &"thin head ".repeat(1_000)),
+            text_msg(2, Role::Assistant, &"protected suffix ".repeat(10_000)),
+        ];
+        let below_minimum_decision = check_compartment_trigger(&thin_head, &below_minimum);
+        assert_eq!(
+            below_minimum_decision.no_fire_cause,
+            Some(HistorianNoFireCause::BelowMinimumEligibleContent)
+        );
+        assert_eq!(
+            below_minimum_decision
+                .no_fire_cause
+                .unwrap()
+                .canonical_cause(),
+            "below_min_chunk"
+        );
+
+        let typescript_only_preflight_causes = [
+            (
+                HistorianNoFireCause::CheapGateBelowTriggerBudget,
+                "cheap_skip",
+            ),
+            (
+                HistorianNoFireCause::RawTailInspectionFailed,
+                "raw_history_unavailable",
+            ),
+            (HistorianNoFireCause::DrainBudgetSpent, "drain_budget"),
+            (
+                HistorianNoFireCause::MissingBoundarySnapshot,
+                "missing_boundary_snapshot",
+            ),
+            (
+                HistorianNoFireCause::StaleBoundarySnapshot,
+                "stale_boundary_snapshot",
+            ),
+            (HistorianNoFireCause::EmptyFilteredChunk, "below_min_chunk"),
+            (
+                HistorianNoFireCause::InvalidChunkCoverage,
+                "invalid_chunk_coverage",
+            ),
+        ];
+        for (cause, canonical) in typescript_only_preflight_causes {
+            assert_eq!(cause.canonical_cause(), canonical);
+        }
     }
 
     #[test]

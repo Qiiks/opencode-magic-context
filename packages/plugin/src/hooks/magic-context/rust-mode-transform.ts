@@ -585,6 +585,8 @@ function formatRustPassLog(args: {
     reason: string;
     schedulerDecision?: string;
     schedulerDeferReason?: string;
+    historianNoFire?: string;
+    historianCanonicalCause?: string;
     servedFrom: string;
     inputCount: number;
     outputCount: number;
@@ -611,7 +613,10 @@ function formatRustPassLog(args: {
     const schedulerFields = args.schedulerDecision
         ? ` scheduler=${args.schedulerDecision}${args.schedulerDeferReason ? ` defer_reason=${args.schedulerDeferReason}` : ""}`
         : "";
-    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    const historianFields = args.historianCanonicalCause
+        ? ` historian_no_fire=${args.historianNoFire ?? "unknown"} canonical_cause=${args.historianCanonicalCause}`
+        : "";
+    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1719,6 +1724,8 @@ export function createRustModeTransform(
         let materializeReason = "none";
         let schedulerDecision: string | undefined;
         let schedulerDeferReason: string | undefined;
+        let historianNoFire: string | undefined;
+        let historianCanonicalCause: string | undefined;
         let servedFrom = "none";
         let moduleElapsedMs = 0;
         let rowVersion = 0;
@@ -1844,6 +1851,8 @@ export function createRustModeTransform(
                     reason: materializeReason,
                     schedulerDecision,
                     schedulerDeferReason,
+                    historianNoFire,
+                    historianCanonicalCause,
                     servedFrom,
                     inputCount,
                     outputCount: output.messages.length,
@@ -1882,6 +1891,13 @@ export function createRustModeTransform(
             schedulerDeferReason =
                 typeof response.scheduler_defer_reason === "string"
                     ? response.scheduler_defer_reason
+                    : undefined;
+            const historian = isRecord(response.historian) ? response.historian : undefined;
+            historianNoFire =
+                typeof historian?.no_fire === "string" ? historian.no_fire : undefined;
+            historianCanonicalCause =
+                typeof historian?.canonical_cause === "string"
+                    ? historian.canonical_cause
                     : undefined;
             materializeReason =
                 typeof response.materialize_reason === "string" &&
