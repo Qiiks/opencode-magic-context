@@ -48,6 +48,8 @@ export interface RustTestHarnessOptions {
     modelContextLimit?: number;
     /** Default response used when the mock queue is empty. */
     mockDefault?: MockResponse;
+    /** Mock provider id exposed to OpenCode. Defaults to "mock-anthropic". */
+    providerID?: string;
     /**
      * Start opencode in TS mode instead of Rust mode. The hermetic daemon still
      * runs (so a later `restart({ rust: true })` can flip to Rust against the
@@ -132,6 +134,7 @@ export class RustTestHarness {
     private modelContextLimit: number | undefined;
     private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
+    private readonly providerID: string;
     private readonly historianProducerAvailable: boolean;
 
     private constructor(args: {
@@ -144,6 +147,7 @@ export class RustTestHarness {
         logPath: string;
         modelContextLimit: number | undefined;
         mockDefault: MockResponse;
+        providerID: string;
         historianProducerAvailable: boolean;
     }) {
         this.mock = args.mock;
@@ -155,6 +159,7 @@ export class RustTestHarness {
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
         this.mockDefault = args.mockDefault;
+        this.providerID = args.providerID;
         this.historianProducerAvailable = args.historianProducerAvailable;
     }
 
@@ -225,6 +230,7 @@ export class RustTestHarness {
             logPath,
             modelContextLimit: options.modelContextLimit,
             mockDefault,
+            providerID: options.providerID ?? "mock-anthropic",
             historianProducerAvailable: options.startHistorianProducer ?? true,
         });
     }
@@ -237,14 +243,16 @@ export class RustTestHarness {
         options: RustTestHarnessOptions;
         rustMode: boolean;
     }): Promise<SpawnedOpencode> {
+        const providerID = args.options.providerID ?? "mock-anthropic";
         return spawnOpencode({
             mockProviderURL: args.mockURL,
+            mockProviderID: providerID,
             existingEnv: args.env,
             modelContextLimit: args.options.modelContextLimit,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
             magicContextConfig: {
                 ...(args.options.startHistorianProducer ?? true
-                    ? { historian: { opencode: { model: "mock-anthropic/mock-sonnet" } } }
+                    ? { historian: { opencode: { model: `${providerID}/mock-sonnet` } } }
                     : {}),
                 ...(args.options.magicContextConfig ?? {}),
             },
@@ -292,6 +300,7 @@ export class RustTestHarness {
                 modelContextLimit: this.modelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
                 startHistorianProducer: this.historianProducerAvailable,
+                providerID: this.providerID,
             },
             rustMode: opts.rust ?? true,
         });
@@ -453,7 +462,7 @@ export class RustTestHarness {
         const promptPromise = this.clientInstance.session.prompt({
             path: { id: sessionId },
             body: {
-                model: { providerID: "mock-anthropic", modelID: "mock-sonnet" },
+                model: { providerID: this.providerID, modelID: "mock-sonnet" },
                 parts: [{ type: "text", text }],
                 ...(options.agent ? { agent: options.agent } : {}),
             },

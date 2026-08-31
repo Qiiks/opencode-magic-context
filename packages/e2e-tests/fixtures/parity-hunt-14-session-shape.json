@@ -1,0 +1,100 @@
+{
+    "schema": 1,
+    "source": {
+        "report": "docs/reports/parity-hunt-13.md#H13-03",
+        "capture": "sanitized live OpenCode session structure",
+        "sanitization": "Only role, part order, byte lengths, placeholder class, and signature presence are retained; no captured prose or identifiers are present."
+    },
+    "passes": [
+        {
+            "label": "signed-thinking-index-zero",
+            "input_text_bytes": 96,
+            "response": {
+                "blocks": [
+                    {
+                        "type": "thinking",
+                        "thinking_bytes": 128,
+                        "signature_bytes": 72
+                    },
+                    {
+                        "type": "text",
+                        "text_bytes": 48
+                    }
+                ],
+                "input_tokens": 1000,
+                "output_tokens": 100
+            }
+        },
+        {
+            "label": "isolated-assistant-dropped-placeholder",
+            "input_text_bytes": 80,
+            "response": {
+                "blocks": [
+                    {
+                        "type": "text",
+                        "dropped_tag": 0
+                    }
+                ],
+                "input_tokens": 1200,
+                "output_tokens": 20
+            }
+        },
+        {
+            "label": "raw-empty-assistant-text",
+            "input_text_bytes": 72,
+            "response": {
+                "blocks": [
+                    {
+                        "type": "text",
+                        "empty": true
+                    }
+                ],
+                "input_tokens": 1400,
+                "output_tokens": 1
+            }
+        },
+        {
+            "label": "observe-empty-and-placeholder",
+            "input_text_bytes": 88,
+            "response": {
+                "blocks": [
+                    {
+                        "type": "text",
+                        "text_bytes": 40
+                    }
+                ],
+                "input_tokens": 1600,
+                "output_tokens": 20
+            }
+        }
+    ],
+    "adjudications": [
+        {
+            "pass": "isolated-assistant-dropped-placeholder",
+            "axis": "reasoning_signature_shapes",
+            "ts_only": ["thinking:nonzero_index:signed"],
+            "rust_only": ["thinking:index_0:signed"],
+            "decision": "intentional_difference",
+            "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
+            "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+        },
+        {
+            "pass": "raw-empty-assistant-text",
+            "axis": "reasoning_signature_shapes",
+            "ts_only": ["thinking:nonzero_index:signed"],
+            "rust_only": ["thinking:index_0:signed"],
+            "decision": "intentional_difference",
+            "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
+            "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+        },
+        {
+            "pass": "observe-empty-and-placeholder",
+            "axis": "reasoning_signature_shapes",
+            "ts_only": ["thinking:nonzero_index:signed"],
+            "rust_only": ["thinking:index_0:signed"],
+            "decision": "intentional_difference",
+            "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
+            "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+        }
+    ]
+}
