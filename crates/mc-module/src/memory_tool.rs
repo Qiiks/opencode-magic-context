@@ -136,6 +136,23 @@ pub struct MemorySearchOptions<'a> {
     pub excluded_memory_ids: &'a BTreeSet<i64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemorySearchDiagnostics {
+    pub suppressed_visible_memory_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySearchOutcome {
+    pub results: Vec<MemorySearchResult>,
+    pub diagnostics: MemorySearchDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryIdSearchOutcome {
+    pub results: Option<Vec<MemorySearchResult>>,
+    pub diagnostics: MemorySearchDiagnostics,
+}
+
 /// Update an owned, primary (active/permanent and not superseded) memory.
 pub fn update_memory(
     store: &McStore,
@@ -351,20 +368,43 @@ pub fn search_available_corpora_for_session(
     query: &str,
     options: MemorySearchOptions<'_>,
 ) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
+    Ok(search_available_corpora_for_session_with_diagnostics(
+        store,
+        project_path,
+        session_id,
+        query,
+        options,
+    )?
+    .results)
+}
+
+pub fn search_available_corpora_for_session_with_diagnostics(
+    store: &McStore,
+    project_path: &str,
+    session_id: &str,
+    query: &str,
+    options: MemorySearchOptions<'_>,
+) -> Result<MemorySearchOutcome, MemoryToolError> {
     let query = query.trim();
     if query.is_empty() || options.limit == 0 {
-        return Ok(Vec::new());
+        return Ok(MemorySearchOutcome {
+            results: Vec::new(),
+            diagnostics: MemorySearchDiagnostics::default(),
+        });
     }
 
     let mut ranked = Vec::new();
+    let mut suppressed_visible_memory_ids = Vec::new();
     if options.include_memories {
         for memory in store.search_visible_memory_contents(project_path, query)? {
-            if options.excluded_memory_ids.contains(&memory.id) {
+            if first_match(&memory.content, query).is_none() {
                 continue;
             }
-            if first_match(&memory.content, query).is_some() {
-                ranked.push(memory_search_hit(memory, query));
+            if options.excluded_memory_ids.contains(&memory.id) {
+                suppressed_visible_memory_ids.push(memory.id);
+                continue;
             }
+            ranked.push(memory_search_hit(memory, query));
         }
     }
     if options.include_messages {
@@ -394,7 +434,13 @@ pub fn search_available_corpora_for_session(
             .then_with(|| left.result.id.cmp(&right.result.id))
     });
     ranked.truncate(options.limit);
-    Ok(ranked.into_iter().map(|ranked| ranked.result).collect())
+    suppressed_visible_memory_ids.sort_unstable();
+    Ok(MemorySearchOutcome {
+        results: ranked.into_iter().map(|ranked| ranked.result).collect(),
+        diagnostics: MemorySearchDiagnostics {
+            suppressed_visible_memory_ids,
+        },
+    })
 }
 
 /// Resolve a whole-query memory-id list through the same visibility rules as keyword search,
@@ -407,19 +453,44 @@ pub fn resolve_memory_ids_for_search(
     limit: usize,
     excluded_memory_ids: &BTreeSet<i64>,
 ) -> Result<Option<Vec<MemorySearchResult>>, MemoryToolError> {
+    Ok(resolve_memory_ids_for_search_with_diagnostics(
+        store,
+        project_path,
+        ids,
+        limit,
+        excluded_memory_ids,
+    )?
+    .results)
+}
+
+pub fn resolve_memory_ids_for_search_with_diagnostics(
+    store: &McStore,
+    project_path: &str,
+    ids: &[i64],
+    limit: usize,
+    excluded_memory_ids: &BTreeSet<i64>,
+) -> Result<MemoryIdSearchOutcome, MemoryToolError> {
     if ids.is_empty() || limit == 0 {
-        return Ok(None);
+        return Ok(MemoryIdSearchOutcome {
+            results: None,
+            diagnostics: MemorySearchDiagnostics::default(),
+        });
     }
     let visible = store.get_visible_memories_by_ids(project_path, ids)?;
     let mut results = Vec::new();
+    let mut suppressed_visible_memory_ids = Vec::new();
     let mut seen = BTreeSet::new();
     for id in ids {
-        if !seen.insert(*id) || excluded_memory_ids.contains(id) {
+        if !seen.insert(*id) {
             continue;
         }
         let Some(memory) = visible.get(id) else {
             continue;
         };
+        if excluded_memory_ids.contains(id) {
+            suppressed_visible_memory_ids.push(*id);
+            continue;
+        }
         let rank = i64::try_from(results.len()).unwrap_or(i64::MAX);
         results.push(MemorySearchResult {
             source_kind: MemorySearchSourceKind::Memory,
@@ -442,7 +513,13 @@ pub fn resolve_memory_ids_for_search(
             break;
         }
     }
-    Ok((!results.is_empty()).then_some(results))
+    suppressed_visible_memory_ids.sort_unstable();
+    Ok(MemoryIdSearchOutcome {
+        results: (!results.is_empty()).then_some(results),
+        diagnostics: MemorySearchDiagnostics {
+            suppressed_visible_memory_ids,
+        },
+    })
 }
 
 fn load_owned_memory(

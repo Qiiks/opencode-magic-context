@@ -10733,31 +10733,35 @@ impl McHandler {
 
         if include_memories {
             if let Some(ids) = parse_search_memory_ids(query) {
-                match memory_tool::resolve_memory_ids_for_search(
+                match memory_tool::resolve_memory_ids_for_search_with_diagnostics(
                     store,
                     memory_project,
                     &ids,
                     limit.max(ids.len()),
                     &visible_memory_ids,
                 ) {
-                    Ok(Some(results)) => {
+                    Ok(outcome)
+                        if outcome.results.is_some()
+                            || !outcome.diagnostics.suppressed_visible_memory_ids.is_empty() =>
+                    {
                         return mcp_text_result(
                             render_facade_search_results(
                                 query,
-                                &results,
+                                outcome.results.as_deref().unwrap_or_default(),
+                                &outcome.diagnostics,
                                 conversation_key,
                                 workspace_membership.as_ref(),
                             ),
                             false,
                         )
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 }
             }
         }
 
-        match memory_tool::search_available_corpora_for_session(
+        match memory_tool::search_available_corpora_for_session_with_diagnostics(
             store,
             memory_project,
             conversation_key,
@@ -10770,10 +10774,11 @@ impl McHandler {
                 excluded_memory_ids: &visible_memory_ids,
             },
         ) {
-            Ok(results) => mcp_text_result(
+            Ok(outcome) => mcp_text_result(
                 render_facade_search_results(
                     query,
-                    &results,
+                    &outcome.results,
+                    &outcome.diagnostics,
                     conversation_key,
                     workspace_membership.as_ref(),
                 ),
@@ -13274,16 +13279,26 @@ fn format_search_age(created_at_ms: i64) -> String {
 fn render_facade_search_results(
     query: &str,
     results: &[memory_tool::MemorySearchResult],
+    diagnostics: &memory_tool::MemorySearchDiagnostics,
     current_session_id: &str,
     workspace_membership: Option<&mc_store::WorkspaceMembership>,
 ) -> String {
+    let visible_ids = &diagnostics.suppressed_visible_memory_ids;
     if results.is_empty() {
+        if !visible_ids.is_empty() {
+            let count = visible_ids.len();
+            let noun = if count == 1 { "match" } else { "matches" };
+            return format!(
+                "No hidden results found for \"{query}\".\n\nMemories: {count} {noun} found, all already visible in your project-memory block (ids {}).",
+                join_i64s(visible_ids)
+            );
+        }
         return format!(
             "No results found for \"{query}\" across notes, memories, primers, git commits, or message history."
         );
     }
 
-    let mut body = Vec::with_capacity(results.len() + 2);
+    let mut body = Vec::with_capacity(results.len() + 3);
     for (index, result) in results.iter().enumerate() {
         let score = result.score_hundredths as f64 / 100.0;
         let rendered = match result.source_kind {
@@ -13335,6 +13350,15 @@ fn render_facade_search_results(
             }
         };
         body.push(rendered);
+    }
+    if !visible_ids.is_empty() {
+        let count = visible_ids.len();
+        let noun = if count == 1 { "match" } else { "matches" };
+        let pronoun = if count == 1 { "it is" } else { "they are" };
+        body.push(format!(
+            "Memories: {count} additional {noun} suppressed because {pronoun} already visible in your project-memory block (ids {}).",
+            join_i64s(visible_ids)
+        ));
     }
     if results.iter().any(|result| {
         matches!(
@@ -24747,6 +24771,9 @@ mod tests {
         }));
         assert!(all.contains(&format!("[memory] score=1.00 id={first_id}")));
         assert!(all.contains(&format!("[memory] score=1.00 id={second_id}")));
+        assert!(all.contains(&format!(
+            "Memories: 1 additional match suppressed because it is already visible in your project-memory block (ids {visible_id})."
+        )));
         assert!(
             all.find(&format!("id={first_id}")) < all.find(&format!("id={second_id}")),
             "equal-score/equal-recency memory ties must use ascending ids: {all}"
@@ -24780,6 +24807,21 @@ mod tests {
         );
         assert!(id_lookup.contains(&format!("id={second_id}")));
         assert!(id_lookup.contains("match=fts"));
+
+        let visible_lookup = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": format!("#{visible_id}"), "sources": ["memory"]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            visible_lookup,
+            format!(
+                "No hidden results found for \"#{visible_id}\".\n\nMemories: 1 match found, all already visible in your project-memory block (ids {visible_id})."
+            )
+        );
 
         let unsupported_corpus = tool_text(
             call_facade(

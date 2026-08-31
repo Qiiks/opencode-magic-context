@@ -143,6 +143,44 @@ describe("createCtxSearchTool", () => {
 		}
 	});
 
+	it("explains when an id-shaped memory hit is already visible (Pi parity)", async () => {
+		const db = createTestDb();
+		const { insertMemory } = await import(
+			"@magic-context/core/features/magic-context/memory"
+		);
+		const projectIdentity = resolveProjectIdentity(process.cwd());
+		const memory = insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "ARCHITECTURE",
+			content: "Visible Pi memory for direct lookup.",
+		});
+		db.prepare(
+			"INSERT INTO session_meta (session_id, memory_block_ids) VALUES (?, ?)",
+		).run("ses-visible", JSON.stringify([memory.id]));
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+			});
+
+			const result = await tool.execute(
+				"call-visible",
+				{ query: `#${memory.id}`, sources: ["memory"] },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-visible", process.cwd()) as never,
+			);
+
+			expect(result.content[0]?.text).toBe(
+				`No hidden results found for "#${memory.id}".\n\nMemories: 1 match found, all already visible in your project-memory block (ids ${memory.id}).`,
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("resolves a `#1234` query directly without calling unifiedSearch (Pi parity)", async () => {
 		const db = createTestDb();
 		// Dynamically import `insertMemory` to seed a memory for this test,
