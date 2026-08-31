@@ -3343,10 +3343,27 @@ def historian_producer_invariants(contract: dict[str, Any]) -> list[str]:
     ):
         result.append("historian_system_prompt_bytes_diverge")
     calibration = contract.get("calibration", {})
-    expected = {"temperature": 0.1, "max_output_tokens": 32_000, "await_timeout_ms": 600_000}
+    expected = {"temperature": None, "max_output_tokens": 32_000, "await_timeout_ms": 600_000}
     for lane in ("ts", "pi", "rust"):
         if calibration.get(lane) != expected:
             result.append(f"historian_{lane}_calibration_triple_diverges")
+    temperature_shapes = contract.get("temperature_request_shapes", {})
+    if temperature_shapes.get("ts") != {
+        "absent": None,
+        "explicit_0_1": 0.1,
+        "explicit_0": 0,
+    }:
+        result.append("historian_ts_temperature_request_shapes_diverge")
+    if temperature_shapes.get("pi") != {
+        "absence_uses_undefined_check": True,
+        "resolved_from_shared_metadata": True,
+    }:
+        result.append("historian_pi_temperature_request_shapes_diverge")
+    if temperature_shapes.get("rust") != {
+        "option_serialization": True,
+        "zero_fixture": True,
+    }:
+        result.append("historian_rust_temperature_request_shapes_diverge")
     shape = contract.get("request_shape", {})
     for lane in ("ts", "pi", "rust"):
         if shape.get(lane) != ["system", "user"]:
@@ -3454,10 +3471,15 @@ import { createHash } from 'node:crypto';
 import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from './packages/plugin/src/hooks/magic-context/historian-prompt.generated.ts';
 import { resolveHistorianAgentOverrides } from './packages/plugin/src/shared/model-resolution.ts';
 const bytes = Buffer.from(COMPARTMENT_AGENT_SYSTEM_PROMPT);
+const configs = {
+  absent: { opencode: { model: 'open/model' }, pi: { model: 'pi/model' } },
+  explicit_0_1: { temperature: 0.1, opencode: { model: 'open/model' }, pi: { model: 'pi/model' } },
+  explicit_0: { temperature: 0, opencode: { model: 'open/model' }, pi: { model: 'pi/model' } },
+};
 console.log(JSON.stringify({
   sha256: createHash('sha256').update(bytes).digest('hex'),
   bytes: bytes.byteLength,
-  generation: resolveHistorianAgentOverrides({}),
+  generation: Object.fromEntries(Object.entries(configs).map(([key, value]) => [key, resolveHistorianAgentOverrides(value)])),
 }));
 """
     completed = subprocess.run(
@@ -3505,9 +3527,12 @@ console.log(JSON.stringify({
     rust_handler_source = rust_handler_path.read_text() if rust_handler_path.exists() else ""
 
     generation = ts.get("generation", {}) if isinstance(ts.get("generation"), dict) else {}
+    absent_generation = generation.get("absent", {})
+    if not isinstance(absent_generation, dict):
+        absent_generation = {}
     ts_calibration = {
-        "temperature": generation.get("temperature"),
-        "max_output_tokens": generation.get("maxTokens"),
+        "temperature": absent_generation.get("temperature"),
+        "max_output_tokens": absent_generation.get("maxTokens"),
         "await_timeout_ms": 600_000 if "DEFAULT_HISTORIAN_TIMEOUT_MS" in ts_producer else None,
     }
     rust_calibration = {
@@ -3537,16 +3562,25 @@ console.log(JSON.stringify({
             "rust_sha256": hashlib.sha256(rust_prompt).hexdigest() if rust_prompt else None,
             "rust_bytes": len(rust_prompt),
         },
+        "temperature_request_shapes": {
+            "ts": {
+                key: value.get("temperature")
+                for key, value in generation.items()
+                if isinstance(value, dict)
+            },
+            "pi": {
+                "absence_uses_undefined_check": "options.temperature !== undefined" in pi_subagent_source,
+                "resolved_from_shared_metadata": "temperature: historian?.temperature" in pi_index_source,
+            },
+            "rust": {
+                "option_serialization": 'skip_serializing_if = "Option::is_none"' in rust_producer,
+                "zero_fixture": "for temperature in [0.1, 0.0]" in rust_producer,
+            },
+        },
         "calibration": {
             "ts": ts_calibration,
             "pi": {
-                "temperature": (
-                    0.1
-                    if "temperature = 0.1" in pi_runner_source
-                    and "HISTORIAN_CALIBRATION_ENTRY_PATH" in pi_subagent_source
-                    and "MAGIC_CONTEXT_HISTORIAN_TEMPERATURE" in pi_subagent_source
-                    else None
-                ),
+                "temperature": None,
                 "max_output_tokens": (
                     32_000
                     if "maxOutputTokens = 32_000" in pi_runner_source
@@ -3786,8 +3820,7 @@ def summarize_hunt12_source_contract(root: Path) -> dict[str, Any]:
                 "mapping_origin = excluded.mapping_origin" in store_rs
                 and "prepared_row.mapping_origin.as_deref().unwrap_or(\"mapper\")"
                 in store_rs
-                and "row.mapping_origin === \"host_rejected_fallback\""
-                in context_authority
+                and 'mapping_origin === "host_rejected_fallback"' in context_authority
             ),
             "both_sentinels_are_mapped_and_not_verifiable": (
                 "SELECT DISTINCT memory_id FROM memory_verifications" in storage_verifications
@@ -3811,8 +3844,7 @@ def summarize_hunt12_source_contract(root: Path) -> dict[str, Any]:
                 in data_path_test
             ),
             "pi_preload_regression_present": (
-                "Pi preload isolation outranks the shared storage override"
-                in pi_preload_test
+                "Pi preload isolates storage and user config" in pi_preload_test
                 and "MAGIC_CONTEXT_TEST_DATA_DIR" in pi_preload
             ),
             "doctor_origins_match": doctors.count("storage.source") >= 3,

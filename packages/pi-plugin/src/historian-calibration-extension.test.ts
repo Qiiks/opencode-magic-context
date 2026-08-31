@@ -43,6 +43,20 @@ describe("historian provider calibration", () => {
 		).toEqual({ inferenceConfig: { temperature: 0.1, maxTokens: 32_000 } });
 	});
 
+	it("preserves an explicit zero temperature", () => {
+		expect(calibrateHistorianProviderPayload({ max_tokens: 4096 }, 0, 32_000)).toEqual({
+			max_tokens: 32_000,
+			temperature: 0,
+		});
+		expect(
+			calibrateHistorianProviderPayload(
+				{ generationConfig: { maxOutputTokens: 4096 } },
+				0,
+				32_000,
+			),
+		).toEqual({ generationConfig: { maxOutputTokens: 32_000, temperature: 0 } });
+	});
+
 	it("never sends temperature when it is not configured", () => {
 		const fixtures = [
 			{ input: { max_tokens: 4096 }, key: "max_tokens" },

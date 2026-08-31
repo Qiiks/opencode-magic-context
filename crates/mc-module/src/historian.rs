@@ -839,7 +839,15 @@ impl HistorianProducerDriver for HistorianProducer {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
-        HistorianProducer::start_with_temperature(self, session_id, system, prompt, model, temperature).await
+        HistorianProducer::start_with_temperature(
+            self,
+            session_id,
+            system,
+            prompt,
+            model,
+            temperature,
+        )
+        .await
     }
 
     async fn start_with_generation(
@@ -2096,6 +2104,7 @@ mod tests {
         observed_sessions: Vec<String>,
         observed_systems: Vec<String>,
         observed_prompts: Vec<String>,
+        observed_temperatures: Vec<Option<f64>>,
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
@@ -2146,6 +2155,18 @@ mod tests {
             self.starts
                 .pop_front()
                 .expect("scripted start result available")
+        }
+
+        async fn start_with_temperature(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.observed_temperatures.push(temperature);
+            self.start(session_id, system, prompt, model).await
         }
 
         async fn await_output(
@@ -2469,18 +2490,15 @@ mod tests {
             .with_start(Ok(run_handle("run-2")))
             .with_output(Ok(producer_output(historian_xml("fallback model summary"))));
 
-        let outcome = run_historian_firing(
-            &mut producer,
-            fire_request(
-                &fallback_store,
-                "placeholder prompt",
-                &models,
-                &chunk,
-                &prior,
-            ),
-        )
-        .await
-        .unwrap();
+        let mut request = fire_request(
+            &fallback_store,
+            "placeholder prompt",
+            &models,
+            &chunk,
+            &prior,
+        );
+        request.temperature = Some(0.0);
+        let outcome = run_historian_firing(&mut producer, request).await.unwrap();
         let HistorianDriveOutcome::Completed(success) = outcome else {
             panic!("expected completed fallback outcome");
         };
@@ -2499,6 +2517,7 @@ mod tests {
             ],
             "fallback retries author a new session/run instead of resuming under another model"
         );
+        assert_eq!(producer.observed_temperatures, vec![Some(0.0), Some(0.0)]);
         assert_eq!(
             fallback_store
                 .load("ses")

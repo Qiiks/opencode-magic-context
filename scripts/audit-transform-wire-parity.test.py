@@ -25,10 +25,14 @@ class AuditTransformWireParityTest(unittest.TestCase):
         self.assertEqual(
             contract["calibration"]["ts"],
             {
-                "temperature": 0.1,
+                "temperature": None,
                 "max_output_tokens": 32_000,
                 "await_timeout_ms": 600_000,
             },
+        )
+        self.assertEqual(
+            contract["temperature_request_shapes"]["ts"],
+            {"absent": None, "explicit_0_1": 0.1, "explicit_0": 0},
         )
         self.assertEqual(contract["request_shape"]["pi"], ["system", "user"])
         self.assertEqual(contract["request_shape"]["rust"], ["system", "user"])
@@ -55,7 +59,7 @@ class AuditTransformWireParityTest(unittest.TestCase):
         )
 
         broken = json.loads(json.dumps(contract))
-        broken["calibration"]["ts"]["temperature"] = 1.0
+        broken["calibration"]["ts"]["temperature"] = 0.1
         self.assertEqual(
             module["historian_producer_invariants"](broken),
             ["historian_ts_calibration_triple_diverges"],
@@ -373,6 +377,61 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             self.assertEqual(matrix["unexplained_wire_invariants"][0]["lane"], "ts")
 
+    def test_provider_matrix_keeps_anthropic_value_space_divergences_as_findings(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            temp = Path(temporary)
+            dump_dir = temp / "dumps"
+            dump_dir.mkdir()
+            roots = {"rust": temp / "rust-project", "ts": temp / "ts-project"}
+            for lane, project in roots.items():
+                (project / ".cortexkit").mkdir(parents=True)
+                (project / ".cortexkit" / "magic-context.jsonc").write_text(
+                    json.dumps({"transform_mode": lane})
+                )
+                self._write_dump(
+                    dump_dir,
+                    f"ses_{lane}",
+                    project,
+                    f"{lane}-call",
+                    "anthropic",
+                    0 if lane == "rust" else 1,
+                )
+
+            rust_path = next(dump_dir.glob("*ses_rust*.body.json"))
+            rust_body = json.loads(rust_path.read_text())
+            rust_body["messages"].append(
+                {"role": "assistant", "content": [{"type": "text", "text": ""}]}
+            )
+            rust_path.write_text(json.dumps(rust_body))
+
+            ts_path = next(dump_dir.glob("*ses_ts*.body.json"))
+            ts_body = json.loads(ts_path.read_text())
+            ts_body["messages"].append({"role": "assistant", "content": "[dropped]"})
+            ts_path.write_text(json.dumps(ts_body))
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--date",
+                    DATE,
+                    "--rust-session",
+                    "ses_rust",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            matrix = json.loads(completed.stdout)["provider_matrix_parity"]
+            axes = {row["axis"]: row for row in matrix["unexplained_byte_classes"]}
+            self.assertEqual(axes["empty_content_shapes"]["verdict"], "divergent_value_space")
+            self.assertEqual(
+                axes["dropped_placeholder_shapes"]["verdict"],
+                "divergent_value_space",
+            )
+
     def test_provider_matrix_supports_openai_responses_wire(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             temp = Path(temporary)
@@ -631,6 +690,15 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 if row["provider_family"] == "openai:openai_responses"
             ]
             self.assertEqual([row["lane"] for row in responses], ["ts"])
+            self.assertEqual(
+                report["live_probe"]["decision_window"]["scheduler_history"],
+                {
+                    "rows": 2,
+                    "decisions": {"defer": 2},
+                    "pass_bands": {"Defer": 2},
+                    "defer_reasons": {"none": 1, "mid_turn_boundary": 1},
+                },
+            )
             self.assertEqual(
                 report["provider_live"]["lane_coordinate_coverage"],
                 {
@@ -1018,9 +1086,36 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 "INSERT INTO mc_project_mural_artifacts VALUES (?, ?, 'mural-hash', ?)",
                 ("git:rust", b"data:image/png;base64,cG5n", now),
             )
+            scheduler_history = json.dumps(
+                [
+                    {
+                        "timestamp_ms": now,
+                        "scheduler_decision": "Defer",
+                        "drain_latch_active": False,
+                    },
+                    {
+                        "timestamp_ms": now + 1,
+                        "scheduler_decision": "Defer",
+                        "canonical_decision": "defer",
+                        "defer_reason": "mid_turn_boundary",
+                        "drain_latch_active": False,
+                    },
+                ]
+            )
             db.execute(
                 "INSERT INTO mc_pass_trace VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("ses_rust", "[]", "[]", now, now, None, None, 3, 0, None),
+                (
+                    "ses_rust",
+                    scheduler_history,
+                    "[]",
+                    now,
+                    now,
+                    None,
+                    None,
+                    3,
+                    0,
+                    None,
+                ),
             )
             db.execute(
                 "INSERT INTO mc_compartments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

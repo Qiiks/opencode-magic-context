@@ -1252,6 +1252,35 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("preserves an explicit zero historian temperature in the child environment", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "test/historian",
+			temperature: 0,
+		});
+		child.writeStdoutLine({ type: "session", id: "s1" });
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+
+		const [, , spawnOptions] = (spawnImpl.mock.calls as unknown[][])[0] as [
+			string,
+			string[],
+			{ env: NodeJS.ProcessEnv },
+		];
+		expect(spawnOptions.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE).toBe("0");
+	});
+
 	it("omits historian temperature from the spawned child environment when unspecified", async () => {
 		const previousTemperature = process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
 		delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;

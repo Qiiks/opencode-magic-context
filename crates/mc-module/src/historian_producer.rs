@@ -1613,23 +1613,32 @@ mod tests {
 
     #[tokio::test]
     async fn start_with_explicit_temperature_serializes_it() {
-        let server = fake_server(json!({"state":"active","run_id":"run-temperature"}), Vec::new()).await;
-        let mut client = client(&server).await;
-        client
-            .start_with_temperature(
-                "mc-historian:proj:1",
-                "role guidance",
-                "prompt",
-                "prov/model-a",
-                Some(0.1),
+        for temperature in [0.1, 0.0] {
+            let server = fake_server(
+                json!({"state":"active","run_id":"run-temperature"}),
+                Vec::new(),
             )
-            .await
-            .unwrap();
-        client.close().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+            .await;
+            let mut client = client(&server).await;
+            client
+                .start_with_temperature(
+                    "mc-historian:proj:1",
+                    "role guidance",
+                    "prompt",
+                    "prov/model-a",
+                    Some(temperature),
+                )
+                .await
+                .unwrap();
+            client.close().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let log = server.log.lock().await;
-        assert_eq!(log.sends[0]["generation"]["temperature"], json!(0.1));
+            let log = server.log.lock().await;
+            assert_eq!(
+                log.sends[0]["generation"]["temperature"],
+                json!(temperature)
+            );
+        }
     }
 
     #[tokio::test]

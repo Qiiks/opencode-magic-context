@@ -1587,6 +1587,17 @@ function maintenanceEvidence(store: Database, afterMs: number): Record<string, u
 	};
 }
 
+function canonicalSchedulerDecision(observation: Row): string {
+	if (typeof observation.canonical_decision === "string")
+		return observation.canonical_decision;
+	const legacy = String(observation.scheduler_decision ?? "none");
+	return legacy === "Defer"
+		? "defer"
+		: legacy === "Execute" || legacy === "Force85" || legacy === "Emergency95"
+			? "execute"
+			: legacy;
+}
+
 function decisionEvidence(
 	context: Database,
 	store: Database,
@@ -1652,6 +1663,8 @@ function decisionEvidence(
 	fixedClasses.repeated_render_config_within_120s = repeatedRenderConfig;
 
 	const scheduler: Record<string, number> = {};
+	const schedulerPassBands: Record<string, number> = {};
+	const schedulerDeferReasons: Record<string, number> = {};
 	let schedulerRows = 0;
 	if (tableExists(store, "mc_pass_trace")) {
 		for (const row of store
@@ -1668,15 +1681,25 @@ function decisionEvidence(
 				const observation = item as Row;
 				if (Number(observation.timestamp_ms ?? -1) < afterMs) continue;
 				schedulerRows += 1;
-				const decision = String(observation.scheduler_decision ?? "none");
+				const passBand = String(observation.scheduler_decision ?? "none");
+				const decision = canonicalSchedulerDecision(observation);
+				const deferReason = String(observation.defer_reason ?? "none");
 				scheduler[decision] = (scheduler[decision] ?? 0) + 1;
+				schedulerPassBands[passBand] = (schedulerPassBands[passBand] ?? 0) + 1;
+				schedulerDeferReasons[deferReason] =
+					(schedulerDeferReasons[deferReason] ?? 0) + 1;
 			}
 		}
 	}
 	return {
 		cutoff_ms: afterMs,
 		transform_decisions: distributions,
-		scheduler_history: { rows: schedulerRows, decisions: scheduler },
+		scheduler_history: {
+			rows: schedulerRows,
+			decisions: scheduler,
+			pass_bands: schedulerPassBands,
+			defer_reasons: schedulerDeferReasons,
+		},
 		fixed_self_caused_classes: fixedClasses,
 		unexplained_invariants: Object.entries(fixedClasses)
 			.filter(([, value]) => value > 0)

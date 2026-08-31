@@ -1213,11 +1213,23 @@ mod tests {
 
     #[test]
     fn historian_temperature_is_optional_and_user_tier_only() {
-        let user = serde_json::json!({ "historian": { "temperature": 0.1 } });
         let project = serde_json::json!({ "historian": { "temperature": 0.9 } });
         assert_eq!(merge_tiers(None, None).historian_temperature, None);
-        assert_eq!(merge_tiers(Some(&user), Some(&project)).historian_temperature, Some(0.1));
-        assert_eq!(merge_tiers(None, Some(&project)).historian_temperature, None);
+        for temperature in [0.1, 0.0] {
+            let user = serde_json::json!({
+                "historian": {
+                    "temperature": temperature,
+                    "module_model": "module/historian"
+                }
+            });
+            let resolved = merge_tiers(Some(&user), Some(&project));
+            assert_eq!(resolved.historian_temperature, Some(temperature));
+            assert_eq!(resolved.model_chain, vec!["module/historian"]);
+        }
+        assert_eq!(
+            merge_tiers(None, Some(&project)).historian_temperature,
+            None
+        );
     }
 
     #[test]

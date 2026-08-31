@@ -583,6 +583,8 @@ function emptyRustPassTimings(): RustPassTimings {
 function formatRustPassLog(args: {
     decision: string;
     reason: string;
+    schedulerDecision?: string;
+    schedulerDeferReason?: string;
     servedFrom: string;
     inputCount: number;
     outputCount: number;
@@ -606,7 +608,10 @@ function formatRustPassLog(args: {
     // must not be subtracted into `other` or they would hide leftover serve work.
     const unattributed = Math.max(0, args.elapsedMs - measured);
     const rowVersion = Number.isSafeInteger(args.rowVersion) ? args.rowVersion : 0;
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    const schedulerFields = args.schedulerDecision
+        ? ` scheduler=${args.schedulerDecision}${args.schedulerDeferReason ? ` defer_reason=${args.schedulerDeferReason}` : ""}`
+        : "";
+    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1712,6 +1717,8 @@ export function createRustModeTransform(
         let requestInputTokens = 0;
         let decision = "error";
         let materializeReason = "none";
+        let schedulerDecision: string | undefined;
+        let schedulerDeferReason: string | undefined;
         let servedFrom = "none";
         let moduleElapsedMs = 0;
         let rowVersion = 0;
@@ -1835,6 +1842,8 @@ export function createRustModeTransform(
                 formatRustPassLog({
                     decision,
                     reason: materializeReason,
+                    schedulerDecision,
+                    schedulerDeferReason,
                     servedFrom,
                     inputCount,
                     outputCount: output.messages.length,
@@ -1866,6 +1875,14 @@ export function createRustModeTransform(
                         : "unknown";
             servedFrom =
                 typeof response.served_from === "string" ? response.served_from : "unknown";
+            schedulerDecision =
+                typeof response.scheduler_decision === "string"
+                    ? response.scheduler_decision
+                    : undefined;
+            schedulerDeferReason =
+                typeof response.scheduler_defer_reason === "string"
+                    ? response.scheduler_defer_reason
+                    : undefined;
             materializeReason =
                 typeof response.materialize_reason === "string" &&
                 response.materialize_reason.length > 0
