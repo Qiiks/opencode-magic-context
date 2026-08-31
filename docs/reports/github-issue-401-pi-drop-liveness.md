@@ -173,3 +173,15 @@ The follow-up keeps the scheduler and drop behavior unchanged while making the d
 - The shared boundary decision carries a resolved `deferReason` into OpenCode postprocess and Pi. A base `execute` downgraded by the mid-turn boundary is logged as `mid_turn_boundary`; a genuine below-threshold base defer remains `scheduler_defer`.
 - Pending-op `WILL APPLY` and `WILL NOT APPLY` lines use a durable `COUNT(*)` queue depth. If that diagnostic read fails, they emit `not loaded (deferred pass)` rather than presenting an unloaded array as `pendingOps=0`.
 - No Rust twin of either user-facing log line exists in the current module, so no Rust wire or diagnostic output changed.
+
+### Mutation evidence
+
+Each guard was deliberately reverted once, the relevant test was run, and the original implementation was restored before this report was amended:
+
+| Mutation | Diagnostic guard | Executed check | Recorded failing assertion |
+|---|---|---|---|
+| Replace carried defer reasons with the constant `scheduler_defer` | Mid-turn downgrade must report `mid_turn_boundary` | `bun test packages/pi-plugin/src/context-handler.test.ts` | `packages/pi-plugin/src/context-handler.test.ts:174` |
+| Replace durable queue depth with deferred-pass array length | A queued durable operation must not be reported as `pendingOps=0` | `bun test packages/pi-plugin/src/context-handler.test.ts` | `packages/pi-plugin/src/context-handler.test.ts:174` and `:232` |
+| Restore both anonymous historian redundancy-skip strings | Both skip sites must identify the historian and next eligible execute pass | `bun test packages/plugin/src/hooks/magic-context/compartment-trigger.test.ts` | `packages/plugin/src/hooks/magic-context/compartment-trigger.test.ts:34` |
+
+The queue-depth mutation produced the observed lie directly: the refusal lines became `pendingOps=0` while the durable queue contained one row. The restored focused checks passed, confirming the tests are non-vacuous against all three guarded regressions.
