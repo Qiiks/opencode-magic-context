@@ -227,28 +227,55 @@ describe("local embedding runtime selection", () => {
 });
 
 describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
-    test("a vulnerable Bun host loads the web bundle without importing the native addon", async () => {
+    test("a vulnerable Bun host injects WASM before transformers and never takes the native fallback", async () => {
         const cacheDir = mkdtempSync(join(tmpdir(), "mc-bun-wasm-default-"));
-        let nativeImports = 0;
-        let wasmImports = 0;
+        const calls: string[] = [];
+        let fallbackImports = 0;
+        const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
         try {
             __setLocalEmbeddingTestHooks({
                 host: () => ({ isElectron: false, isBun: true, bunVersion: "1.3.14" }),
-                importTransformers: async () => {
-                    nativeImports++;
-                    throw new Error("native import must not run");
+                injectWasmOrt: async () => {
+                    calls.push("inject");
+                    return true;
                 },
-                injectWasmOrt: async () => true,
+                importTransformers: async () => {
+                    calls.push("transformers");
+                    return fakeTransformersModule({
+                        onPipeline: (options) => pipelineOptions.push(options),
+                    });
+                },
                 importTransformersWasmFallback: async () => {
-                    wasmImports++;
-                    return fakeTransformersModule();
+                    fallbackImports++;
+                    throw new Error("injected Bun path must not use the load-failure fallback");
                 },
                 modelCacheDir: () => cacheDir,
             });
 
             expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
-            expect(nativeImports).toBe(0);
-            expect(wasmImports).toBe(1);
+            expect(calls).toEqual(["inject", "transformers"]);
+            expect(fallbackImports).toBe(0);
+            expect(pipelineOptions).toEqual([{ dtype: "fp32", device: "auto" }]);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("native selection omits a device option", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-native-device-default-"));
+        const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () =>
+                    fakeTransformersModule({
+                        onPipeline: (options) => pipelineOptions.push(options),
+                    }),
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(pipelineOptions).toEqual([{ dtype: "fp32" }]);
         } finally {
             rmSync(cacheDir, { recursive: true, force: true });
         }

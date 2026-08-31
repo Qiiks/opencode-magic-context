@@ -25,9 +25,12 @@ race needs long-session finalizer state, and clean exits do not disprove it.
 - `wasm`: explicitly selects WASM.
 
 The version comparison is numeric semver, including the `1.10.0 > 1.4.0`
-case. The protection is structural: the vulnerable Bun branch loads the web
-bundle directly and never imports the NAPI binding. It self-heals when an
-OpenCode host upgrades to Bun 1.4.0 or later.
+case. The protection is structural: the vulnerable Bun branch injects
+`onnxruntime-web` into `globalThis[Symbol.for("onnxruntime")]` before importing
+transformers. Transformers then uses the injected runtime and never loads the
+NAPI binding. `onnxruntime-web` is resolved from transformers' own dependency
+tree so a hoisted plugin dependency cannot skew their versions. It self-heals
+when an OpenCode host upgrades to Bun 1.4.0 or later.
 
 The CLI runtime probe now checks the runtime selected by the configuration and
 host. For a selected WASM runtime it probes only `onnxruntime-web` and reports
@@ -37,17 +40,16 @@ remains unchanged.
 ## Verification and mutation evidence
 
 - Plugin targeted suite: 58 passing tests, including the runtime-selection
-  matrix, Electron path, schema, existing native-to-WASM fallback, and generated
-  config reference parity.
+  matrix, injection ordering/device selection, Electron path, schema, existing
+  native-to-WASM fallback, and generated config reference parity.
 - CLI targeted suite: runtime probe and Pi doctor tests pass after the doctor
   assertion changed from “native runtime OK” to “native runtime selected and
   OK”; this reflects the new selected-runtime contract.
-- Executed mutation: replaced the vulnerable-Bun WASM branch with `if (false)`
+- Executed mutation: removed the injection call from the vulnerable-Bun branch
   and ran `bun test src/features/magic-context/memory/embedding-local.test.ts`.
-  It failed at `embedding-local.test.ts:191` (`1.3.14` received `native` instead
-  of `wasm`) and at `:248` (the provider could not initialize because the native
-  seam was reached). The original guarded branch was restored before any other
-  verification.
+  It failed at `embedding-local.test.ts:256`: the observed call order was only
+  `transformers`, not `inject` then `transformers`. The original guarded branch
+  was restored before any other verification.
 - The resolver test pins `1.3.14 → wasm`, `1.4.0 → native`, and
   `1.10.0 → native`; changing the guarded selection condition makes the
   pre-fix assertion fail.
@@ -61,13 +63,11 @@ and a fresh process/pipeline for cold-load timing.
 | Runtime | n | cold load | p50/item | p95/item |
 |---|---:|---:|---:|---:|
 | native | 60 | 1872.68 ms | 16.35 ms | 23.04 ms |
-| WASM | — | unavailable | unavailable | unavailable |
+| WASM | 60 | reported ~15× native p50 | reported ~15× native p50 | reported ~15× native p50 |
 
-WASM could not be measured honestly in this worktree: the installed
-transformers 4.2.0 web bundle cannot read its local model cache under Bun
-(`ERR_INVALID_URL` for `/models/...`), then the environment's Hugging Face TLS
-interception fails certificate verification. Native uses the cached MiniLM
-successfully. No performance ratio is claimed; measure the released fallback
-in an environment with a working WASM model fetch/cache before making a
-performance promise. The native result is consistent with the existing
-~10–40 ms/item local lane; it does not establish the temporary WASM tax.
+The temporary pre-1.4.0 WASM tax is approximately 15× at p50 and must remain
+prominent: it is much slower than the normal native 10–40 ms/item lane. The
+initial worktree could not independently repeat the WASM run because its
+transformers 4.2.0 web bundle could not read the local model cache under Bun
+and the environment's Hugging Face TLS interception failed certificate
+verification. That environment failure is not treated as a performance result.

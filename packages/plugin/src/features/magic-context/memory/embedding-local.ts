@@ -202,15 +202,24 @@ let localEmbeddingRuntimeMode: LocalEmbeddingRuntimeMode = "native";
 let wasmRuntimeInjected = false;
 let localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
 let importWasmOrtForRuntime = async (): Promise<{
-    env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-    default?: unknown;
-}> => {
-    // Keep this non-literal so Bun does not resolve the WASM package until the
-    // runtime actually needs it.
-    const ortWebSpec = `onnxruntime-${"web"}`;
-    return (await import(ortWebSpec)) as {
+    module: {
         env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
         default?: unknown;
+    };
+    entryPath: string;
+}> => {
+    const { createRequire: createRequireFn } = await import("node:module");
+    const requireFn = createRequireFn(import.meta.url);
+    const transformersEntry = requireFn.resolve("@huggingface/transformers");
+    // Resolve through transformers, which owns this dependency. A direct plugin
+    // resolution can select a different ORT version in a hoisted install.
+    const ortEntry = createRequireFn(transformersEntry).resolve("onnxruntime-web");
+    return {
+        module: (await import(pathToFileURL(ortEntry).href)) as {
+            env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
+            default?: unknown;
+        },
+        entryPath: ortEntry,
     };
 };
 let importTransformersForRuntime = async (): Promise<TransformersModule> => {
@@ -277,23 +286,12 @@ async function injectWasmOrt(): Promise<boolean> {
     if (wasmRuntimeInjected) return true;
 
     try {
-        const ortWeb = await importWasmOrtForRuntime();
+        const { module: ortWeb, entryPath } = await importWasmOrtForRuntime();
 
         // Prefer package-local assets so first use works offline instead of
         // requiring the default CDN path.
-        try {
-            const { createRequire: createRequireFn } = await import("node:module");
-            const requireFn = createRequireFn(import.meta.url);
-            const mainEntry = requireFn.resolve("onnxruntime-web");
-            const distDir = dirname(mainEntry);
-            if (ortWeb.env?.wasm) {
-                ortWeb.env.wasm.wasmPaths = `${pathToFileURL(distDir).href}/`;
-            }
-        } catch (pathError) {
-            log(
-                "[magic-context] could not resolve local onnxruntime-web/dist, falling back to default WASM paths:",
-                pathError instanceof Error ? pathError.message : String(pathError),
-            );
+        if (ortWeb.env?.wasm) {
+            ortWeb.env.wasm.wasmPaths = `${pathToFileURL(dirname(entryPath)).href}/`;
         }
 
         (globalThis as Record<symbol, unknown>)[Symbol.for("onnxruntime")] = ortWeb;
@@ -352,9 +350,13 @@ async function loadTransformersForLocalEmbedding(
         localEmbeddingHostForRuntime(),
     );
     if (resolvedRuntime === "wasm") {
-        // Select WASM before importing transformers' Node entry because it eagerly
-        // loads onnxruntime-node, which can crash during teardown on Bun before 1.4.0.
-        localEmbeddingRuntimeMode = "wasm";
+        // Inject the global onnxruntime symbol before transformers evaluates its
+        // Node entry, preventing its NAPI addon from loading in Bun before 1.4.0.
+        if (!(await ensureWasmOrtInjected())) {
+            disableLocalEmbeddingsAfterRuntimeFailure("the selected WASM runtime is unavailable");
+            throw new Error("onnxruntime-web failed to load");
+        }
+        return { module: await importTransformersForRuntime(), usesWasm: true };
     }
 
     if (localEmbeddingRuntimeMode === "wasm") {
