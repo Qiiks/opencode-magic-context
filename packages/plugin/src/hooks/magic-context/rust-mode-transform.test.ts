@@ -588,6 +588,12 @@ describe("Rust mode authority adapter", () => {
                 decision: "HARD",
                 materialize_reason: "first_render",
                 scheduler_decision: "execute",
+                historian: {
+                    fired: false,
+                    no_fire: "trigger_false",
+                    canonical_cause: "no_new_raw_history",
+                    state: "idle",
+                },
                 served_from: "transform",
                 timings: { handler_total: 5, total: 4, native_cache_encoded_messages: 1 },
             },
@@ -625,6 +631,9 @@ describe("Rust mode authority adapter", () => {
             expect(passLines).toHaveLength(2);
             expect(passLines[0]).toContain("decision=HARD");
             expect(passLines[0]).toContain("scheduler=execute");
+            expect(passLines[0]).toContain(
+                "historian_no_fire=trigger_false canonical_cause=no_new_raw_history",
+            );
             expect(passLines[0]).toContain("served_from=transform");
             expect(passLines[1]).toContain("decision=SOFT+");
             expect(passLines[1]).toContain(

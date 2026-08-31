@@ -2786,10 +2786,11 @@ pub struct HistorianDurableState {
     /// later firing establishes its producer run.
     #[serde(default)]
     pub last_failure: Option<String>,
-    /// Why the most recent pass declined to fire (reason discriminant only, no numbers,
-    /// so steady-state passes rewrite nothing). The twin of `last_failure` for the
-    /// pre-fire half: a supervised rig cannot read the transform response's diagnostics
-    /// block, so the skip branch must be readable from the state dump. Cleared on fire.
+    /// Why the most recent pass declined to fire. The structured text retains the raw Rust
+    /// cause, a TypeScript-aligned canonical cause, and quantized measurements when available.
+    /// Its change gate prevents steady-state passes from rewriting the row. The twin of
+    /// `last_failure` for the pre-fire half: a supervised rig cannot read the transform response's
+    /// diagnostics block, so the skip branch must be readable from the state dump. Cleared on fire.
     #[serde(default)]
     pub last_no_fire: Option<String>,
     /// Consecutive failures on the historian publication path. This is diagnostic-only

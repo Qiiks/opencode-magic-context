@@ -180,6 +180,104 @@ pub enum FireOutcome {
     Busy(HistorianDurableState),
 }
 
+/// Rust's concrete reason for declining a historian firing. The raw variant name stays
+/// available for Rust incident tooling while `canonical_cause` maps the decision onto the
+/// TypeScript operator vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorianNoFireCause {
+    HistorianAlreadyInProgress,
+    LiveHistorianClaimBusy,
+    RestartRecoveryInProgress,
+    CheapGateBelowTriggerBudget,
+    NoLiveMessageAtOrAfterOffset,
+    RawTailInspectionFailed,
+    ProjectedPostDropSatisfied,
+    ProtectedTailWindowEmpty,
+    BelowProactiveFloor,
+    BelowMinimumEligibleContent,
+    DrainBudgetSpent,
+    MissingBoundarySnapshot,
+    StaleBoundarySnapshot,
+    EmptyFilteredChunk,
+    InvalidChunkCoverage,
+    NoModels,
+    FailureBackoff,
+    PendingRewrite,
+    StateLoadFailed,
+    ContinuedOrdinalOffsetMissing,
+    MissingBoundary,
+    EmptyEligibleRange,
+    EmptyChunk,
+    BelowSubstanceFloor,
+    MissingBlockIdentity,
+    AssemblyFailed,
+    SubagentSession,
+}
+
+impl HistorianNoFireCause {
+    pub const fn raw_cause(self) -> &'static str {
+        match self {
+            Self::HistorianAlreadyInProgress => "HistorianAlreadyInProgress",
+            Self::LiveHistorianClaimBusy => "LiveHistorianClaimBusy",
+            Self::RestartRecoveryInProgress => "RestartRecoveryInProgress",
+            Self::CheapGateBelowTriggerBudget => "CheapGateBelowTriggerBudget",
+            Self::NoLiveMessageAtOrAfterOffset => "NoLiveMessageAtOrAfterOffset",
+            Self::RawTailInspectionFailed => "RawTailInspectionFailed",
+            Self::ProjectedPostDropSatisfied => "ProjectedPostDropSatisfied",
+            Self::ProtectedTailWindowEmpty => "ProtectedTailWindowEmpty",
+            Self::BelowProactiveFloor => "BelowProactiveFloor",
+            Self::BelowMinimumEligibleContent => "BelowMinimumEligibleContent",
+            Self::DrainBudgetSpent => "DrainBudgetSpent",
+            Self::MissingBoundarySnapshot => "MissingBoundarySnapshot",
+            Self::StaleBoundarySnapshot => "StaleBoundarySnapshot",
+            Self::EmptyFilteredChunk => "EmptyFilteredChunk",
+            Self::InvalidChunkCoverage => "InvalidChunkCoverage",
+            Self::NoModels => "NoModels",
+            Self::FailureBackoff => "FailureBackoff",
+            Self::PendingRewrite => "PendingRewrite",
+            Self::StateLoadFailed => "StateLoadFailed",
+            Self::ContinuedOrdinalOffsetMissing => "ContinuedOrdinalOffsetMissing",
+            Self::MissingBoundary => "MissingBoundary",
+            Self::EmptyEligibleRange => "EmptyEligibleRange",
+            Self::EmptyChunk => "EmptyChunk",
+            Self::BelowSubstanceFloor => "BelowSubstanceFloor",
+            Self::MissingBlockIdentity => "MissingBlockIdentity",
+            Self::AssemblyFailed => "AssemblyFailed",
+            Self::SubagentSession => "SubagentSession",
+        }
+    }
+
+    pub const fn canonical_cause(self) -> &'static str {
+        match self {
+            Self::HistorianAlreadyInProgress
+            | Self::LiveHistorianClaimBusy
+            | Self::RestartRecoveryInProgress => "in_flight",
+            Self::CheapGateBelowTriggerBudget => "cheap_skip",
+            Self::NoLiveMessageAtOrAfterOffset | Self::EmptyChunk => "no_new_raw_history",
+            Self::RawTailInspectionFailed => "raw_history_unavailable",
+            Self::ProjectedPostDropSatisfied => "redundancy_skip",
+            Self::ProtectedTailWindowEmpty | Self::MissingBoundary | Self::EmptyEligibleRange => {
+                "protected_tail"
+            }
+            Self::BelowMinimumEligibleContent | Self::BelowSubstanceFloor => "below_min_chunk",
+            Self::DrainBudgetSpent => "drain_budget",
+            Self::MissingBoundarySnapshot => "missing_boundary_snapshot",
+            Self::StaleBoundarySnapshot => "stale_boundary_snapshot",
+            Self::EmptyFilteredChunk => "below_min_chunk",
+            Self::InvalidChunkCoverage => "invalid_chunk_coverage",
+            Self::BelowProactiveFloor => "below_proactive_floor",
+            Self::NoModels => "no_models",
+            Self::FailureBackoff => "rate_limit",
+            Self::PendingRewrite => "pending_rewrite",
+            Self::StateLoadFailed => "state_load_failed",
+            Self::ContinuedOrdinalOffsetMissing => "state_incomplete",
+            Self::MissingBlockIdentity => "invalid_boundary_identity",
+            Self::AssemblyFailed => "assembly_failed",
+            Self::SubagentSession => "subagent_session",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum HistorianStateError {
     InvalidRange {

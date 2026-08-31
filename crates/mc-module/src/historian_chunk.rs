@@ -14,7 +14,9 @@ use serde_json::Value;
 
 use crate::boundary::BoundaryResolution;
 use crate::ck_wire::{CkIngressMessage, CkKind, FlatBlock};
-use crate::historian::{compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest};
+use crate::historian::{
+    compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest, HistorianNoFireCause,
+};
 use crate::historian_prompt::{
     build_compartment_agent_prompt, build_reference_blocks_from_stored,
     render_historian_memory_block, CompartmentPromptInputs,
@@ -486,6 +488,18 @@ pub enum HistorianNoFireReason {
     MissingBlockIdentity {
         message_id: String,
     },
+}
+
+impl HistorianNoFireReason {
+    pub const fn cause(&self) -> HistorianNoFireCause {
+        match self {
+            Self::NoModels => HistorianNoFireCause::NoModels,
+            Self::EmptyEligibleRange { .. } => HistorianNoFireCause::EmptyEligibleRange,
+            Self::EmptyChunk => HistorianNoFireCause::EmptyChunk,
+            Self::BelowBudget { .. } => HistorianNoFireCause::BelowSubstanceFloor,
+            Self::MissingBlockIdentity { .. } => HistorianNoFireCause::MissingBlockIdentity,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1713,13 +1727,48 @@ mod tests {
     }
 
     #[test]
+    fn assembly_no_fire_reasons_preserve_distinct_canonical_causes() {
+        let cases = [
+            (HistorianNoFireReason::NoModels, "no_models"),
+            (
+                HistorianNoFireReason::EmptyEligibleRange {
+                    start_ordinal: 8,
+                    eligible_end_ordinal: 8,
+                },
+                "protected_tail",
+            ),
+            (HistorianNoFireReason::EmptyChunk, "no_new_raw_history"),
+            (
+                HistorianNoFireReason::BelowBudget {
+                    token_estimate: 20,
+                    minimum: 512,
+                },
+                "below_min_chunk",
+            ),
+            (
+                HistorianNoFireReason::MissingBlockIdentity {
+                    message_id: "m1".to_string(),
+                },
+                "invalid_boundary_identity",
+            ),
+        ];
+
+        for (reason, canonical) in cases {
+            assert_eq!(reason.cause().canonical_cause(), canonical);
+        }
+    }
+
+    #[test]
     fn below_budget_when_tail_reclaim_not_fold_only() {
         // Tail reducers exist (owned-llmrunner leg): substance floor blocks below emergency.
         match tiny_chunk_assemble(false) {
-            AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::BelowBudget {
-                minimum,
-                ..
-            }) => assert_eq!(minimum, 512),
+            AssembleHistorianFiringOutcome::NoFire(
+                reason @ HistorianNoFireReason::BelowBudget { minimum, .. },
+            ) => {
+                assert_eq!(minimum, 512);
+                assert_eq!(reason.cause(), HistorianNoFireCause::BelowSubstanceFloor);
+                assert_eq!(reason.cause().canonical_cause(), "below_min_chunk");
+            }
             other => panic!("expected BelowBudget no-fire, got {other:?}"),
         }
     }

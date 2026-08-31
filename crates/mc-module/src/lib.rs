@@ -92,7 +92,10 @@ use classify::{
 };
 use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
-use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
+use historian::{
+    reattach_historian_producer, run_historian_firing, HistorianNoFireCause,
+    HistorianProducerDriver,
+};
 use historian_chunk::{
     assemble_historian_firing, AssembleHistorianFiringOutcome, AssembledHistorianFiring,
     HistorianAssemblerConfig,
@@ -3165,6 +3168,44 @@ struct PreparedHistorianFiring {
     task: HistorianFiringTask,
 }
 
+fn historian_no_fire_detail(
+    kind: &str,
+    cause: HistorianNoFireCause,
+    extra: Option<&str>,
+) -> String {
+    let suffix = extra
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(",{value}"))
+        .unwrap_or_default();
+    format!(
+        "{kind}{{raw_cause={},canonical_cause={}{suffix}}}",
+        cause.raw_cause(),
+        cause.canonical_cause(),
+    )
+}
+
+fn historian_no_fire_diagnostics(
+    no_fire: impl Into<String>,
+    detail_kind: &str,
+    cause: HistorianNoFireCause,
+    extra: Option<&str>,
+    reason: Option<String>,
+    state: String,
+    progress: Option<transform::HistorianTriggerProgress>,
+    last_failure: Option<String>,
+) -> HistorianDiagnostics {
+    HistorianDiagnostics {
+        fired: false,
+        reason,
+        no_fire: Some(no_fire.into()),
+        no_fire_detail: Some(historian_no_fire_detail(detail_kind, cause, extra)),
+        canonical_cause: Some(cause.canonical_cause().to_string()),
+        state,
+        progress,
+        last_failure,
+    }
+}
+
 enum PreparedHistorianAction {
     Complete(HistorianDiagnostics),
     Busy {
@@ -4668,38 +4709,64 @@ impl McHandler {
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some(format!("state_load_failed:{e}")),
-                    state: "unknown".to_string(),
-                    progress: None,
-                    last_failure: None,
-                });
+                return PreparedHistorianAction::Complete(historian_no_fire_diagnostics(
+                    format!("state_load_failed:{e}"),
+                    "state_load_failed",
+                    HistorianNoFireCause::StateLoadFailed,
+                    None,
+                    None,
+                    "unknown".to_string(),
+                    None,
+                    None,
+                ));
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
         let last_failure = loaded.meta.historian.last_failure.clone();
         if loaded.meta.pending_rewrite.is_some() {
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some("pending_rewrite".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "pending_rewrite",
+                "pending_rewrite",
+                HistorianNoFireCause::PendingRewrite,
+                None,
+                None,
                 state,
-                progress: None,
+                None,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
+            let diagnostics = historian_no_fire_diagnostics(
+                "busy",
+                "busy",
+                HistorianNoFireCause::LiveHistorianClaimBusy,
+                None,
+                None,
+                state,
+                None,
+                last_failure,
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
             return PreparedHistorianAction::Busy {
-                diagnostics: HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some("busy".to_string()),
-                    state,
-                    progress: None,
-                    last_failure,
-                },
+                diagnostics,
                 completion,
             };
         }
@@ -4715,14 +4782,26 @@ impl McHandler {
                     now,
                 )
                 .unwrap_or("busy");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some(no_fire.to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                no_fire,
+                "restart_recovery",
+                HistorianNoFireCause::RestartRecoveryInProgress,
+                None,
+                None,
                 state,
-                progress: None,
+                None,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let boundary_build_started_at = Instant::now();
         let CachedBoundaryMessages {
@@ -4750,15 +4829,26 @@ impl McHandler {
                     "mc-module: aborting historian trigger for {}: {detail}",
                     parsed.session_id
                 );
-                self.record_no_fire(&store, &parsed.session_id, &loaded, detail);
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some(detail.to_string()),
+                let diagnostics = historian_no_fire_diagnostics(
+                    detail,
+                    detail,
+                    HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
+                    None,
+                    None,
                     state,
-                    progress: None,
+                    None,
                     last_failure,
-                });
+                );
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
+                );
+                return PreparedHistorianAction::Complete(diagnostics);
             }
             Ok(_) | Err(_) => None,
         };
@@ -4826,37 +4916,40 @@ impl McHandler {
                 protected_start_ordinal: p.protected_start_ordinal,
             });
         if !trigger.fire {
-            let reason = if loaded.meta.historian.state == HistorianPhase::Idle {
-                "trigger_false"
-            } else {
-                "busy"
-            };
-            if reason == "trigger_false" {
-                // Carry the measurement, not just the branch: a bare trigger_false is
-                // not actionable from a state dump (is the bar honestly uncrossed, or
-                // is eligible measuring zero against real content?). Sizes quantize to
-                // the nearest 1k so routine content growth keeps the change-gate
-                // effective instead of rewriting the row on every pass.
-                let detail = match trigger.progress.as_ref() {
-                    Some(p) => format!(
-                        "trigger_false{{eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}}}",
-                        (p.eligible_chunk_tokens / 1000.0).round(),
-                        (p.tail_size_bar / 1000.0).round(),
-                        (p.n_tokens / 1000.0).round(),
-                        context_limit,
-                    ),
-                    None => "trigger_false".to_string(),
-                };
-                self.record_no_fire(&store, &parsed.session_id, &loaded, &detail);
-            }
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some(reason.to_string()),
+            let cause = trigger
+                .no_fire_cause
+                .expect("a false historian trigger carries its concrete cause");
+            // Quantized measurements keep the durable change gate effective while the raw and
+            // canonical causes make each refusal branch independently diagnosable.
+            let extra = trigger.progress.as_ref().map(|p| {
+                format!(
+                    "eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}",
+                    (p.eligible_chunk_tokens / 1000.0).round(),
+                    (p.tail_size_bar / 1000.0).round(),
+                    (p.n_tokens / 1000.0).round(),
+                    context_limit,
+                )
+            });
+            let diagnostics = historian_no_fire_diagnostics(
+                "trigger_false",
+                "trigger_false",
+                cause,
+                extra.as_deref(),
+                None,
                 state,
                 progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let trigger_reason = trigger.reason.map(|r| r.as_str().to_string());
         let model_chain = parsed
@@ -4864,26 +4957,48 @@ impl McHandler {
             .as_deref()
             .unwrap_or(&cfg.model_chain);
         if model_chain.is_empty() {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "no_models");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: trigger_reason,
-                no_fire: Some("no_models".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "no_models",
+                "no_models",
+                HistorianNoFireCause::NoModels,
+                None,
+                trigger_reason,
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let Some(boundary) = trigger.boundary.clone() else {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "missing_boundary");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: None,
-                no_fire: Some("missing_boundary".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "missing_boundary",
+                "missing_boundary",
+                HistorianNoFireCause::MissingBoundary,
+                None,
+                None,
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         };
         if loaded
             .meta
@@ -4891,15 +5006,26 @@ impl McHandler {
             .failure_backoff_at_ms
             .is_some_and(|backoff_at_ms| now < backoff_at_ms)
         {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "backoff");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: trigger_reason,
-                no_fire: Some("backoff".to_string()),
+            let diagnostics = historian_no_fire_diagnostics(
+                "backoff",
+                "backoff",
+                HistorianNoFireCause::FailureBackoff,
+                None,
+                trigger_reason,
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
-            });
+            );
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                diagnostics
+                    .no_fire_detail
+                    .as_deref()
+                    .expect("no-fire detail"),
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let live: Vec<_> = projection
             .blocks
@@ -4947,42 +5073,60 @@ impl McHandler {
         let firing = match assemble {
             Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                let raw_no_fire = format!("assemble:{reason:?}");
+                let raw_detail = format!("detail={reason:?}");
+                let diagnostics = historian_no_fire_diagnostics(
+                    raw_no_fire,
+                    "assemble",
+                    reason.cause(),
+                    Some(&raw_detail),
+                    trigger_reason,
+                    state,
+                    progress,
+                    last_failure,
+                );
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
                     &loaded,
-                    &format!("assemble:{reason:?}"),
+                    diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
                 );
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger_reason,
-                    no_fire: Some(format!("assemble:{reason:?}")),
-                    state,
-                    progress: progress.clone(),
-                    last_failure,
-                });
+                return PreparedHistorianAction::Complete(diagnostics);
             }
             Err(e) => {
+                let raw_no_fire = format!("assemble_failed:{e}");
+                let raw_detail = format!("error={e}");
+                let diagnostics = historian_no_fire_diagnostics(
+                    raw_no_fire,
+                    "assemble_failed",
+                    HistorianNoFireCause::AssemblyFailed,
+                    Some(&raw_detail),
+                    trigger_reason,
+                    state,
+                    progress,
+                    last_failure,
+                );
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
                     &loaded,
-                    &format!("assemble_failed:{e}"),
+                    diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
                 );
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger_reason,
-                    no_fire: Some(format!("assemble_failed:{e}")),
-                    state,
-                    progress: progress.clone(),
-                    last_failure,
-                });
+                return PreparedHistorianAction::Complete(diagnostics);
             }
         };
         let diagnostics = HistorianDiagnostics {
             fired: true,
             reason: trigger_reason,
             no_fire: None,
+            no_fire_detail: None,
+            canonical_cause: None,
             state: state.clone(),
             progress: progress.clone(),
             last_failure: last_failure.clone(),
@@ -4990,15 +5134,27 @@ impl McHandler {
         let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
             LiveHistorianSessionClaim::Acquired(live_guard) => live_guard,
             LiveHistorianSessionClaim::Busy(completion) => {
+                let busy_diagnostics = historian_no_fire_diagnostics(
+                    "busy",
+                    "busy",
+                    HistorianNoFireCause::LiveHistorianClaimBusy,
+                    None,
+                    diagnostics.reason,
+                    state,
+                    progress,
+                    last_failure,
+                );
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    busy_diagnostics
+                        .no_fire_detail
+                        .as_deref()
+                        .expect("no-fire detail"),
+                );
                 return PreparedHistorianAction::Busy {
-                    diagnostics: HistorianDiagnostics {
-                        fired: false,
-                        reason: diagnostics.reason,
-                        no_fire: Some("busy".to_string()),
-                        state,
-                        progress,
-                        last_failure,
-                    },
+                    diagnostics: busy_diagnostics,
                     completion,
                 };
             }
@@ -5152,11 +5308,11 @@ impl McHandler {
         diagnostics
     }
 
-    /// Persist the skip-branch discriminant so a supervised rig can read WHY the
-    /// historian declined to fire from the state dump (the transform response's
-    /// diagnostics block never reaches disk). Change-gated: steady-state passes that
-    /// skip for the same reason write nothing, so this stays off the hot path. A CAS
-    /// conflict just drops the diagnostic; it must never fail a pass.
+    /// Persist structured skip detail so a supervised rig can read why the historian declined
+    /// to fire from the state dump (the transform response's diagnostics block never reaches
+    /// disk). Change-gated: steady-state passes with the same cause and quantized measurements
+    /// write nothing, so this stays off the hot path. A CAS conflict just drops the diagnostic;
+    /// it must never fail a pass.
     fn record_no_fire(
         &self,
         store: &McStore,
@@ -8160,14 +8316,16 @@ impl McHandler {
         }
         let mut trigger_timings = HistorianTriggerTimings::default();
         let diagnostics = if parsed.is_subagent {
-            HistorianDiagnostics {
-                fired: false,
-                reason: Some("subagent_session".to_string()),
-                no_fire: Some("subagent_session".to_string()),
-                state: "disabled".to_string(),
-                progress: None,
-                last_failure: None,
-            }
+            historian_no_fire_diagnostics(
+                "subagent_session",
+                "subagent_session",
+                HistorianNoFireCause::SubagentSession,
+                None,
+                Some("subagent_session".to_string()),
+                "disabled".to_string(),
+                None,
+                None,
+            )
         } else if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             match self.prepare_historian_fire(
                 Arc::clone(&store),
@@ -29039,6 +29197,7 @@ mod tests {
         let backed_off = call_transform(&handler, messages.clone()).await;
         assert_eq!(backed_off["historian"]["fired"], false);
         assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(backed_off["historian"]["canonical_cause"], "rate_limit");
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
 
         expire_historian_backoff(&store);
@@ -29251,10 +29410,14 @@ mod tests {
         let response = call_transform(&handler, messages).await;
         assert_eq!(response["historian"]["fired"], false);
         assert_eq!(response["historian"]["no_fire"], "backoff");
+        assert_eq!(response["historian"]["canonical_cause"], "rate_limit");
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
-        assert_eq!(state.last_no_fire.as_deref(), Some("backoff"));
+        assert_eq!(
+            state.last_no_fire.as_deref(),
+            Some("backoff{raw_cause=FailureBackoff,canonical_cause=rate_limit}")
+        );
         assert!(
             state
                 .failure_backoff_at_ms
@@ -29392,6 +29555,7 @@ mod tests {
         let backed_off = call_transform(&handler, messages.clone()).await;
         assert_eq!(backed_off["historian"]["fired"], false);
         assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(backed_off["historian"]["canonical_cause"], "rate_limit");
         assert_eq!(producer.connects.load(Ordering::SeqCst), 1);
 
         expire_historian_backoff(&store);
@@ -29419,7 +29583,7 @@ mod tests {
         let loaded = store.load("ses").unwrap();
         assert_eq!(
             loaded.meta.historian.last_no_fire.as_deref(),
-            Some("no_models")
+            Some("no_models{raw_cause=NoModels,canonical_cause=no_models}")
         );
         let version_after_first = loaded.row_version;
 
@@ -29493,7 +29657,13 @@ mod tests {
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         let messages = vec![ck("m1", 1, "small turn")];
         let _ = call_transform(&handler, messages.clone()).await;
-        let _ = call_transform(&handler, messages).await;
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["canonical_cause"], "protected_tail");
+        assert_eq!(response["historian"]["no_fire"], "trigger_false");
+        assert!(response["historian"]["no_fire_detail"]
+            .as_str()
+            .unwrap()
+            .contains("raw_cause=ProtectedTailWindowEmpty"));
         let loaded = store.load("ses").unwrap();
         let detail = loaded
             .meta
@@ -29502,6 +29672,8 @@ mod tests {
             .expect("trigger_false recorded");
         assert!(
             detail.starts_with("trigger_false{")
+                && detail.contains("raw_cause=ProtectedTailWindowEmpty")
+                && detail.contains("canonical_cause=protected_tail")
                 && detail.contains("bar~")
                 && detail.contains("ctx_limit="),
             "detail carries the numbers: {detail}"

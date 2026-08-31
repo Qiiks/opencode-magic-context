@@ -1623,7 +1623,15 @@ impl TransformResponse {
 pub struct HistorianDiagnostics {
     pub fired: bool,
     pub reason: Option<String>,
+    /// Existing transform consumers still read this coarse Rust discriminant; newer
+    /// consumers use the additional structured fields below.
     pub no_fire: Option<String>,
+    /// Structured diagnostic detail retaining the raw Rust cause and its TypeScript-aligned class.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub no_fire_detail: Option<String>,
+    /// Canonical TypeScript no-fire vocabulary for adapter logs and incident grep parity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub canonical_cause: Option<String>,
     pub state: String,
     /// Tail-size progress numbers from the trigger's boundary resolution, absent when the
     /// pass never reached boundary resolution (busy, load failure, no messages). Purely
