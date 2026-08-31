@@ -55,7 +55,7 @@ describe("native ONNX install shape", () => {
             );
             expect(manifest.devDependencies?.[TRANSFORMERS]).toBe("^4.1.0");
             expect(manifest.optionalDependencies?.[ONNX_RUNTIME_NODE]).toBe("1.24.3");
-            expect(manifest.optionalDependencies?.[SHARP]).toBe("^0.34.5");
+            expect(manifest.optionalDependencies?.[SHARP]).toBe("^0.35.0");
             expect(manifest.scripts?.build).toContain("transformers-web-entry.ts");
             expect(manifest.scripts?.build).not.toContain("--external @huggingface/transformers");
             expect(manifest.scripts?.build).toContain("--external onnxruntime-node");
@@ -66,7 +66,7 @@ describe("native ONNX install shape", () => {
             expect(directDependenciesLockBlock(lockBlock)).not.toContain(`"${ONNX_RUNTIME_NODE}":`);
             expect(directDependenciesLockBlock(lockBlock)).not.toContain(`"${SHARP}":`);
             expect(lockBlock).toContain(
-                `"optionalDependencies": {\n        "${ONNX_RUNTIME_NODE}": "1.24.3",\n        "${SHARP}": "^0.34.5",`,
+                `"optionalDependencies": {\n        "${ONNX_RUNTIME_NODE}": "1.24.3",\n        "${SHARP}": "^0.35.0",`,
             );
         }
     });
