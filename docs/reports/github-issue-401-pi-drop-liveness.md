@@ -164,3 +164,24 @@ The stuck-at-79% symptom is still important. In the two quoted lines, the second
 As a secondary check, there is also a v0.41.0 Pi historian regression under review in PR #399: if your configured historian chain uses reasoning/thinking models, the plugin's implicit `temperature: 0.1` can make those requests fail (often surfaced only as `no_assistant`). That cannot be the mechanism shown in your excerpt: while a historian is in flight Pi logs `historian trigger eval: in-flight, skipping`, and a terminal failure logs the historian failure/count, whereas your lines show a never-firing trigger evaluating and declining on projection. It could still be an additional problem once the historian eventually fires. Could you share which historian model/fallbacks you use?
 
 Please run `npx @cortexkit/magic-context@latest doctor --issue` and attach the sanitized output for this session. The bundle will show the configured historian chain, scheduler decisions, boundary pass classes (`midTurn`/effective execute or defer), pending-op counts, drop-application timestamps, and historian spawn/failure timing. Those fields will tell us whether this was repeated same-turn deferral, protected newest tags, stale installed/DB state, a runtime-only pressure mismatch, or an unexpected executor failure. If the chain is reasoning-only, PR #399's separate v0.41.0 regression may also affect later historian attempts; its fix is already in review.
+
+## v0.41.1 observability follow-up
+
+The follow-up keeps the scheduler and drop behavior unchanged while making the diagnostic surfaces explicit:
+
+- Historian redundancy skips now identify the summarizer as the subsystem that declined to run, retain the usage/force-band, projected, and target percentages, and say that queued or automatic reclaim is expected on the next eligible execute pass.
+- The shared boundary decision carries a resolved `deferReason` into OpenCode postprocess and Pi. A base `execute` downgraded by the mid-turn boundary is logged as `mid_turn_boundary`; a genuine below-threshold base defer remains `scheduler_defer`.
+- Pending-op `WILL APPLY` and `WILL NOT APPLY` lines use a durable `COUNT(*)` queue depth. If that diagnostic read fails, they emit `not loaded (deferred pass)` rather than presenting an unloaded array as `pendingOps=0`.
+- No Rust twin of either user-facing log line exists in the current module, so no Rust wire or diagnostic output changed.
+
+### Mutation evidence
+
+Each guard was deliberately reverted once, the relevant test was run, and the original implementation was restored before this report was amended:
+
+| Mutation | Diagnostic guard | Executed check | Recorded failing assertion |
+|---|---|---|---|
+| Replace carried defer reasons with the constant `scheduler_defer` | Mid-turn downgrade must report `mid_turn_boundary` | `bun test packages/pi-plugin/src/context-handler.test.ts` | `packages/pi-plugin/src/context-handler.test.ts:174` |
+| Replace durable queue depth with deferred-pass array length | A queued durable operation must not be reported as `pendingOps=0` | `bun test packages/pi-plugin/src/context-handler.test.ts` | `packages/pi-plugin/src/context-handler.test.ts:174` and `:232` |
+| Restore both anonymous historian redundancy-skip strings | Both skip sites must identify the historian and next eligible execute pass | `bun test packages/plugin/src/hooks/magic-context/compartment-trigger.test.ts` | `packages/plugin/src/hooks/magic-context/compartment-trigger.test.ts:34` |
+
+The queue-depth mutation produced the observed lie directly: the refusal lines became `pendingOps=0` while the durable queue contained one row. The restored focused checks passed, confirming the tests are non-vacuous against all three guarded regressions.

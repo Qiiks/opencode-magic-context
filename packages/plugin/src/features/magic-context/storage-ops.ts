@@ -5,6 +5,7 @@ import type { PendingOp } from "./types";
 
 const queuePendingOpStatements = new WeakMap<Database, PreparedStatement>();
 const getPendingOpsStatements = new WeakMap<Database, PreparedStatement>();
+const getPendingOpsCountStatements = new WeakMap<Database, PreparedStatement>();
 const clearPendingOpsStatements = new WeakMap<Database, PreparedStatement>();
 const removePendingOpStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -97,6 +98,24 @@ export function getPendingOps(db: Database, sessionId: string): PendingOp[] {
     const rows = getPendingOpsStatement(db).all(sessionId).filter(isPendingOpRow);
 
     return rows.map(toPendingOp).filter((op): op is PendingOp => op !== null);
+}
+
+/** Read durable queue depth without loading rows on a deferred pass. */
+export function getPendingOpsCount(db: Database, sessionId: string): number | null {
+    try {
+        let statement = getPendingOpsCountStatements.get(db);
+        if (!statement) {
+            statement = db.prepare(
+                "SELECT COUNT(*) AS count FROM pending_ops WHERE session_id = ?",
+            );
+            getPendingOpsCountStatements.set(db, statement);
+        }
+        const row = statement.get(sessionId) as { count?: number } | null;
+        return typeof row?.count === "number" && Number.isFinite(row.count) ? row.count : null;
+    } catch {
+        // A diagnostic read must never turn a fail-open transform into a failure.
+        return null;
+    }
 }
 
 export function clearPendingOps(db: Database, sessionId: string): void {

@@ -73,6 +73,7 @@ import {
 	getMaxDroppedTagNumber,
 	getOldestActiveUnprotectedToolTags,
 	getPendingOps,
+	getPendingOpsCount,
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
@@ -122,6 +123,7 @@ import {
 import {
 	applyMidTurnDeferral,
 	detectMidTurnBypassReason,
+	type SchedulerDeferReason,
 } from "@magic-context/core/hooks/magic-context/boundary-execution";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import {
@@ -279,6 +281,7 @@ let persistStableIdSchemeForRun = updateSessionMeta;
 let afterFallbackAdoptionForTests:
 	| ((stableIdSchemeCutover: boolean) => void)
 	| undefined;
+let pendingDecisionLogObserverForTests: ((message: string) => void) | undefined;
 let mutationGateObserverForTests:
 	| ((snapshot: {
 			foldDue: boolean;
@@ -339,6 +342,14 @@ export const __test = {
 		afterFallbackAdoptionForTests = fn;
 		return () => {
 			afterFallbackAdoptionForTests = undefined;
+		};
+	},
+	setPendingDecisionLogObserverForTests(
+		fn: typeof pendingDecisionLogObserverForTests,
+	): () => void {
+		pendingDecisionLogObserverForTests = fn;
+		return () => {
+			pendingDecisionLogObserverForTests = undefined;
 		};
 	},
 	setMutationGateObserverForTests(
@@ -2635,17 +2646,21 @@ export function registerPiContextHandler(
 				effectiveExecuteThresholdPercentage,
 			});
 
-			const { midTurnAdjustedSchedulerDecision, sideEffect } =
-				options.compactionOff
-					? {
-							midTurnAdjustedSchedulerDecision: "defer" as const,
-							sideEffect: "none" as const,
-						}
-					: applyMidTurnDeferral({
-							base: schedulerDecisionEarly,
-							bypassReason,
-							midTurn,
-						});
+			const {
+				midTurnAdjustedSchedulerDecision,
+				sideEffect,
+				deferReason: schedulerDeferReason,
+			} = options.compactionOff
+				? {
+						midTurnAdjustedSchedulerDecision: "defer" as const,
+						sideEffect: "none" as const,
+						deferReason: "scheduler_defer" as const,
+					}
+				: applyMidTurnDeferral({
+						base: schedulerDecisionEarly,
+						bypassReason,
+						midTurn,
+					});
 
 			if (sideEffect === "set-flag" && !options.compactionOff) {
 				const flagPayload = {
@@ -2889,6 +2904,7 @@ export function registerPiContextHandler(
 				reusableMessageIds,
 				stableIdSchemeCutover,
 				schedulerDecision,
+				schedulerDeferReason,
 				// 95% emergency forces drop-all-tools regardless of the
 				// derived force gate, so the LLM call sees the smallest possible
 				// prompt before we hand control back to Pi.
@@ -4199,6 +4215,8 @@ interface RunPipelineArgs {
 	 * cached injection). Mirrors OpenCode's `schedulerDecisionEarly`.
 	 */
 	schedulerDecision: "execute" | "defer";
+	/** The defer reason is computed once when the scheduler decision is made; preserve it so refusal logs report the actual reason instead of recomputing it. */
+	schedulerDeferReason: SchedulerDeferReason | null;
 	/**
 	 * Force-materialization signal: when true, drop-all-tools mode
 	 * activates (mirrors OpenCode's derived force-band emergency cleanup). Caller
@@ -4857,10 +4875,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					: foldExecutedThisPass && args.schedulerDecision !== "execute"
 						? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
 						: `scheduler_execute (scheduler=${args.schedulerDecision})`;
-		sessionLog(
-			args.sessionId,
-			`pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
-		);
+		const pendingOpsDepth = getPendingOpsCount(args.db, args.sessionId);
+		const pendingDecisionLog = `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOpsDepth === null ? "not loaded (deferred pass)" : pendingOpsDepth} context=${args.contextUsage.percentage.toFixed(1)}%`;
+		sessionLog(args.sessionId, pendingDecisionLog);
+		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
 		try {
 			const tApplyPending = performance.now();
 			pendingOpsDidMutate = applyPendingOperations(
@@ -4907,10 +4925,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			throw err;
 		}
 	} else {
-		sessionLog(
-			args.sessionId,
-			`pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=${pendingOps.length} context=${args.contextUsage.percentage.toFixed(1)}%`,
-		);
+		const pendingOpsDepth = getPendingOpsCount(args.db, args.sessionId);
+		const refusalReason =
+			args.schedulerDeferReason ??
+			(historianRunning ? "historian_in_flight" : "scheduler_defer");
+		const pendingDecisionLog = `pending ops WILL NOT APPLY — reason=${refusalReason} pendingOps=${pendingOpsDepth === null ? "not loaded (deferred pass)" : pendingOpsDepth} context=${args.contextUsage.percentage.toFixed(1)}%`;
+		sessionLog(args.sessionId, pendingDecisionLog);
+		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
 	}
 
 	// 3. Apply persistent dropped/truncated tag statuses so cross-pass
@@ -5074,14 +5095,22 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			: foldExecutedThisPass && args.schedulerDecision !== "execute"
 				? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
 				: `scheduler_execute (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
-		sessionLog(
-			args.sessionId,
-			`heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=n/a`,
-		);
+		const heuristicsDecisionLog = `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=n/a`;
+		sessionLog(args.sessionId, heuristicsDecisionLog);
+		pendingDecisionLogObserverForTests?.(heuristicsDecisionLog);
 	} else {
 		const reason =
-			args.heuristics === undefined ? "disabled" : "scheduler_defer";
-		sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${reason}`);
+			args.heuristics === undefined
+				? "disabled"
+				: (args.schedulerDeferReason ??
+					(historianRunning
+						? "historian_in_flight"
+						: alreadyRanHeuristicsThisTurn
+							? "already_ran_this_turn"
+							: "scheduler_defer"));
+		const heuristicsDecisionLog = `heuristics WILL NOT RUN — reason=${reason}`;
+		sessionLog(args.sessionId, heuristicsDecisionLog);
+		pendingDecisionLogObserverForTests?.(heuristicsDecisionLog);
 	}
 	if (shouldRunHeuristics && args.heuristics) {
 		try {

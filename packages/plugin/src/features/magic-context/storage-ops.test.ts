@@ -3,7 +3,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { clearPendingOps, getPendingOps, queuePendingOp, removePendingOp } from "./storage-ops";
+import {
+    clearPendingOps,
+    getPendingOps,
+    getPendingOpsCount,
+    queuePendingOp,
+    removePendingOp,
+} from "./storage-ops";
 
 let db: Database;
 
@@ -38,6 +44,19 @@ describe("storage-ops", () => {
                 expect.objectContaining({ tagId: 1, operation: "drop", queuedAt: 10 }),
                 expect.objectContaining({ tagId: 2, operation: "drop", queuedAt: 20 }),
             ]);
+        });
+
+        it("reports durable queue depth without loading pending-op rows", () => {
+            db = makeMemoryDatabase();
+
+            queuePendingOp(db, "ses-1", 1, "drop");
+            queuePendingOp(db, "ses-1", 2, "drop");
+            db.prepare(
+                "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, ?, ?, ?)",
+            ).run("ses-1", 3, "noop", Date.now());
+
+            expect(getPendingOpsCount(db, "ses-1")).toBe(3);
+            expect(getPendingOpsCount(db, "ses-2")).toBe(0);
         });
 
         it("ignores unsupported pending-op rows", () => {

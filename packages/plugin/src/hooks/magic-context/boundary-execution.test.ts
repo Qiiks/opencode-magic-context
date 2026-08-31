@@ -15,19 +15,35 @@ describe("applyMidTurnDeferral", () => {
                 bypassReason: "force-materialize",
                 midTurn: true,
             }),
-        ).toEqual({ midTurnAdjustedSchedulerDecision: "execute", sideEffect: "none" });
+        ).toEqual({
+            midTurnAdjustedSchedulerDecision: "execute",
+            sideEffect: "none",
+            deferReason: null,
+        });
 
         expect(
             applyMidTurnDeferral({ base: "execute", bypassReason: "none", midTurn: true }),
-        ).toEqual({ midTurnAdjustedSchedulerDecision: "defer", sideEffect: "set-flag" });
+        ).toEqual({
+            midTurnAdjustedSchedulerDecision: "defer",
+            sideEffect: "set-flag",
+            deferReason: "mid_turn_boundary",
+        });
 
         expect(
             applyMidTurnDeferral({ base: "execute", bypassReason: "none", midTurn: false }),
-        ).toEqual({ midTurnAdjustedSchedulerDecision: "execute", sideEffect: "none" });
+        ).toEqual({
+            midTurnAdjustedSchedulerDecision: "execute",
+            sideEffect: "none",
+            deferReason: null,
+        });
 
         expect(
             applyMidTurnDeferral({ base: "defer", bypassReason: "none", midTurn: true }),
-        ).toEqual({ midTurnAdjustedSchedulerDecision: "defer", sideEffect: "none" });
+        ).toEqual({
+            midTurnAdjustedSchedulerDecision: "defer",
+            sideEffect: "none",
+            deferReason: "scheduler_defer",
+        });
     });
 
     it("keeps defer base decisions deferred even when a bypass reason is present", () => {
@@ -37,7 +53,11 @@ describe("applyMidTurnDeferral", () => {
                 bypassReason: "force-materialize",
                 midTurn: true,
             }),
-        ).toEqual({ midTurnAdjustedSchedulerDecision: "defer", sideEffect: "none" });
+        ).toEqual({
+            midTurnAdjustedSchedulerDecision: "defer",
+            sideEffect: "none",
+            deferReason: "scheduler_defer",
+        });
     });
 });
 

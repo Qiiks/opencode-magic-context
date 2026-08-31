@@ -116,6 +116,133 @@ describe("Pi pressure guards", () => {
 	});
 });
 
+describe("Pi scheduler decision observability", () => {
+	async function runPass(
+		handler: (
+			event: { messages: never[] },
+			ctx: never,
+		) => Promise<{ messages: never[] } | undefined>,
+		sessionId: string,
+		messages: ReturnType<typeof userMessage>[],
+	): Promise<void> {
+		await handler(
+			{ messages: messages as never[] },
+			fakeContext(
+				sessionId,
+				process.cwd(),
+				messages.map((_message, index) => `entry-${index}`),
+				messages as never,
+			) as never,
+		);
+	}
+
+	it("logs the durable queue depth and mid-turn boundary reason", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-decision-log-mid-turn";
+		const lines: string[] = [];
+		const restoreObserver =
+			contextHandlerInternals.setPendingDecisionLogObserverForTests((line) =>
+				lines.push(line),
+			);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: {},
+			});
+			const handler = fake.handlers.get("context") as Parameters<
+				typeof runPass
+			>[0];
+			const firstPass = [
+				userMessage("first", 1),
+				assistantMessage("answer", 2),
+			];
+			await runPass(handler, sessionId, firstPass);
+			lines.length = 0;
+			queuePendingOp(db, sessionId, 1, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 70,
+				lastInputTokens: 70_000,
+				lastResponseTime: Date.now(),
+			});
+			const midTurnPass = [
+				userMessage("second", 3),
+				assistantToolCall("call-1", "ctx_reduce", {}, 4),
+			];
+			await runPass(handler, sessionId, midTurnPass);
+
+			expect(lines).toContain(
+				"pending ops WILL NOT APPLY — reason=mid_turn_boundary pendingOps=1 context=70.0%",
+			);
+			expect(lines).toContain(
+				"heuristics WILL NOT RUN — reason=mid_turn_boundary",
+			);
+
+			lines.length = 0;
+			const boundaryPass = [
+				userMessage("third", 5),
+				assistantMessage("answer", 6),
+			];
+			await runPass(handler, sessionId, boundaryPass);
+			expect(lines).toContain(
+				"pending ops WILL APPLY — reason=scheduler_execute (scheduler=execute), pendingOps=1 context=70.0%",
+			);
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("keeps scheduler_defer for a genuine below-threshold refusal", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-decision-log-genuine-defer";
+		const lines: string[] = [];
+		const restoreObserver =
+			contextHandlerInternals.setPendingDecisionLogObserverForTests((line) =>
+				lines.push(line),
+			);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: {},
+			});
+			const handler = fake.handlers.get("context") as Parameters<
+				typeof runPass
+			>[0];
+			const firstPass = [
+				userMessage("first", 1),
+				assistantMessage("answer", 2),
+			];
+			await runPass(handler, sessionId, firstPass);
+			lines.length = 0;
+			queuePendingOp(db, sessionId, 1, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 20,
+				lastInputTokens: 20_000,
+				lastResponseTime: Date.now(),
+			});
+			const freshTurn = [
+				userMessage("second", 3),
+				assistantMessage("answer", 4),
+			];
+			await runPass(handler, sessionId, freshTurn);
+
+			expect(lines).toContain(
+				"pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=1 context=20.0%",
+			);
+			expect(lines).toContain(
+				"heuristics WILL NOT RUN — reason=scheduler_defer",
+			);
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+});
+
 describe("Pi hard cache expiry", () => {
 	const { isPiHardCacheExpired } = contextHandlerInternals;
 

@@ -26,22 +26,42 @@ export interface ApplyMidTurnDeferralInput {
     midTurn: boolean;
 }
 
+export type SchedulerDeferReason = "scheduler_defer" | "mid_turn_boundary";
+
 export interface ApplyMidTurnDeferralOutput {
     midTurnAdjustedSchedulerDecision: "execute" | "defer";
     sideEffect: "set-flag" | "none";
+    /** Preserve the reason that corresponds to the final mid-turn scheduler decision so refusal logs remain consistent and do not recompute state after the decision changes. */
+    deferReason: SchedulerDeferReason | null;
 }
 
 export function applyMidTurnDeferral(input: ApplyMidTurnDeferralInput): ApplyMidTurnDeferralOutput {
     // Scope: bypass evaluation is nested under base === "execute".
     if (input.base === "defer") {
-        return { midTurnAdjustedSchedulerDecision: "defer", sideEffect: "none" };
+        return {
+            midTurnAdjustedSchedulerDecision: "defer",
+            sideEffect: "none",
+            deferReason: "scheduler_defer",
+        };
     }
     // base === "execute"
     if (input.bypassReason !== "none") {
-        return { midTurnAdjustedSchedulerDecision: "execute", sideEffect: "none" };
+        return {
+            midTurnAdjustedSchedulerDecision: "execute",
+            sideEffect: "none",
+            deferReason: null,
+        };
     }
     if (input.midTurn) {
-        return { midTurnAdjustedSchedulerDecision: "defer", sideEffect: "set-flag" };
+        return {
+            midTurnAdjustedSchedulerDecision: "defer",
+            sideEffect: "set-flag",
+            deferReason: "mid_turn_boundary",
+        };
     }
-    return { midTurnAdjustedSchedulerDecision: "execute", sideEffect: "none" };
+    return {
+        midTurnAdjustedSchedulerDecision: "execute",
+        sideEffect: "none",
+        deferReason: null,
+    };
 }

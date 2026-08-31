@@ -255,6 +255,7 @@ export {
 export {
     clearPendingOps,
     getPendingOps,
+    getPendingOpsCount,
     queuePendingOp,
     removePendingOp,
 } from "./storage-ops";
