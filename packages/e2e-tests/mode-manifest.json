@@ -135,6 +135,18 @@
             ]
         },
         {
+            "path": "tests/paired-session-replay.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "CI-fast unit guard for paired replay byte/value-space classification vocabulary",
+            "contract_refs": [
+                "PARITY-REPLAY"
+            ]
+        },
+        {
             "path": "tests/pi-cache-invariants.test.ts",
             "tier": "ts-only",
             "invocation": {
@@ -478,6 +490,19 @@
             ]
         },
         {
+            "path": "tests/rust-maintenance-contract.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "hermetic wrapup/recomp command drill pins durable coverage, row-version, and disposition contracts",
+            "contract_refs": [
+                "RUST-E2E",
+                "MAINTENANCE-COMMANDS"
+            ]
+        },
+        {
             "path": "tests/rust-memory-off-parity.test.ts",
             "tier": "rust-only",
             "invocation": {
@@ -514,6 +539,19 @@
             "rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
             "contract_refs": [
                 "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-paired-session-replay.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "same sanitized session shape is replayed through TS and Rust provider-wire lanes and diffed pass by pass",
+            "contract_refs": [
+                "RUST-E2E",
+                "PARITY-REPLAY"
             ]
         },
         {

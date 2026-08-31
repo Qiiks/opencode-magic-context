@@ -13462,7 +13462,9 @@ fn is_sentinel_invisible_text_block(block: &CkWireBlock) -> bool {
 }
 
 fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
-    if is_sentinel_invisible_text_block(block) {
+    if is_sentinel_invisible_text_block(block)
+        || matches!(&block.kind, ck_wire::CkKind::Text { text } if is_dropped_placeholder_text(tag_stripped_text(text)))
+    {
         return true;
     }
     matches!(
@@ -21362,6 +21364,52 @@ pub(crate) mod tests {
         );
         assert_eq!(in_flight[0]["parts"][0]["text"], "");
         assert_eq!(in_flight[1]["parts"][0]["text"], "thinking-latest");
+    }
+
+    #[test]
+    fn dropped_assistant_shell_does_not_steal_signed_reasoning_exemption() {
+        let signed = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed thinking".to_string(),
+                signature: Some("signature".to_string()),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("signed".to_string()),
+                ..Default::default()
+            },
+        );
+        let dropped = CkWireMessage::from_parts(
+            "assistant",
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "§12§ [dropped §901§]".to_string(),
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("dropped".to_string()),
+                ..Default::default()
+            },
+        );
+        let ingress = vec![
+            CkIngressMessage {
+                mid: "signed".to_string(),
+                ordinal: 1,
+                ck: signed,
+            },
+            CkIngressMessage {
+                mid: "dropped".to_string(),
+                ordinal: 2,
+                ck: dropped,
+            },
+        ];
+
+        assert_eq!(
+            latest_assistant_reasoning_mutation_exempt_mid(&ingress),
+            Some("signed")
+        );
     }
 
     #[test]

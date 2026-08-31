@@ -59,6 +59,8 @@ export interface SpawnedOpencode {
 export interface SpawnOptions {
     /** URL of the mock Anthropic server, e.g. "http://127.0.0.1:12345" */
     mockProviderURL: string;
+    /** Provider id registered for the mock. Defaults to "mock-anthropic". */
+    mockProviderID?: string;
     /** Port for opencode serve. Default: random available */
     port?: number;
     /** magic-context.jsonc overrides. Defaults keep most features on. */
@@ -245,6 +247,7 @@ function writeConfigs(
     opts: SpawnOptions,
 ): void {
     const pluginSpec = `file://${PLUGIN_ENTRY}`;
+    const mockProviderID = opts.mockProviderID ?? "mock-anthropic";
 
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
@@ -256,7 +259,7 @@ function writeConfigs(
         // detector disables itself and the plugin becomes a no-op.
         compaction: { auto: false, prune: false },
         provider: {
-            "mock-anthropic": {
+            [mockProviderID]: {
                 api: "@ai-sdk/anthropic",
                 name: "Mock Anthropic",
                 npm: "@ai-sdk/anthropic",
@@ -353,6 +356,7 @@ export interface ReadinessOptions {
     expectedMagicContextState?: "enabled" | "conflict-disabled";
     pluginLogPath?: string;
     pluginLogStartOffset?: number;
+    mockProviderID?: string;
 }
 
 const CONFLICT_DISABLE_VERDICT = "[magic-context] disabled due to conflicts:";
@@ -400,6 +404,7 @@ export async function waitForReady(
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
     const expectedMagicContextState = options.expectedMagicContextState ?? "enabled";
+    const mockProviderID = options.mockProviderID ?? "mock-anthropic";
     if (expectedMagicContextState === "conflict-disabled" && !options.pluginLogPath) {
         throw new Error("conflict-disabled readiness requires a plugin log path");
     }
@@ -489,7 +494,7 @@ export async function waitForReady(
                   (provider) =>
                       provider &&
                       typeof provider === "object" &&
-                      (provider as { id?: unknown }).id === "mock-anthropic",
+                      (provider as { id?: unknown }).id === mockProviderID,
               )
             : null;
         const models =
@@ -497,7 +502,7 @@ export async function waitForReady(
                 ? (mockProvider as { models?: unknown }).models
                 : null;
         if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
-            throw new Error("mock-anthropic/mock-sonnet provider config is not ready");
+            throw new Error(`${mockProviderID}/mock-sonnet provider config is not ready`);
         }
     });
 }
@@ -672,6 +677,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
             expectedMagicContextState: resolvedOpts.expectedMagicContextState,
             pluginLogPath,
             pluginLogStartOffset,
+            mockProviderID: resolvedOpts.mockProviderID,
         });
     } catch (err) {
         // Surface captured output on boot failure to help debugging.

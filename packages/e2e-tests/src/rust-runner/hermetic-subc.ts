@@ -714,12 +714,16 @@ export class HermeticSubcStack {
         return (this.producerLog().match(/session\.send /g) ?? []).length;
     }
 
-    async moduleStatus(
+    async moduleRequest(
         sessionId: string,
         projectRoot: string,
-        method: "status" | "session.status" = "status",
+        request: Record<string, unknown>,
     ): Promise<Record<string, unknown>> {
-        const identity: BindIdentity = { project_root: resolve(projectRoot), harness: "opencode", session: sessionId };
+        const identity: BindIdentity = {
+            project_root: resolve(projectRoot),
+            harness: "opencode",
+            session: sessionId,
+        };
         const client = this.statusClient ?? (this.statusClient = await SubcClient.connect({
             connectionFile: this.connectionFile,
             identity,
@@ -732,7 +736,11 @@ export class HermeticSubcStack {
                 { kind: "tool_provider", module_id: MODULE_ID },
                 identity,
             );
-            const response = await client.request(route, { method, v: 1, session_id: sessionId });
+            const response = await client.request(route, {
+                v: 1,
+                session_id: sessionId,
+                ...request,
+            });
             return (response && typeof response === "object" ? response : {}) as Record<string, unknown>;
         } catch (error) {
             client.close();
@@ -741,6 +749,14 @@ export class HermeticSubcStack {
         } finally {
             if (route) await client.closeRoute(route).catch(() => undefined);
         }
+    }
+
+    async moduleStatus(
+        sessionId: string,
+        projectRoot: string,
+        method: "status" | "session.status" = "status",
+    ): Promise<Record<string, unknown>> {
+        return this.moduleRequest(sessionId, projectRoot, { method });
     }
 
     /** Wait until SIGKILL is observed before driving an outage or spawning a replacement. */
