@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import {
     __resetLocalEmbeddingForTests,
@@ -9,6 +10,7 @@ import {
     isNativeRuntimeMissingError,
     type LocalEmbeddingDtype,
     LocalEmbeddingProvider,
+    resolveLocalEmbeddingRuntime,
 } from "./embedding-local";
 
 afterEach(() => {
@@ -179,7 +181,106 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
     });
 });
 
+describe("local embedding runtime selection", () => {
+    test("auto selects WASM for Bun before the NAPI teardown fix and native at 1.4.0", () => {
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: false,
+                isBun: true,
+                bunVersion: "1.3.14",
+            }),
+        ).toBe("wasm");
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: false,
+                isBun: true,
+                bunVersion: "1.4.0",
+            }),
+        ).toBe("native");
+        // This catches a lexical version comparison: 1.10.0 is newer than 1.4.0.
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: false,
+                isBun: true,
+                bunVersion: "1.10.0",
+            }),
+        ).toBe("native");
+    });
+
+    test("auto stays native in Node and explicit native/WASM override the host default", () => {
+        const oldBun = { isElectron: false, isBun: true, bunVersion: "1.3.14" };
+        expect(resolveLocalEmbeddingRuntime("auto", { isElectron: false, isBun: false })).toBe(
+            "native",
+        );
+        expect(resolveLocalEmbeddingRuntime("native", oldBun)).toBe("native");
+        expect(resolveLocalEmbeddingRuntime("wasm", oldBun)).toBe("wasm");
+    });
+
+    test("auto preserves Electron's existing early WASM injection path", () => {
+        expect(
+            resolveLocalEmbeddingRuntime("auto", {
+                isElectron: true,
+                isBun: false,
+            }),
+        ).toBe("electron");
+    });
+});
+
 describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
+    test("a vulnerable Bun host injects WASM before transformers and never takes the native fallback", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-bun-wasm-default-"));
+        const calls: string[] = [];
+        let fallbackImports = 0;
+        const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: true, bunVersion: "1.3.14" }),
+                injectWasmOrt: async () => {
+                    calls.push("inject");
+                    return true;
+                },
+                importTransformers: async () => {
+                    calls.push("transformers");
+                    return fakeTransformersModule({
+                        onPipeline: (options) => pipelineOptions.push(options),
+                    });
+                },
+                importTransformersWasmFallback: async () => {
+                    fallbackImports++;
+                    throw new Error("injected Bun path must not use the load-failure fallback");
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(calls).toEqual(["inject", "transformers"]);
+            expect(fallbackImports).toBe(0);
+            expect(pipelineOptions).toEqual([{ dtype: "fp32", device: "auto" }]);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("native selection omits a device option", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-native-device-default-"));
+        const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () =>
+                    fakeTransformersModule({
+                        onPipeline: (options) => pipelineOptions.push(options),
+                    }),
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(pipelineOptions).toEqual([{ dtype: "fp32" }]);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
     test("retries a classified native load failure once with WASM and keeps that decision process-sticky", async () => {
         const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-fallback-"));
         const logs: string[] = [];
@@ -273,7 +374,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
         let wasmInjections = 0;
         try {
             __setLocalEmbeddingTestHooks({
-                isElectron: () => true,
+                host: () => ({ isElectron: true, isBun: false }),
                 injectWasmOrt: async () => {
                     wasmInjections++;
                     return true;

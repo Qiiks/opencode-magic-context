@@ -7,6 +7,7 @@ import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import type { LocalEmbeddingRuntime } from "@magic-context/core/features/magic-context/memory/embedding-local";
 import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
@@ -20,7 +21,6 @@ import {
 } from "@magic-context/core/shared/data-path";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
-
 import {
     isDevPathPluginEntry,
     isLocalPathPluginEntry,
@@ -39,6 +39,7 @@ import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
     formatLocalEmbeddingRuntimeWasmFallback,
+    formatLocalEmbeddingRuntimeWasmSelected,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import { formatGithubIssueFallback, submitGithubIssue } from "../lib/github-issue";
@@ -401,12 +402,21 @@ async function runIssueFlow(): Promise<number> {
 // resolver error in the log. Shared by the explicit-`local` branch AND the
 // no-config / default-provider path (local is the default, so a missing config
 // still means local embeddings).
-function checkLocalEmbeddingRuntimeForDoctor(): {
+function checkLocalEmbeddingRuntimeForDoctor(runtimePreference: LocalEmbeddingRuntime = "auto"): {
     issues: number;
     localRuntimeBroken?: boolean;
     unverified?: boolean;
 } {
-    const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
+    const runtime = checkLocalEmbeddingRuntime(
+        getOpenCodePluginCacheRoots(),
+        process.platform,
+        process.arch,
+        runtimePreference,
+    );
+    if (runtime.state === "wasm-selected") {
+        log.info(formatLocalEmbeddingRuntimeWasmSelected(runtime));
+        return { issues: 0 };
+    }
     if (runtime.state === "wasm-fallback") {
         log.warn(formatLocalEmbeddingRuntimeWasmFallback(runtime));
         return { issues: 0 };
@@ -419,7 +429,9 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success("Embedding provider: local (native runtime OK; Xenova/all-MiniLM-L6-v2 bundled)");
+    log.success(
+        "Embedding provider: local (native runtime selected and OK; Xenova/all-MiniLM-L6-v2 bundled)",
+    );
     return { issues: 0 };
 }
 
@@ -470,7 +482,11 @@ async function checkEmbeddingConfig(
     }
 
     if (provider === undefined || provider === "local") {
-        return checkLocalEmbeddingRuntimeForDoctor();
+        const runtimePreference =
+            embedding?.local_runtime === "native" || embedding?.local_runtime === "wasm"
+                ? embedding.local_runtime
+                : "auto";
+        return checkLocalEmbeddingRuntimeForDoctor(runtimePreference);
     }
 
     if (provider !== "openai-compatible") {

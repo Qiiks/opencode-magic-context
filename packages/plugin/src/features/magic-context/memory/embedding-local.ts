@@ -28,6 +28,57 @@ export type LocalEmbeddingDtype =
     | "q1"
     | "q1f16";
 
+export type LocalEmbeddingRuntime = "auto" | "native" | "wasm";
+export type ResolvedLocalEmbeddingRuntime = "native" | "wasm" | "electron";
+
+const BUN_NAPI_TEARDOWN_FIX_VERSION = [1, 4, 0] as const;
+
+export type LocalEmbeddingHost = {
+    isElectron: boolean;
+    isBun: boolean;
+    bunVersion?: string;
+};
+
+function currentLocalEmbeddingHost(): LocalEmbeddingHost {
+    const bun = (globalThis as { Bun?: unknown }).Bun;
+    const bunVersion =
+        typeof process !== "undefined" && typeof process.versions?.bun === "string"
+            ? process.versions.bun
+            : undefined;
+    return {
+        isElectron: typeof process !== "undefined" && Boolean(process.versions?.electron),
+        // Check both globals because Bun hosts have exposed each form across releases.
+        isBun: Boolean(bun) || Boolean(bunVersion),
+        bunVersion,
+    };
+}
+
+function bunHasNapiTeardownFix(version: string | undefined): boolean {
+    const match = version?.match(
+        /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/,
+    );
+    if (!match || match[4]) return false;
+    const parsed = [Number(match[1]), Number(match[2]), Number(match[3])];
+    return parsed.some((part) => !Number.isSafeInteger(part))
+        ? false
+        : parsed[0] > BUN_NAPI_TEARDOWN_FIX_VERSION[0] ||
+              (parsed[0] === BUN_NAPI_TEARDOWN_FIX_VERSION[0] &&
+                  (parsed[1] > BUN_NAPI_TEARDOWN_FIX_VERSION[1] ||
+                      (parsed[1] === BUN_NAPI_TEARDOWN_FIX_VERSION[1] &&
+                          parsed[2] >= BUN_NAPI_TEARDOWN_FIX_VERSION[2])));
+}
+
+/** Resolves the local ONNX runtime without loading either implementation. */
+export function resolveLocalEmbeddingRuntime(
+    preference: LocalEmbeddingRuntime = "auto",
+    host: LocalEmbeddingHost = currentLocalEmbeddingHost(),
+): ResolvedLocalEmbeddingRuntime {
+    if (preference === "native" || preference === "wasm") return preference;
+    if (host.isElectron) return "electron";
+    if (host.isBun && !bunHasNapiTeardownFix(host.bunVersion)) return "wasm";
+    return "native";
+}
+
 /**
  * Cross-process mutex for embedding-model load. When two OpenCode processes
  * spawn simultaneously (typical Desktop sidecar + TUI + dashboard setup), they
@@ -139,7 +190,7 @@ type TransformersModule = Record<string, unknown>;
 type LocalEmbeddingRuntimeMode = "native" | "wasm" | "disabled";
 
 type LocalEmbeddingTestHooks = {
-    isElectron?: () => boolean;
+    host?: () => LocalEmbeddingHost;
     injectWasmOrt?: () => Promise<boolean>;
     importTransformers?: () => Promise<TransformersModule>;
     importTransformersWasmFallback?: () => Promise<TransformersModule>;
@@ -149,18 +200,26 @@ type LocalEmbeddingTestHooks = {
 
 let localEmbeddingRuntimeMode: LocalEmbeddingRuntimeMode = "native";
 let wasmRuntimeInjected = false;
-let isElectronForRuntime = () =>
-    typeof process !== "undefined" && Boolean(process.versions?.electron);
+let localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
 let importWasmOrtForRuntime = async (): Promise<{
-    env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-    default?: unknown;
-}> => {
-    // Keep this non-literal so Bun does not resolve the WASM package until the
-    // runtime actually needs it.
-    const ortWebSpec = `onnxruntime-${"web"}`;
-    return (await import(ortWebSpec)) as {
+    module: {
         env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
         default?: unknown;
+    };
+    entryPath: string;
+}> => {
+    const { createRequire: createRequireFn } = await import("node:module");
+    const requireFn = createRequireFn(import.meta.url);
+    const transformersEntry = requireFn.resolve("@huggingface/transformers");
+    // Resolve through transformers, which owns this dependency. A direct plugin
+    // resolution can select a different ORT version in a hoisted install.
+    const ortEntry = createRequireFn(transformersEntry).resolve("onnxruntime-web");
+    return {
+        module: (await import(pathToFileURL(ortEntry).href)) as {
+            env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
+            default?: unknown;
+        },
+        entryPath: ortEntry,
     };
 };
 let importTransformersForRuntime = async (): Promise<TransformersModule> => {
@@ -184,7 +243,7 @@ let injectWasmOrtForRuntime: () => Promise<boolean> = injectWasmOrt;
 
 /** Test-only seams keep native-loader failures reproducible without loading a real addon. */
 export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): void {
-    isElectronForRuntime = hooks.isElectron ?? (() => false);
+    localEmbeddingHostForRuntime = hooks.host ?? (() => ({ isElectron: false, isBun: false }));
     injectWasmOrtForRuntime = hooks.injectWasmOrt ?? injectWasmOrt;
     importTransformersForRuntime = hooks.importTransformers ?? importTransformersForRuntimeDefault;
     importTransformersWasmFallbackForRuntime =
@@ -198,8 +257,7 @@ export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): vo
 export function __resetLocalEmbeddingForTests(): void {
     localEmbeddingRuntimeMode = "native";
     wasmRuntimeInjected = false;
-    isElectronForRuntime = () =>
-        typeof process !== "undefined" && Boolean(process.versions?.electron);
+    localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
     importWasmOrtForRuntime = importWasmOrtForRuntimeDefault;
     importTransformersForRuntime = importTransformersForRuntimeDefault;
     importTransformersWasmFallbackForRuntime = importTransformersWasmFallbackForRuntimeDefault;
@@ -228,23 +286,12 @@ async function injectWasmOrt(): Promise<boolean> {
     if (wasmRuntimeInjected) return true;
 
     try {
-        const ortWeb = await importWasmOrtForRuntime();
+        const { module: ortWeb, entryPath } = await importWasmOrtForRuntime();
 
         // Prefer package-local assets so first use works offline instead of
         // requiring the default CDN path.
-        try {
-            const { createRequire: createRequireFn } = await import("node:module");
-            const requireFn = createRequireFn(import.meta.url);
-            const mainEntry = requireFn.resolve("onnxruntime-web");
-            const distDir = dirname(mainEntry);
-            if (ortWeb.env?.wasm) {
-                ortWeb.env.wasm.wasmPaths = `${pathToFileURL(distDir).href}/`;
-            }
-        } catch (pathError) {
-            log(
-                "[magic-context] could not resolve local onnxruntime-web/dist, falling back to default WASM paths:",
-                pathError instanceof Error ? pathError.message : String(pathError),
-            );
+        if (ortWeb.env?.wasm) {
+            ortWeb.env.wasm.wasmPaths = `${pathToFileURL(dirname(entryPath)).href}/`;
         }
 
         (globalThis as Record<symbol, unknown>)[Symbol.for("onnxruntime")] = ortWeb;
@@ -288,12 +335,28 @@ function disableLocalEmbeddingsAfterRuntimeFailure(detail: string): void {
     );
 }
 
-async function loadTransformersForLocalEmbedding(): Promise<{
+async function loadTransformersForLocalEmbedding(
+    runtimePreference: LocalEmbeddingRuntime,
+): Promise<{
     module: TransformersModule;
     usesWasm: boolean;
 }> {
     if (localEmbeddingRuntimeMode === "disabled") {
         throw new Error("local embedding runtime is disabled");
+    }
+
+    const resolvedRuntime = resolveLocalEmbeddingRuntime(
+        runtimePreference,
+        localEmbeddingHostForRuntime(),
+    );
+    if (resolvedRuntime === "wasm") {
+        // Inject the global onnxruntime symbol before transformers evaluates its
+        // Node entry, preventing its NAPI addon from loading in Bun before 1.4.0.
+        if (!(await ensureWasmOrtInjected())) {
+            disableLocalEmbeddingsAfterRuntimeFailure("the selected WASM runtime is unavailable");
+            throw new Error("onnxruntime-web failed to load");
+        }
+        return { module: await importTransformersForRuntime(), usesWasm: true };
     }
 
     if (localEmbeddingRuntimeMode === "wasm") {
@@ -313,7 +376,7 @@ async function loadTransformersForLocalEmbedding(): Promise<{
         }
     }
 
-    const electron = isElectronForRuntime();
+    const electron = resolvedRuntime === "electron";
     if (electron) {
         const wasInjected = wasmRuntimeInjected;
         if (await ensureWasmOrtInjected()) {
@@ -529,6 +592,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
     private readonly model: string;
     private readonly dtype: LocalEmbeddingDtype;
+    private readonly runtimePreference: LocalEmbeddingRuntime;
     private pipeline: EmbeddingPipeline | null = null;
     private initPromise: Promise<void> | null = null;
     private inFlight = 0;
@@ -540,13 +604,16 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         model = DEFAULT_LOCAL_EMBEDDING_MODEL,
         maxInputTokens = 512,
         dtype: LocalEmbeddingDtype = DEFAULT_LOCAL_DTYPE,
+        runtimePreference: LocalEmbeddingRuntime = "auto",
     ) {
         this.model = model;
         this.maxInputTokens = maxInputTokens;
         this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
+        this.runtimePreference = runtimePreference;
         this.modelId = getEmbeddingProviderIdentity({
             provider: "local",
             model,
+            local_runtime: runtimePreference,
             // Only fold non-default dtype into identity so the default config
             // produces the byte-identical identity string as before this field
             // existed (no forced re-embed on upgrade). See issue #259.
@@ -581,7 +648,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 }
 
                 const { module: transformersModule, usesWasm } =
-                    await loadTransformersForLocalEmbedding();
+                    await loadTransformersForLocalEmbedding(this.runtimePreference);
                 const env = transformersModule.env as {
                     logLevel?: unknown;
                     cacheDir?: string;
@@ -704,7 +771,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                         error instanceof Error ? error.message : String(error),
                     );
                 } else if (!localEmbeddingRuntimeIsDisabled()) {
-                    log("[magic-context] embedding model failed to load:", error);
+                    logForRuntime("[magic-context] embedding model failed to load:", error);
                 }
                 this.pipeline = null;
             } finally {

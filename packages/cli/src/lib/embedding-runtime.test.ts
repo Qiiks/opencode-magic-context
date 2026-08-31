@@ -9,6 +9,7 @@ import {
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
     formatLocalEmbeddingRuntimeWasmFallback,
+    formatLocalEmbeddingRuntimeWasmSelected,
 } from "./embedding-runtime";
 
 afterEach(() => {
@@ -51,6 +52,38 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
             installPackage(root, true);
             const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64");
             expect(status.state).toBe("ok");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("configured WASM reports the selected runtime without probing native", () => {
+        const root = makeRoot();
+        try {
+            installWasmPackage(root);
+            let nativeProbeCalls = 0;
+            __setEmbeddingRuntimeTestHooks({
+                runOnnxRuntimeNodeLoadProbeChild: (packageDir) => {
+                    if (packageDir.endsWith("onnxruntime-node")) {
+                        nativeProbeCalls++;
+                        throw new Error("native probe must not run for selected WASM");
+                    }
+                    return { stdout: JSON.stringify({ ok: true }), status: 0, signal: null };
+                },
+            });
+
+            const status = checkLocalEmbeddingRuntimeAt(root, "win32", "x64", "wasm", {
+                isBun: false,
+                isElectron: false,
+            });
+
+            expect(status.state).toBe("wasm-selected");
+            expect(nativeProbeCalls).toBe(0);
+            if (status.state === "wasm-selected") {
+                expect(formatLocalEmbeddingRuntimeWasmSelected(status)).toContain(
+                    "native addon was not probed or loaded",
+                );
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

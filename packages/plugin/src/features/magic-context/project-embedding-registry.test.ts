@@ -266,7 +266,7 @@ describe("project embedding registry", () => {
         }).toEqual({
             providerIdentity: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
             runtimeFingerprint:
-                "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:f0bab7fe74e0f0a0",
+                "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:4bc2bab437bc88bc",
         });
         expect({
             providerIdentity: openai.providerIdentity,

@@ -30,6 +30,7 @@ describe("MagicContextConfigSchema", () => {
                 embedding: {
                     provider: "local",
                     model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                    local_runtime: "auto",
                 },
                 memory: {
                     enabled: true,
@@ -654,17 +655,35 @@ describe("MagicContextConfigSchema", () => {
             ).toThrow();
         });
 
+        it("defaults local embedding runtime to auto and accepts explicit overrides", () => {
+            expect(
+                MagicContextConfigSchema.parse({ embedding: { provider: "local" } }).embedding,
+            ).toMatchObject({ local_runtime: "auto" });
+            expect(
+                MagicContextConfigSchema.parse({
+                    embedding: { provider: "local", local_runtime: "wasm" },
+                }).embedding,
+            ).toMatchObject({ local_runtime: "wasm" });
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    embedding: { provider: "local", local_runtime: "unsafe" },
+                }).success,
+            ).toBe(false);
+        });
+
         it("accepts a configured local embedding dtype", () => {
             const result = MagicContextConfigSchema.parse({
                 embedding: {
                     provider: "local",
                     model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                    local_runtime: "auto",
                     local_dtype: "q8",
                 },
             });
             expect(result.embedding).toEqual({
                 provider: "local",
                 model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                local_runtime: "auto",
                 local_dtype: "q8",
             });
         });
@@ -676,6 +695,7 @@ describe("MagicContextConfigSchema", () => {
             expect(result.embedding).toEqual({
                 provider: "local",
                 model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                local_runtime: "auto",
             });
             expect("local_dtype" in result.embedding).toBe(false);
         });
