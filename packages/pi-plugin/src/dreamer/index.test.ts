@@ -239,6 +239,31 @@ describe("Pi dreamer wiring", () => {
 		secondInstance.__test.reset();
 	});
 
+	test("threads resolved memory and embedding config into scheduled maintenance", async () => {
+		db = createDb();
+		let registration:
+			| { memoryEnabled?: boolean; embeddingConfig?: { provider?: string } }
+			| undefined;
+		__test.setStartDreamScheduleTimerFactory(async (captured) => {
+			registration = captured;
+			return mock(() => {});
+		});
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity: "git:pi-maintenance-config",
+		});
+
+		registerPiDreamerProject({
+			...opts,
+			memoryEnabled: true,
+			embeddingConfig: { provider: "local" },
+		});
+		await flushMicrotasks();
+
+		expect(registration?.memoryEnabled).toBe(true);
+		expect(registration?.embeddingConfig?.provider).toBe("local");
+	});
+
 	test("threads language into scheduled dreamer registration", async () => {
 		db = createDb();
 		let language: string | undefined;

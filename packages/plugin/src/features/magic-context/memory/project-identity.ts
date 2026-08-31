@@ -545,6 +545,13 @@ function gitRootDirectory(canonical: string): string | null {
     }
 }
 
+/** Cheap metadata probe for user-facing commit-search availability. This avoids
+ * running `git log` on every ctx_search call while still distinguishing a true
+ * non-repository directory from a transient `dir:` identity fallback. */
+export function directoryHasGitMetadata(directory: string): boolean {
+    return gitRootDirectory(path.resolve(directory)) !== null;
+}
+
 export function resolveProjectIdentityForSession(
     directory: string,
     allowHomeProject = false,

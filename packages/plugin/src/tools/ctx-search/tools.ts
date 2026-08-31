@@ -4,10 +4,12 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
+import { directoryHasGitMetadata } from "../../features/magic-context/memory/project-identity";
 import {
+    createUnifiedSearchDiagnostics,
+    formatSearchResults,
     parseIdShapedQuery,
     resolveMemoriesByIdsForSearch,
-    type UnifiedSearchResult,
     unifiedSearch,
 } from "../../features/magic-context/search";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
@@ -57,107 +59,6 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
         }
     }
     return result;
-}
-
-function formatAge(committedAtMs: number): string {
-    const ageMs = Date.now() - committedAtMs;
-    if (ageMs < 0) return "future";
-    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
-    if (days <= 0) return "today";
-    if (days === 1) return "1d ago";
-    if (days < 30) return `${days}d ago`;
-    const months = Math.floor(days / 30);
-    if (months === 1) return "1mo ago";
-    if (months < 12) return `${months}mo ago`;
-    const years = Math.floor(days / 365);
-    return years === 1 ? "1y ago" : `${years}y ago`;
-}
-
-const NOTE_EXPAND_HINT =
-    "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
-
-function formatResult(
-    result: UnifiedSearchResult,
-    index: number,
-    currentSessionId: string,
-): string {
-    if (result.source === "memory") {
-        const source = result.sourceName ? ` source=${result.sourceName}` : "";
-        return [
-            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${result.category}${source} match=${result.matchType}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "git_commit") {
-        return [
-            `[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${result.shortSha} ${formatAge(result.committedAtMs)} match=${result.matchType}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "primer") {
-        return [
-            `[${index}] [primer] score=${result.score.toFixed(2)} id=${result.primerId} support=${result.support} match=${result.matchType}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "note") {
-        const anchor =
-            result.anchorOrdinal !== null && result.sourceSessionId === currentSessionId
-                ? ` @msg ${result.anchorOrdinal}`
-                : "";
-        return [
-            `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "compartment") {
-        return [
-            `[${index}] [message] score=${result.score.toFixed(2)} compartment_id=${result.compartmentId} range=${result.startOrdinal}-${result.endOrdinal} match=${result.matchType} title=${result.title}`,
-            result.snippet ? `Snippet: ${result.snippet}` : result.content,
-        ].join("\n");
-    }
-
-    const expandStart = Math.max(1, result.messageOrdinal - 3);
-    const expandEnd = result.messageOrdinal + 3;
-    return [
-        `[${index}] [message] score=${result.score.toFixed(2)} ordinal=${result.messageOrdinal} range=${expandStart}-${expandEnd} role=${result.role}`,
-        result.content,
-    ].join("\n");
-}
-
-function formatSearchResults(
-    query: string,
-    results: UnifiedSearchResult[],
-    currentSessionId: string,
-): string {
-    if (results.length === 0) {
-        return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
-    }
-
-    const bodyParts = results.map((result, index) =>
-        formatResult(result, index + 1, currentSessionId),
-    );
-    if (results.some((result) => result.source === "message" || result.source === "compartment")) {
-        bodyParts.push(
-            "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
-        );
-    }
-    if (
-        results.some(
-            (result) =>
-                result.source === "note" &&
-                result.anchorOrdinal !== null &&
-                result.sourceSessionId === currentSessionId,
-        )
-    ) {
-        bodyParts.push(NOTE_EXPAND_HINT);
-    }
-    const body = bodyParts.join("\n\n");
-    return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${body}`;
 }
 
 const ctxSearchArgsShape = {
@@ -217,6 +118,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             // They're visible in message[0], so returning them wastes output
             // tokens and crowds out high-signal raw-history hits.
             const visibleMemoryIds = getVisibleMemoryIds(deps.db, toolContext.sessionID);
+            const diagnostics = createUnifiedSearchDiagnostics();
 
             // Resolve the session's actual project from `toolContext.directory`
             // each call. OpenCode's top-level `ctx.directory` (the launch dir)
@@ -254,9 +156,15 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     ids: idShape,
                     limit: Math.max(normalizeLimit(args.limit), idShape.length),
                     visibleMemoryIds,
+                    diagnostics,
                 });
-                if (idResults !== null) {
-                    return formatSearchResults(query, idResults, toolContext.sessionID);
+                if (idResults !== null || diagnostics.suppressedVisibleMemoryIds.length > 0) {
+                    return formatSearchResults(
+                        query,
+                        idResults ?? [],
+                        toolContext.sessionID,
+                        diagnostics,
+                    );
                 }
             }
 
@@ -284,6 +192,11 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     gitCommitsEnabled,
                     sources: normalizeSources(args.sources),
                     visibleMemoryIds,
+                    diagnostics,
+                    gitRepositoryAvailable:
+                        typeof toolContext.directory === "string"
+                            ? directoryHasGitMetadata(toolContext.directory)
+                            : undefined,
                     // Explicit agent search → enable literal-probe multi-query
                     // recall for symbol/command/path lookups. Auto-search hints
                     // (the hot path) leave this off to protect their latency.
@@ -291,7 +204,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 },
             );
 
-            return formatSearchResults(query, results, toolContext.sessionID);
+            return formatSearchResults(query, results, toolContext.sessionID, diagnostics);
         },
     });
 }

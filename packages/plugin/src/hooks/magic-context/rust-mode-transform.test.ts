@@ -1319,7 +1319,9 @@ describe("Rust mode authority adapter", () => {
             { query: `#${memory.id}`, sources: ["memory"] },
             { sessionID: sessionId, directory: "/tmp/project" } as never,
         );
-        expect(search).toContain("No results found");
+        expect(search).toContain(
+            `Memories: 1 match found, all already visible in your project-memory block (ids ${memory.id}).`,
+        );
 
         await run();
         expect(

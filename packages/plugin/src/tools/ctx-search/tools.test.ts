@@ -10,7 +10,8 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createCtxSearchTools } from "./tools";
 
-const toolContext = (sessionID = "ses-search") => ({ sessionID }) as never;
+const toolContext = (sessionID = "ses-search", directory?: string) =>
+    ({ sessionID, directory }) as never;
 const EXPAND_HINT =
     "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.";
 const NOTE_EXPAND_HINT =
@@ -59,7 +60,135 @@ describe("createCtxSearchTools", () => {
 
         const result = await tools.ctx_search.execute({ query: "missing" }, toolContext());
 
-        expect(result).toContain("No results found");
+        expect(result).toBe(
+            'No results found for "missing" across notes, memories, primers, git commits, or message history.',
+        );
+    });
+
+    it("explains when the reporter-shaped memory match set is entirely visible", async () => {
+        const matchingIds = new Set([6, 3, 49, 55, 51, 50, 7]);
+        for (let id = 1; id <= 55; id += 1) {
+            const memory = insertMemory(db, {
+                projectPath: "git:reporter",
+                category: "ARCHITECTURE",
+                content: matchingIds.has(id)
+                    ? `Odoo reporter memory ${id}`
+                    : `unrelated reporter memory ${id}`,
+            });
+            expect(memory.id).toBe(id);
+        }
+        const visibleIds = [3, 4, 54, 5, 7, 49, 53, 6, 50, 51, 52, 55];
+        db.prepare("INSERT INTO session_meta (session_id, memory_block_ids) VALUES (?, ?)").run(
+            "ses-reporter",
+            JSON.stringify(visibleIds),
+        );
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "git:reporter",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "Odoo", sources: ["memory"] },
+            toolContext("ses-reporter"),
+        );
+
+        expect(result).toBe(
+            'No hidden results found for "Odoo".\n\nMemories: 7 matches found, all already visible in your project-memory block (ids 3, 6, 7, 49, 50, 51, 55).',
+        );
+    });
+
+    it("returns hidden memories and reports additional visible matches", async () => {
+        const memories = ["visible one", "visible two", "hidden three"].map((label) =>
+            insertMemory(db, {
+                projectPath: "git:mixed",
+                category: "ARCHITECTURE",
+                content: `Aurora ${label}`,
+            }),
+        );
+        db.prepare("INSERT INTO session_meta (session_id, memory_block_ids) VALUES (?, ?)").run(
+            "ses-mixed",
+            JSON.stringify([memories[0]?.id, memories[1]?.id]),
+        );
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "git:mixed",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "Aurora", sources: ["memory"] },
+            toolContext("ses-mixed"),
+        );
+
+        expect(result).toContain(`id=${memories[2]?.id}`);
+        expect(result).not.toContain(`id=${memories[0]?.id} `);
+        expect(result).toContain(
+            `Memories: 2 additional matches suppressed because they are already visible in your project-memory block (ids ${memories[0]?.id}, ${memories[1]?.id}).`,
+        );
+    });
+
+    it("explains when matching raw messages are still in the live tail", async () => {
+        indexMessagesAfterOrdinal(
+            db,
+            "ses-live-tail",
+            [
+                {
+                    ordinal: 1,
+                    id: "live-1",
+                    role: "user",
+                    parts: [{ type: "text", text: "boundaryneedle first" }],
+                },
+                {
+                    ordinal: 2,
+                    id: "live-2",
+                    role: "assistant",
+                    parts: [{ type: "text", text: "boundaryneedle second" }],
+                },
+            ],
+            0,
+            2,
+        );
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "git:messages",
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "boundaryneedle", sources: ["message"] },
+            toolContext("ses-live-tail"),
+        );
+
+        expect(result).toBe(
+            'No hidden results found for "boundaryneedle".\n\nMessage history: 2 raw-message matches are newer than the last compartment boundary (already in your context).',
+        );
+    });
+
+    it("explains why commit search is unavailable for a non-repository project", async () => {
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "dir:no-repo",
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            gitCommitsEnabled: true,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "release", sources: ["git_commit"] },
+            toolContext("ses-dir", "/tmp/cortexkit-search-no-repo"),
+        );
+
+        expect(result).toBe(
+            'No hidden results found for "release".\n\nGit commits: no git repository — commit search unavailable for this project.',
+        );
     });
 
     it("preserves an explicit empty sources list as no sources", async () => {

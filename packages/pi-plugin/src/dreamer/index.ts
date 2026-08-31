@@ -207,6 +207,8 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		dreamerConfig: opts.config,
 		language: opts.language,
 		gitCommitIndexing: opts.gitCommitIndexing,
+		memoryEnabled: opts.memoryEnabled,
+		embeddingConfig: opts.embeddingConfig,
 		retinaHandoff: opts.retinaHandoff,
 		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,

@@ -58,6 +58,9 @@ interface MessageSearchRow {
     messageId?: string;
     role?: string;
     content?: string;
+    suppressedCount?: number;
+    summaryOnly?: number;
+    ftsRank?: number;
 }
 
 interface BatchedMessageSearchRow extends MessageSearchRow {
@@ -72,6 +75,7 @@ interface BatchedFtsCountRow {
 
 const messageSearchStatements = new WeakMap<Database, PreparedStatement>();
 const messageSearchStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
+const messageSearchDiagnosticStatements = new WeakMap<Database, PreparedStatement>();
 const batchedMessageSearchStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
 const batchedFtsCountStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
 
@@ -82,6 +86,20 @@ export interface CapturedQueryEmbedding {
     modelId: string;
     chunkModelId: string;
     generation: number;
+}
+
+export interface UnifiedSearchDiagnostics {
+    suppressedVisibleMemoryIds: number[];
+    suppressedLiveMessageMatches: number;
+    gitCommitUnavailable: "no_git_repository" | null;
+}
+
+export function createUnifiedSearchDiagnostics(): UnifiedSearchDiagnostics {
+    return {
+        suppressedVisibleMemoryIds: [],
+        suppressedLiveMessageMatches: 0,
+        gitCommitUnavailable: null,
+    };
 }
 
 export interface UnifiedSearchOptions {
@@ -111,6 +129,13 @@ export interface UnifiedSearchOptions {
      *  to disable filtering (for callers outside the transform context that
      *  can't resolve the visible set). */
     visibleMemoryIds?: Set<number> | null;
+    /** Optional mutable diagnostic sink for explicit tool calls. Search fills it
+     *  from the same candidate sets used by visibility filters; background
+     *  callers can omit it and retain the lean result-only path. */
+    diagnostics?: UnifiedSearchDiagnostics;
+    /** Whether the calling directory has git metadata. False lets the formatter
+     *  distinguish an unavailable commit corpus from a genuine empty search. */
+    gitRepositoryAvailable?: boolean;
     /** Abort signal — if provided, cancels in-flight embedding requests
      *  (and any downstream HTTP calls) when the caller gives up. Used by
      *  transform-hot-path callers like auto-search whose own 3s timeout
@@ -362,6 +387,56 @@ function getMessageSearchStatementWithCutoff(db: Database): PreparedStatement {
     return stmt;
 }
 
+/** Explicit tool searches need both eligible rows and the exact number of
+ * matching live-tail rows. Materializing the FTS match set once keeps that
+ * diagnostic from issuing a second search query, while the ordinary hot path
+ * continues to use the narrower cutoff statement above. */
+function getMessageSearchDiagnosticStatement(db: Database): PreparedStatement {
+    let stmt = messageSearchDiagnosticStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(`
+            WITH matches AS MATERIALIZED (
+                SELECT
+                    message_ordinal AS messageOrdinal,
+                    message_id AS messageId,
+                    role,
+                    content,
+                    CAST(message_ordinal AS INTEGER) AS ordinalValue,
+                    bm25(message_history_fts) AS ftsRank
+                FROM message_history_fts
+                WHERE session_id = ? AND message_history_fts MATCH ?
+            ),
+            eligible AS (
+                SELECT * FROM matches
+                WHERE ordinalValue <= ?
+                ORDER BY ftsRank, ordinalValue ASC
+                LIMIT ?
+            ),
+            summary AS (
+                SELECT COUNT(*) AS suppressedCount
+                FROM matches
+                WHERE ordinalValue > ?
+            )
+            SELECT
+                eligible.messageOrdinal,
+                eligible.messageId,
+                eligible.role,
+                eligible.content,
+                eligible.ftsRank,
+                summary.suppressedCount,
+                0 AS summaryOnly
+            FROM eligible CROSS JOIN summary
+            UNION ALL
+            SELECT NULL, NULL, NULL, NULL, NULL, summary.suppressedCount, 1
+            FROM summary
+            WHERE NOT EXISTS (SELECT 1 FROM eligible)
+            ORDER BY summaryOnly ASC, ftsRank ASC, messageOrdinal ASC
+        `);
+        messageSearchDiagnosticStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
 function getBatchedFtsCountStatement(
     db: Database,
     queryCount: number,
@@ -593,19 +668,13 @@ function mergeMemoryResults(args: {
     limit: number;
     visibleMemoryIds?: Set<number> | null;
     sourceNameByMemoryId?: ReadonlyMap<number, string>;
-}): MemorySearchResult[] {
+}): { results: MemorySearchResult[]; suppressedVisibleIds: number[] } {
     const memoryById = new Map(args.memories.map((memory) => [memory.id, memory]));
     const candidateIds = new Set<number>([...args.semanticScores.keys(), ...args.ftsScores.keys()]);
     const results: MemorySearchResult[] = [];
+    const suppressedVisibleIds: number[] = [];
 
     for (const id of candidateIds) {
-        // Hard-filter: memory is already rendered in <session-history>, so the
-        // agent sees it in message[0]. Returning it from ctx_search wastes
-        // output tokens and displaces high-signal raw-history hits.
-        if (args.visibleMemoryIds?.has(id)) {
-            continue;
-        }
-
         const memory = memoryById.get(id);
         if (!memory) {
             continue;
@@ -631,6 +700,13 @@ function mergeMemoryResults(args: {
             continue;
         }
 
+        // Record candidates before dropping them so an empty result can explain
+        // that search worked and the matching memories are already in context.
+        if (args.visibleMemoryIds?.has(id)) {
+            suppressedVisibleIds.push(id);
+            continue;
+        }
+
         results.push({
             source: "memory",
             content: previewText(memory.content),
@@ -642,14 +718,17 @@ function mergeMemoryResults(args: {
         });
     }
 
-    return results
-        .sort((left, right) => {
-            if (right.score !== left.score) {
-                return right.score - left.score;
-            }
-            return left.memoryId - right.memoryId;
-        })
-        .slice(0, args.limit);
+    return {
+        results: results
+            .sort((left, right) => {
+                if (right.score !== left.score) {
+                    return right.score - left.score;
+                }
+                return left.memoryId - right.memoryId;
+            })
+            .slice(0, args.limit),
+        suppressedVisibleIds: suppressedVisibleIds.sort((left, right) => left - right),
+    };
 }
 
 async function searchMemories(args: {
@@ -665,9 +744,9 @@ async function searchMemories(args: {
     queryModelId?: string | null;
     workspace?: SearchWorkspaceContext;
     visibleMemoryIds?: Set<number> | null;
-}): Promise<MemorySearchResult[]> {
+}): Promise<{ results: MemorySearchResult[]; suppressedVisibleIds: number[] }> {
     if (!args.memoryEnabled) {
-        return [];
+        return { results: [], suppressedVisibleIds: [] };
     }
 
     const memories = args.workspace?.isWorkspaced
@@ -681,7 +760,7 @@ async function searchMemories(args: {
           )
         : getMemoriesByProject(args.db, args.projectPath);
     if (memories.length === 0) {
-        return [];
+        return { results: [], suppressedVisibleIds: [] };
     }
 
     const ftsMatches = getFtsMatches({
@@ -801,6 +880,27 @@ function runMessageFtsQuery(
     return result;
 }
 
+function runMessageFtsQueryWithDiagnostics(args: {
+    db: Database;
+    sessionId: string;
+    ftsQuery: string;
+    fetchLimit: number;
+    cutoff: number;
+}): { rows: NormalizedMessageRow[]; suppressedCount: number } {
+    if (args.ftsQuery.length === 0) return { rows: [], suppressedCount: 0 };
+    const rawRows = getMessageSearchDiagnosticStatement(args.db)
+        .all(args.sessionId, args.ftsQuery, args.cutoff, args.fetchLimit, args.cutoff)
+        .map((row) => row as MessageSearchRow);
+    const suppressedCount = rawRows[0]?.suppressedCount ?? 0;
+    const rows: NormalizedMessageRow[] = [];
+    for (const row of rawRows) {
+        if (row.summaryOnly === 1) continue;
+        const normalized = normalizeMessageSearchRow(row, args.cutoff);
+        if (normalized) rows.push(normalized);
+    }
+    return { rows, suppressedCount };
+}
+
 function getBatchedMessageSearchStatement(
     db: Database,
     queryCount: number,
@@ -906,6 +1006,7 @@ function searchMessages(args: {
     /** Literal probes to additionally query (multi-probe recall). Empty = the
      * original single-query behavior (unchanged for NL queries / hot path). */
     probes?: string[];
+    diagnostics?: UnifiedSearchDiagnostics;
 }): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
     const fetchLimit =
@@ -917,13 +1018,29 @@ function searchMessages(args: {
     // No probes → original single-query path, byte-identical scoring. This is
     // the hot path (auto-search) and every plain natural-language query.
     if (probes.length === 0) {
-        const filtered = runMessageFtsQuery(
-            args.db,
-            args.sessionId,
-            baseQuery,
-            fetchLimit,
-            cutoff,
-        ).slice(0, args.limit);
+        const outcome =
+            args.diagnostics && cutoff !== null
+                ? runMessageFtsQueryWithDiagnostics({
+                      db: args.db,
+                      sessionId: args.sessionId,
+                      ftsQuery: baseQuery,
+                      fetchLimit,
+                      cutoff,
+                  })
+                : {
+                      rows: runMessageFtsQuery(
+                          args.db,
+                          args.sessionId,
+                          baseQuery,
+                          fetchLimit,
+                          cutoff,
+                      ),
+                      suppressedCount: 0,
+                  };
+        if (args.diagnostics) {
+            args.diagnostics.suppressedLiveMessageMatches = outcome.suppressedCount;
+        }
+        const filtered = outcome.rows.slice(0, args.limit);
         return filtered.map((row, rank) => ({
             source: "message" as const,
             content: previewText(row.content),
@@ -947,8 +1064,22 @@ function searchMessages(args: {
         sanitizedProbes.map((entry) => entry.query),
         cutoff,
     );
+    const collectBaseDiagnostics = args.diagnostics !== undefined && cutoff !== null;
+    const baseOutcome =
+        collectBaseDiagnostics && baseQuery.length > 0
+            ? runMessageFtsQueryWithDiagnostics({
+                  db: args.db,
+                  sessionId: args.sessionId,
+                  ftsQuery: baseQuery,
+                  fetchLimit,
+                  cutoff,
+              })
+            : null;
+    if (args.diagnostics) {
+        args.diagnostics.suppressedLiveMessageMatches = baseOutcome?.suppressedCount ?? 0;
+    }
     const searchQueries = [
-        ...(baseQuery.length > 0 ? [baseQuery] : []),
+        ...(!collectBaseDiagnostics && baseQuery.length > 0 ? [baseQuery] : []),
         ...sanitizedProbes.map((entry) => entry.query),
     ];
     const rowsByQuery = runMessageFtsQueriesBatch(
@@ -963,11 +1094,11 @@ function searchMessages(args: {
     let queryIndex = 0;
     if (baseQuery.length > 0) {
         queryLists.push({
-            rows: rowsByQuery[queryIndex] ?? [],
+            rows: baseOutcome?.rows ?? rowsByQuery[queryIndex] ?? [],
             // The full query is AND-joined and inherently discriminative.
             weight: 1,
         });
-        queryIndex += 1;
+        if (!collectBaseDiagnostics) queryIndex += 1;
     }
     const probeWeights = new Map<string, number>();
     sanitizedProbes.forEach((entry, probeIndex) => {
@@ -1549,7 +1680,11 @@ export function resolveMemoriesByIdsForSearch(args: {
     /** Optional filter mirroring the m[0] hard-filter — already-rendered
      *  memories are skipped so the agent doesn't see the same content twice. */
     visibleMemoryIds?: Set<number> | null;
+    diagnostics?: UnifiedSearchDiagnostics;
 }): MemorySearchResult[] | null {
+    if (args.diagnostics) {
+        args.diagnostics.suppressedVisibleMemoryIds = [];
+    }
     if (args.ids.length === 0) {
         return null;
     }
@@ -1569,12 +1704,21 @@ export function resolveMemoriesByIdsForSearch(args: {
     }
     const memoriesById = new Map(fetched.map((memory) => [memory.id, memory]));
     const ordered: Memory[] = [];
+    const suppressedVisibleIds = new Set<number>();
     for (const id of args.ids) {
         const memory = memoriesById.get(id);
         if (!memory) continue;
-        if (args.visibleMemoryIds?.has(id)) continue;
+        if (args.visibleMemoryIds?.has(id)) {
+            suppressedVisibleIds.add(id);
+            continue;
+        }
         ordered.push(memory);
         if (ordered.length >= args.limit) break;
+    }
+    if (args.diagnostics) {
+        args.diagnostics.suppressedVisibleMemoryIds = [...suppressedVisibleIds].sort(
+            (left, right) => left - right,
+        );
     }
     if (ordered.length === 0) {
         return null;
@@ -1605,6 +1749,11 @@ export async function unifiedSearch(
 
     const limit = normalizeLimit(options.limit);
     const tierLimit = Math.max(limit * 3, DEFAULT_UNIFIED_SEARCH_LIMIT);
+    if (options.diagnostics) {
+        options.diagnostics.suppressedVisibleMemoryIds = [];
+        options.diagnostics.suppressedLiveMessageMatches = 0;
+        options.diagnostics.gitCommitUnavailable = null;
+    }
 
     const embeddingEnabled = options.embeddingEnabled ?? true;
     const embedQuery = options.embedQuery ?? embedText;
@@ -1616,6 +1765,13 @@ export async function unifiedSearch(
     const runMemory = activeSources.has("memory") && memoryFeatureEnabled;
     const runMessages = activeSources.has("message");
     const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
+    if (
+        options.diagnostics &&
+        activeSources.has("git_commit") &&
+        options.gitRepositoryAvailable === false
+    ) {
+        options.diagnostics.gitCommitUnavailable = "no_git_repository";
+    }
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
@@ -1674,6 +1830,7 @@ export async function unifiedSearch(
               limit: tierLimit,
               maxOrdinal: options.maxMessageOrdinal,
               probes: messageProbes,
+              diagnostics: options.diagnostics,
           })
         : [];
 
@@ -1713,7 +1870,7 @@ export async function unifiedSearch(
         limit: tierLimit,
     });
 
-    const [memoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+    const [memoryOutcome, gitCommitResults, primerResults, noteResults] = await Promise.all([
         runMemory
             ? searchMemories({
                   db,
@@ -1727,7 +1884,10 @@ export async function unifiedSearch(
                   workspace,
                   visibleMemoryIds: options.visibleMemoryIds,
               })
-            : Promise.resolve([] as MemorySearchResult[]),
+            : Promise.resolve({
+                  results: [] as MemorySearchResult[],
+                  suppressedVisibleIds: [] as number[],
+              }),
         runGitCommits
             ? Promise.resolve(
                   searchGitCommits({
@@ -1768,8 +1928,11 @@ export async function unifiedSearch(
             : Promise.resolve([] as NoteSearchResult[]),
     ]);
 
+    if (options.diagnostics) {
+        options.diagnostics.suppressedVisibleMemoryIds = memoryOutcome.suppressedVisibleIds;
+    }
     const results = [
-        ...memoryResults,
+        ...memoryOutcome.results,
         ...primerResults,
         ...messageLikeResults,
         ...gitCommitResults,
@@ -1819,4 +1982,143 @@ export async function unifiedSearch(
     }
 
     return results;
+}
+
+const SEARCH_NOTE_EXPAND_HINT =
+    "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
+
+function formatSearchAge(timestampMs: number): string {
+    const ageMs = Date.now() - timestampMs;
+    if (ageMs < 0) return "future";
+    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+    if (days <= 0) return "today";
+    if (days === 1) return "1d ago";
+    if (days < 30) return `${days}d ago`;
+    const months = Math.floor(days / 30);
+    if (months === 1) return "1mo ago";
+    if (months < 12) return `${months}mo ago`;
+    const years = Math.floor(days / 365);
+    return years === 1 ? "1y ago" : `${years}y ago`;
+}
+
+function formatUnifiedSearchResult(
+    result: UnifiedSearchResult,
+    index: number,
+    currentSessionId: string,
+): string {
+    if (result.source === "memory") {
+        const source = result.sourceName ? ` source=${result.sourceName}` : "";
+        return [
+            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${result.category}${source} match=${result.matchType}`,
+            result.content,
+        ].join("\n");
+    }
+    if (result.source === "git_commit") {
+        return [
+            `[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${result.shortSha} ${formatSearchAge(result.committedAtMs)} match=${result.matchType}`,
+            result.content,
+        ].join("\n");
+    }
+    if (result.source === "primer") {
+        return [
+            `[${index}] [primer] score=${result.score.toFixed(2)} id=${result.primerId} support=${result.support} match=${result.matchType}`,
+            result.content,
+        ].join("\n");
+    }
+    if (result.source === "note") {
+        const anchor =
+            result.anchorOrdinal !== null && result.sourceSessionId === currentSessionId
+                ? ` @msg ${result.anchorOrdinal}`
+                : "";
+        return [
+            `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatSearchAge(result.createdAt)}${anchor}`,
+            result.content,
+        ].join("\n");
+    }
+    if (result.source === "compartment") {
+        return [
+            `[${index}] [message] score=${result.score.toFixed(2)} compartment_id=${result.compartmentId} range=${result.startOrdinal}-${result.endOrdinal} match=${result.matchType} title=${result.title}`,
+            result.snippet ? `Snippet: ${result.snippet}` : result.content,
+        ].join("\n");
+    }
+    const expandStart = Math.max(1, result.messageOrdinal - 3);
+    const expandEnd = result.messageOrdinal + 3;
+    return [
+        `[${index}] [message] score=${result.score.toFixed(2)} ordinal=${result.messageOrdinal} range=${expandStart}-${expandEnd} role=${result.role}`,
+        result.content,
+    ].join("\n");
+}
+
+function formatSearchDiagnosticLines(
+    results: UnifiedSearchResult[],
+    diagnostics: UnifiedSearchDiagnostics | undefined,
+): string[] {
+    if (!diagnostics) return [];
+    const lines: string[] = [];
+    const visibleIds = [...diagnostics.suppressedVisibleMemoryIds].sort(
+        (left, right) => left - right,
+    );
+    if (visibleIds.length > 0) {
+        const count = visibleIds.length;
+        const noun = count === 1 ? "match" : "matches";
+        const ids = visibleIds.join(", ");
+        if (results.some((result) => result.source === "memory")) {
+            lines.push(
+                `Memories: ${count} additional ${noun} suppressed because ${count === 1 ? "it is" : "they are"} already visible in your project-memory block (ids ${ids}).`,
+            );
+        } else {
+            lines.push(
+                `Memories: ${count} ${noun} found, all already visible in your project-memory block (ids ${ids}).`,
+            );
+        }
+    }
+    if (diagnostics.suppressedLiveMessageMatches > 0) {
+        const count = diagnostics.suppressedLiveMessageMatches;
+        lines.push(
+            `Message history: ${count} raw-message ${count === 1 ? "match is" : "matches are"} newer than the last compartment boundary (already in your context).`,
+        );
+    }
+    if (diagnostics.gitCommitUnavailable === "no_git_repository") {
+        lines.push("Git commits: no git repository — commit search unavailable for this project.");
+    }
+    return lines;
+}
+
+/** Render output for explicit `ctx_search` callers in OpenCode and Pi. Include
+ * diagnostics so intentional visibility suppression is explained while genuine
+ * empty corpora retain their established wording. */
+export function formatSearchResults(
+    query: string,
+    results: UnifiedSearchResult[],
+    currentSessionId: string,
+    diagnostics?: UnifiedSearchDiagnostics,
+): string {
+    const diagnosticLines = formatSearchDiagnosticLines(results, diagnostics);
+    if (results.length === 0) {
+        if (diagnosticLines.length > 0) {
+            return `No hidden results found for "${query}".\n\n${diagnosticLines.join("\n")}`;
+        }
+        return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
+    }
+
+    const bodyParts = results.map((result, index) =>
+        formatUnifiedSearchResult(result, index + 1, currentSessionId),
+    );
+    if (diagnosticLines.length > 0) bodyParts.push(diagnosticLines.join("\n"));
+    if (results.some((result) => result.source === "message" || result.source === "compartment")) {
+        bodyParts.push(
+            "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
+        );
+    }
+    if (
+        results.some(
+            (result) =>
+                result.source === "note" &&
+                result.anchorOrdinal !== null &&
+                result.sourceSessionId === currentSessionId,
+        )
+    ) {
+        bodyParts.push(SEARCH_NOTE_EXPAND_HINT);
+    }
+    return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${bodyParts.join("\n\n")}`;
 }
