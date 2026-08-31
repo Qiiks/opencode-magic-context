@@ -14,6 +14,7 @@ import {
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
     getPendingOps,
+    getPendingOpsCount,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
     getProcessedImageStrippedIds,
@@ -52,6 +53,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
+import type { SchedulerDeferReason } from "./boundary-execution";
 import {
     rearmChannel2AfterCoverageAdvancingHardFold,
     rearmChannel2AfterMeasuredCollapse,
@@ -589,6 +591,8 @@ interface RunPostTransformPhaseArgs {
     /** Usable tokens available for soft scheduling thresholds and usage-ratio calculation. */
     usableWindow: number;
     schedulerDecision: "execute" | "defer";
+    /** Use the defer reason resolved with the scheduler decision at the boundary; do not recompute it from this phase's inputs, which may no longer reflect that decision. */
+    schedulerDeferReason?: SchedulerDeferReason | null;
     fullFeatureMode: boolean;
     /**
      * Compaction-off mode (issue #266), boot-resolved. Every mutating gate in
@@ -1042,6 +1046,10 @@ export async function runPostTransformPhase(
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
+    const formatPendingOpsDepth = (): string => {
+        const depth = getPendingOpsCount(args.db, args.sessionId);
+        return depth === null ? "not loaded (deferred pass)" : String(depth);
+    };
     // Keep pending-op materialization coupled to the force signal itself. This
     // prevents an escalation-band change from letting emergency cleanup mutate
     // the wire while queued operations remain deferred.
@@ -1162,6 +1170,8 @@ export async function runPostTransformPhase(
             args.sessionId,
             `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=${args.currentTurnId}`,
         );
+    } else if (args.schedulerDeferReason !== undefined && args.schedulerDeferReason !== null) {
+        sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${args.schedulerDeferReason}`);
     }
     // Only show "skipping" log for primary sessions — subagents bypass the
     // once-per-turn guard and DO re-run, so logging "skipping" would be wrong.
@@ -1174,6 +1184,16 @@ export async function runPostTransformPhase(
         sessionLog(
             args.sessionId,
             `transform: skipping heuristics (already ran for turn ${args.currentTurnId})`,
+        );
+    }
+    if (
+        !shouldApplyPendingOps &&
+        args.schedulerDeferReason !== undefined &&
+        args.schedulerDeferReason !== null
+    ) {
+        sessionLog(
+            args.sessionId,
+            `pending ops WILL NOT APPLY — reason=${args.schedulerDeferReason} pendingOps=${formatPendingOpsDepth()} context=${args.contextUsage.percentage.toFixed(1)}%`,
         );
     }
     if (compartmentRunning && hasPendingUserOps) {
@@ -1224,7 +1244,7 @@ export async function runPostTransformPhase(
                     : `scheduler_execute (scheduler=${args.schedulerDecision})`;
             sessionLog(
                 args.sessionId,
-                `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,
+                `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${formatPendingOpsDepth()}, context=${args.contextUsage.percentage.toFixed(1)}%`,
             );
             const tApply = performance.now();
             // P0 perf: don't pass `args.tags` here. applyPendingOperations

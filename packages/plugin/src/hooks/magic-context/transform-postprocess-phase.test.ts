@@ -213,6 +213,7 @@ function basePostTransformArgs(
         contextUsage: { percentage: 20, inputTokens: 1000 },
         usableWindow: 128_000,
         schedulerDecision: "defer",
+        schedulerDeferReason: "scheduler_defer",
         fullFeatureMode: true,
         canRunCompartments: false,
         awaitedCompartmentRun: false,

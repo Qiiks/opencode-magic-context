@@ -61,7 +61,12 @@ function applyGate(input: {
     historyRefresh?: boolean;
     isSubagent?: boolean;
     effectiveExecuteThresholdPercentage?: number;
-}): { effective: "execute" | "defer"; sideEffect: "set-flag" | "none"; bypass: BypassReason } {
+}): {
+    effective: "execute" | "defer";
+    sideEffect: "set-flag" | "none";
+    bypass: BypassReason;
+    deferReason: "scheduler_defer" | "mid_turn_boundary" | null;
+} {
     const historyRefreshSessions = new Set<string>();
     if (input.historyRefresh) historyRefreshSessions.add(input.sessionId);
     const bypass = detectMidTurnBypassReason({
@@ -71,7 +76,7 @@ function applyGate(input: {
         sessionId: input.sessionId,
         effectiveExecuteThresholdPercentage: input.effectiveExecuteThresholdPercentage ?? 65,
     });
-    const { midTurnAdjustedSchedulerDecision, sideEffect } = applyMidTurnDeferral({
+    const { midTurnAdjustedSchedulerDecision, sideEffect, deferReason } = applyMidTurnDeferral({
         base: input.base,
         bypassReason: bypass,
         midTurn: input.midTurn,
@@ -81,7 +86,7 @@ function applyGate(input: {
     } else {
         ensureSessionMetaRow(input.db, input.sessionId);
     }
-    return { effective: midTurnAdjustedSchedulerDecision, sideEffect, bypass };
+    return { effective: midTurnAdjustedSchedulerDecision, sideEffect, bypass, deferReason };
 }
 
 function drainIfWorkExecuted(db: Database, sessionId: string): boolean {
@@ -94,8 +99,20 @@ describe("boundary execution OpenCode integration", () => {
     it("1. mid-turn execute without prior flag defers and sets a flag", () => {
         const db = createDb();
         const result = applyGate({ db, sessionId: "s1", base: "execute", midTurn: true });
-        expect(result).toEqual({ effective: "defer", sideEffect: "set-flag", bypass: "none" });
+        expect(result).toEqual({
+            effective: "defer",
+            sideEffect: "set-flag",
+            bypass: "none",
+            deferReason: "mid_turn_boundary",
+        });
         expect(peekDeferredExecutePending(db, "s1")?.id).toBe("gate-flag");
+    });
+
+    it("1b. below-threshold defer carries the scheduler reason", () => {
+        const db = createDb();
+        const result = applyGate({ db, sessionId: "s1", base: "defer", midTurn: true });
+        expect(result.deferReason).toBe("scheduler_defer");
+        expect(result.effective).toBe("defer");
     });
 
     it("2. boundary execute without prior flag executes and drain no-ops", () => {

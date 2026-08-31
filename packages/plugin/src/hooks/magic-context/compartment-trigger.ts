@@ -632,7 +632,7 @@ export function checkCompartmentTrigger(
         ) {
             sessionLog(
                 sessionId,
-                `compartment trigger: skipping force band ${forceMaterializationPercentage}% because projected post-drop usage is ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%)`,
+                `historian redundancy skip: summarizer not needed this pass — force band is ${forceMaterializationPercentage}%; queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%) on the next eligible execute pass`,
             );
             return { shouldFire: false };
         }
@@ -751,7 +751,7 @@ export function checkCompartmentTrigger(
     ) {
         sessionLog(
             sessionId,
-            `compartment trigger: not firing at ${usage.percentage.toFixed(1)}% because projected post-drop usage is ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%)`,
+            `historian redundancy skip: summarizer not needed this pass — usage is ${usage.percentage.toFixed(1)}%; queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%) on the next eligible execute pass`,
         );
         return { shouldFire: false };
     }

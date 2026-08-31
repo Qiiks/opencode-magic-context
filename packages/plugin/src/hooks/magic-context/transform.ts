@@ -1378,7 +1378,11 @@ export function createTransform(deps: TransformDeps) {
             effectiveExecuteThresholdPercentage,
         });
 
-        const { midTurnAdjustedSchedulerDecision, sideEffect } = applyMidTurnDeferral({
+        const {
+            midTurnAdjustedSchedulerDecision,
+            sideEffect,
+            deferReason: schedulerDeferReason,
+        } = applyMidTurnDeferral({
             base: schedulerDecisionEarly,
             bypassReason,
             midTurn,
@@ -2202,6 +2206,7 @@ export function createTransform(deps: TransformDeps) {
             contextUsage,
             usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
+            schedulerDeferReason,
             fullFeatureMode,
             compactionOff,
             canRunCompartments,
