@@ -1257,8 +1257,13 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
 		try {
 			const child = createMockChild();
-			const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
-			const resultPromise = runner.run({ ...baseOptions, model: "test/historian" });
+			const { runner, spawnImpl } = runnerWith(child, {
+				piBinary: "custom-pi",
+			});
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "test/historian",
+			});
 			child.writeStdoutLine({ type: "session", id: "s1" });
 			child.writeStdoutLine(
 				agentEnd([
@@ -1277,10 +1282,14 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				string[],
 				{ env: NodeJS.ProcessEnv },
 			];
-			expect(spawnOptions.env).not.toHaveProperty("MAGIC_CONTEXT_HISTORIAN_TEMPERATURE");
+			expect(spawnOptions.env).not.toHaveProperty(
+				"MAGIC_CONTEXT_HISTORIAN_TEMPERATURE",
+			);
 		} finally {
-			if (previousTemperature === undefined) delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
-			else process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = previousTemperature;
+			if (previousTemperature === undefined)
+				delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+			else
+				process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = previousTemperature;
 		}
 	});
 
