@@ -15033,38 +15033,15 @@ fn ctx_note_schema() -> Value {
 /// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
 /// bound sessions obtain preset-selected description text through `manifest.get`.
 pub fn manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        // Introduced by subc-protocol 0.12: optional pre-validated capability
-        // declarations. MC requests nothing beyond its role grants, so None keeps
-        // the HELLO identical to the pre-field wire shape (serde skips None).
-        capabilities: None,
-        // Introduced by subc-protocol 0.14: optional self-signal manifest registry.
-        // Some(vec![]) is deliberate over None per the falsy-value discrimination
-        // rule: it declares "examined, none to register" (MC emits no self-signals
-        // today), while None would read as "never examined". Serde still emits the
-        // field, which is the examined marker the daemon census reads.
-        self_signals: Some(vec![]),
-        // Introduced by subc-protocol 0.13: build provenance for the deploy ladder.
-        // The git sha is stamped by the release build command (MC_BUILD_SHA env at
-        // compile time); a bare `cargo build` leaves it absent rather than wrong.
-        // The daemon renders these in module status, which gives deploy
-        // verification a queryable build identity instead of binary archaeology.
-        provenance: Some(build_provenance(option_env!("MC_BUILD_SHA"), None, None)),
-        provides: vec![ProviderRole::ToolProvider {
-            tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: false,
-            sub_supervises: false,
-        }],
-        consumes: vec![ConsumerRole::ServiceClient {
-            of: vec!["thalamus".to_string()],
-        }],
-        bindings: Bindings {
+    // Constructed via the subc-protocol builder (never a struct literal): ModuleManifest is
+    // #[non_exhaustive], so builder methods are the only construction path that survives additive
+    // field landings. Every field below is set to the exact value the pre-builder struct literal
+    // produced, so the serialized HELLO is byte-identical to the pre-migration wire shape.
+    ModuleManifest::builder(
+        module_id.to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -15076,7 +15053,39 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         },
-    }
+    )
+    .protocol_ver(PROTOCOL_VERSION)
+    // Introduced by subc-protocol 0.12: optional pre-validated capability
+    // declarations. MC requests nothing beyond its role grants, so None keeps
+    // the HELLO identical to the pre-field wire shape (serde skips None).
+    .capabilities(None)
+    // Introduced by subc-protocol 0.14: optional self-signal manifest registry.
+    // Some(vec![]) is deliberate over None per the falsy-value discrimination
+    // rule: it declares "examined, none to register" (MC emits no self-signals
+    // today), while None would read as "never examined". Serde still emits the
+    // field, which is the examined marker the daemon census reads. Actual
+    // signal publication remains deferred; this empty marker is preserved
+    // byte-identically from the pre-builder manifest.
+    .self_signals(Some(vec![]))
+    // Introduced by subc-protocol 0.13: build provenance for the deploy ladder.
+    // The git sha is stamped by the release build command (MC_BUILD_SHA env at
+    // compile time); a bare `cargo build` leaves it absent rather than wrong.
+    // The daemon renders these in module status, which gives deploy
+    // verification a queryable build identity instead of binary archaeology.
+    // build_provenance is the subc-protocol library call (re-exported through
+    // subc-client-rs); it normalizes sentinel/empty values to field omission.
+    .provenance(Some(build_provenance(option_env!("MC_BUILD_SHA"), None, None)))
+    .provides(vec![ProviderRole::ToolProvider {
+        tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: false,
+        sub_supervises: false,
+    }])
+    .consumes(vec![ConsumerRole::ServiceClient {
+        of: vec!["thalamus".to_string()],
+    }])
+    .build()
 }
 
 #[cfg(test)]
@@ -15878,7 +15887,27 @@ mod tests {
     fn manifest_declares_module_id_and_storage() {
         let m = manifest("magic-context");
         assert_eq!(m.module_id, "magic-context");
+        assert_eq!(m.module_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(m.trust_tier, TrustTier::FirstParty);
         assert_eq!(m.protocol_ver, PROTOCOL_VERSION);
+        // The builder migration must preserve the deliberate empty self-signal
+        // marker ("examined, none to register") byte-identically; actual signal
+        // publication remains deferred.
+        assert_eq!(m.self_signals, Some(vec![]));
+        // Provenance is stamped by the subc-protocol build_provenance helper.
+        // The wire_crate_version is always present (a compile-time constant of
+        // the linked subc-protocol crate); build_git_sha is present only when
+        // MC_BUILD_SHA was set at compile time.
+        let provenance = m.provenance.as_ref().expect("manifest must carry provenance");
+        assert_eq!(
+            provenance.wire_crate_version.as_deref(),
+            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+        );
+        assert_eq!(
+            provenance.build_git_sha.as_deref(),
+            option_env!("MC_BUILD_SHA"),
+            "build_git_sha must mirror the compile-time MC_BUILD_SHA exactly"
+        );
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
