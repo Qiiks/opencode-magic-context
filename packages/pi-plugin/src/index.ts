@@ -703,7 +703,7 @@ export function resolveHistorianFromConfig(
 		fallbackModels,
 		historianChunkTokens,
 		timeoutMs: config.historian_timeout_ms,
-		temperature: historian?.temperature ?? 0.1,
+		temperature: historian?.temperature,
 		maxOutputTokens: historian?.maxTokens ?? 32_000,
 		// `historian.two_pass` runs an editor pass after a successful
 		// first pass to clean low-signal U: lines and cross-compartment

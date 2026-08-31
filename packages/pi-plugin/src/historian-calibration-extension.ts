@@ -10,13 +10,21 @@ function finiteNumber(value: string | undefined): number | undefined {
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
-/** Apply the historian calibration to each provider's serialized request shape. */
+/**
+ * Apply the historian calibration to each provider's serialized request shape.
+ *
+ * Both knobs are optional and applied independently: reasoning models reject
+ * `temperature` outright, so an output-token budget must still be applicable
+ * on its own.
+ */
 export function calibrateHistorianProviderPayload(
 	payload: unknown,
-	temperature: number,
-	maxOutputTokens: number,
+	temperature: number | undefined,
+	maxOutputTokens: number | undefined,
 ): unknown {
 	if (typeof payload !== "object" || payload === null || Array.isArray(payload))
+		return payload;
+	if (temperature === undefined && maxOutputTokens === undefined)
 		return payload;
 	const calibrated = { ...(payload as Record<string, unknown>) };
 	const generationConfig = calibrated.generationConfig;
@@ -27,8 +35,8 @@ export function calibrateHistorianProviderPayload(
 	) {
 		calibrated.generationConfig = {
 			...(generationConfig as Record<string, unknown>),
-			temperature,
-			maxOutputTokens,
+			...(temperature !== undefined ? { temperature } : {}),
+			...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
 		};
 		return calibrated;
 	}
@@ -40,21 +48,25 @@ export function calibrateHistorianProviderPayload(
 	) {
 		calibrated.inferenceConfig = {
 			...(inferenceConfig as Record<string, unknown>),
-			temperature,
-			maxTokens: maxOutputTokens,
+			...(temperature !== undefined ? { temperature } : {}),
+			...(maxOutputTokens !== undefined ? { maxTokens: maxOutputTokens } : {}),
 		};
 		return calibrated;
 	}
 
-	calibrated.temperature = temperature;
-	if ("max_output_tokens" in calibrated) {
-		calibrated.max_output_tokens = maxOutputTokens;
-	} else if ("max_completion_tokens" in calibrated) {
-		calibrated.max_completion_tokens = maxOutputTokens;
-	} else if ("max_tokens" in calibrated) {
-		calibrated.max_tokens = maxOutputTokens;
-	} else if ("maxTokens" in calibrated) {
-		calibrated.maxTokens = maxOutputTokens;
+	if (temperature !== undefined) {
+		calibrated.temperature = temperature;
+	}
+	if (maxOutputTokens !== undefined) {
+		if ("max_output_tokens" in calibrated) {
+			calibrated.max_output_tokens = maxOutputTokens;
+		} else if ("max_completion_tokens" in calibrated) {
+			calibrated.max_completion_tokens = maxOutputTokens;
+		} else if ("max_tokens" in calibrated) {
+			calibrated.max_tokens = maxOutputTokens;
+		} else if ("maxTokens" in calibrated) {
+			calibrated.maxTokens = maxOutputTokens;
+		}
 	}
 	return calibrated;
 }
@@ -64,7 +76,7 @@ export default function historianCalibrationExtension(pi: ExtensionAPI): void {
 	const maxOutputTokens = finiteNumber(
 		process.env[HISTORIAN_MAX_OUTPUT_TOKENS_ENV],
 	);
-	if (temperature === undefined || maxOutputTokens === undefined) return;
+	if (temperature === undefined && maxOutputTokens === undefined) return;
 	pi.on("before_provider_request", (event) =>
 		calibrateHistorianProviderPayload(
 			event.payload,

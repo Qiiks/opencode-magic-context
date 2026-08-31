@@ -444,7 +444,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		refreshBoundarySnapshot,
 		currentContextLimit,
 		historianTimeoutMs = DEFAULT_HISTORIAN_TIMEOUT_MS,
-		temperature = 0.1,
+		temperature,
 		maxOutputTokens = 32_000,
 		signal,
 		retryBackoffMs,

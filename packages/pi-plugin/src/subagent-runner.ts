@@ -1658,13 +1658,16 @@ export class PiSubagentRunner implements SubagentRunner {
 						trimmedAssistantText === null ||
 						trimmedAssistantText.length === 0
 					) {
+						const emptyAssistantReason =
+							trimmedAssistantText === null
+								? "pi agent_end did not include an assistant message"
+								: "pi assistant produced empty text";
 						settle({
 							ok: false,
 							reason: "no_assistant",
-							error:
-								trimmedAssistantText === null
-									? "pi agent_end did not include an assistant message"
-									: "pi assistant produced empty text",
+							error: finalErrorMessage
+								? `${emptyAssistantReason} (provider error: ${finalErrorMessage})`
+								: emptyAssistantReason,
 							durationMs: Date.now() - startTime,
 							// Pi machinery worked (agent_end / terminal message_end seen);
 							// the model just returned empty text. Mark protocol output as

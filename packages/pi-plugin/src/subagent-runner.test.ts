@@ -1732,6 +1732,34 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("surfaces the provider error behind empty assistant text", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage:
+						"OpenAI API error (400): Unsupported parameter: temperature",
+				},
+			]),
+		);
+		child.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: false,
+			reason: "no_assistant",
+			error:
+				"pi assistant produced empty text (provider error: OpenAI API error (400): Unsupported parameter: temperature)",
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined, sawProtocolOutput: true },
+		});
+	});
+
 	it("returns no_assistant for empty stdout and successful exit", async () => {
 		// Issue #238: an empty-stdout exit-0 primary now fires the one-shot
 		// isolated retry. When the isolated attempt ALSO exits 0 with no output,
