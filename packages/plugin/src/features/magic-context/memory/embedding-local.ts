@@ -210,12 +210,9 @@ let importWasmOrtForRuntime = async (): Promise<{
 }> => {
     const { createRequire: createRequireFn } = await import("node:module");
     const requireFn = createRequireFn(import.meta.url);
-    const transformersEntry = requireFn.resolve("@huggingface/transformers");
-    // Resolve through transformers, which owns this dependency. A direct plugin
-    // resolution can select a different ORT version in a hoisted install.
-    const ortEntry = createRequireFn(transformersEntry).resolve("onnxruntime-web");
+    const ortEntry = requireFn.resolve("onnxruntime-web");
     return {
-        module: (await import(pathToFileURL(ortEntry).href)) as {
+        module: (await import("onnxruntime-web")) as {
             env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
             default?: unknown;
         },
@@ -223,18 +220,15 @@ let importWasmOrtForRuntime = async (): Promise<{
     };
 };
 let importTransformersForRuntime = async (): Promise<TransformersModule> => {
-    // Keep this non-literal so Bun does not probe transformers while loading the plugin.
-    const transformersSpec = `@huggingface/${"transformers"}`;
-    return (await import(transformersSpec)) as TransformersModule;
+    // Keep transformers in a lazy split chunk: the host can load the plugin and
+    // use remote embeddings without evaluating the optional native accelerator.
+    return (await import("@huggingface/transformers")) as TransformersModule;
 };
 let importTransformersWasmFallbackForRuntime = async (): Promise<TransformersModule> => {
-    // The package's Node export statically imports onnxruntime-node before it can
-    // observe the override symbol. Resolve its web bundle explicitly after the
-    // native import failed so module-cache failure cannot prevent the retry.
-    const { createRequire: createRequireFn } = await import("node:module");
-    const requireFn = createRequireFn(import.meta.url);
-    const nodeEntry = requireFn.resolve("@huggingface/transformers");
-    const webEntry = pathToFileURL(join(dirname(nodeEntry), "transformers.web.js")).href;
+    // The Node entry statically imports onnxruntime-node. The browser-condition
+    // build emits this sibling file so the web entry stays loadable when the
+    // optional native package is absent.
+    const webEntry = new URL("./transformers-web.js", import.meta.url).href;
     return (await import(webEntry)) as TransformersModule;
 };
 let modelCacheDirForRuntime = () => join(getMagicContextStorageDir(), "models");
@@ -495,6 +489,11 @@ export function isNativeRuntimeMissingError(error: unknown): boolean {
     if (code === "ERR_DLOPEN_FAILED" && lower.includes("onnxruntime")) {
         return true;
     }
+
+    // transformers' Node entry also loads optional Sharp bindings at module
+    // initialization. Treat its known loader failure like an absent ONNX addon:
+    // the bundled web entry does not need either native dependency.
+    if (lower.includes('could not load the "sharp" module')) return true;
 
     const mentionsNativeRuntime =
         lower.includes("onnxruntime-node") || lower.includes("onnxruntime_binding");

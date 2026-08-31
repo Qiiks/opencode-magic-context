@@ -107,7 +107,12 @@ function writeHealthyFiles(agentDir: string, cwd: string): void {
     );
 }
 
-function createInstalledPiPlugin(agentDir: string, withNativeBinding: boolean): void {
+function createInstalledPiPlugin(
+    agentDir: string,
+    withNativeBinding: boolean,
+    withWasmFallback = false,
+    withNativePackage = true,
+): void {
     const pluginDir = join(agentDir, "npm", "node_modules", "@cortexkit", "pi-magic-context");
     mkdirSync(pluginDir, { recursive: true });
     writeFileSync(
@@ -115,18 +120,30 @@ function createInstalledPiPlugin(agentDir: string, withNativeBinding: boolean): 
         JSON.stringify({ name: "@cortexkit/pi-magic-context", version: "0.0.0" }),
     );
 
-    const onnxDir = join(pluginDir, "node_modules", "onnxruntime-node");
-    mkdirSync(onnxDir, { recursive: true });
-    writeFileSync(
-        join(onnxDir, "package.json"),
-        JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
-    );
-    writeFileSync(join(onnxDir, "index.js"), "module.exports = {};\n");
+    if (withNativePackage) {
+        const onnxDir = join(pluginDir, "node_modules", "onnxruntime-node");
+        mkdirSync(onnxDir, { recursive: true });
+        writeFileSync(
+            join(onnxDir, "package.json"),
+            JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
+        );
+        writeFileSync(join(onnxDir, "index.js"), "module.exports = {};\n");
 
-    if (withNativeBinding) {
-        const binDir = join(onnxDir, "bin", "napi-v6", process.platform, process.arch);
-        mkdirSync(binDir, { recursive: true });
-        writeFileSync(join(binDir, "onnxruntime_binding.node"), "mock native binding");
+        if (withNativeBinding) {
+            const binDir = join(onnxDir, "bin", "napi-v6", process.platform, process.arch);
+            mkdirSync(binDir, { recursive: true });
+            writeFileSync(join(binDir, "onnxruntime_binding.node"), "mock native binding");
+        }
+    }
+
+    if (withWasmFallback) {
+        const wasmDir = join(pluginDir, "node_modules", "onnxruntime-web");
+        mkdirSync(wasmDir, { recursive: true });
+        writeFileSync(
+            join(wasmDir, "package.json"),
+            JSON.stringify({ name: "onnxruntime-web", main: "index.js" }),
+        );
+        writeFileSync(join(wasmDir, "index.js"), "module.exports = {};\n");
     }
 }
 
@@ -324,6 +341,25 @@ describe("Pi doctor", () => {
         expect(output).toContain("postinstall likely failed");
         expect(output).toContain("Stale Pi extension cache found");
         expect(output).toContain("WARN 2");
+    });
+
+    it("reports the WASM fallback when onnxruntime-node is completely absent", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        createInstalledPiPlugin(agentDir, false, true, false);
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            "WARN Embedding provider: local — onnxruntime-node native binding failed",
+        );
+        expect(output).toContain("using onnxruntime-web (WASM)");
+        expect(output).not.toContain("native runtime and WASM fallback both unavailable");
     });
 
     it("passes the local embedding check when the onnxruntime native binding is present", async () => {

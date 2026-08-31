@@ -35,7 +35,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/transformers-web.js dist/*-*.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
@@ -51,7 +51,6 @@
   },
   "dependencies": {
     "@cortexkit/subc-client": "0.4.1",
-    "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "@opencode-ai/plugin": "^1.17.11",
     "@opencode-ai/sdk": "^1.17.11",
@@ -65,8 +64,13 @@
     "solid-js": "1.9.12",
     "zod": "^4.1.8"
   },
+  "optionalDependencies": {
+    "onnxruntime-node": "1.24.3",
+    "sharp": "^0.34.5"
+  },
   "devDependencies": {
     "@ai-sdk/anthropic": "3.0.82",
+    "@huggingface/transformers": "^4.1.0",
     "@ai-sdk/openai-compatible": "2.0.41",
     "@biomejs/biome": "^2.5.1",
     "@types/better-sqlite3": "^7.6.13",
