@@ -118,3 +118,15 @@ Have `pi_sessions.rs` emit a turn root from durable user branch entries while ex
 | Claude Code message-id request dedup mutation control | `packages/dashboard/src-tauri/src/external_cache_sessions.rs::tests::parses_claude_code_usage_and_skips_sidechains` |
 
 The mutation controls are observable: classifying synthetic rows as real advances the coupled Channel-1 cadence specimens; treating any tool result as completion fails the Pi and Rust unpaired-result tests; removing Claude `message.id` dedup changes the expected request count from two to three; ignoring OpenCode `parentID` merges the two equal-time dashboard turns.
+
+## Executed mutation evidence
+
+Each deliberate source mutation was marked `NON-VACUITY BREAK`, run to a failing assertion, and restored immediately. The commands below are the red runs, not hypothetical controls.
+
+| Mutation | Command | Recorded failing assertion file:line |
+| --- | --- | --- |
+| Classify an all-synthetic OpenCode user row as real by inverting the all-parts predicate | `cd packages/plugin && bun test src/hooks/magic-context/hook-handlers.test.ts -t "uses real user turns for sticky refires, expiration, and escalation"` | `packages/plugin/src/hooks/magic-context/hook-handlers.test.ts:851` (`Expected: 0`, `Received: 1`) |
+| Treat any Pi tool result as completing the newest call, without matching `toolCallId` | `cd packages/pi-plugin && bun test src/boundary-execution-pi.test.ts -t "pairs only matching tool results and releases only for genuine branch users"` | `packages/pi-plugin/src/boundary-execution-pi.test.ts:62` (`Expected: true`, `Received: false`) |
+| Treat any Rust tool-result arc as completing the newest assistant call, without matching arc id | `cargo test -p mc-module tail_state_requires_a_result_paired_to_the_newest_assistant_call` | `crates/mc-module/src/transform.rs:15945` (`an unrelated result must not end the newest unpaired tool arc`) |
+| Remove Claude Code `message.id` dedup by assigning every content-block row a unique map key | `cd packages/dashboard/src-tauri && cargo test external_cache_sessions::tests::parses_claude_code_usage_and_skips_sidechains` | `packages/dashboard/src-tauri/src/external_cache_sessions.rs:755` (`left: 3`, `right: 2`) |
+| Ignore OpenCode `parentID` and use finish inference for two equal-time queued users | `cd packages/dashboard/src-tauri && cargo test db::cache_turn_tests::native_opencode_parent_id_overrides_finish_heuristics` | `packages/dashboard/src-tauri/src/db.rs:7430` (`left: 1`, `right: 2`) |
