@@ -42,6 +42,36 @@ describe.skipIf(!rustPrereqs.ok)("rust maintenance command contract", () => {
         await h?.dispose();
     });
 
+    it("persists the canonical historian no-fire cause", async () => {
+        const sessionId = await h.createSession();
+        h.mock.setDefault({
+            text: "historian no-fire reply",
+            usage: {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_input_tokens: 0,
+            },
+        });
+        await h.sendPrompt(sessionId, "historian no-fire evaluation");
+
+        const store = new Database(
+            join(h.env.dataDir, "cortexkit", "magic-context", "store.db"),
+            { readonly: true },
+        );
+        store.exec("PRAGMA query_only = ON");
+        try {
+            const row = store
+                .prepare(
+                    "SELECT json_extract(meta, '$.historian.last_no_fire') AS last_no_fire FROM mc_cache_state WHERE session_id = ?",
+                )
+                .get(sessionId) as { last_no_fire: string | null };
+            expect(row.last_no_fire).toContain("raw_cause=BelowProactiveFloor");
+            expect(row.last_no_fire).toContain("canonical_cause=below_proactive_floor");
+        } finally {
+            store.close();
+        }
+    }, 120_000);
+
     it("records wrapup and recomp dispositions with monotonic cache versions", async () => {
         const sessionId = await h.createSession();
         for (let turn = 1; turn <= 10; turn += 1) {
