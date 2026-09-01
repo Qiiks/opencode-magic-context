@@ -304,6 +304,75 @@ describe("todo state synthesis — live permission cache boundaries", () => {
     });
 });
 
+describe("todo state synthesis — coverage-fold relocation", () => {
+    it("rides an unchanged synthetic pair to the new tail anchor and replays it on defer", async () => {
+        useTempDataHome("todo-coverage-relocation-");
+        const db = openDatabase();
+        const sessionId = "ses-coverage-relocation";
+        updateSessionMeta(db, sessionId, { lastTodoState: ACTIVE_TODOS_JSON });
+        const availability = { callable: true, frozen: true } as const;
+
+        const initialMessages = buildMessages();
+        await applyTodoSynthesis({
+            db,
+            sessionId,
+            messages: initialMessages,
+            fullFeatureMode: true,
+            isCacheBustingPass: true,
+            sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            todowriteAvailability: availability,
+        });
+        const initialPair = findSyntheticPart(initialMessages);
+        expect(initialPair?.messageId).toBe("msg-asst-2");
+        const frozenPairBytes = JSON.stringify(initialPair?.part);
+        const callId = getPersistedTodoSyntheticAnchor(db, sessionId)?.callId;
+
+        const foldedMessages: MessageLike[] = [
+            {
+                info: { id: "msg-user-3", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Continue after the fold" }],
+            },
+            {
+                info: { id: "msg-asst-3", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "Continuing" }],
+            },
+        ];
+        await applyTodoSynthesis({
+            db,
+            sessionId,
+            messages: foldedMessages,
+            fullFeatureMode: true,
+            isCacheBustingPass: true,
+            sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            todowriteAvailability: availability,
+        });
+        const relocated = findSyntheticPart(foldedMessages);
+        expect(relocated?.messageId).toBe("msg-asst-3");
+        expect(JSON.stringify(relocated?.part)).toBe(frozenPairBytes);
+        expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toEqual({
+            callId,
+            messageId: "msg-asst-3",
+            stateJson: ACTIVE_TODOS_JSON,
+        });
+
+        const deferMessages = foldedMessages.map((message) => ({
+            info: { ...message.info },
+            parts: message.parts.filter((part) => !isSyntheticTodoPart(part)),
+        }));
+        await applyTodoSynthesis({
+            db,
+            sessionId,
+            messages: deferMessages,
+            fullFeatureMode: true,
+            isCacheBustingPass: false,
+            sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            todowriteAvailability: availability,
+        });
+        expect(JSON.stringify(findSyntheticPart(deferMessages)?.part)).toBe(frozenPairBytes);
+        expect(findSyntheticPart(deferMessages)?.messageId).toBe("msg-asst-3");
+    });
+});
+
 describe("todo state synthesis — cache-busting branches", () => {
     it("Branch 1: cache-bust + render null + no sticky → no-op", () => {
         useTempDataHome("todo-b1-");

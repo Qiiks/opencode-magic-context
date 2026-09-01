@@ -20,6 +20,7 @@
  *   Falls back to schema defaults when neither file exists.
  */
 
+import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
@@ -785,6 +786,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const bootProjectDir = process.cwd();
 	ensureConfigLocationsMigrated(bootProjectDir);
 	const bootConfig = loadPiConfig({ cwd: bootProjectDir });
+	reloadWindowOverlay(bootConfig.config.models?.window_overlay_path);
 	setStoragePrivatePermissionEnforcement(
 		bootConfig.config.storage.enforce_private_permissions,
 	);

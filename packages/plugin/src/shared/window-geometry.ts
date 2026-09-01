@@ -326,6 +326,15 @@ export function readWindowOverlayFile(
 
 /** Set the user-tier overlay path. Undefined restores the Fusiform data-dir default. */
 export function setWindowOverlayPath(path: string | undefined): void {
+    // Runtime hooks may resolve unchanged config more than once. Preserve the
+    // process snapshot unless the configured path actually changes, so an
+    // external same-path rewrite cannot alter geometry between turns.
+    if (configuredOverlayPath === path) return;
+    reloadWindowOverlay(path);
+}
+
+/** Start a new overlay snapshot at an explicit plugin/extension reload boundary. */
+export function reloadWindowOverlay(path: string | undefined): void {
     configuredOverlayPath = path;
     loadedOverlayPath = undefined;
     loadedOverlay = undefined;

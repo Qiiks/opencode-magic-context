@@ -301,6 +301,13 @@ export class PiRpcClient {
     return this.stderr;
   }
 
+  async restart(): Promise<void> {
+    await this.shutdown();
+    this.extensionErrors.length = 0;
+    this.stderr = "";
+    await this.start();
+  }
+
   async shutdown(timeoutMs = 2_000): Promise<void> {
     if (!this.process) return;
     const child = this.process;

@@ -5,6 +5,11 @@ import { join } from "node:path";
 
 import { resolveHistorianModel } from "../shared/model-resolution";
 import { createTestTempDir } from "../shared/test-temp-dir";
+import {
+    getWindowOverlay,
+    reloadWindowOverlay,
+    setWindowOverlayPath,
+} from "../shared/window-geometry";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
 import { resolveConfigProfile } from "./profiles";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "./schema/magic-context";
@@ -112,6 +117,42 @@ function loadWithUserAndProjectConfig(
         }
     }
 }
+
+describe("loadPluginConfig — Fusiform overlay reload", () => {
+    it("does not invalidate a same-path overlay during routine config reads", () => {
+        const overlayDir = mkdtempSync(join(tmpdir(), "mc-config-overlay-"));
+        const overlayPath = join(overlayDir, "window-overlay.json");
+        const configText = JSON.stringify({ models: { window_overlay_path: overlayPath } });
+        const writeOverlay = (modelId: string) =>
+            writeFileSync(
+                overlayPath,
+                JSON.stringify({
+                    schema: "fusiform-window-overlay/v1",
+                    generated_at: "2026-09-01T00:00:00Z",
+                    minted_provider_ids: [],
+                    cells: [{ provider_id: "hunt-provider", model_id: modelId, facts: {} }],
+                }),
+            );
+
+        try {
+            writeOverlay("before-rewrite");
+            loadWithUserConfig(configText);
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+            writeOverlay("after-rewrite");
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+            loadWithUserConfig(configText);
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+            reloadWindowOverlay(overlayPath);
+            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("after-rewrite");
+        } finally {
+            setWindowOverlayPath(undefined);
+            rmSync(overlayDir, { recursive: true, force: true });
+        }
+    });
+});
 
 describe("loadPluginConfig — preload user-config isolation", () => {
     it("resolves schema-default embedding config for a fixture with no config (#388)", () => {
