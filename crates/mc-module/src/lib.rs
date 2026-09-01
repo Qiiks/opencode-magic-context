@@ -11481,6 +11481,10 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
+                                    string_arg(args, "compiled_provider"),
+                                    string_arg(args, "compiled_config"),
+                                    i64_arg(args, "compiled_at"),
+                                    string_arg(args, "compile_status"),
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?
@@ -22064,7 +22068,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn smart_note_writes_require_the_host_evaluator_capability() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
             default_test_config(),
             resolver,
@@ -22115,11 +22119,82 @@ mod tests {
                 "action": "write",
                 "content": "smart note with evaluator",
                 "surface_condition": "when evaluated",
+                "compiled_provider": "retina-local-fs",
+                "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"old\"}",
+                "compiled_at": 100,
+                "compile_status": "compiled",
             }),
         )
         .await;
         let accepted_text = tool_text(accepted);
         assert!(accepted_text.contains("Created smart note"));
+        let project = project.to_str().unwrap();
+        let note_id = store
+            .search_notes_like(project, "ses", "smart note with evaluator")
+            .unwrap()[0]
+            .id;
+        let written = store
+            .get_note_by_id(project, "ses", note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            written.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(written.compiled_at, Some(100));
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: project,
+                note_id,
+                source_revision: written.status_version,
+                verdict: false,
+                compiled_check: Some("old compiled check"),
+                manifest_json: Some("{\"kind\":\"old\"}"),
+                check_hash: Some("old-hash"),
+                next_due_at: Some(999),
+                now_ms: 150,
+            })
+            .unwrap();
+
+        let updated = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "update",
+                "note_id": note_id,
+                "surface_condition": "when the replacement path exists",
+                "compiled_provider": "retina-local-fs",
+                "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"new\"}",
+                "compiled_at": 200,
+                "compile_status": "compiled",
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(updated));
+        let updated = store
+            .get_note_by_id(project, "ses", note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.surface_condition.as_deref(),
+            Some("when the replacement path exists")
+        );
+        assert_eq!(
+            updated.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            updated.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\",\"path\":\"new\"}")
+        );
+        assert_eq!(updated.compiled_at, Some(200));
+        assert_eq!(updated.compile_status.as_deref(), Some("compiled"));
+        assert_eq!(updated.compiled_check, None);
+        assert_eq!(updated.manifest_json, None);
+        assert_eq!(updated.check_hash, None);
+        assert_eq!(updated.check_next_due_at, None);
+        assert_eq!(updated.last_checked_at, None);
+        assert_eq!(updated.check_status.as_deref(), Some("uncompiled"));
 
         let plain_with_capability = call_facade(
             &handler,
@@ -22828,36 +22903,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn note_facade_reads_a_preexisting_seeded_ts_note_after_authority_flip() {
+    async fn note_facade_recovers_pre_and_post_migration_compilation_metadata() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
+        let (handler, store, dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
-        store
-            .seed_authority_row(
-                "context-db",
-                "notes",
-                42,
-                &json!({
+        let rows = [
+            AuthoritySeedRow {
+                source_row_id: 42,
+                snapshot: json!({
                     "type": "smart",
                     "project_path": "/repo",
                     "session_id": "session",
-                    "content": "seeded before Rust mode",
+                    "content": "seeded before migration 52",
                     "status": "ready",
-                    "surface_condition": "condition",
-                    "ready_reason": "condition met",
+                    "surface_condition": "legacy condition",
+                    "ready_reason": "legacy condition met",
                     "status_version": 2,
                     "created_at": 1,
                     "updated_at": 2
                 }),
-            )
+            },
+            AuthoritySeedRow {
+                source_row_id: 43,
+                snapshot: json!({
+                    "type": "smart",
+                    "project_path": "/repo",
+                    "session_id": "session",
+                    "content": "seeded after migration 52",
+                    "status": "ready",
+                    "surface_condition": "compiled condition",
+                    "compiled_provider": "retina-local-fs",
+                    "compiled_config": "{\"kind\":\"path_exists\"}",
+                    "compiled_at": 123,
+                    "compile_status": "compiled",
+                    "ready_reason": "compiled condition met",
+                    "status_version": 3,
+                    "created_at": 3,
+                    "updated_at": 4
+                }),
+            },
+        ];
+        store
+            .seed_authority_rows("context-db", "/repo", "notes", &rows)
             .unwrap();
+
+        let pre_migration = store
+            .get_note_by_id("/repo", "session", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre_migration.compiled_provider, None);
+        assert_eq!(pre_migration.compiled_config, None);
+        assert_eq!(pre_migration.compiled_at, None);
+        assert_eq!(pre_migration.compile_status, None);
+        let post_migration = store
+            .get_note_by_id("/repo", "session", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            post_migration.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            post_migration.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\"}")
+        );
+        assert_eq!(post_migration.compiled_at, Some(123));
+        assert_eq!(post_migration.compile_status.as_deref(), Some("compiled"));
 
         let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(output.contains("## 🔔 Ready Smart Notes"));
-        assert!(output.contains("seeded before Rust mode"));
+        assert!(output.contains("seeded before migration 52"));
+        assert!(output.contains("seeded after migration 52"));
+
+        drop(handler);
+        drop(store);
+        let reopened = McStore::open(&dev_descriptor_at(
+            dir.path().join("data").to_str().unwrap(),
+        ))
+        .unwrap();
+        let durable = reopened
+            .get_note_by_id("/repo", "session", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(durable.compiled_at, Some(123));
+        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
     }
 
     #[tokio::test(flavor = "current_thread")]
