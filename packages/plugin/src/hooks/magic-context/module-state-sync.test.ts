@@ -14,6 +14,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { setChannel2NudgeState } from "../../features/magic-context/storage-meta-persisted";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
     insertTag,
@@ -232,6 +233,31 @@ describe("module drop-state cold-start seed", () => {
         ]);
         expect(body.drop_seeds[0]?.payload).toContain("src/main.ts");
         expect(body.drop_seed_skipped).toBe(1);
+    });
+});
+
+describe("module Channel-2 lease cold-start seed", () => {
+    it("carries the durable terminal lease into a restarted module", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-channel2-restart-seed";
+        setChannel2NudgeState(db, sessionId, "delivered");
+        const calls: Array<Record<string, unknown>> = [];
+
+        await syncModuleState({
+            client: {
+                async call(args) {
+                    calls.push(args.body as Record<string, unknown>);
+                    return { result: { shadow_seq: 1 } };
+                },
+            },
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.channel2_nudge_state).toBe("delivered");
     });
 });
 
