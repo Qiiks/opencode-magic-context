@@ -1,0 +1,86 @@
+# Draft for cortexkit/magic-context — .github/workflows/sign-notarize-dispatch.yml
+# Signs + notarizes a caller-supplied macOS CLI artifact with this repo's
+# existing Developer ID + ASC secrets. Runs HERE so custody never moves.
+# Guardrails per MC's hosting conditions: actor allowlist, sha256 pinned and
+# re-verified before signing, printed audit line, Developer ID used only for
+# the requested artifact, no ad-hoc fallback arm. CLI zips are notarized
+# without stapling (bare Mach-O cannot staple; Gatekeeper fetches the ticket
+# online — this repo's own dashboard finding).
+
+name: sign-notarize-dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: "URL of the zip to sign (binary at archive root)"
+        required: true
+      sha256:
+        description: "Expected hex sha256 of the zip bytes at artifact_url"
+        required: true
+      identifier:
+        description: "codesign identifier to pin (the deployed binary name, e.g. ck-subc)"
+        required: true
+      requester:
+        description: "Requesting seat (audit line)"
+        required: true
+
+jobs:
+  sign:
+    runs-on: macos-latest
+    # workflow_dispatch already requires write access; this narrows further.
+    # Allowlist: operator + MC's GitHub App. Add SUBC's dispatch actor when named.
+    if: contains(fromJSON('["ualtinok","magic-alfonso[bot]"]'), github.actor)
+    steps:
+      - name: Fetch and verify input bytes
+        run: |
+          curl -fsSL -o input.zip "${{ inputs.artifact_url }}"
+          got="$(shasum -a 256 input.zip | awk '{print $1}')"
+          if [ "$got" != "${{ inputs.sha256 }}" ]; then
+            echo "REFUSED: input digest mismatch (got $got, pinned ${{ inputs.sha256 }})"
+            exit 1
+          fi
+          echo "AUDIT sign-request requester=${{ inputs.requester }} sha256=$got identifier=${{ inputs.identifier }} at=$(date -u +%FT%TZ)"
+
+      - name: Import Developer ID into ephemeral keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Same mechanism as dashboard-release.yml; MC aligns step details.
+          security create-keychain -p ephemeral build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ephemeral build.keychain
+          echo "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k ephemeral build.keychain
+
+      - name: Sign, re-zip, notarize
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          mkdir work && cd work && unzip -q ../input.zip
+          bin="$(find . -maxdepth 1 -type f -perm +111 | head -1)"
+          if [ -z "$bin" ]; then echo "REFUSED: no executable at archive root"; exit 1; fi
+          identity="$(security find-identity -v -p codesigning build.keychain | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          if [ -z "$identity" ]; then echo "REFUSED: no Developer ID identity in keychain (no fallback arm by design)"; exit 1; fi
+          codesign --force --options runtime --timestamp \
+            --identifier "${{ inputs.identifier }}" \
+            --sign "$identity" "$bin"
+          codesign --verify --strict "$bin"
+          cd .. && (cd work && zip -q ../signed.zip "$(basename "$bin")")
+          echo "$APPLE_API_KEY_CONTENT" > key.p8
+          xcrun notarytool submit signed.zip --key key.p8 \
+            --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait --timeout 30m
+          rm key.p8
+          out="$(shasum -a 256 signed.zip | awk '{print $1}')"
+          echo "AUDIT sign-complete requester=${{ inputs.requester }} sha256_in=${{ inputs.sha256 }} sha256_out=$out at=$(date -u +%FT%TZ)"
+
+      - name: Publish result as run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-${{ inputs.identifier }}
+          path: signed.zip
