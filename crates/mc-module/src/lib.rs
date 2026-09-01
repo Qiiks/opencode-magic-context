@@ -15266,11 +15266,10 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     // verification a queryable build identity instead of binary archaeology.
     // build_provenance is the subc-protocol library call (re-exported through
     // subc-client-rs); it normalizes sentinel/empty values to field omission.
-    .provenance(Some(build_provenance(
-        option_env!("MC_BUILD_SHA"),
-        None,
-        None,
-    )))
+    .provenance(Some(
+        build_provenance(option_env!("MC_BUILD_SHA"), None, None)
+            .expect("compile-time MC build provenance is valid"),
+    ))
     .provides(vec![ProviderRole::ToolProvider {
         tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -16890,6 +16889,72 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
         (handler, store, dir, project)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_mural_write_family_is_hash_gated_and_claude_code_inherits_by_project() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+        let mural_a = "data:image/png;base64,YQ==";
+
+        let mut first = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        first["serializer_profile"] = json!("opencode-aisdk");
+        first["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": mural_a,
+            "content_hash": "mural-a",
+        });
+        let first_response = call_transform_request(&handler, first).await;
+        assert_eq!(first_response["status"], "ok", "{first_response}");
+        let artifact = store
+            .load_project_mural_artifact(&project_path)
+            .unwrap()
+            .expect("OpenCode host artifact");
+        assert_eq!(artifact.data_url, mural_a.as_bytes());
+        assert_eq!(artifact.content_hash, "mural-a");
+
+        let mut same_hash = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        same_hash["serializer_profile"] = json!("opencode-aisdk");
+        same_hash["render_config"] = json!("cfg1");
+        same_hash["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,c2FtZS1oYXNoLWRyaWZ0",
+            "content_hash": "mural-a",
+        });
+        let same_hash_response = call_transform_request(&handler, same_hash).await;
+        assert_eq!(same_hash_response["status"], "ok", "{same_hash_response}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(&project_path)
+                .unwrap()
+                .expect("hash-gated artifact"),
+            artifact,
+        );
+
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "claude-code", "cc-ses"),
+        );
+        let mut claude_code = request(vec![ck("cc-1", 1, "Claude Code tail")]);
+        claude_code["serializer_profile"] = json!("claude-code-anthropic");
+        claude_code["session_id"] = json!("cc-ses");
+        claude_code["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,dW50cnVzdGVkLWNjLWJ5dGVz",
+            "content_hash": "untrusted-cc-hash",
+        });
+        let claude_code_response = call_transform_request(&handler, claude_code).await;
+        assert_eq!(
+            claude_code_response["status"], "ok",
+            "{claude_code_response}"
+        );
+        let response_bytes = serde_json::to_string(&claude_code_response).unwrap();
+        assert!(response_bytes.contains(mural_a));
+        assert!(!response_bytes.contains("dW50cnVzdGVkLWNjLWJ5dGVz"));
     }
 
     #[test]

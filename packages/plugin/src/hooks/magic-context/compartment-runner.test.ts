@@ -26,6 +26,7 @@ import {
     incrementHistorianFailure,
     loadProtectedTailMeta,
     openDatabase,
+    recordOverflowDetected,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
@@ -1328,6 +1329,65 @@ describe("runCompartmentAgent", () => {
             query: { directory: "/tmp/parent" },
         });
         expect(promptSession.mock.calls[0]?.[0]?.body.agent).toBe("historian");
+    });
+
+    it("keeps both chunk-edge compartments when emergency recovery is armed", async () => {
+        useTempDataHome("compartment-runner-emergency-discard-last-");
+        const sessionId = "ses-emergency-discard-last";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "First eligible message" },
+            { id: "m-2", role: "assistant", text: "Second eligible message" },
+            { id: "m-3", role: "user", text: "Third eligible message" },
+            { id: "m-4", role: "assistant", text: "Fourth eligible message" },
+            { id: "m-5", role: "user", text: "protected 1" },
+            { id: "m-6", role: "user", text: "protected 2" },
+            { id: "m-7", role: "user", text: "protected 3" },
+            { id: "m-8", role: "user", text: "protected 4" },
+            { id: "m-9", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        recordOverflowDetected(db, sessionId, 4_096, "anthropic/test");
+
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/emergency-discard-last" } })),
+                create: mock(async () => ({ data: { id: "ses-agent-emergency-discard-last" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<compartment start="1" end="2" title="First"><p1>First summary</p1></compartment>\n<compartment start="3" end="4" title="Second"><p1>Second summary</p1></compartment>`,
+                                },
+                            ],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(getCompartments(db, sessionId).map((compartment) => compartment.endMessage)).toEqual([
+            2, 4,
+        ]);
+        expect(
+            db
+                .prepare(
+                    "SELECT discarded_last FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get(sessionId),
+        ).toEqual({ discarded_last: 0 });
     });
 
     it("keeps a committed publish succeeded and signaled when post-commit project registration throws", async () => {
