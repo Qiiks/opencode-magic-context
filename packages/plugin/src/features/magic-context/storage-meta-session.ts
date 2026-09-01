@@ -185,18 +185,29 @@ export function markSessionCleanupPending(
     db: Database,
     sessionId: string,
     rustModuleCleanupRequired = false,
-): void {
-    db.prepare(
-        `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
-         VALUES (?, ?, ?, NULL)
-         ON CONFLICT(session_id) DO UPDATE SET
-             harness = excluded.harness,
-             requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)`,
-    ).run(
-        sessionId,
-        rustModuleCleanupRequired ? rustCleanupHarness() : getHarness(),
-        Date.now(),
-    );
+): boolean {
+    const row = db
+        .prepare(
+            `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
+             VALUES (?, ?, ?, NULL)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 harness = CASE
+                     WHEN pending_session_cleanup.harness LIKE '%:rust'
+                         THEN pending_session_cleanup.harness
+                     ELSE excluded.harness
+                 END,
+                 requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)
+             RETURNING harness`,
+        )
+        .get(
+            sessionId,
+            rustModuleCleanupRequired ? rustCleanupHarness() : getHarness(),
+            Date.now(),
+        ) as { harness: string };
+
+    // The Rust suffix means module-owned state must be deleted before host rows.
+    // Replaying the event in TypeScript mode cannot make host-only cleanup safe.
+    return row.harness.endsWith(":rust");
 }
 
 export function retryPendingSessionCleanups(
@@ -247,12 +258,9 @@ export async function retryPendingRustSessionCleanupsForProject(
              ORDER BY pending.requested_at ASC, pending.session_id ASC
              LIMIT ?`,
         )
-        .all(
-            harness,
-            rustCleanupHarness(),
-            projectPath,
-            Math.max(1, Math.floor(limit)),
-        ) as Array<{ session_id: string }>;
+        .all(harness, rustCleanupHarness(), projectPath, Math.max(1, Math.floor(limit))) as Array<{
+        session_id: string;
+    }>;
     const failedSessionIds: string[] = [];
     let cleared = 0;
     for (const row of rows) {
