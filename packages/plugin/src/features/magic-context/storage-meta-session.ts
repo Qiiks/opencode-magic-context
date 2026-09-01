@@ -269,7 +269,7 @@ export async function retryPendingRustSessionCleanupsForProject(
                 "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
             ).run(Date.now(), row.session_id);
             await deleteSession(row.session_id);
-            clearSession(db, row.session_id);
+            clearSession(db, row.session_id, true);
             cleared += 1;
         } catch {
             failedSessionIds.push(row.session_id);
@@ -278,10 +278,16 @@ export async function retryPendingRustSessionCleanupsForProject(
     return { attempted: rows.length, cleared, failedSessionIds };
 }
 
-export function clearSession(db: Database, sessionId: string): void {
+export function clearSession(
+    db: Database,
+    sessionId: string,
+    rustModuleCleanupAcknowledged = false,
+): void {
     const transactionStartedAt = performance.now();
     db.transaction(() => {
-        deleteSessionScopedRows(db, [sessionId]);
+        deleteSessionScopedRows(db, [sessionId], undefined, {
+            rustModuleCleanupAcknowledged,
+        });
     })();
     logSlowWriteTransaction("clear-session", transactionStartedAt);
 }

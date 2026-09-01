@@ -795,6 +795,55 @@ describe("SubcModuleTransport", () => {
         expect(starts).toEqual(["state_sync", "transform", "session.status"]);
     });
 
+    it("queues session.delete behind an in-flight transform on the same route", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const transformStarted = deferred();
+        const releaseTransform = deferred();
+        const starts: string[] = [];
+        const client = {
+            request: async (_route: RouteHandle, body: unknown) => {
+                const method = (body as { method: string }).method;
+                starts.push(method);
+                if (method === "transform") {
+                    transformStarted.resolve();
+                    await releaseTransform.promise;
+                }
+                return { result: { method } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "delete-race-session\0/workspace/project",
+            generation: 0,
+        });
+        const transform = transport.call({
+            sessionId: "delete-race-session",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform" },
+        });
+        await transformStarted.promise;
+
+        const deletion = transport.deleteSession("delete-race-session", "/workspace/project");
+        await Promise.resolve();
+        expect(starts).toEqual(["transform"]);
+        releaseTransform.resolve();
+        await Promise.all([transform, deletion]);
+        expect(starts).toEqual(["transform", "session.delete"]);
+    });
+
     it("coalesces concurrent connection recovery and retries two sessions on one fresh generation", async () => {
         const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
         const oldRouteA = { channel: 7, epoch: 70 } as RouteHandle;

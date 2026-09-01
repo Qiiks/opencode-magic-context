@@ -203,6 +203,12 @@ function makeCortexkitDb() {
           project_path TEXT NOT NULL,
           PRIMARY KEY (session_id, harness)
         );
+        CREATE TABLE pending_session_cleanup (
+          session_id TEXT PRIMARY KEY,
+          harness TEXT NOT NULL,
+          requested_at INTEGER NOT NULL,
+          last_attempt_at INTEGER
+        );
         CREATE TABLE migration_pending (
           migration_key TEXT PRIMARY KEY,
           source_session_id TEXT NOT NULL,
@@ -1204,6 +1210,32 @@ describe("sweepPendingMigrations — phase reconciliation", () => {
         expect(report).toEqual({ completed: 0, rolledForward: 0, rolledBack: 0, lost: [row] });
         // Never silently deleted: the checksum row survives to name the loss.
         expect(readJournalRows(ck)).toEqual([row]);
+    });
+
+    it("leaves a pending Rust cleanup marker and project coordinate untouched", () => {
+        const ck = makeCortexkitDb();
+        const dir = tempDir();
+        const row = seedRow(ck, dir);
+        mkdirSync(dirname(row.stage_path), { recursive: true });
+        writeFileSync(row.stage_path, "{}\n", "utf-8");
+        ck.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path) VALUES (?, 'opencode', 'git:migration-cleanup')",
+        ).run(row.source_session_id);
+        ck.prepare(
+            "INSERT INTO pending_session_cleanup (session_id, harness, requested_at) VALUES (?, 'opencode:rust', 1)",
+        ).run(row.source_session_id);
+
+        expect(sweepPendingMigrations(ck).rolledBack).toBe(1);
+        expect(
+            ck
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(row.source_session_id),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(
+            ck
+                .prepare("SELECT project_path FROM session_projects WHERE session_id = ?")
+                .get(row.source_session_id),
+        ).toEqual({ project_path: "git:migration-cleanup" });
     });
 
     it("is a no-op when the journal table does not exist", () => {

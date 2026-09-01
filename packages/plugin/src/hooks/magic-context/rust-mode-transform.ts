@@ -1438,7 +1438,7 @@ export function createRustModeTransform(
         output: { messages: unknown[] },
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ) => Promise<void>;
-    clearSession: (sessionId: string) => void;
+    clearSession: (sessionId: string) => Promise<void>;
     invalidateWireState: (sessionId: string) => void;
     getState: (sessionId: string) => Readonly<RustSessionState>;
 } {
@@ -3082,10 +3082,13 @@ export function createRustModeTransform(
         async clearSession(sessionId: string): Promise<void> {
             const projectRoot =
                 states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
-            dropSlot(sessionId, "session-deleted");
-            states.delete(sessionId);
-            wireCaches.delete(sessionId);
-            clearCompartmentMirrorCursor(sessionId);
+            const clearLocalState = () => {
+                dropSlot(sessionId, "session-deleted");
+                states.delete(sessionId);
+                wireCaches.delete(sessionId);
+                clearCompartmentMirrorCursor(sessionId);
+            };
+            clearLocalState();
             try {
                 if (projectRoot && options.moduleClient.deleteSession) {
                     await options.moduleClient.deleteSession(sessionId, projectRoot);
@@ -3094,6 +3097,10 @@ export function createRustModeTransform(
                 sessionLog(sessionId, "rust module session deletion failed:", error);
                 throw error;
             } finally {
+                // A transform that was already running may finish while session.delete waits.
+                // Clear the state again so its completion cannot repopulate this route's
+                // wire or last-known-good state after deletion has begun.
+                clearLocalState();
                 options.moduleClient.closeSession?.(sessionId);
             }
         },

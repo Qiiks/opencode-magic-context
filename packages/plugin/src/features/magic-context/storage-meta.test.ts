@@ -6,6 +6,7 @@ import { clearSession, updateSessionMeta } from "./storage-meta";
 
 function createMockDb() {
     const prepare = mock((_sql: string) => ({
+        all: mock((..._args: unknown[]) => []),
         run: mock((..._args: unknown[]) => {}),
     }));
 
@@ -85,7 +86,7 @@ describe("storage-meta", () => {
             // encompassing transaction; message-index rows no longer need a
             // separate nested cleanup transaction.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(29);
+            expect(db.prepare).toHaveBeenCalledTimes(30);
         });
     });
 });

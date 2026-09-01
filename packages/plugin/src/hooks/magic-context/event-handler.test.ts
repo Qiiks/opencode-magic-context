@@ -20,6 +20,7 @@ import {
     incrementCompressionDepth,
     incrementHistorianFailure,
     insertTag,
+    markSessionCleanupPending,
     openDatabase,
     retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
@@ -117,6 +118,20 @@ function countMessageIndexRows(sessionId: string): number {
 
 function waitForTimers(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function deferred<T = void>(): {
+    promise: Promise<T>;
+    resolve: (value?: T | PromiseLike<T>) => void;
+    reject: (reason?: unknown) => void;
+} {
+    let resolve!: (value?: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = (value) => res(value as T | PromiseLike<T>);
+        reject = rej;
+    });
+    return { promise, resolve, reject };
 }
 
 function createDeps(contextUsageMap: Map<string, ContextUsageCacheEntry>) {
@@ -1023,6 +1038,149 @@ describe("createEventHandler", () => {
                 )
                 .get(sessionId),
         ).toEqual({ count: 0 });
+    });
+
+    it("preserves a failed Rust cleanup across TS → Rust → TS double flips", async () => {
+        useTempDataHome("context-event-rust-delete-double-flip-ts-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-double-flip-ts";
+        const projectPath = "git:rust-double-flip-ts";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        markSessionCleanupPending(deps.db, sessionId, true);
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(async () => {
+                throw new Error("module unavailable");
+            }),
+            rustSessionCleanup: true,
+        })(event);
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        await retryPendingRustSessionCleanupsForProject(deps.db, projectPath, async () => {});
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
+    it("preserves a failed Rust cleanup across Rust → TS → Rust double flips", async () => {
+        useTempDataHome("context-event-rust-delete-double-flip-rust-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-double-flip-rust";
+        const projectPath = "git:rust-double-flip-rust";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+        const failRustDelete = () =>
+            createEventHandler({
+                ...deps,
+                onSessionDeleted: mock(async () => {
+                    throw new Error("module unavailable");
+                }),
+                rustSessionCleanup: true,
+            })(event);
+
+        await failRustDelete();
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+        await failRustDelete();
+
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        await retryPendingRustSessionCleanupsForProject(deps.db, projectPath, async () => {});
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
+    it("serializes the durable outcome of two concurrent session.deleted deliveries", async () => {
+        useTempDataHome("context-event-rust-delete-concurrent-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-concurrent";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        const first = deferred<void>();
+        const second = deferred<void>();
+        let calls = 0;
+        const handler = createEventHandler({
+            ...deps,
+            rustSessionCleanup: true,
+            onSessionDeleted: mock(() => (calls++ === 0 ? first.promise : second.promise)),
+        });
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        const firstDelivery = handler(event);
+        const secondDelivery = handler(event);
+        await Promise.resolve();
+        expect(calls).toBe(2);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        first.reject(new Error("first module delete failed"));
+        second.resolve();
+        await Promise.all([firstDelivery, secondDelivery]);
+
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("keeps host rows while a delete races the project-scoped Rust retry", async () => {
+        useTempDataHome("context-event-rust-delete-timer-race-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-timer-race";
+        const projectPath = "git:rust-delete-timer-race";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        markSessionCleanupPending(deps.db, sessionId, true);
+        const retryDelete = deferred<void>();
+        const retry = retryPendingRustSessionCleanupsForProject(
+            deps.db,
+            projectPath,
+            () => retryDelete.promise,
+        );
+        await Promise.resolve();
+
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })({
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+
+        retryDelete.resolve();
+        await expect(retry).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
     });
 
     it("cleans up removed-message tags and indexed content", async () => {
