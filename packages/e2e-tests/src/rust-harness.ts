@@ -1,8 +1,8 @@
 /**
  * RustTestHarness — facade for the Rust-mode (ck-mc over subc) e2e lane.
  *
- * Reuses the OpenCode e2e machinery UNCHANGED — the mock Anthropic provider and
- * the `opencode serve` subprocess + SDK session driving — and layers on the two
+ * Reuses the OpenCode e2e mock-provider, `opencode serve`, and SDK session-driving
+ * machinery, then layers on the two
  * things Rust mode needs that the TS lane does not:
  *
  *   1. a hermetic subc daemon + ck-mc module (HermeticSubcStack) whose
@@ -50,6 +50,10 @@ export interface RustTestHarnessOptions {
     mockDefault?: MockResponse;
     /** Mock provider id exposed to OpenCode. Defaults to "mock-anthropic". */
     providerID?: string;
+    /** AI SDK provider package used by the mock. Defaults to "@ai-sdk/anthropic". */
+    providerAPI?: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+    /** Mock model id used for prompts. Defaults to "mock-sonnet". */
+    modelID?: string;
     /**
      * Start opencode in TS mode instead of Rust mode. The hermetic daemon still
      * runs (so a later `restart({ rust: true })` can flip to Rust against the
@@ -135,6 +139,8 @@ export class RustTestHarness {
     private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
     private readonly providerID: string;
+    private readonly providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+    private readonly modelID: string;
     private readonly historianProducerAvailable: boolean;
 
     private constructor(args: {
@@ -148,6 +154,8 @@ export class RustTestHarness {
         modelContextLimit: number | undefined;
         mockDefault: MockResponse;
         providerID: string;
+        providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+        modelID: string;
         historianProducerAvailable: boolean;
     }) {
         this.mock = args.mock;
@@ -160,6 +168,8 @@ export class RustTestHarness {
         this.modelContextLimit = args.modelContextLimit;
         this.mockDefault = args.mockDefault;
         this.providerID = args.providerID;
+        this.providerAPI = args.providerAPI;
+        this.modelID = args.modelID;
         this.historianProducerAvailable = args.historianProducerAvailable;
     }
 
@@ -231,6 +241,8 @@ export class RustTestHarness {
             modelContextLimit: options.modelContextLimit,
             mockDefault,
             providerID: options.providerID ?? "mock-anthropic",
+            providerAPI: options.providerAPI ?? "@ai-sdk/anthropic",
+            modelID: options.modelID ?? "mock-sonnet",
             historianProducerAvailable: options.startHistorianProducer ?? true,
         });
     }
@@ -244,15 +256,18 @@ export class RustTestHarness {
         rustMode: boolean;
     }): Promise<SpawnedOpencode> {
         const providerID = args.options.providerID ?? "mock-anthropic";
+        const modelID = args.options.modelID ?? "mock-sonnet";
         return spawnOpencode({
             mockProviderURL: args.mockURL,
             mockProviderID: providerID,
+            mockProviderAPI: args.options.providerAPI,
+            mockModelID: modelID,
             existingEnv: args.env,
             modelContextLimit: args.options.modelContextLimit,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
             magicContextConfig: {
                 ...(args.options.startHistorianProducer ?? true
-                    ? { historian: { opencode: { model: `${providerID}/mock-sonnet` } } }
+                    ? { historian: { opencode: { model: `${providerID}/${modelID}` } } }
                     : {}),
                 ...(args.options.magicContextConfig ?? {}),
             },
@@ -301,6 +316,8 @@ export class RustTestHarness {
                 magicContextConfig: opts.magicContextConfig,
                 startHistorianProducer: this.historianProducerAvailable,
                 providerID: this.providerID,
+                providerAPI: this.providerAPI,
+                modelID: this.modelID,
             },
             rustMode: opts.rust ?? true,
         });
@@ -453,16 +470,54 @@ export class RustTestHarness {
         }
     }
 
+    /** Seed the latest isolated tool result for a sanitized provider-wire replay fixture. */
+    seedLatestToolOutputForReplay(sessionId: string, output: string): void {
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            const row = db
+                .prepare(
+                    "SELECT id, data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'tool' ORDER BY time_created DESC LIMIT 1",
+                )
+                .get(sessionId) as { id: string; data: string } | undefined;
+            if (!row) throw new Error("paired replay setup did not persist a tool result");
+            const data = JSON.parse(row.data) as Record<string, unknown>;
+            const state =
+                data.state && typeof data.state === "object"
+                    ? (data.state as Record<string, unknown>)
+                    : null;
+            data.output = output;
+            if (state) {
+                state.output = output;
+                if (state.metadata && typeof state.metadata === "object") {
+                    (state.metadata as Record<string, unknown>).output = output;
+                }
+            }
+            db.prepare("UPDATE part SET data = ? WHERE id = ?").run(JSON.stringify(data), row.id);
+        } finally {
+            db.close();
+        }
+    }
+
     async sendPrompt(
         sessionId: string,
         text: string,
-        options: { agent?: string; timeoutMs?: number } = {},
+        options: {
+            agent?: string;
+            timeoutMs?: number;
+            providerID?: string;
+            modelID?: string;
+        } = {},
     ): Promise<unknown> {
         const timeoutMs = options.timeoutMs ?? 180_000;
         const promptPromise = this.clientInstance.session.prompt({
             path: { id: sessionId },
             body: {
-                model: { providerID: this.providerID, modelID: "mock-sonnet" },
+                model: {
+                    providerID: options.providerID ?? this.providerID,
+                    modelID: options.modelID ?? this.modelID,
+                },
                 parts: [{ type: "text", text }],
                 ...(options.agent ? { agent: options.agent } : {}),
             },
@@ -513,7 +568,7 @@ export class RustTestHarness {
     mainRequests() {
         return this.mock
             .requests()
-            .filter((r) => JSON.stringify(r.body.system ?? "").includes("## Magic Context"));
+            .filter((request) => JSON.stringify(request.body).includes("## Magic Context"));
     }
 
     /** The messages array of the most recent main-agent request. */
@@ -534,10 +589,10 @@ export class RustTestHarness {
         return Buffer.byteLength(stableSerialize(req.body.messages ?? []));
     }
 
-    /** Stable serialization of the most recent main-agent messages array (cache_control stripped). */
-    lastMainWireSerialized(): string {
+    /** Deterministically serialize messages or input from the latest main-provider request. */
+    lastMainWireSerialized(requestField: "messages" | "input" = "messages"): string {
         const req = this.mainRequests().at(-1);
-        return stableSerialize(req?.body.messages ?? []);
+        return stableSerialize(req?.body[requestField] ?? []);
     }
 
     // ── plugin-log rust-pass decisions (secondary signal) ─────────────────────

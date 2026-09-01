@@ -1,12 +1,10 @@
 /**
- * Minimal Anthropic-compatible mock server.
+ * Minimal Anthropic Messages and OpenAI Responses mock server.
  *
- * Accepts POST to /messages (matching `${baseURL}/messages` path used by @ai-sdk/anthropic),
- * captures each request body, and returns a scripted response with full control over
- * input/output/cache_read/cache_write token counts.
+ * Accepts POST to `/messages` or `/responses`, captures each request body, and returns
+ * a scripted response with full control over input/output/cache token counts.
  *
- * Supports both Anthropic Messages SSE streaming (OpenCode's default transport) and
- * single-shot JSON responses (useful for direct unit-level probing of the mock).
+ * Supports each API's SSE stream plus single-shot JSON responses for direct probes.
  */
 
 export interface MockUsage {
@@ -21,6 +19,8 @@ export interface MockResponse {
     text?: string;
     /** Override content block array directly (for tool calls, multi-block). */
     content?: unknown[];
+    /** OpenAI Responses output items. Used only for POST /responses. */
+    openaiOutput?: unknown[];
     /** Stop reason reported to the caller. */
     stop_reason?: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
     /**
@@ -155,10 +155,11 @@ export class MockProvider {
         const url = new URL(req.url);
         const method = req.method;
 
-        // Accept both /messages and /v1/messages (depending on how baseURL is configured).
+        // Accept paths with and without /v1; AI SDK providers differ in how they join baseURL.
         const isMessages = url.pathname === "/messages" || url.pathname === "/v1/messages";
+        const isResponses = url.pathname === "/responses" || url.pathname === "/v1/responses";
 
-        if (method === "POST" && isMessages) {
+        if (method === "POST" && (isMessages || isResponses)) {
             let body: Record<string, unknown> = {};
             try {
                 body = (await req.json()) as Record<string, unknown>;
@@ -252,6 +253,10 @@ export class MockProvider {
             const respModel =
                 scripted.model ??
                 (typeof body.model === "string" ? body.model : "mock-model");
+
+            if (isResponses) {
+                return this.openAIResponsesResponse(body, scripted, usage, respModel, content);
+            }
 
             const wantsStream = body.stream === true;
             const messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
@@ -477,6 +482,195 @@ export class MockProvider {
         return new Response(JSON.stringify({ error: "not_found", path: url.pathname }), {
             status: 404,
             headers: { "content-type": "application/json" },
+        });
+    }
+
+    private openAIResponsesResponse(
+        body: Record<string, unknown>,
+        scripted: MockResponse,
+        usage: MockUsage,
+        model: string,
+        anthropicContent: unknown[],
+    ): Response {
+        const responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        const output: Record<string, unknown>[] = (scripted.openaiOutput ?? [
+            {
+                type: "message",
+                role: "assistant",
+                content: anthropicContent.map((rawBlock) => {
+                    const block = rawBlock as { text?: unknown };
+                    return {
+                        type: "output_text",
+                        text: typeof block.text === "string" ? block.text : "",
+                        annotations: [],
+                        logprobs: [],
+                    };
+                }),
+            },
+        ]).map((rawItem, index) => {
+            const item = rawItem as Record<string, unknown>;
+            return {
+                id:
+                    item.id ??
+                    `${item.type === "reasoning" ? "rs" : item.type === "function_call" ? "fc" : "msg"}_${responseId}_${index}`,
+                status: item.status ?? "completed",
+                ...item,
+            };
+        });
+        const responseUsage = {
+            input_tokens: usage.input_tokens,
+            input_tokens_details: {
+                cached_tokens: usage.cache_read_input_tokens ?? 0,
+            },
+            output_tokens: usage.output_tokens,
+            output_tokens_details: {
+                reasoning_tokens: 0,
+            },
+            total_tokens: usage.input_tokens + usage.output_tokens,
+        };
+        const completedResponse = {
+            id: responseId,
+            object: "response",
+            created_at: Math.floor(Date.now() / 1000),
+            status: "completed",
+            error: null,
+            incomplete_details: null,
+            instructions: null,
+            max_output_tokens: null,
+            model,
+            output,
+            parallel_tool_calls: true,
+            previous_response_id:
+                typeof body.previous_response_id === "string" ? body.previous_response_id : null,
+            reasoning: null,
+            store: false,
+            temperature: 1,
+            text: { format: { type: "text" } },
+            tool_choice: "auto",
+            tools: Array.isArray(body.tools) ? body.tools : [],
+            top_p: 1,
+            truncation: "disabled",
+            usage: responseUsage,
+        };
+
+        if (body.stream !== true) {
+            return new Response(JSON.stringify(completedResponse), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            });
+        }
+
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+            start(controller) {
+                const send = (data: Record<string, unknown>) => {
+                    const type = String(data.type ?? "message");
+                    controller.enqueue(
+                        encoder.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`),
+                    );
+                };
+                send({
+                    type: "response.created",
+                    sequence_number: 0,
+                    response: { ...completedResponse, status: "in_progress", output: [], usage: null },
+                });
+                let sequenceNumber = 1;
+                output.forEach((item, outputIndex) => {
+                    send({
+                        type: "response.output_item.added",
+                        sequence_number: sequenceNumber++,
+                        output_index: outputIndex,
+                        item: {
+                            ...item,
+                            ...(item.type === "function_call" ? { arguments: "" } : {}),
+                            status: "in_progress",
+                        },
+                    });
+                    if (item.type === "message" && Array.isArray(item.content)) {
+                        item.content.forEach((part: unknown, contentIndex: number) => {
+                            const contentPart = part as Record<string, unknown>;
+                            send({
+                                type: "response.content_part.added",
+                                sequence_number: sequenceNumber++,
+                                item_id: item.id,
+                                output_index: outputIndex,
+                                content_index: contentIndex,
+                                part: { ...contentPart, text: "" },
+                            });
+                            if (
+                                contentPart.type === "output_text" &&
+                                typeof contentPart.text === "string"
+                            ) {
+                                send({
+                                    type: "response.output_text.delta",
+                                    sequence_number: sequenceNumber++,
+                                    item_id: item.id,
+                                    output_index: outputIndex,
+                                    content_index: contentIndex,
+                                    delta: contentPart.text,
+                                    logprobs: [],
+                                });
+                                send({
+                                    type: "response.output_text.done",
+                                    sequence_number: sequenceNumber++,
+                                    item_id: item.id,
+                                    output_index: outputIndex,
+                                    content_index: contentIndex,
+                                    text: contentPart.text,
+                                    logprobs: [],
+                                });
+                            }
+                            send({
+                                type: "response.content_part.done",
+                                sequence_number: sequenceNumber++,
+                                item_id: item.id,
+                                output_index: outputIndex,
+                                content_index: contentIndex,
+                                part: contentPart,
+                            });
+                        });
+                    } else if (
+                        item.type === "function_call" &&
+                        typeof item.arguments === "string"
+                    ) {
+                        send({
+                            type: "response.function_call_arguments.delta",
+                            sequence_number: sequenceNumber++,
+                            item_id: item.id,
+                            output_index: outputIndex,
+                            delta: item.arguments,
+                        });
+                        send({
+                            type: "response.function_call_arguments.done",
+                            sequence_number: sequenceNumber++,
+                            item_id: item.id,
+                            output_index: outputIndex,
+                            arguments: item.arguments,
+                        });
+                    }
+                    send({
+                        type: "response.output_item.done",
+                        sequence_number: sequenceNumber++,
+                        output_index: outputIndex,
+                        item,
+                    });
+                });
+                send({
+                    type: "response.completed",
+                    sequence_number: sequenceNumber,
+                    response: completedResponse,
+                });
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+            },
+        });
+        return new Response(stream, {
+            status: 200,
+            headers: {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+                connection: "keep-alive",
+            },
         });
     }
 }

@@ -14,6 +14,7 @@ describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
         for (const pass of result.passes) {
             expect(pass.empty_content_shapes.classification).toBe("matched_value_space");
             expect(pass.dropped_placeholder_shapes.classification).toBe("matched_value_space");
+            expect(pass.tool_pairing_shapes.classification).toBe("matched_value_space");
             if (pass.reasoning_signature_shapes.classification === "divergent_value_space") {
                 expect(pass.reasoning_signature_shapes.adjudication?.decision).toBe(
                     "intentional_difference",
@@ -47,6 +48,36 @@ describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
         );
         expect(droppedPass?.dropped_placeholder_shapes.shared).toContain(
             "assistant:isolated_dropped_placeholder",
+        );
+    }, 600_000);
+
+    it("keeps the OpenAI Responses empty-tool, pairing, and reasoning surfaces aligned", async () => {
+        const result = await runPairedSessionReplay({ providerArm: "openai-responses" });
+
+        expect(result.wire_family).toBe("openai_responses");
+        expect(result.unadjudicated_divergence_count).toBe(0);
+        expect(result.divergence_count).toBe(0);
+        expect(result.passes).toHaveLength(2);
+        for (const pass of result.passes) {
+            expect(pass.empty_content_shapes.classification).toBe("matched_value_space");
+            expect(pass.dropped_placeholder_shapes.classification).toBe("matched_value_space");
+            expect(pass.reasoning_signature_shapes.classification).toBe("matched_value_space");
+            expect(pass.tool_pairing_shapes.classification).toBe("matched_value_space");
+        }
+
+        const toolPass = result.passes.find(
+            (pass) => pass.pass === "observe-empty-tool-output-with-reasoning",
+        );
+        expect(toolPass?.empty_content_shapes.shared).toEqual([]);
+        expect(toolPass?.dropped_placeholder_shapes.shared).toContain(
+            "tool:isolated_dropped_placeholder",
+        );
+        expect(toolPass?.tool_pairing_shapes.shared).toContain("tool_call:paired");
+        const historyPass = result.passes.find(
+            (pass) => pass.pass === "observe-responses-history",
+        );
+        expect(historyPass?.reasoning_signature_shapes.shared).toContain(
+            "reasoning:nonzero_index:signed",
         );
     }, 600_000);
 });
