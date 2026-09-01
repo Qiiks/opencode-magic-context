@@ -28,14 +28,17 @@ function installWasmPackage(root: string): void {
         JSON.stringify({ name: "onnxruntime-web", main: "index.js" }),
     );
     writeFileSync(join(pkgDir, "index.js"), "module.exports = {};\n");
+    const distDir = join(root, "dist");
+    mkdirSync(distDir, { recursive: true });
+    writeFileSync(join(distDir, "transformers-node-wasm.js"), "export {};\n");
 }
 
-function installPackage(root: string, withBinary: boolean): void {
+function installPackage(root: string, withBinary: boolean, version = "1.23.0"): void {
     const pkgDir = join(root, "node_modules", "onnxruntime-node");
     mkdirSync(pkgDir, { recursive: true });
     writeFileSync(
         join(pkgDir, "package.json"),
-        JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
+        JSON.stringify({ name: "onnxruntime-node", version, main: "index.js" }),
     );
     writeFileSync(join(pkgDir, "index.js"), "module.exports = {};\n");
     if (withBinary) {
@@ -119,6 +122,62 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
                 expect(formatLocalEmbeddingRuntimeWasmFallback(status)).toContain(
                     "WASM inference is slower than native",
                 );
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("darwin/x64 on onnxruntime-node 1.24 reports native unavailability and active WASM guidance", () => {
+        const root = makeRoot();
+        try {
+            installPackage(root, false, "1.24.3");
+            installWasmPackage(root);
+
+            const status = checkLocalEmbeddingRuntimeAt(root, "darwin", "x64");
+
+            expect(status.state).toBe("wasm-fallback");
+            if (status.state === "wasm-fallback") {
+                expect(status.nativeFailure.state).toBe("binary-missing");
+                if (status.nativeFailure.state === "binary-missing") {
+                    expect(status.nativeFailure.knownUnavailable).toEqual({
+                        kind: "darwin-x64-dropped",
+                        packageVersion: "1.24.3",
+                    });
+                }
+                const guidance = formatLocalEmbeddingRuntimeWasmFallback(status);
+                expect(guidance).toContain("no native binding for darwin/x64");
+                expect(guidance).toContain("WASM fallback active");
+                expect(guidance).toContain("onnxruntime-node@1.23.0");
+                expect(guidance).toContain("doctor --force");
+                expect(guidance).toContain("cannot restore native inference");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("does not report a loadable onnxruntime-web package as functional when the Node bundle is missing", () => {
+        const root = makeRoot();
+        try {
+            installPackage(root, false, "1.24.3");
+            const pkgDir = join(root, "node_modules", "onnxruntime-web");
+            mkdirSync(pkgDir, { recursive: true });
+            writeFileSync(
+                join(pkgDir, "package.json"),
+                JSON.stringify({ name: "onnxruntime-web", main: "index.js" }),
+            );
+            writeFileSync(join(pkgDir, "index.js"), "module.exports = {};\n");
+
+            const status = checkLocalEmbeddingRuntimeAt(root, "darwin", "x64");
+
+            expect(status.state).toBe("both-broken");
+            if (status.state === "both-broken") {
+                expect(status.wasmReason).toContain("functional Node WASM Transformers bundle");
+                const guidance = formatLocalEmbeddingRuntimeDoctorWarning(status);
+                expect(guidance).toContain("doctor --force");
+                expect(guidance).toContain("cannot restore native inference");
+                expect(guidance).toContain("repair the WASM package only");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });

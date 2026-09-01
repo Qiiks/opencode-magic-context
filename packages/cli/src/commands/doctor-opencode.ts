@@ -395,13 +395,10 @@ async function runIssueFlow(): Promise<number> {
  *   - Provider that accepts the URL shape but doesn't implement embeddings
  *     (OpenRouter's /v1 for example) — same detection path.
  */
-// Local embeddings need the native ONNX runtime (onnxruntime-node). On Windows
-// it sometimes fails to install (its native binary download is interrupted), and
-// the plugin's static `import "onnxruntime-node"` then throws on every embedding
-// (#128). Surface it here with the fix instead of leaving users with the cryptic
-// resolver error in the log. Shared by the explicit-`local` branch AND the
-// no-config / default-provider path (local is the default, so a missing config
-// still means local embeddings).
+// Local embeddings prefer onnxruntime-node and fall back to the Node WASM
+// bundle when the native addon is absent. Verify both lanes so a loadable
+// onnxruntime-web package cannot hide a missing persistence-capable bundle.
+// Shared by the explicit-`local` branch and the no-config/default-provider path.
 function checkLocalEmbeddingRuntimeForDoctor(runtimePreference: LocalEmbeddingRuntime = "auto"): {
     issues: number;
     localRuntimeBroken?: boolean;

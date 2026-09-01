@@ -35,9 +35,10 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/transformers-web.js dist/*-*.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/transformers-web.js dist/transformers-node-wasm.js dist/*-*.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
+    "check:transformers-node-wasm": "bun scripts/verify-transformers-node-wasm.ts",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun install --frozen-lockfile && bun test --parallel --timeout 30000",
     "test:serial": "bun install --frozen-lockfile && bun test --timeout 30000",
