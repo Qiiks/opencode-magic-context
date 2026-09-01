@@ -372,6 +372,45 @@ describe("auto-search-runner", () => {
         }
     });
 
+    test("preserves canonical whitespace bytes while sanitizing adversarial multi-part prompts", async () => {
+        let capturedPrompt = "";
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async (_db, _s, _p, prompt) => {
+                capturedPrompt = prompt;
+                return [];
+            },
+        );
+        try {
+            const messages: MessageLike[] = [
+                {
+                    info: { id: "u-byte-parity", role: "user" },
+                    parts: [
+                        { type: "text", text: "§17§ alpha   beta\tgamma" },
+                        {
+                            type: "text",
+                            text: "<system-reminder>drop <system-reminder>nested</system-reminder> tail</system-reminder>",
+                        },
+                        { type: "text", text: "<!-- hidden\ncomment -->" },
+                        { type: "text", text: "<custom-tag>delta</custom-tag>" },
+                        { type: "text", text: "" },
+                        { type: "text", text: "omega  end" },
+                    ],
+                } as unknown as MessageLike,
+            ];
+
+            await runAutoSearchHint({
+                sessionId: "s-byte-parity",
+                db,
+                messages,
+                options: baseOptions,
+            });
+
+            expect(capturedPrompt).toBe("alpha   beta\tgamma\n\ndelta\n\nomega  end");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     test("strips week-format temporal markers (+Xw / +Xw Yd) before embedding", async () => {
         let capturedPrompt = "";
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(

@@ -212,6 +212,20 @@ export class PiTestHarness {
     if (data?.cancelled) throw new Error("Pi new_session was cancelled by an extension");
   }
 
+  /** Exercise Pi's in-process extension/resource reload without replacing the RPC process. */
+  async reloadExtensions(): Promise<void> {
+    const response = await this.rpc.sendCommand(
+      "prompt",
+      { message: "/e2e-reload-extensions" },
+      { timeoutMs: 60_000, label: "Pi extension reload" },
+    );
+    requireSuccessfulResponse(response);
+    const extensionErrors = this.rpc.getExtensionErrors();
+    if (extensionErrors.length > 0) {
+      throw new Error(`Pi extension reload error: ${JSON.stringify(extensionErrors)}`);
+    }
+  }
+
   /** Restart Pi against the same isolated session, data, and config roots. */
   async restart(): Promise<void> {
     this.closeContextDb();

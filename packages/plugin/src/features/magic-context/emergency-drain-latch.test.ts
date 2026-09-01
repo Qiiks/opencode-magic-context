@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
+import { escalationBands } from "../../shared/escalation-bands";
 import { Database } from "../../shared/sqlite";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -143,6 +144,30 @@ describe("emergency drain catch-up latch", () => {
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBe(0);
         reserve(db, SID, 92, t + 10, { executeThreshold: 90 });
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBeGreaterThan(0);
+    });
+
+    it("arms, holds, and exits across every raised T+2 force-band threshold", () => {
+        const t = 5_600_000;
+        for (let threshold = 84; threshold <= 90; threshold += 1) {
+            const sessionId = `${SID}-${threshold}`;
+            const force = escalationBands(threshold).forceMaterializationPercentage;
+            expect(force).toBe(threshold + 2);
+
+            reserve(db, sessionId, force - 1, t, { executeThreshold: threshold });
+            expect(loadProtectedTailMeta(db, sessionId).emergencyDrainActive).toBe(0);
+
+            reserve(db, sessionId, force, t + 1, { executeThreshold: threshold });
+            const armedAt = loadProtectedTailMeta(db, sessionId).emergencyDrainActive;
+            expect(armedAt).toBe(t + 1);
+
+            reserve(db, sessionId, force - 1, t + 2, { executeThreshold: threshold });
+            expect(loadProtectedTailMeta(db, sessionId).emergencyDrainActive).toBe(armedAt);
+
+            reserve(db, sessionId, threshold - 10.1, t + 3, {
+                executeThreshold: threshold,
+            });
+            expect(loadProtectedTailMeta(db, sessionId).emergencyDrainActive).toBe(0);
+        }
     });
 
     it("suppresses the bypass during the historian-failure backoff window", () => {

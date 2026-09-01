@@ -793,6 +793,19 @@
                 "RUST-E2E",
                 "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
+        },
+        {
+            "path": "tests/window-overlay-reload.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "heavy dual-harness real-process lifecycle drill; run focused after overlay or Pi reload changes instead of placing it in the ordinary host-e2e load lane",
+            "contract_refs": [
+                "OVERLAY-SAME-PATH-AUTO-REFRESH",
+                "PI-EXTENSION-RELOAD"
+            ]
         }
     ]
 }

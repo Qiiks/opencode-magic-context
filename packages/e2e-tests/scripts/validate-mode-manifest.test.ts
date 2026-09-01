@@ -18,7 +18,7 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
-        expect(validation.files.length).toBe(64);
+        expect(validation.files.length).toBe(65);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -34,7 +34,11 @@ describe("mode manifest validator", () => {
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(22);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(20);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
-        expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
+        const excluded = validation.manifest.entries
+            .filter((entry) => entry.tier === "excluded")
+            .map((entry) => entry.path);
+        expect(excluded).toEqual(["tests/window-overlay-reload.test.ts"]);
+        expect(new Set([...ts, ...rust]).size).toBe(validation.files.length - excluded.length);
     });
 
     it("rejects a missing, duplicated, or dead manifest path", () => {

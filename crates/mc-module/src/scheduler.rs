@@ -1408,6 +1408,35 @@ mod tests {
     }
 
     #[test]
+    fn raised_threshold_ladder_arms_holds_and_exits_at_typescript_boundaries() {
+        let t = 2_000_000;
+        for threshold in 84..=90 {
+            let threshold = f64::from(threshold);
+            let force = threshold + 2.0;
+            assert_eq!(
+                escalation_bands(threshold).force_materialize_percentage,
+                force
+            );
+
+            let below = advance_drain_latch(LatchState::default(), force - 1.0, threshold, t);
+            assert_eq!(below.active_since_ms, None, "threshold {threshold}");
+
+            let entered = advance_drain_latch(below, force, threshold, t + 1);
+            assert_eq!(
+                entered.active_since_ms,
+                Some(t + 1),
+                "threshold {threshold}"
+            );
+
+            let held = advance_drain_latch(entered, force - 1.0, threshold, t + 2);
+            assert_eq!(held, entered, "threshold {threshold}");
+
+            let exited = advance_drain_latch(held, threshold - 10.1, threshold, t + 3);
+            assert_eq!(exited.active_since_ms, None, "threshold {threshold}");
+        }
+    }
+
+    #[test]
     fn decide_is_deterministic_for_identical_inputs() {
         let mut inputs = base_inputs();
         inputs.usage.percentage = 86.0;
