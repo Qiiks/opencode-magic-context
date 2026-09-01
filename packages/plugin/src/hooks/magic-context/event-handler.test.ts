@@ -990,13 +990,29 @@ describe("createEventHandler", () => {
             failedSessionIds: [],
         });
 
+        // A replay after cleanup switches to TypeScript must preserve the pending
+        // Rust marker and host rows until module-owned state is deleted.
+        const flippedHandler = createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        });
+        await flippedHandler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: sessionId } },
+            },
+        });
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+
         const deleteSession = mock(async () => {});
         await expect(
-            retryPendingRustSessionCleanupsForProject(
-                deps.db,
-                projectPath,
-                deleteSession,
-            ),
+            retryPendingRustSessionCleanupsForProject(deps.db, projectPath, deleteSession),
         ).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
         expect(deleteSession).toHaveBeenCalledWith(sessionId);
         expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);

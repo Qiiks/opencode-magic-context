@@ -839,14 +839,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 // Rust cleanup is distinguished in the initial durable write. If the
                 // module call fails, the ordinary sweeper must retain both this marker
                 // and the session→project binding needed for a project-scoped retry.
-                markSessionCleanupPending(deps.db, sessionId, deps.rustSessionCleanup === true);
+                const rustCleanupPending = markSessionCleanupPending(
+                    deps.db,
+                    sessionId,
+                    deps.rustSessionCleanup === true,
+                );
                 await deps.onSessionDeleted?.(sessionId);
-                // Read and remove compaction marker BEFORE clearSession destroys session_meta.
-                // Plan v6: pending_compaction_marker_state lives on the same row, so
-                // clearSession's session_meta DELETE wipes it automatically — no
-                // separate CAS-clear needed here.
-                removeCompactionMarkerForSession(deps.db, sessionId);
-                clearSession(deps.db, sessionId);
+                // A duplicate deletion may arrive after cleanup switches to TypeScript.
+                // Preserve host rows until the pending Rust module deletion succeeds.
+                if (!rustCleanupPending || deps.rustSessionCleanup === true) {
+                    // Read and remove compaction marker BEFORE clearSession destroys session_meta.
+                    // Plan v6: pending_compaction_marker_state lives on the same row, so
+                    // clearSession's session_meta DELETE wipes it automatically — no
+                    // separate CAS-clear needed here.
+                    removeCompactionMarkerForSession(deps.db, sessionId);
+                    clearSession(deps.db, sessionId);
+                }
             } catch (error) {
                 sessionLog(sessionId, "event session.deleted persistence failed:", error);
             }
