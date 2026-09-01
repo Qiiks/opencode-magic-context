@@ -46,6 +46,7 @@ function resolvePiPackageJson(): string {
 
 export const PI_PACKAGE_JSON = resolvePiPackageJson();
 export const PI_CLI = join(dirname(PI_PACKAGE_JSON), "dist/cli.js");
+export const PI_RELOAD_EXTENSION = join(import.meta.dir, "reload-extension.mjs");
 
 export interface PiIsolatedEnv {
   baseDir: string;

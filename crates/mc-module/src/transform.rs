@@ -9205,10 +9205,23 @@ fn sanitize_user_hint_query(text: &str) -> String {
     let without_reminders = strip_system_reminder_wrappers(text);
     let without_comments = html_comment_regex().replace_all(&without_reminders, "");
     let without_markup = xml_html_tag_regex().replace_all(&without_comments, "");
-    strip_mc_tag_notation(&without_markup)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let without_tag_notation = strip_mc_tag_notation(&without_markup);
+    let without_line_trailing_space =
+        trailing_horizontal_whitespace_regex().replace_all(&without_tag_notation, "\n");
+    excess_newlines_regex()
+        .replace_all(&without_line_trailing_space, "\n\n")
+        .trim()
+        .to_string()
+}
+
+fn trailing_horizontal_whitespace_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"[ \t]+\n").expect("valid trailing whitespace regex"))
+}
+
+fn excess_newlines_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\n{3,}").expect("valid excess newline regex"))
 }
 
 fn html_comment_regex() -> &'static Regex {
@@ -25613,10 +25626,31 @@ pub(crate) mod tests {
             ],
         );
         let query = user_hint_query(&message);
-        assert_eq!(query, format!("keep words {long_tail}"));
+        assert_eq!(query, format!("keep  words\n{long_tail}"));
         assert!(!query.contains("§12§"));
         assert!(!query.contains("drop"));
         assert!(query.chars().count() > 500);
+    }
+
+    #[test]
+    fn user_hint_query_preserves_typescript_whitespace_bytes_after_adversarial_sanitization() {
+        let message = wire_item(
+            "user",
+            "query-byte-parity",
+            1,
+            &[
+                "§17§ alpha   beta\tgamma",
+                "<system-reminder>drop <system-reminder>nested</system-reminder> tail</system-reminder>",
+                "<!-- hidden\ncomment -->",
+                "<custom-tag>delta</custom-tag>",
+                "",
+                "omega  end",
+            ],
+        );
+        assert_eq!(
+            user_hint_query(&message),
+            "alpha   beta\tgamma\n\ndelta\n\nomega  end"
+        );
     }
 
     #[test]
@@ -25625,12 +25659,12 @@ pub(crate) mod tests {
             (
                 "nested system reminder",
                 "retained <system-reminder>drop <system-reminder>nested</system-reminder></system-reminder> text",
-                "retained text",
+                "retained  text",
             ),
             (
                 "HTML comment",
                 "retained <!-- remove <hidden> --> text",
-                "retained text",
+                "retained  text",
             ),
             (
                 "XML tag",
@@ -30184,10 +30218,7 @@ pub(crate) mod tests {
         assert_eq!(run(&store, &request, &spine()).action, "SOFT");
         let first_units = stored_caveman_units(&store, session);
         assert_eq!(
-            first_units
-                .iter()
-                .map(caveman_depth)
-                .collect::<Vec<_>>(),
+            first_units.iter().map(caveman_depth).collect::<Vec<_>>(),
             vec![3, 2, 1],
             "five eligible rows place positions 0, 1, and 2 on the exact 20/40/60 percent tiers"
         );

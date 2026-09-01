@@ -60,7 +60,7 @@ async function settlePressure(): Promise<void> {
 }
 
 describe("same-path Fusiform overlay reload", () => {
-    it("keeps OpenCode and Pi on their snapshots until each live harness restarts", async () => {
+    it("refreshes Pi on a hot extension reload and OpenCode on restart", async () => {
         const overlayRoot = mkdtempSync(join(tmpdir(), "mc-overlay-reload-"));
         const overlayPath = join(overlayRoot, "window-overlay.json");
         const config = {
@@ -125,11 +125,11 @@ describe("same-path Fusiform overlay reload", () => {
             await settlePressure();
             stalePiPressure = persistedPressure(pi, stalePiTurn.sessionId!);
 
-            await pi.restart();
-            const reloadedPiTurn = await pi.sendPrompt("reloaded Pi overlay probe", {
+            await pi.reloadExtensions();
+            const reloadedPiTurn = await pi.sendPrompt("hot-reloaded Pi overlay probe", {
                 timeoutMs: 60_000,
             });
-            expect(reloadedPiTurn.sessionId).toBeTruthy();
+            expect(reloadedPiTurn.sessionId).toBe(firstPiTurn.sessionId);
             await settlePressure();
             expect(persistedPressure(pi, reloadedPiTurn.sessionId!)).toBe(RELOADED_PRESSURE);
             expect([staleOpenCodePressure, stalePiPressure]).toEqual([
