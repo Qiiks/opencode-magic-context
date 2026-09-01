@@ -813,6 +813,36 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("keeps the provisional final compartment during emergency recovery", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [twoCompartmentSuccessXml()],
+			providerMessages: rawMessages(5),
+			boundarySnapshot: makeBoundarySnapshot({
+				protectedTailStart: 5,
+				protectedTailStartMessageId: "m5",
+				eligibleEndOrdinal: 5,
+				eligibleEndMessageId: "m4",
+				rawMessageCountAtTrigger: 5,
+				rawLastMessageIdAtTrigger: "m5",
+			}),
+			beforeRun: (database) => {
+				recordOverflowDetected(database, "ses-historian", 100_000);
+			},
+		});
+		try {
+			const compartments = getCompartments(db, "ses-historian");
+			expect(compartments.map((compartment) => compartment.endMessage)).toEqual([
+				2, 4,
+			]);
+			expect(compartments.map((compartment) => compartment.title)).toEqual([
+				"Initial Pi slice",
+				"Provisional Pi slice",
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("downgrades forced final keep on token-capped chunks so discard-last healing still applies", async () => {
 		const projectPath = resolveProjectIdentity(process.cwd());
 		const longMessages = rawMessages(10).map((message) => ({

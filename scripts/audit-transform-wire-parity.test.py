@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "audit-transform-wire-parity.py"
 DATE = "2026-08-27"
+EMPTY_NEWEST_DATE = "2026-08-28"
 
 
 class AuditTransformWireParityTest(unittest.TestCase):
@@ -766,9 +767,11 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     str(dump_dir),
                     "--live",
                     "--date",
-                    DATE,
+                    EMPTY_NEWEST_DATE,
                     "--after",
-                    f"{DATE}T00-00-00",
+                    f"{EMPTY_NEWEST_DATE}T00-00-00",
+                    "--min-provider-bodies",
+                    "3",
                     "--context-db",
                     str(context_db),
                     "--store-db",
@@ -791,6 +794,16 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             report = json.loads(completed.stdout)
             self.assertEqual(report["method"]["mode"], "live")
+            self.assertEqual(
+                report["method"]["capture_window"],
+                {
+                    "minimum_provider_bodies": 3,
+                    "body_count": 3,
+                    "requested_lower_bound": f"{EMPTY_NEWEST_DATE}T00-00-00",
+                    "effective_lower_bound": f"{DATE}T12-00-00-000Z",
+                    "lower_bound_widened": True,
+                },
+            )
             self.assertEqual(report["method"]["sqlite_contract"], {"readonly": True})
             live_helper = (ROOT / "scripts" / "audit-transform-wire-parity-live.ts").read_text()
             self.assertEqual(live_helper.count("new Database("), 1)

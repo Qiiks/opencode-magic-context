@@ -193,14 +193,17 @@ describe("project identity merge", () => {
             .run(targetId);
         database
             .prepare(
-                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
-                 VALUES (?, 'src/shared.ts', 40, 35), (?, 'src/source.ts', 30, 25)`,
+                `INSERT INTO memory_verifications
+                    (memory_id, file_path, verified_at, mapped_at, mapping_origin)
+                 VALUES (?, 'src/shared.ts', 40, 35, 'host_rejected_fallback'),
+                        (?, 'src/source.ts', 30, 25, 'host_rejected_fallback')`,
             )
             .run(sourceId, sourceId);
         database
             .prepare(
-                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
-                 VALUES (?, 'src/shared.ts', 15, 10)`,
+                `INSERT INTO memory_verifications
+                    (memory_id, file_path, verified_at, mapped_at, mapping_origin)
+                 VALUES (?, 'src/shared.ts', 15, 10, 'mapper')`,
             )
             .run(targetId);
 
@@ -228,7 +231,7 @@ describe("project identity merge", () => {
         expect(
             database
                 .prepare(
-                    `SELECT memory_id, file_path, verified_at, mapped_at
+                    `SELECT memory_id, file_path, verified_at, mapped_at, mapping_origin
                        FROM memory_verifications
                       WHERE memory_id = ?
                       ORDER BY file_path`,
@@ -240,12 +243,14 @@ describe("project identity merge", () => {
                 file_path: "src/shared.ts",
                 verified_at: 40,
                 mapped_at: 35,
+                mapping_origin: "host_rejected_fallback",
             },
             {
                 memory_id: targetId,
                 file_path: "src/source.ts",
                 verified_at: 30,
                 mapped_at: 25,
+                mapping_origin: "host_rejected_fallback",
             },
         ]);
         expect(
