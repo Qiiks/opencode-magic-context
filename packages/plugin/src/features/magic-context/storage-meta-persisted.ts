@@ -2263,6 +2263,65 @@ export function removeStrippedPlaceholderId(
     return true;
 }
 
+// ── State for retrying Fable 5.1 requests after a thinking-prefix binding rejection ──
+
+export const NEWEST_REASONING_BEARING_ASSISTANT = "newest_reasoning_bearing_assistant";
+export const THINKING_BINDING_RECOVERY_FROZEN_PREFIX = "binding_mismatch:";
+
+export function thinkingBindingRecoveryFrozenId(messageId: string): string {
+    return `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${messageId}`;
+}
+
+export function getThinkingBindingRecoveryTarget(db: Database, sessionId: string): string | null {
+    const row = db
+        .prepare("SELECT thinking_binding_recovery_target FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { thinking_binding_recovery_target?: string | null } | undefined;
+    const target = row?.thinking_binding_recovery_target;
+    return typeof target === "string" && target.length > 0 ? target : null;
+}
+
+/**
+ * Persist the provider-supplied assistant id. When no id is available, store a
+ * marker that makes the next live transform select the newest assistant that
+ * still contains reasoning.
+ */
+export function armThinkingBindingRecovery(
+    db: Database,
+    sessionId: string,
+    messageId?: string,
+): void {
+    ensureSessionMetaRow(db, sessionId);
+    const target =
+        typeof messageId === "string" && messageId.length > 0
+            ? messageId
+            : NEWEST_REASONING_BEARING_ASSISTANT;
+    if (target === NEWEST_REASONING_BEARING_ASSISTANT) {
+        // A later session.error without an id must not replace a more precise id
+        // already captured from message.updated or the provider error body.
+        db.prepare(
+            "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ? AND COALESCE(thinking_binding_recovery_target, '') = ''",
+        ).run(target, sessionId);
+        return;
+    }
+    db.prepare(
+        "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ?",
+    ).run(target, sessionId);
+}
+
+/** Clear only the flag this live pass actually applied; a concurrent re-arm wins. */
+export function clearThinkingBindingRecoveryIf(
+    db: Database,
+    sessionId: string,
+    expectedTarget: string,
+): boolean {
+    const result = db
+        .prepare(
+            "UPDATE session_meta SET thinking_binding_recovery_target = '' WHERE session_id = ? AND thinking_binding_recovery_target = ?",
+        )
+        .run(sessionId, expectedTarget);
+    return result.changes > 0;
+}
+
 // ── Merged-assistant reasoning stripped IDs (frozen replay watermark) ──
 
 /**

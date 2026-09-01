@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ContextLimitProvenance } from "../../shared/context-limit-provenance";
-import { detectOverflow, extractErrorMessage, parseReportedLimit } from "./overflow-detection";
+import {
+    detectOverflow,
+    detectThinkingBindingMismatch,
+    extractErrorMessage,
+    parseReportedLimit,
+} from "./overflow-detection";
 
 describe("overflow-detection / extractErrorMessage", () => {
     test("returns message from Error instance", () => {
@@ -105,6 +110,56 @@ describe("overflow-detection / detectOverflow", () => {
         const detection = detectOverflow("prompt is too long: 210000 > 200000");
         expect(detection.isOverflow).toBe(true);
         expect(detection.matchedPattern).toBeDefined();
+    });
+});
+
+describe("overflow-detection / detectThinkingBindingMismatch", () => {
+    test("matches the documented Fable 5.1 400 shape", () => {
+        const detection = detectThinkingBindingMismatch({
+            status: 400,
+            error: {
+                type: "invalid_request_error",
+                message:
+                    'messages.4.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".',
+            },
+        });
+
+        expect(detection).toEqual({
+            isBindingMismatch: true,
+            matchedPattern: "bound to a different conversation",
+        });
+    });
+
+    test("extracts a provider-supplied offending message id when present", () => {
+        expect(
+            detectThinkingBindingMismatch({
+                status: 400,
+                error: {
+                    message: "The block is bound to a different conversation",
+                    message_id: "assistant-with-bound-block",
+                },
+            }).messageId,
+        ).toBe("assistant-with-bound-block");
+    });
+
+    test("tolerates provider prefix and suffix drift but rejects unrelated 400s", () => {
+        expect(
+            detectThinkingBindingMismatch(
+                "invalid_request_error: thinking block is BOUND TO A DIFFERENT CONVERSATION; retry without it",
+            ).isBindingMismatch,
+        ).toBe(true);
+        expect(
+            detectThinkingBindingMismatch({
+                status: 400,
+                message: "thinking block signature is invalid",
+            }).isBindingMismatch,
+        ).toBe(false);
+        expect(
+            detectThinkingBindingMismatch({
+                status: 500,
+                message: "The block is bound to a different conversation",
+            }).isBindingMismatch,
+        ).toBe(false);
     });
 });
 

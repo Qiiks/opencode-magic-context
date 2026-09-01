@@ -33,6 +33,7 @@ import {
     getAutoSearchHintDecisions,
     getNoteNudgeAnchors,
     getPersistedNoteNudge,
+    getThinkingBindingRecoveryTarget,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     normalizeMaterializeReason,
@@ -43,8 +44,8 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
-import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
+import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createEventHandler } from "./event-handler";
 
 type ContextUsageCacheEntry = {
@@ -179,6 +180,56 @@ function providersClient(limit: number, prompt?: ReturnType<typeof mock>) {
 }
 
 describe("createEventHandler", () => {
+    it("arms documented Fable 5.1 binding mismatch recovery and ignores other models", async () => {
+        useTempDataHome("context-event-thinking-binding-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        const error = {
+            status: 400,
+            error: {
+                type: "invalid_request_error",
+                message:
+                    'messages.4.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".',
+            },
+        };
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-fable-51",
+                        providerID: "anthropic",
+                        modelID: "fable-5-1-20260831",
+                        error,
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-fable-51")).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "other-failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-other-model",
+                        providerID: "anthropic",
+                        modelID: "fable-5-0",
+                        error,
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-other-model")).toBeNull();
+    });
+
     it("normalizes transform decision reasons across harnesses", () => {
         expect(normalizeMaterializeReason("opencode", "system_hash", true)).toBe("system_hash");
         expect(normalizeMaterializeReason("opencode", null, true)).toBe("pressure_refold");

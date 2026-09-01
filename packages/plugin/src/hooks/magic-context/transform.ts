@@ -14,6 +14,7 @@ import {
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
@@ -36,6 +37,7 @@ import {
     clearEmergencyRecovery,
     clearHistorianFailureState,
     clearPersistedReasoningWatermark,
+    clearThinkingBindingRecoveryIf,
     getOverflowState,
     loadProtectedTailMeta,
     recordOverflowDetected,
@@ -2252,6 +2254,10 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                modelForBudget?.providerID,
+                modelForBudget?.modelID,
+            ),
             trailingBlankSourceDecisions,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
@@ -2579,6 +2585,19 @@ export function createTransform(deps: TransformDeps) {
         );
 
         deps.maybeAutoEmbedSession?.(sessionId);
+
+        const bindingRecovery = postTransformResult.thinkingBindingRecovery;
+        if (bindingRecovery) {
+            const cleared = clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                bindingRecovery.flagTarget,
+            );
+            sessionLog(
+                sessionId,
+                `thinking binding recovery: stripped bound reasoning from assistant ${bindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+            );
+        }
     };
 
     return Object.assign(transform, {
