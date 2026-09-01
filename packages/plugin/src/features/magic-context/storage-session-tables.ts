@@ -43,18 +43,46 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "lkg_slots" },
 ];
 
+export interface DeleteSessionScopedRowsOptions {
+    /** Set only after the Rust module has acknowledged its idempotent session deletion. */
+    readonly rustModuleCleanupAcknowledged?: boolean;
+}
+
 /**
  * Delete one bounded session-id batch. A supplied harness scopes every table
  * that stores harness provenance; tables without that column rely on the
  * caller's harness-scoped candidate source.
+ *
+ * A Rust cleanup marker protects the entire host-side session until module
+ * acknowledgement. Otherwise an orphan sweep could retain the marker while
+ * deleting its session→project coordinate, making the durable retry unreachable.
  */
 export function deleteSessionScopedRows(
     db: Database,
     sessionIds: readonly string[],
     harness?: string,
-): void {
-    if (sessionIds.length === 0) return;
-    const placeholders = sessionIds.map(() => "?").join(", ");
+    options: DeleteSessionScopedRowsOptions = {},
+): number {
+    if (sessionIds.length === 0) return 0;
+    let deletableSessionIds = [...sessionIds];
+    if (options.rustModuleCleanupAcknowledged !== true) {
+        const placeholders = sessionIds.map(() => "?").join(", ");
+        const harnessPredicate = harness === undefined ? "" : " AND harness = ?";
+        const protectedRows = db
+            .prepare(
+                `SELECT session_id
+                 FROM pending_session_cleanup
+                 WHERE session_id IN (${placeholders})
+                   AND harness LIKE '%:rust'${harnessPredicate}`,
+            )
+            .all(...sessionIds, ...(harness === undefined ? [] : [`${harness}:rust`])) as Array<{
+            session_id: string;
+        }>;
+        const protectedSessionIds = new Set(protectedRows.map((row) => row.session_id));
+        deletableSessionIds = sessionIds.filter((sessionId) => !protectedSessionIds.has(sessionId));
+    }
+    if (deletableSessionIds.length === 0) return 0;
+    const placeholders = deletableSessionIds.map(() => "?").join(", ");
 
     for (const definition of SESSION_SCOPED_TABLES) {
         const predicates = [`session_id IN (${placeholders})`];
@@ -64,7 +92,8 @@ export function deleteSessionScopedRows(
         const statement = db.prepare(
             `DELETE FROM ${definition.table} WHERE ${predicates.join(" AND ")}`,
         );
-        if (bindHarness) statement.run(...sessionIds, harness);
-        else statement.run(...sessionIds);
+        if (bindHarness) statement.run(...deletableSessionIds, harness);
+        else statement.run(...deletableSessionIds);
     }
+    return deletableSessionIds.length;
 }

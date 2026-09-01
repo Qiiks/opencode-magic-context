@@ -3,10 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { recordSessionProjectIdentity } from "../features/magic-context/session-project-storage";
-import {
-    markSessionCleanupPending,
-    openDatabase,
-} from "../features/magic-context/storage";
+import { markSessionCleanupPending, openDatabase } from "../features/magic-context/storage";
 import { startDreamScheduleTimer } from "./dream-timer";
 
 /**
@@ -88,7 +85,7 @@ describe("dream-timer registration cleanup", () => {
         }
     });
 
-    test("retries a durable Rust deletion through the matching project registration", async () => {
+    test("picks up a durable Rust deletion from the cold-boot startup tick", async () => {
         const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-rust-delete-"));
         const timerHandle = {
             unref: mock(() => {}),
@@ -96,16 +93,16 @@ describe("dream-timer registration cleanup", () => {
         const timeoutHandle = {
             unref: mock(() => {}),
         } as unknown as ReturnType<typeof setTimeout>;
-        const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(
-            (() => timeoutHandle) as typeof setTimeout,
-        );
-        let intervalCallback: (() => void) | undefined;
-        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+        let startupCallback: (() => void) | undefined;
+        const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
             callback: () => void,
         ) => {
-            intervalCallback = callback;
-            return timerHandle;
-        }) as typeof setInterval);
+            startupCallback ??= callback;
+            return timeoutHandle;
+        }) as typeof setTimeout);
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(
+            (() => timerHandle) as typeof setInterval,
+        );
         const deleteSession = mock(async () => {});
         const closeSession = mock(() => {});
         const projectIdentity = "git:dream-timer-rust-delete";
@@ -125,7 +122,7 @@ describe("dream-timer registration cleanup", () => {
                 ensureRegistered: async () => undefined,
                 sessionCleanupModuleClient: { deleteSession, closeSession },
             });
-            intervalCallback?.();
+            startupCallback?.();
             const pendingCount = () =>
                 db
                     .prepare(

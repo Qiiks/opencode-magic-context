@@ -636,9 +636,7 @@ describe("Rust mode authority adapter", () => {
             );
             expect(passLines[0]).toContain("served_from=transform");
             expect(passLines[1]).toContain("decision=SOFT+");
-            expect(passLines[1]).toContain(
-                "scheduler=defer defer_reason=scheduler_defer",
-            );
+            expect(passLines[1]).toContain("scheduler=defer defer_reason=scheduler_defer");
             expect(passLines[1]).toContain("served_from=lkg");
             expect(passLines[0]).not.toBe(passLines[1]);
             expect(logged.some((message) => message.startsWith("rust module stages:"))).toBe(true);
@@ -2020,6 +2018,84 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies[2]?.tail_delta).toBeUndefined();
         expect(transformBodies[2]?.messages).toHaveLength(1);
         expect(transform.getState(sessionId).passCount).toBe(1);
+    });
+
+    it("does not let an in-flight transform repopulate a deleted session route", async () => {
+        const sessionId = `rust-clear-session-in-flight-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let releaseTransform!: (value: unknown) => void;
+        let transformStarted!: () => void;
+        const transformStartedPromise = new Promise<void>((resolve) => {
+            transformStarted = resolve;
+        });
+        const pendingTransform = new Promise<unknown>((resolve) => {
+            releaseTransform = resolve;
+        });
+        let releaseDelete!: () => void;
+        const pendingDelete = new Promise<void>((resolve) => {
+            releaseDelete = resolve;
+        });
+        let transformCalls = 0;
+        const deleteSession = mock(() => pendingDelete);
+        const closeSession = mock(() => {});
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBodies.push(body as Record<string, unknown>);
+                transformCalls += 1;
+                if (transformCalls === 2) {
+                    transformStarted();
+                    return pendingTransform;
+                }
+                return { decision: "PASSTHROUGH", native_messages: [] };
+            },
+            deleteSession,
+            closeSession,
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            projectRoot: "/tmp/rust-clear-session-in-flight-project",
+            scheduleLkgCapture: (capture) => capture(),
+        });
+        const initial = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+        const racingInput = makeMessages(sessionId);
+        const racingRun = transform.run(
+            sessionId,
+            racingInput,
+            { messages: [...racingInput] },
+            makeMeta(db, sessionId),
+        );
+        await transformStartedPromise;
+
+        const clearing = transform.clearSession(sessionId);
+        expect(deleteSession).toHaveBeenCalledWith(
+            sessionId,
+            "/tmp/rust-clear-session-in-flight-project",
+        );
+        releaseTransform({ decision: "PASSTHROUGH", native_messages: [] });
+        await racingRun;
+        releaseDelete();
+        await clearing;
+
+        const afterDelete = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            afterDelete,
+            { messages: [...afterDelete] },
+            makeMeta(db, sessionId),
+        );
+        expect(transformBodies[2]?.tail_delta).toBeUndefined();
+        expect(transformBodies[2]?.messages).toHaveLength(1);
+        expect(closeSession).toHaveBeenCalledWith(sessionId);
     });
 
     it("propagates module deletion failures while still closing the transport route", async () => {

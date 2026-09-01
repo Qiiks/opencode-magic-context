@@ -770,8 +770,7 @@ export function sweepOrphanedOpenCodeMessageIndexes(
             const eligibleSessionIds = missingSessionIds.filter((sessionId) =>
                 stillEligible.get(sessionId, cutoff),
             );
-            deleteSessionScopedRows(db, eligibleSessionIds, "opencode");
-            deleted = eligibleSessionIds.length;
+            deleted = deleteSessionScopedRows(db, eligibleSessionIds, "opencode");
             persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt);
             db.exec("COMMIT");
             committed = true;
