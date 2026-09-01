@@ -1721,7 +1721,9 @@ def observed_authority_lanes(
         }
     return {
         session: (
-            "ts"
+            "ambiguous"
+            if operand_rows[session] > 0 and session in module_active
+            else "ts"
             if operand_rows[session] > 0
             else "rust"
             if session in module_active
@@ -1737,13 +1739,12 @@ def apply_observed_lanes(
     observed: dict[str, str],
 ) -> list[Dump]:
     effective: list[Dump] = []
+    durable_resolved_dumps = 0
     for dump in dumps:
         observed_lane = observed.get(dump.session, "unknown")
-        lane = (
-            observed_lane
-            if dump.lane in ("rust", "ts") and observed_lane in ("rust", "ts")
-            else dump.lane
-        )
+        lane = observed_lane if observed_lane in ("rust", "ts") else dump.lane
+        if dump.lane == "unverified" and lane in ("rust", "ts"):
+            durable_resolved_dumps += 1
         effective.append(
             Dump(
                 path=dump.path,
@@ -1758,8 +1759,7 @@ def apply_observed_lanes(
         row["observed_lane"] = observed_lane
         row["effective_lane"] = (
             observed_lane
-            if row["configured_lane"] in ("rust", "ts")
-            and observed_lane in ("rust", "ts")
+            if observed_lane in ("rust", "ts")
             else row["configured_lane"]
         )
         if (
@@ -1768,13 +1768,38 @@ def apply_observed_lanes(
             and observed_lane != row["configured_lane"]
         ):
             row["status"] = "config_and_durable_authority_disagree"
+        elif row["configured_lane"] == "unverified" and observed_lane in ("rust", "ts"):
+            row["status"] = "resolved_from_durable_authority"
+        elif row["configured_lane"] == "unverified" and observed_lane == "ambiguous":
+            row["status"] = "durable_authority_ambiguous"
     verification["denominator_dump_counts"] = dict(
         sorted(collections.Counter(dump.lane for dump in effective).items())
     )
+    verification["durable_authority_resolution"] = {
+        "resolved_dumps": durable_resolved_dumps,
+        "remaining_unverified_dumps": sum(
+            dump.lane == "unverified" for dump in effective
+        ),
+    }
     verification["rule"] = (
-        "read live project config first; decisive in-window durable authority then selects the effective denominator"
+        "read served project config first; otherwise decisive in-window transform-decision/module activity selects the denominator; durable authority also wins a config conflict"
     )
     return effective
+
+
+def require_non_empty_provider_denominator(dumps: list[Dump]) -> None:
+    admitted = sum(dump.lane in ("rust", "ts") for dump in dumps)
+    if admitted > 0:
+        return
+    detail = (
+        f"{len(dumps)} served captures were all excluded"
+        if dumps
+        else "no served captures matched the selected window"
+    )
+    raise SystemExit(
+        "non-live provider differ refused: "
+        f"{detail}; provide readable project configs or in-window --context-db/--store-db lane evidence"
+    )
 
 
 def summarize_engine_adjacent_state(
@@ -4348,6 +4373,7 @@ def main() -> None:
             args.context_db, args.store_db, sessions, start_ms, end_ms
         ),
     )
+    require_non_empty_provider_denominator(dumps)
     lane_by_session: dict[str, str] = {}
     for session in sessions:
         observed = {dump.lane for dump in dumps if dump.session == session}

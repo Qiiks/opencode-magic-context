@@ -177,14 +177,26 @@ export interface PendingSessionCleanupRetryResult {
     failedSessionIds: string[];
 }
 
-export function markSessionCleanupPending(db: Database, sessionId: string): void {
+function rustCleanupHarness(): string {
+    return `${getHarness()}:rust`;
+}
+
+export function markSessionCleanupPending(
+    db: Database,
+    sessionId: string,
+    rustModuleCleanupRequired = false,
+): void {
     db.prepare(
         `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
          VALUES (?, ?, ?, NULL)
          ON CONFLICT(session_id) DO UPDATE SET
              harness = excluded.harness,
              requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)`,
-    ).run(sessionId, getHarness(), Date.now());
+    ).run(
+        sessionId,
+        rustModuleCleanupRequired ? rustCleanupHarness() : getHarness(),
+        Date.now(),
+    );
 }
 
 export function retryPendingSessionCleanups(
@@ -193,7 +205,11 @@ export function retryPendingSessionCleanups(
 ): PendingSessionCleanupRetryResult {
     const rows = db
         .prepare(
-            "SELECT session_id FROM pending_session_cleanup ORDER BY requested_at ASC, session_id ASC LIMIT ?",
+            `SELECT session_id
+             FROM pending_session_cleanup
+             WHERE harness NOT LIKE '%:rust'
+             ORDER BY requested_at ASC, session_id ASC
+             LIMIT ?`,
         )
         .all(Math.max(1, Math.floor(limit))) as Array<{ session_id: string }>;
     const failedSessionIds: string[] = [];
@@ -203,6 +219,48 @@ export function retryPendingSessionCleanups(
             db.prepare(
                 "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
             ).run(Date.now(), row.session_id);
+            clearSession(db, row.session_id);
+            cleared += 1;
+        } catch {
+            failedSessionIds.push(row.session_id);
+        }
+    }
+    return { attempted: rows.length, cleared, failedSessionIds };
+}
+
+export async function retryPendingRustSessionCleanupsForProject(
+    db: Database,
+    projectPath: string,
+    deleteSession: (sessionId: string) => Promise<void>,
+    limit = 200,
+): Promise<PendingSessionCleanupRetryResult> {
+    const harness = getHarness();
+    const rows = db
+        .prepare(
+            `SELECT pending.session_id
+             FROM pending_session_cleanup pending
+             JOIN session_projects projects
+               ON projects.session_id = pending.session_id
+              AND projects.harness = ?
+             WHERE pending.harness = ?
+               AND projects.project_path = ?
+             ORDER BY pending.requested_at ASC, pending.session_id ASC
+             LIMIT ?`,
+        )
+        .all(
+            harness,
+            rustCleanupHarness(),
+            projectPath,
+            Math.max(1, Math.floor(limit)),
+        ) as Array<{ session_id: string }>;
+    const failedSessionIds: string[] = [];
+    let cleared = 0;
+    for (const row of rows) {
+        try {
+            db.prepare(
+                "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
+            ).run(Date.now(), row.session_id);
+            await deleteSession(row.session_id);
             clearSession(db, row.session_id);
             cleared += 1;
         } catch {

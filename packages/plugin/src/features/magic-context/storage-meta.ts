@@ -109,6 +109,7 @@ export {
     getOrCreateSessionMeta,
     markSessionCleanupPending,
     type PendingSessionCleanupRetryResult,
+    retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
     updateSessionMeta,
 } from "./storage-meta-session";

@@ -89,7 +89,8 @@ export interface EventHandlerDeps {
     compactionOff?: boolean;
     onSessionCacheInvalidated?: (sessionId: string) => void;
     onRustWireInvalidated?: (sessionId: string) => void;
-    onSessionDeleted?: (sessionId: string) => void;
+    onSessionDeleted?: (sessionId: string) => Promise<void> | void;
+    rustSessionCleanup?: boolean;
     config: {
         protected_tags: number;
         clear_reasoning_age?: number;
@@ -835,7 +836,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 // Commit the retry marker before any deletion work. clearSession removes
                 // it in the same transaction as the session data, so a BUSY/rollback
                 // leaves a durable retry for the next maintenance tick.
-                markSessionCleanupPending(deps.db, sessionId);
+                // Rust cleanup is distinguished in the initial durable write. If the
+                // module call fails, the ordinary sweeper must retain both this marker
+                // and the session→project binding needed for a project-scoped retry.
+                markSessionCleanupPending(deps.db, sessionId, deps.rustSessionCleanup === true);
+                await deps.onSessionDeleted?.(sessionId);
                 // Read and remove compaction marker BEFORE clearSession destroys session_meta.
                 // Plan v6: pending_compaction_marker_state lives on the same row, so
                 // clearSession's session_meta DELETE wipes it automatically — no
@@ -847,7 +852,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
             resetDegradedCacheCount(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
-            deps.onSessionDeleted?.(sessionId);
             deps.contextUsageMap.delete(sessionId);
             deps.tagger.cleanup(sessionId);
             clearTransformDecisionSession(sessionId);

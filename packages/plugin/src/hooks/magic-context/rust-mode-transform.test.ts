@@ -2006,8 +2006,7 @@ describe("Rust mode authority adapter", () => {
         }
         expect(transformBodies[1]?.tail_delta).toBeDefined();
 
-        transform.clearSession(sessionId);
-        await Bun.sleep(0);
+        await transform.clearSession(sessionId);
         expect(deleteSession).toHaveBeenCalledWith(sessionId, "/tmp/rust-clear-session-project");
         expect(closeSession).toHaveBeenCalledWith(sessionId);
         const afterClear = makeMessages(sessionId);
@@ -2021,6 +2020,31 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies[2]?.tail_delta).toBeUndefined();
         expect(transformBodies[2]?.messages).toHaveLength(1);
         expect(transform.getState(sessionId).passCount).toBe(1);
+    });
+
+    it("propagates module deletion failures while still closing the transport route", async () => {
+        const sessionId = `rust-clear-session-failure-${Date.now()}`;
+        const db = makeDb();
+        const deleteSession = mock(async () => {
+            throw new Error("module unavailable");
+        });
+        const closeSession = mock(() => {});
+        const moduleClient: RustModeModuleClient = {
+            call: async () => ({ ok: true }),
+            deleteSession,
+            closeSession,
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            projectRoot: "/tmp/rust-clear-session-failure-project",
+        });
+
+        await expect(transform.clearSession(sessionId)).rejects.toThrow("module unavailable");
+        expect(deleteSession).toHaveBeenCalledWith(
+            sessionId,
+            "/tmp/rust-clear-session-failure-project",
+        );
+        expect(closeSession).toHaveBeenCalledWith(sessionId);
     });
 
     it("keeps a 1,000-message steady-state pass under the adapter budget", async () => {

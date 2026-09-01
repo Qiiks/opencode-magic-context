@@ -202,10 +202,16 @@ const server: Plugin = async (ctx) => {
     }
 
     const liveSessionState = createLiveSessionState();
-    const rustModeModuleClient: RustModeModuleClient | undefined =
+    const rustModeModuleTransport =
         pluginConfig.transform_mode === "rust"
             ? new SubcModuleTransport(pluginConfig.subc?.connection_file)
             : undefined;
+    const rustModeModuleClient: RustModeModuleClient | undefined = rustModeModuleTransport;
+    // A durable Rust-deletion retry can outlive a config flip back to TypeScript,
+    // so cleanup keeps a lazy transport even when new transforms no longer use Rust.
+    const sessionCleanupModuleClient = pluginConfig.enabled
+        ? (rustModeModuleTransport ?? new SubcModuleTransport(pluginConfig.subc?.connection_file))
+        : undefined;
 
     const hooks = await createSessionHooksAsync({
         ctx,
@@ -413,6 +419,7 @@ const server: Plugin = async (ctx) => {
                     }
                 },
                 moduleClient: classifyModuleClient,
+                sessionCleanupModuleClient,
             };
             // Fail OPEN: the dream timer is best-effort background maintenance and must
             // never abort the plugin load. This block is awaited and runs BEFORE the
