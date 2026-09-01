@@ -6103,6 +6103,10 @@ impl<'a> FacadeMutationTxn<'a> {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        compiled_provider: Option<&str>,
+        compiled_config: Option<&str>,
+        compiled_at: Option<i64>,
+        compile_status: Option<&str>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
         let current = load_note_tx(self.tx, note_id)
@@ -6135,19 +6139,36 @@ impl<'a> FacadeMutationTxn<'a> {
             .tx
             .execute(
                 "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
+                    compiled_provider = CASE WHEN ?2 THEN ?4 ELSE compiled_provider END,
+                    compiled_config = CASE WHEN ?2 THEN ?5 ELSE compiled_config END,
+                    compiled_at = CASE WHEN ?2 THEN ?6 ELSE compiled_at END,
+                    compile_status = CASE WHEN ?2 THEN ?7 ELSE compile_status END,
+                    status = ?8, status_version = status_version + 1, updated_at_ms = ?9,
                     last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
                     ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
                     ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
                     compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
                     manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
                     check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                    check_cron = CASE WHEN ?2 THEN NULL ELSE check_cron END,
+                    check_version = CASE WHEN ?2 THEN 0 ELSE check_version END,
+                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END,
+                    check_failure_count = CASE WHEN ?2 THEN 0 ELSE check_failure_count END,
+                    check_network_failure_count = CASE WHEN ?2 THEN 0 ELSE check_network_failure_count END,
+                    check_quarantined_until = CASE WHEN ?2 THEN NULL ELSE check_quarantined_until END,
+                    check_next_due_at = CASE WHEN ?2 THEN NULL ELSE check_next_due_at END,
+                    check_compiled_at = CASE WHEN ?2 THEN NULL ELSE check_compiled_at END,
+                    check_false_since_at = CASE WHEN ?2 THEN NULL ELSE check_false_since_at END,
+                    check_last_liveness_at = CASE WHEN ?2 THEN NULL ELSE check_last_liveness_at END
+                  WHERE id = ?10 AND project_path = ?11 AND status = ?12 AND status_version = ?13",
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
+                    compiled_provider,
+                    compiled_config,
+                    compiled_at,
+                    compile_status,
                     next_status,
                     now_ms,
                     note_id,
@@ -10692,9 +10713,10 @@ impl McStore {
                     )?;
                     tx.execute(
                         &format!(
-                            "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
-                             SELECT type, project_path, ?1, content, status, surface_condition,
-                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
+                             "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
+                              SELECT type, project_path, ?1, content, status, surface_condition,
+                                     compiled_provider, compiled_config, compiled_at, compile_status,
+                                     ready_at, ready_reason, manifest_json, compiled_check, check_hash,
                                     check_cron, check_failure_count, check_network_failure_count,
                                     check_quarantined_until, check_next_due_at, check_compiled_at,
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
@@ -13219,8 +13241,9 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
+                  compiled_provider, compiled_config, compiled_at, compile_status,
                   anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'module', ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -13230,6 +13253,10 @@ impl McStore {
                         .surface_condition
                         .map(str::trim)
                         .filter(|value| !value.is_empty()),
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.anchor_block_id,
                     input.anchor_ordinal,
                     input.now_ms,
@@ -15400,11 +15427,14 @@ impl McStore {
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
                  ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
                     type=excluded.type, project_path=excluded.project_path,
                     session_id=excluded.session_id, content=excluded.content,
                     status=excluded.status, surface_condition=excluded.surface_condition,
+                    compiled_provider=excluded.compiled_provider,
+                    compiled_config=excluded.compiled_config, compiled_at=excluded.compiled_at,
+                    compile_status=excluded.compile_status,
                     ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
                     manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
                     check_hash=excluded.check_hash, check_cron=excluded.check_cron,
@@ -15446,6 +15476,10 @@ impl McStore {
                     text("content").unwrap_or(""),
                     text("status").unwrap_or("active"),
                     text("surface_condition"),
+                    text("compiled_provider"),
+                    text("compiled_config"),
+                    integer("compiled_at"),
+                    text("compile_status"),
                     integer("ready_at"),
                     text("ready_reason"),
                     text("manifest_json"),
@@ -16357,7 +16391,7 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
 }
 
 const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
@@ -20586,6 +20620,134 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining_classes, vec!["byte-mismatch"]);
+    }
+
+    #[test]
+    fn migration_52_preserves_legacy_notes_and_durably_stores_compilation_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_context| Ok("/repo".to_string()),
+            )
+            .unwrap();
+        for function in ["mc_facade_authority_domain", "mc_facade_authority_route"] {
+            connection
+                .create_scalar_function(function, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                    Ok(String::new())
+                })
+                .unwrap();
+        }
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 )",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 25)
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS mc_notes_ownership_insert;
+                 DROP TRIGGER IF EXISTS mc_notes_ownership_update;
+                 DROP TRIGGER IF EXISTS mc_notes_ownership_delete;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mc_notes
+                     (project_path, session_id, content, status, surface_condition,
+                      created_at_ms, updated_at_ms)
+                 VALUES ('/repo', 'session', 'legacy note', 'active',
+                         'legacy condition', 1, 2)",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| (26..=51).contains(&migration.version))
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let legacy = store
+            .get_note_by_id("/repo", "session", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.compiled_provider, None);
+        assert_eq!(legacy.compiled_config, None);
+        assert_eq!(legacy.compiled_at, None);
+        assert_eq!(legacy.compile_status, None);
+
+        let compiled = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "/repo",
+                route_project_root: None,
+                session_id: Some("session"),
+                content: "compiled note",
+                surface_condition: Some("compiled condition"),
+                compiled_provider: Some("retina-local-fs"),
+                compiled_config: Some("{\"kind\":\"path_exists\"}"),
+                compiled_at: Some(123),
+                compile_status: Some("compiled"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            compiled.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            compiled.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\"}")
+        );
+        assert_eq!(compiled.compiled_at, Some(123));
+        assert_eq!(compiled.compile_status.as_deref(), Some("compiled"));
+        let compiled_id = compiled.id;
+        drop(store);
+
+        let reopened = McStore::open(&descriptor(dir.path())).unwrap();
+        let durable = reopened
+            .get_note_by_id("/repo", "session", compiled_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(durable.compiled_at, Some(123));
+        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
     }
 
     #[test]
@@ -26249,6 +26411,10 @@ mod shadow_tests {
                         initial.status_version,
                         Some("  keep surrounding whitespace  "),
                         Some(Some("same condition")),
+                        None,
+                        None,
+                        None,
+                        None,
                         2,
                     )?;
                     Ok(Vec::new())
@@ -26279,6 +26445,10 @@ mod shadow_tests {
                         &updated.status,
                         updated.status_version,
                         Some(""),
+                        None,
+                        None,
+                        None,
+                        None,
                         None,
                         3,
                     )?;

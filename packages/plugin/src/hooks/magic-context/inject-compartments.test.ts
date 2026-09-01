@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -9,9 +9,12 @@ import {
     replaceAllCompartmentState,
 } from "../../features/magic-context/compartment-storage";
 import {
+    archiveMemory,
     getMemoriesByProject,
     insertMemory,
     setMemoryClassification,
+    supersededMemory,
+    updateMemoryContent,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
 import { unifiedSearch } from "../../features/magic-context/search";
@@ -2891,6 +2894,145 @@ describe("m[0]/m[1] materialization", () => {
         ]);
         expect(revoke).toContain(`<removed id="${foreignMemory.id}"/>`);
         expect(revoke).not.toContain("foreign visibility memory below watermark");
+    });
+
+    it("matches the module delta bytes across interleaved update, archive, and cross-watermark merge", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const initialMemories = [
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "original alpha",
+            }),
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "archive beta",
+            }),
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "merge source gamma",
+            }),
+            insertMemory(db, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "merge target delta",
+            }),
+        ];
+        expect(initialMemories.map((memory) => memory.id)).toEqual([1, 2, 3, 4]);
+        const [updated, archived, foldedSource, mergeTarget] = initialMemories;
+        const state = readStateFromMeta();
+        const hard = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            memoryInjectionBudgetTokens: 8_000,
+        });
+        expect(hard.snapshotMarkers.maxMemoryId).toBe(mergeTarget.id);
+        expect(hard.renderedMemoryIds).toEqual([1, 2, 3, 4]);
+
+        updateMemoryContent(db, updated.id, "updated <alpha> & stable", "updated-alpha");
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "update",
+            targetMemoryId: updated.id,
+            category: "CONSTRAINTS",
+            newContent: "updated <alpha> & stable",
+            queuedAt: 10,
+        });
+        archiveMemory(db, archived.id);
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "archive",
+            targetMemoryId: archived.id,
+            queuedAt: 11,
+        });
+
+        const firstDefer = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            hard.snapshotMarkers,
+            hard.renderedMemoryIds,
+        );
+        const fixture = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/memory-update-delta-parity.json",
+                ),
+                "utf8",
+            ),
+        ) as { first_delta: string; second_delta: string; reconciled_m0: string };
+        const block = (text: string, tag: string): string | undefined =>
+            text.match(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`))?.[0];
+        expect(block(firstDefer, "memory-updates")).toBe(fixture.first_delta);
+
+        const lateSource = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONSTRAINTS",
+            content: "late merge source epsilon",
+        });
+        expect(lateSource.id).toBeGreaterThan(hard.snapshotMarkers.maxMemoryId);
+        supersededMemory(db, foldedSource.id, mergeTarget.id);
+        supersededMemory(db, lateSource.id, mergeTarget.id);
+        updateMemoryContent(
+            db,
+            mergeTarget.id,
+            "merged <delta> & sources",
+            "merged-delta-sources",
+        );
+        for (const source of [foldedSource, lateSource]) {
+            queueMemoryMutation(db, {
+                projectPath: PROJECT_PATH,
+                mutationType: "superseded",
+                targetMemoryId: source.id,
+                supersededById: mergeTarget.id,
+                queuedAt: 20 + source.id,
+            });
+        }
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "update",
+            targetMemoryId: mergeTarget.id,
+            category: "CONSTRAINTS",
+            newContent: "merged <delta> & sources",
+            queuedAt: 30,
+        });
+
+        const secondDefer = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            hard.snapshotMarkers,
+            hard.renderedMemoryIds,
+        );
+        expect(block(secondDefer, "memory-updates")).toBe(fixture.second_delta);
+
+        const reconciled = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            memoryInjectionBudgetTokens: 8_000,
+        });
+        expect(block(reconciled.m0Text, "project-memory")).toBe(fixture.reconciled_m0);
+        expect(reconciled.m1Text).not.toContain("<memory-updates>");
     });
 
     it("renders memory mutation removals on cache-busting pass and replays them on defer", () => {

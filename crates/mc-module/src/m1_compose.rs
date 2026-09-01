@@ -927,6 +927,183 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_memory_deltas_match_the_typescript_byte_fixture_and_next_hard_fold() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project = "git:proj";
+        let initial_ids = [
+            store
+                .insert_memory(insert_input(project, "CONSTRAINTS", "original alpha", 1))
+                .unwrap(),
+            store
+                .insert_memory(insert_input(project, "CONSTRAINTS", "archive beta", 1))
+                .unwrap(),
+            store
+                .insert_memory(insert_input(
+                    project,
+                    "CONSTRAINTS",
+                    "merge source gamma",
+                    1,
+                ))
+                .unwrap(),
+            store
+                .insert_memory(insert_input(
+                    project,
+                    "CONSTRAINTS",
+                    "merge target delta",
+                    1,
+                ))
+                .unwrap(),
+        ];
+        assert_eq!(initial_ids, [1, 2, 3, 4]);
+        let hard = crate::m0_compose::compose_m0_from_store(
+            store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: "ses",
+                project_path: project,
+                project_directory: fixture.dir.path().to_str().unwrap(),
+                now_ms: 1,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        assert_eq!(hard.rendered_memory_ids, initial_ids);
+        let meta = meta_after_hard(
+            hard.folded_compartment_seq,
+            hard.coverage_ordinal,
+            hard.max_memory_id,
+            hard.memory_mutation_cursor,
+            hard.rendered_memory_ids.clone(),
+        );
+
+        store
+            .update_memory_content(project, initial_ids[0], "updated <alpha> & stable", 10)
+            .unwrap();
+        store
+            .archive_memory(project, initial_ids[1], None, 11)
+            .unwrap();
+        let first = compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &meta,
+            1,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+
+        let late_source = store
+            .insert_memory(insert_input(
+                project,
+                "CONSTRAINTS",
+                "late merge source epsilon",
+                20,
+            ))
+            .unwrap();
+        assert!(late_source > hard.max_memory_id);
+        store
+            .merge_memories(
+                project,
+                initial_ids[3],
+                &[initial_ids[2], late_source],
+                "merged <delta> & sources",
+                30,
+            )
+            .unwrap();
+        let second = compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &meta,
+            1,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        let reconciled = crate::m0_compose::compose_m0_from_store(
+            store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: "ses",
+                project_path: project,
+                project_directory: fixture.dir.path().to_str().unwrap(),
+                now_ms: 30,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        let reconciled_meta = meta_after_hard(
+            reconciled.folded_compartment_seq,
+            reconciled.coverage_ordinal,
+            reconciled.max_memory_id,
+            reconciled.memory_mutation_cursor,
+            reconciled.rendered_memory_ids.clone(),
+        );
+        let post_hard = compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &reconciled_meta,
+            30,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/memory-update-delta-parity.json"))
+                .unwrap();
+        let xml_block = |text: &str, tag: &str| {
+            let start_tag = format!("<{tag}>");
+            let end_tag = format!("</{tag}>");
+            let start = text.find(&start_tag).unwrap();
+            let end = text[start..].find(&end_tag).unwrap() + start + end_tag.len();
+            text[start..end].to_string()
+        };
+        assert_eq!(
+            xml_block(&first.body, "memory-updates"),
+            expected["first_delta"].as_str().unwrap()
+        );
+        assert_eq!(
+            xml_block(&second.body, "memory-updates"),
+            expected["second_delta"].as_str().unwrap()
+        );
+        assert_eq!(
+            xml_block(&reconciled.m0_bytes, "project-memory"),
+            expected["reconciled_m0"].as_str().unwrap()
+        );
+        assert_eq!(post_hard.body, crate::memory_render::M1_PLACEHOLDER);
+    }
+
+    #[test]
     fn public_memory_ports_drive_m1_revision_and_delta_blocks() {
         let project = "git:proj";
 

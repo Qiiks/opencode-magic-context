@@ -29,6 +29,7 @@ import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/stora
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
+import { getNotes } from "./storage-notes";
 import { initializeDatabase } from "./storage-db";
 
 function db(): Database {
@@ -253,6 +254,92 @@ describe("memory authority protocol", () => {
             check_version: 7,
             policy_version: 3,
         });
+    });
+
+    test("module note recovery preserves pre-migration nulls and post-migration facade shape", () => {
+        const database = db();
+        const contextStoreUuid = ensureContextStoreUuid(database);
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 0,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "notes",
+                        op: "insert",
+                        module_row_id: 42,
+                        full_row_snapshot: {
+                            type: "smart",
+                            project_path: "/repo",
+                            session_id: "session",
+                            content: "pre migration note",
+                            status: "ready",
+                            surface_condition: "legacy condition",
+                            ready_reason: "legacy condition met",
+                            created_at_ms: 1,
+                            updated_at_ms: 2,
+                            context_store_uuid: contextStoreUuid,
+                            context_row_id: 42,
+                        },
+                        content_hash: null,
+                    },
+                    {
+                        feed_seq: 2,
+                        domain: "notes",
+                        op: "insert",
+                        module_row_id: 43,
+                        full_row_snapshot: {
+                            type: "smart",
+                            project_path: "/repo",
+                            session_id: "session",
+                            content: "post migration note",
+                            status: "ready",
+                            surface_condition: "compiled condition",
+                            compiled_provider: "retina-local-fs",
+                            compiled_config: '{"kind":"path_exists"}',
+                            compiled_at: 123,
+                            compile_status: "compiled",
+                            ready_reason: "compiled condition met",
+                            created_at_ms: 3,
+                            updated_at_ms: 4,
+                            context_store_uuid: contextStoreUuid,
+                            context_row_id: 43,
+                        },
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+
+        const notes = getNotes(database, { projectPath: "/repo", type: "smart" });
+        expect(
+            notes.map((note) => ({
+                content: note.content,
+                compiledProvider: note.compiledProvider,
+                compiledConfig: note.compiledConfig,
+                compiledAt: note.compiledAt,
+                compileStatus: note.compileStatus,
+            })),
+        ).toEqual([
+            {
+                content: "pre migration note",
+                compiledProvider: null,
+                compiledConfig: null,
+                compiledAt: null,
+                compileStatus: null,
+            },
+            {
+                content: "post migration note",
+                compiledProvider: "retina-local-fs",
+                compiledConfig: '{"kind":"path_exists"}',
+                compiledAt: 123,
+                compileStatus: "compiled",
+            },
+        ]);
     });
 
     test("mirrored note compilation updates its audit timestamp", () => {
