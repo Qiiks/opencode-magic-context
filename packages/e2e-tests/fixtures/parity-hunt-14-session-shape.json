@@ -1,100 +1,164 @@
 {
-    "schema": 1,
+    "schema": 2,
     "source": {
-        "report": "docs/reports/parity-hunt-13.md#H13-03",
-        "capture": "sanitized live OpenCode session structure",
-        "sanitization": "Only role, part order, byte lengths, placeholder class, and signature presence are retained; no captured prose or identifiers are present."
+        "report": "docs/reports/parity-hunt-13.md#H13-03--H13-04",
+        "capture": "sanitized live OpenCode session structures",
+        "sanitization": "Only provider family, role/item order, byte lengths, placeholder class, tool pairing, and signature presence are retained; no captured prose or identifiers are present. Tool arguments are synthetic fixture behavior."
     },
-    "passes": [
+    "provider_arms": [
         {
-            "label": "signed-thinking-index-zero",
-            "input_text_bytes": 96,
-            "response": {
-                "blocks": [
-                    {
-                        "type": "thinking",
-                        "thinking_bytes": 128,
-                        "signature_bytes": 72
-                    },
-                    {
-                        "type": "text",
-                        "text_bytes": 48
+            "id": "anthropic",
+            "provider_id": "anthropic",
+            "provider_api": "@ai-sdk/anthropic",
+            "model_id": "mock-sonnet",
+            "wire_family": "anthropic_messages",
+            "passes": [
+                {
+                    "label": "signed-thinking-index-zero",
+                    "input_text_bytes": 96,
+                    "response": {
+                        "blocks": [
+                            {
+                                "type": "thinking",
+                                "thinking_bytes": 128,
+                                "signature_bytes": 72
+                            },
+                            {
+                                "type": "text",
+                                "text_bytes": 48
+                            }
+                        ],
+                        "input_tokens": 1000,
+                        "output_tokens": 100
                     }
-                ],
-                "input_tokens": 1000,
-                "output_tokens": 100
-            }
-        },
-        {
-            "label": "isolated-assistant-dropped-placeholder",
-            "input_text_bytes": 80,
-            "response": {
-                "blocks": [
-                    {
-                        "type": "text",
-                        "dropped_tag": 0
+                },
+                {
+                    "label": "isolated-assistant-dropped-placeholder",
+                    "input_text_bytes": 80,
+                    "response": {
+                        "blocks": [
+                            {
+                                "type": "text",
+                                "dropped_tag": 0
+                            }
+                        ],
+                        "input_tokens": 1200,
+                        "output_tokens": 20
                     }
-                ],
-                "input_tokens": 1200,
-                "output_tokens": 20
-            }
-        },
-        {
-            "label": "raw-empty-assistant-text",
-            "input_text_bytes": 72,
-            "response": {
-                "blocks": [
-                    {
-                        "type": "text",
-                        "empty": true
+                },
+                {
+                    "label": "raw-empty-assistant-text",
+                    "input_text_bytes": 72,
+                    "response": {
+                        "blocks": [
+                            {
+                                "type": "text",
+                                "empty": true
+                            }
+                        ],
+                        "input_tokens": 1400,
+                        "output_tokens": 1
                     }
-                ],
-                "input_tokens": 1400,
-                "output_tokens": 1
-            }
-        },
-        {
-            "label": "observe-empty-and-placeholder",
-            "input_text_bytes": 88,
-            "response": {
-                "blocks": [
-                    {
-                        "type": "text",
-                        "text_bytes": 40
+                },
+                {
+                    "label": "observe-empty-and-placeholder",
+                    "input_text_bytes": 88,
+                    "response": {
+                        "blocks": [
+                            {
+                                "type": "text",
+                                "text_bytes": 40
+                            }
+                        ],
+                        "input_tokens": 1600,
+                        "output_tokens": 20
                     }
-                ],
-                "input_tokens": 1600,
-                "output_tokens": 20
-            }
-        }
-    ],
-    "adjudications": [
-        {
-            "pass": "isolated-assistant-dropped-placeholder",
-            "axis": "reasoning_signature_shapes",
-            "ts_only": ["thinking:nonzero_index:signed"],
-            "rust_only": ["thinking:index_0:signed"],
-            "decision": "intentional_difference",
-            "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
-            "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+                }
+            ],
+            "adjudications": [
+                {
+                    "pass": "isolated-assistant-dropped-placeholder",
+                    "axis": "reasoning_signature_shapes",
+                    "ts_only": ["thinking:nonzero_index:signed"],
+                    "rust_only": ["thinking:index_0:signed"],
+                    "decision": "intentional_difference",
+                    "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
+                    "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+                },
+                {
+                    "pass": "raw-empty-assistant-text",
+                    "axis": "reasoning_signature_shapes",
+                    "ts_only": ["thinking:nonzero_index:signed"],
+                    "rust_only": ["thinking:index_0:signed"],
+                    "decision": "intentional_difference",
+                    "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
+                    "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+                },
+                {
+                    "pass": "observe-empty-and-placeholder",
+                    "axis": "reasoning_signature_shapes",
+                    "ts_only": ["thinking:nonzero_index:signed"],
+                    "rust_only": ["thinking:index_0:signed"],
+                    "decision": "intentional_difference",
+                    "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
+                    "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+                }
+            ]
         },
         {
-            "pass": "raw-empty-assistant-text",
-            "axis": "reasoning_signature_shapes",
-            "ts_only": ["thinking:nonzero_index:signed"],
-            "rust_only": ["thinking:index_0:signed"],
-            "decision": "intentional_difference",
-            "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
-            "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
-        },
-        {
-            "pass": "observe-empty-and-placeholder",
-            "axis": "reasoning_signature_shapes",
-            "ts_only": ["thinking:nonzero_index:signed"],
-            "rust_only": ["thinking:index_0:signed"],
-            "decision": "intentional_difference",
-            "reason": "Rust serves the provider-native signed-thinking vector verbatim; TS provider projection adds tag and blank text around it. Preserving native content-array positions is the signed-reasoning safety exception.",
-            "source": "crates/mc-module/src/codec/opencode.rs:459-477,759-776"
+            "id": "openai-responses",
+            "provider_id": "mock-openai-responses",
+            "provider_api": "@ai-sdk/openai",
+            "model_id": "gpt-5-responses-fixture",
+            "wire_family": "openai_responses",
+            "setup": {
+                "label": "empty-tool-output-with-reasoning",
+                "input_text_bytes": 96,
+                "tool_call": {
+                    "call_id": "call_empty_output_fixture",
+                    "name": "bash",
+                    "arguments": {
+                        "command": "true",
+                        "description": "Produce an empty tool result for replay"
+                    }
+                },
+                "replace_tool_output_with_dropped_sentinel": true
+            },
+            "passes": [
+                {
+                    "label": "observe-empty-tool-output-with-reasoning",
+                    "input_text_bytes": 96,
+                    "response": {
+                        "items": [
+                            {
+                                "type": "reasoning",
+                                "summary_bytes": 48,
+                                "encrypted_content_bytes": 64
+                            },
+                            {
+                                "type": "message",
+                                "text_bytes": 40
+                            }
+                        ],
+                        "input_tokens": 1100,
+                        "output_tokens": 20
+                    }
+                },
+                {
+                    "label": "observe-responses-history",
+                    "input_text_bytes": 80,
+                    "response": {
+                        "items": [
+                            {
+                                "type": "message",
+                                "text_bytes": 36
+                            }
+                        ],
+                        "input_tokens": 1300,
+                        "output_tokens": 20
+                    }
+                }
+            ]
         }
     ]
 }

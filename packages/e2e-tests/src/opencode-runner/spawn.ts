@@ -61,6 +61,10 @@ export interface SpawnOptions {
     mockProviderURL: string;
     /** Provider id registered for the mock. Defaults to "mock-anthropic". */
     mockProviderID?: string;
+    /** AI SDK provider package used by the mock. Defaults to "@ai-sdk/anthropic". */
+    mockProviderAPI?: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+    /** Model id exposed by the mock provider. Defaults to "mock-sonnet". */
+    mockModelID?: string;
     /** Port for opencode serve. Default: random available */
     port?: number;
     /** magic-context.jsonc overrides. Defaults keep most features on. */
@@ -235,9 +239,8 @@ export function createIsolatedEnv(): IsolatedEnv {
 /**
  * Write opencode.json + magic-context.jsonc + tui.json into config/workdir.
  *
- * - opencode.json: registers our plugin via file:// spec, defines a mock-anthropic
- *   provider and a mock model, sets provider.mock-anthropic.options.baseURL to the
- *   mock server's URL.
+ * - opencode.json: registers our plugin via file:// spec and defines a configurable
+ *   mock provider/model whose baseURL points to the local mock server.
  * - magic-context.jsonc: starts with small thresholds so tests trigger historian
  *   deterministically with modest scripted token counts.
  */
@@ -248,6 +251,34 @@ function writeConfigs(
 ): void {
     const pluginSpec = `file://${PLUGIN_ENTRY}`;
     const mockProviderID = opts.mockProviderID ?? "mock-anthropic";
+    const mockProviderAPI = opts.mockProviderAPI ?? "@ai-sdk/anthropic";
+    const mockModelID = opts.mockModelID ?? "mock-sonnet";
+    const providerConfig = (
+        api: "@ai-sdk/anthropic" | "@ai-sdk/openai",
+        modelID: string,
+    ): Record<string, unknown> => ({
+        api,
+        name: api === "@ai-sdk/openai" ? "Mock OpenAI Responses" : "Mock Anthropic",
+        npm: api,
+        env: [],
+        options: {
+            apiKey: "test-key-not-real",
+            baseURL: mockProviderURL,
+        },
+        models: {
+            [modelID]: {
+                id: modelID,
+                name: `Mock ${modelID}`,
+                cost: { input: 0, output: 0 },
+                limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
+                modalities: {
+                    input: ["text", "image", "pdf"],
+                    output: ["text"],
+                },
+                options: {},
+            },
+        },
+    });
 
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
@@ -259,33 +290,15 @@ function writeConfigs(
         // detector disables itself and the plugin becomes a no-op.
         compaction: { auto: false, prune: false },
         provider: {
-            [mockProviderID]: {
-                api: "@ai-sdk/anthropic",
-                name: "Mock Anthropic",
-                npm: "@ai-sdk/anthropic",
-                env: [],
-                options: {
-                    apiKey: "test-key-not-real",
-                    baseURL: mockProviderURL,
-                },
-                models: {
-                    "mock-sonnet": {
-                        id: "mock-sonnet",
-                        name: "Mock Sonnet",
-                        cost: { input: 0, output: 0 },
-                        limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
-                        // Advertise image + pdf input support so OpenCode does
-                        // not substitute inline file parts with "this model
-                        // does not support X input" text messages. Matches the
-                        // real Sonnet capabilities this mock is standing in for.
-                        modalities: {
-                            input: ["text", "image", "pdf"],
-                            output: ["text"],
-                        },
-                        options: {},
-                    },
-                },
-            },
+            [mockProviderID]: providerConfig(mockProviderAPI, mockModelID),
+            ...(mockProviderAPI === "@ai-sdk/openai"
+                ? {
+                      "mock-anthropic-setup": providerConfig(
+                          "@ai-sdk/anthropic",
+                          "mock-sonnet",
+                      ),
+                  }
+                : {}),
         },
         ...(opts.openCodeConfigExtra ?? {}),
     };
@@ -357,6 +370,7 @@ export interface ReadinessOptions {
     pluginLogPath?: string;
     pluginLogStartOffset?: number;
     mockProviderID?: string;
+    mockModelID?: string;
 }
 
 const CONFLICT_DISABLE_VERDICT = "[magic-context] disabled due to conflicts:";
@@ -405,6 +419,7 @@ export async function waitForReady(
     const FETCH_TIMEOUT_MS = 2_000;
     const expectedMagicContextState = options.expectedMagicContextState ?? "enabled";
     const mockProviderID = options.mockProviderID ?? "mock-anthropic";
+    const mockModelID = options.mockModelID ?? "mock-sonnet";
     if (expectedMagicContextState === "conflict-disabled" && !options.pluginLogPath) {
         throw new Error("conflict-disabled readiness requires a plugin log path");
     }
@@ -501,8 +516,8 @@ export async function waitForReady(
             mockProvider && typeof mockProvider === "object"
                 ? (mockProvider as { models?: unknown }).models
                 : null;
-        if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
-            throw new Error(`${mockProviderID}/mock-sonnet provider config is not ready`);
+        if (!models || typeof models !== "object" || !(mockModelID in models)) {
+            throw new Error(`${mockProviderID}/${mockModelID} provider config is not ready`);
         }
     });
 }
@@ -678,6 +693,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
             pluginLogPath,
             pluginLogStartOffset,
             mockProviderID: resolvedOpts.mockProviderID,
+            mockModelID: resolvedOpts.mockModelID,
         });
     } catch (err) {
         // Surface captured output on boot failure to help debugging.

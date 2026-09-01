@@ -1587,6 +1587,81 @@ function maintenanceEvidence(store: Database, afterMs: number): Record<string, u
 	};
 }
 
+const LEGACY_HISTORIAN_CAUSES: Record<string, string> = {
+	backoff: "rate_limit",
+	busy: "in_flight",
+	missing_boundary: "protected_tail",
+	no_models: "no_models",
+	pending_rewrite: "pending_rewrite",
+	restart_recovery: "in_flight",
+	state_load_failed: "state_load_failed",
+	subagent_session: "subagent_session",
+	trigger_false: "legacy_trigger_false",
+};
+
+export function canonicalHistorianNoFire(detail: unknown): {
+	canonicalCause: string;
+	rawCause: string;
+	detailKind: string;
+	legacyGeneric: boolean;
+} | null {
+	if (typeof detail !== "string" || !detail.trim()) return null;
+	const trimmed = detail.trim();
+	const detailKind = trimmed.split(/[{:]/, 1)[0] || "unknown";
+	const canonicalCause = trimmed.match(/(?:^|[{,])canonical_cause=([^,}]+)/)?.[1];
+	const rawCause = trimmed.match(/(?:^|[{,])raw_cause=([^,}]+)/)?.[1];
+	return {
+		canonicalCause:
+			canonicalCause ?? LEGACY_HISTORIAN_CAUSES[detailKind] ?? detailKind,
+		rawCause: rawCause ?? detailKind,
+		detailKind,
+		legacyGeneric: canonicalCause === undefined && detailKind === "trigger_false",
+	};
+}
+
+function historianNoFireEvidence(
+	store: Database,
+	afterMs: number,
+): {
+	rows: number;
+	causes: Record<string, number>;
+	raw_causes: Record<string, number>;
+	detail_kinds: Record<string, number>;
+	legacy_generic_rows: number;
+} {
+	const empty = {
+		rows: 0,
+		causes: {},
+		raw_causes: {},
+		detail_kinds: {},
+		legacy_generic_rows: 0,
+	};
+	if (!tableExists(store, "mc_cache_state")) return empty;
+	const cacheColumns = columns(store, "mc_cache_state");
+	if (!cacheColumns.has("meta")) return empty;
+	const where = cacheColumns.has("last_activity_at")
+		? " WHERE last_activity_at >= ?"
+		: "";
+	const rows = store
+		.query(`SELECT meta FROM mc_cache_state${where}`)
+		.all(...(where ? [afterMs] : [])) as Row[];
+	const evidence = { ...empty };
+	for (const row of rows) {
+		const historian = safeJson(safeJson(row.meta).historian);
+		const parsed = canonicalHistorianNoFire(historian.last_no_fire);
+		if (!parsed) continue;
+		evidence.rows += 1;
+		evidence.causes[parsed.canonicalCause] =
+			(evidence.causes[parsed.canonicalCause] ?? 0) + 1;
+		evidence.raw_causes[parsed.rawCause] =
+			(evidence.raw_causes[parsed.rawCause] ?? 0) + 1;
+		evidence.detail_kinds[parsed.detailKind] =
+			(evidence.detail_kinds[parsed.detailKind] ?? 0) + 1;
+		if (parsed.legacyGeneric) evidence.legacy_generic_rows += 1;
+	}
+	return evidence;
+}
+
 function canonicalSchedulerDecision(observation: Row): string {
 	if (typeof observation.canonical_decision === "string")
 		return observation.canonical_decision;
@@ -1694,6 +1769,7 @@ function decisionEvidence(
 	return {
 		cutoff_ms: afterMs,
 		transform_decisions: distributions,
+		historian_no_fire: historianNoFireEvidence(store, afterMs),
 		scheduler_history: {
 			rows: schedulerRows,
 			decisions: scheduler,

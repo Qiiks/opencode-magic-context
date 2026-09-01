@@ -9,9 +9,11 @@ function valueAfter(flag: string): string | undefined {
 }
 
 const fixturePath = valueAfter("--fixture");
+const providerArm = valueAfter("--provider-arm");
 const providerID = valueAfter("--provider-id");
 const output = await runPairedSessionReplay({
     ...(fixturePath ? { fixturePath: resolve(fixturePath) } : {}),
+    ...(providerArm ? { providerArm } : {}),
     ...(providerID ? { providerID } : {}),
 });
 console.log(JSON.stringify(output, null, 2));

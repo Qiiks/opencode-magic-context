@@ -700,6 +700,22 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 },
             )
             self.assertEqual(
+                report["live_probe"]["decision_window"]["historian_no_fire"],
+                {
+                    "rows": 2,
+                    "causes": {
+                        "legacy_trigger_false": 1,
+                        "protected_tail": 1,
+                    },
+                    "raw_causes": {
+                        "ProtectedTailWindowEmpty": 1,
+                        "trigger_false": 1,
+                    },
+                    "detail_kinds": {"trigger_false": 2},
+                    "legacy_generic_rows": 1,
+                },
+            )
+            self.assertEqual(
                 report["provider_live"]["lane_coordinate_coverage"],
                 {
                     "resolved_dumps": 1,
@@ -1060,22 +1076,37 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 dt.datetime(2026, 8, 27, 12, tzinfo=dt.timezone.utc).timestamp() * 1000
             )
             db.execute("INSERT INTO cortexkit_schema_version VALUES ('mc_cache', 50)")
-            db.execute(
+            db.executemany(
                 "INSERT INTO mc_cache_state VALUES (?, ?, ?)",
-                (
-                    "ses_rust",
-                    now,
-                    json.dumps(
-                        {
-                            "initialized": True,
-                            "caveman_age_basis_tag": 9,
-                            "last_usage": {
-                                "current_total_input_tokens": 100,
-                                "context_limit_tokens": 200,
-                            },
-                        }
+                [
+                    (
+                        "ses_rust",
+                        now,
+                        json.dumps(
+                            {
+                                "initialized": True,
+                                "caveman_age_basis_tag": 9,
+                                "last_usage": {
+                                    "current_total_input_tokens": 100,
+                                    "context_limit_tokens": 200,
+                                },
+                                "historian": {
+                                    "last_no_fire": "trigger_false{raw_cause=ProtectedTailWindowEmpty,canonical_cause=protected_tail,eligible~0k}"
+                                },
+                            }
+                        ),
                     ),
-                ),
+                    (
+                        "ses_rust_legacy",
+                        now,
+                        json.dumps(
+                            {
+                                "initialized": True,
+                                "historian": {"last_no_fire": "trigger_false"},
+                            }
+                        ),
+                    ),
+                ],
             )
             db.executemany(
                 "INSERT INTO mc_tags VALUES (?, ?)",
