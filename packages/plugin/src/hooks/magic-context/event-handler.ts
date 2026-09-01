@@ -1,7 +1,12 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
-import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import {
+    detectOverflow,
+    detectThinkingBindingMismatch,
+    isFable51ThinkingBindingModel,
+} from "../../features/magic-context/overflow-detection";
+import {
+    armThinkingBindingRecovery,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
     clearSession,
@@ -57,6 +62,7 @@ import {
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
 import { readRawSessionMessages } from "./read-session-chunk";
+import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
 import { clearMessageTokensCache } from "./transform";
@@ -87,6 +93,8 @@ export interface EventHandlerDeps {
      * the off-transition clears any persisted intent.
      */
     compactionOff?: boolean;
+    /** The host-side recovery arm is TS-only until the module protocol carries this flag. */
+    thinkingBindingRecoveryEnabled?: boolean;
     onSessionCacheInvalidated?: (sessionId: string) => void;
     onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
@@ -297,6 +305,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
             try {
+                const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
+                if (bindingMismatch.isBindingMismatch) {
+                    const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
+                    if (
+                        deps.thinkingBindingRecoveryEnabled !== false &&
+                        !deps.compactionOff &&
+                        isFable51ThinkingBindingModel(model?.providerID, model?.modelID)
+                    ) {
+                        armThinkingBindingRecovery(
+                            deps.db,
+                            errInfo.sessionID,
+                            bindingMismatch.messageId,
+                        );
+                        dropSlot(errInfo.sessionID, "thinking-binding-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(errInfo.sessionID);
+                    }
+                    return;
+                }
+
                 const detection = detectOverflow(errInfo.error);
                 if (!detection.isOverflow) {
                     return;
@@ -426,6 +453,32 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             let messageHadOverflowError = false;
+
+            if (info.error !== undefined && info.error !== null) {
+                const bindingMismatch = detectThinkingBindingMismatch(info.error);
+                if (
+                    bindingMismatch.isBindingMismatch &&
+                    deps.thinkingBindingRecoveryEnabled !== false &&
+                    !deps.compactionOff &&
+                    isFable51ThinkingBindingModel(info.providerID, info.modelID)
+                ) {
+                    try {
+                        armThinkingBindingRecovery(
+                            deps.db,
+                            info.sessionID,
+                            bindingMismatch.messageId,
+                        );
+                        dropSlot(info.sessionID, "thinking-binding-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(info.sessionID);
+                    } catch (error) {
+                        sessionLog(
+                            info.sessionID,
+                            "event message.updated thinking binding recovery persistence failed:",
+                            error,
+                        );
+                    }
+                }
+            }
 
             // Secondary overflow-detection path: OpenCode attaches overflow
             // errors to the assistant message itself in addition to emitting

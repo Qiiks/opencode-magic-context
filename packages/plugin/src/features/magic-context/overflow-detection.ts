@@ -106,6 +106,16 @@ export interface ReportedContextLimit {
     provenance: ContextLimitProvenance;
 }
 
+export interface ThinkingBindingMismatchDetection {
+    isBindingMismatch: boolean;
+    /** Stable provider message substring used for diagnostics. */
+    matchedPattern?: string;
+    /** Provider-supplied id of the assistant whose bound block was rejected. */
+    messageId?: string;
+}
+
+const THINKING_BINDING_MISMATCH_PATTERN = /bound to a different conversation/i;
+
 export interface OverflowDetection {
     /** True if the error message matches a known overflow pattern. */
     isOverflow: boolean;
@@ -156,6 +166,79 @@ export function extractErrorMessage(error: unknown): string {
  * Detect whether an error represents a provider-side context-overflow
  * rejection, and optionally extract the reported limit.
  */
+function extractThinkingBindingMessageId(error: unknown): string | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    const seen = new Set<object>();
+    const queue: object[] = [error];
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || seen.has(current)) continue;
+        seen.add(current);
+        const record = current as Record<string, unknown>;
+        for (const key of ["message_id", "messageID", "messageId"]) {
+            const value = record[key];
+            if (typeof value === "string" && value.length > 0) return value;
+        }
+        for (const value of Object.values(record)) {
+            if (value && typeof value === "object") queue.push(value);
+        }
+    }
+    return undefined;
+}
+
+function extractExplicitHttpStatus(error: unknown): number | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    const seen = new Set<object>();
+    const queue: object[] = [error];
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || seen.has(current)) continue;
+        seen.add(current);
+        const record = current as Record<string, unknown>;
+        for (const key of ["status", "statusCode", "status_code"]) {
+            const value = record[key];
+            if (typeof value === "number") return value;
+        }
+        for (const value of Object.values(record)) {
+            if (value && typeof value === "object") queue.push(value);
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Classify Fable 5.1's documented thinking-prefix binding rejection. The docs
+ * guarantee the phrase, not the surrounding error prose, so only that stable
+ * substring is matched. Runtime account enforcement and exact SDK wrappers vary.
+ * Source (no live specimen available):
+ * https://platform.claude.com/docs/en/models/fable-5-1/whats-new-fable-5-1
+ */
+export function detectThinkingBindingMismatch(error: unknown): ThinkingBindingMismatchDetection {
+    const message = extractErrorMessage(error);
+    const explicitStatus = extractExplicitHttpStatus(error);
+    if (
+        (explicitStatus !== undefined && explicitStatus !== 400) ||
+        !THINKING_BINDING_MISMATCH_PATTERN.test(message)
+    ) {
+        return { isBindingMismatch: false };
+    }
+    const messageId = extractThinkingBindingMessageId(error);
+    return {
+        isBindingMismatch: true,
+        matchedPattern: "bound to a different conversation",
+        ...(messageId ? { messageId } : {}),
+    };
+}
+
+/** True only for canonical Anthropic Fable 5.1 model identifiers. */
+export function isFable51ThinkingBindingModel(
+    providerID: string | null | undefined,
+    modelID: string | null | undefined,
+): boolean {
+    if (providerID?.toLowerCase() !== "anthropic" || !modelID) return false;
+    return /(?:^|[-_.])fable[-_.]?5[-_.]1(?:$|[-_.])/i.test(modelID);
+}
+
 export function detectOverflow(error: unknown): OverflowDetection {
     const message = extractErrorMessage(error);
     if (!message) {

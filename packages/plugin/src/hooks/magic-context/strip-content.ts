@@ -467,6 +467,34 @@ function hasReasoningReplayContent(message: MessageLike): boolean {
  * metadata-only request shell; the adapter drops that shell, so it cannot own the exemption for
  * the completed assistant whose signed reasoning is actually replayed last.
  */
+export function findNewestReasoningBearingAssistantId(messages: MessageLike[]): string | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.info.role !== "assistant") continue;
+        if (
+            !message.parts.some(
+                (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
+            )
+        ) {
+            continue;
+        }
+        const id = message.info.id;
+        if (typeof id === "string" && id.length > 0) return id;
+    }
+    return undefined;
+}
+
+export function assistantHasReasoningPart(messages: MessageLike[], messageId: string): boolean {
+    return messages.some(
+        (message) =>
+            message.info.role === "assistant" &&
+            message.info.id === messageId &&
+            message.parts.some(
+                (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
+            ),
+    );
+}
+
 export function findLatestAssistantReasoningMutationExemptMessage(
     messages: MessageLike[],
 ): MessageLike | undefined {
@@ -829,6 +857,26 @@ export function findMergedReasoningStripCandidateIds(
  * convert-to-anthropic-messages-prompt.ts (case 'assistant'). Same class
  * fixed for Bedrock in vercel/ai#13583/#13972.
  */
+export function stripReasoningFromAssistantIds(
+    messages: MessageLike[],
+    providerID: string | undefined,
+    messageIds: ReadonlySet<string>,
+): number {
+    if (providerID !== "anthropic" || messageIds.size === 0) return 0;
+    let stripped = 0;
+    for (const message of messages) {
+        const id = message.info.id;
+        if (typeof id !== "string" || !messageIds.has(id)) continue;
+        for (let index = 0; index < message.parts.length; index += 1) {
+            const part = message.parts[index];
+            if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
+            message.parts[index] = makeSentinel(part);
+            stripped += 1;
+        }
+    }
+    return stripped;
+}
+
 export function stripReasoningFromMergedAssistants(
     messages: MessageLike[],
     providerID?: string,

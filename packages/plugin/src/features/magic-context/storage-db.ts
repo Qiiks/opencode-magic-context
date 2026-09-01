@@ -1516,8 +1516,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m0_system_hash TEXT,
       cached_m0_tool_set_hash TEXT,
       cached_m0_model_key TEXT,
-      cached_m0_project_identity TEXT,
-      cached_m0_last_baseline_end_message_id TEXT,
+       cached_m0_project_identity TEXT,
+       cached_m0_last_baseline_end_message_id TEXT,
+       thinking_binding_recovery_target TEXT NOT NULL DEFAULT '',
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
     );
@@ -1751,6 +1752,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");

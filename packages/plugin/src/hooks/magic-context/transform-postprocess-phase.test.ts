@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import {
     addProcessedImageStrippedIds,
@@ -29,10 +30,13 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
+    armThinkingBindingRecovery,
+    clearThinkingBindingRecoveryIf,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
+    getThinkingBindingRecoveryTarget,
     getTrailingBlankDecisions,
     setPersistedCompactionMarkerState,
     setPersistedTodoPermissionDenied,
@@ -3263,6 +3267,107 @@ describe("final message representation", () => {
             mergedReasoningParts: 0,
         });
         expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
+    });
+
+    it("recovers a bound newest thinking block once and replays the sentinel byte-stably", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-recovery";
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: "user-prefix", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "mutated prefix" }],
+                },
+                {
+                    info: { id: "assistant-bound", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "thinking",
+                            thinking: "signed thinking bound to the old prefix",
+                            signature: "bound-signature",
+                        },
+                        { type: "text", text: "completed answer" },
+                    ],
+                },
+                {
+                    info: { id: "retry-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+
+        armThinkingBindingRecovery(db, sessionId);
+        const recoveryMessages = buildMessages();
+        const recovery = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, recoveryMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+            }),
+        );
+
+        expect(recovery.thinkingBindingRecovery).toEqual({
+            flagTarget: "newest_reasoning_bearing_assistant",
+            messageId: "assistant-bound",
+        });
+        expect(findMessage(recoveryMessages, "assistant-bound").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        // Postprocessing does not consume the recovery flag. Only a successful live
+        // transform clears it, so a last-known-good fallback cannot clear recovery
+        // for an output that was not successfully transformed.
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(
+            clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                recovery.thinkingBindingRecovery.flagTarget,
+            ),
+        ).toBe(true);
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBeNull();
+
+        const replayMessages = buildMessages();
+        const replay = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replayMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+            }),
+        );
+        expect(replay.thinkingBindingRecovery).toBeNull();
+        expect(serializeAnthropicWirePrefix(replayMessages)).toBe(
+            serializeAnthropicWirePrefix(recoveryMessages),
+        );
+    });
+
+    it("leaves newest thinking byte-identical when no binding recovery was classified", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-inert";
+        const messages = [
+            {
+                info: { id: "assistant-newest", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "thinking", thinking: "keep me", signature: "keep-signature" },
+                    { type: "text", text: "answer" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const before = JSON.stringify(messages);
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(result.thinkingBindingRecovery).toBeNull();
+        expect(JSON.stringify(messages)).toBe(before);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
     });
 
     it("freezes first merged-strip application onto a bust and replays it across fresh rebuilds", async () => {

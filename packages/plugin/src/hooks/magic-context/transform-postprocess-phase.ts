@@ -36,8 +36,12 @@ import {
     getEmergencyInputSample,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getThinkingBindingRecoveryTarget,
     getTrailingBlankDecisions,
+    NEWEST_REASONING_BEARING_ASSISTANT,
     type PersistedCompactionMarkerState,
+    THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+    thinkingBindingRecoveryFrozenId,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     getOldestActiveUnprotectedToolTags,
@@ -93,14 +97,17 @@ import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
     applyFrozenTrailingBlankDecisions,
+    assistantHasReasoningPart,
     clearOldReasoning,
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripCandidateIds,
+    findNewestReasoningBearingAssistantId,
     findTrailingBlankDecisionCandidates,
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
+    stripReasoningFromAssistantIds,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
     type TrailingBlankDecision,
@@ -672,6 +679,8 @@ interface RunPostTransformPhaseArgs {
      * cannot diverge from the main transform on cold DB-recovered passes.
      */
     resolvedProviderID?: string;
+    /** True only when the live request is canonical Anthropic Fable 5.1. */
+    thinkingBindingRecoveryEnabledForModel?: boolean;
     /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     passOutcome?: PassOutcome;
@@ -710,6 +719,8 @@ export interface PostTransformPhaseResult {
     droppedCount: number;
     emergency: boolean;
     bustedThisPass: boolean;
+    /** Pending flag applied to the live output; the caller clears it only after the live lane succeeds. */
+    thinkingBindingRecovery: { flagTarget: string; messageId: string } | null;
 }
 
 export interface ConfirmedAbortClient {
@@ -800,6 +811,7 @@ export function finalizeMessageRepresentation(
         reasoningMutationExemptMessage?: MessageLike;
         trailingBlankNewestAssistant?: MessageLike;
         mergedReasoningStrippedIds?: ReadonlySet<string>;
+        thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
         trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
         skipMergedReasoningStrip?: boolean;
         skipTrailingWhitespaceStrip?: boolean;
@@ -834,12 +846,21 @@ export function finalizeMessageRepresentation(
             break;
         }
     }
-    const mergedReasoningParts = options?.skipMergedReasoningStrip
+    const bindingRecoveryParts = options?.skipMergedReasoningStrip
         ? 0
-        : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
-              mutationExemptMessage: options?.reasoningMutationExemptMessage,
-              frozenMessageIds: options?.mergedReasoningStrippedIds,
-          });
+        : stripReasoningFromAssistantIds(
+              messages,
+              resolvedProviderID,
+              options?.thinkingBindingRecoveryMessageIds ?? new Set(),
+          );
+    const mergedReasoningParts =
+        bindingRecoveryParts +
+        (options?.skipMergedReasoningStrip
+            ? 0
+            : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
+                  mutationExemptMessage: options?.reasoningMutationExemptMessage,
+                  frozenMessageIds: options?.mergedReasoningStrippedIds,
+              }));
     if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
         applyFrozenTrailingBlankDecisions(
             messages,
@@ -2204,11 +2225,46 @@ export async function runPostTransformPhase(
     // any stripped bytes. The newest assistant is excluded from both detection
     // and replay because Anthropic requires its signed blocks byte-identically.
     const mergedReasoningStrippedIds = new Set<string>();
+    const thinkingBindingRecoveryMessageIds = new Set<string>();
+    let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
     if (canUseEmptySentinels && !compactionOff) {
         try {
             for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
                 mergedReasoningStrippedIds.add(id);
+                if (id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
+                    const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+                    if (messageId.length > 0) thinkingBindingRecoveryMessageIds.add(messageId);
+                }
             }
+
+            const flagTarget = args.thinkingBindingRecoveryEnabledForModel
+                ? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+                : null;
+            if (flagTarget) {
+                const messageId =
+                    flagTarget === NEWEST_REASONING_BEARING_ASSISTANT
+                        ? findNewestReasoningBearingAssistantId(args.messages)
+                        : flagTarget;
+                if (messageId && assistantHasReasoningPart(args.messages, messageId)) {
+                    const frozenId = thinkingBindingRecoveryFrozenId(messageId);
+                    const persisted =
+                        mergedReasoningStrippedIds.has(frozenId) ||
+                        addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId]);
+                    if (persisted) {
+                        mergedReasoningStrippedIds.add(frozenId);
+                        thinkingBindingRecoveryMessageIds.add(messageId);
+                        thinkingBindingRecovery = { flagTarget, messageId };
+                        bustedThisPass = true;
+                    } else {
+                        args.passOutcome?.record("thinking-binding-recovery-persistence-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "thinking binding recovery: persistence failed; leaving the bound block intact",
+                        );
+                    }
+                }
+            }
+
             if (isCacheBustingPass) {
                 const candidates = findMergedReasoningStripCandidateIds(
                     args.messages,
@@ -2324,6 +2380,7 @@ export async function runPostTransformPhase(
             reasoningMutationExemptMessage,
             trailingBlankNewestAssistant,
             mergedReasoningStrippedIds,
+            thinkingBindingRecoveryMessageIds,
             trailingBlankDecisions,
             skipMergedReasoningStrip: compactionOff,
             skipTrailingWhitespaceStrip: compactionOff,
@@ -2554,6 +2611,7 @@ export async function runPostTransformPhase(
         droppedCount,
         emergency,
         bustedThisPass,
+        thinkingBindingRecovery,
     };
 }
 
