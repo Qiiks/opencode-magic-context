@@ -15262,7 +15262,11 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     // verification a queryable build identity instead of binary archaeology.
     // build_provenance is the subc-protocol library call (re-exported through
     // subc-client-rs); it normalizes sentinel/empty values to field omission.
-    .provenance(Some(build_provenance(option_env!("MC_BUILD_SHA"), None, None)))
+    .provenance(Some(build_provenance(
+        option_env!("MC_BUILD_SHA"),
+        None,
+        None,
+    )))
     .provides(vec![ProviderRole::ToolProvider {
         tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -16086,7 +16090,10 @@ mod tests {
         // The wire_crate_version is always present (a compile-time constant of
         // the linked subc-protocol crate); build_git_sha is present only when
         // MC_BUILD_SHA was set at compile time.
-        let provenance = m.provenance.as_ref().expect("manifest must carry provenance");
+        let provenance = m
+            .provenance
+            .as_ref()
+            .expect("manifest must carry provenance");
         assert_eq!(
             provenance.wire_crate_version.as_deref(),
             Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
@@ -27785,6 +27792,136 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_terminal_wrapup_dispositions_replay_after_module_restart() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(2, 8));
+        store
+            .record_wrapup_command("ses", "completed", "completed", 2, "finished", 10)
+            .unwrap();
+        store
+            .record_wrapup_command(
+                "ses",
+                "nothing",
+                "nothing_to_compact",
+                0,
+                "nothing eligible",
+                11,
+            )
+            .unwrap();
+        let failed_record = tool_body(handler.terminal_wrapup_response(
+            &store,
+            "ses",
+            Some("failed"),
+            1,
+            0,
+            TerminalWrapupResponse {
+                disposition: "failed",
+                rounds: 1,
+                summary: "wrapup failed".to_string(),
+                reason: Some("producer_failed"),
+                detail: Some("producer unavailable".to_string()),
+                include_rounds_without_command: false,
+            },
+        ));
+        assert_eq!(failed_record["disposition"], json!("failed"));
+        drop(handler);
+        drop(store);
+
+        let reopened = Arc::new(
+            McStore::open(&dev_descriptor_at(
+                dir.path().join("data").to_str().unwrap(),
+            ))
+            .unwrap(),
+        );
+        let restarted = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory {
+                state: Arc::clone(&producer),
+            }),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        restarted.store.set(reopened).ok().unwrap();
+        restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+
+        let completed = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "completed"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            completed,
+            json!({
+                "ok": true,
+                "disposition": "completed",
+                "rounds": 2,
+                "summary": "finished",
+                "replayed": true
+            })
+        );
+
+        let nothing = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "nothing"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            nothing,
+            json!({
+                "ok": true,
+                "disposition": "nothing_to_compact",
+                "rounds": 0,
+                "summary": "nothing eligible",
+                "replayed": true
+            })
+        );
+
+        let failed = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "failed"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            failed,
+            json!({
+                "ok": false,
+                "disposition": "failed",
+                "rounds": 1,
+                "summary": "wrapup failed",
+                "reason": "producer_failed",
+                "detail": "producer unavailable",
+                "replayed": true
+            })
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

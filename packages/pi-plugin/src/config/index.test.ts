@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
+import {
+	getWindowOverlay,
+	reloadWindowOverlay,
+	setWindowOverlayPath,
+} from "@magic-context/core/shared/window-geometry";
 import { loadPiConfig, loadPiConfigDetailed } from "./index";
 
 const tempRoots: string[] = [];
@@ -57,6 +62,7 @@ function writeUserConfig(
 }
 
 afterEach(() => {
+	setWindowOverlayPath(undefined);
 	if (originalHome === undefined) {
 		delete process.env.HOME;
 	} else {
@@ -74,6 +80,47 @@ afterEach(() => {
 });
 
 describe("loadPiConfig", () => {
+	it("does not invalidate a same-path overlay during routine config reads", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		const overlayRoot = makeTempRoot("mc-pi-overlay-");
+		const overlayPath = join(overlayRoot, "window-overlay.json");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({ models: { window_overlay_path: overlayPath } }),
+		);
+		const writeOverlay = (modelId: string) =>
+			writeFileSync(
+				overlayPath,
+				JSON.stringify({
+					schema: "fusiform-window-overlay/v1",
+					generated_at: "2026-09-01T00:00:00Z",
+					minted_provider_ids: [],
+					cells: [
+						{
+							provider_id: "hunt-provider",
+							model_id: modelId,
+							facts: {},
+						},
+					],
+				}),
+			);
+
+		writeOverlay("before-rewrite");
+		loadPiConfig({ cwd });
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+		writeOverlay("after-rewrite");
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+		loadPiConfig({ cwd });
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+		reloadWindowOverlay(overlayPath);
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("after-rewrite");
+	});
+
 	it("marks an unmigrated legacy project config as an untrusted load", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");

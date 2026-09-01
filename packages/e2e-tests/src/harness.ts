@@ -66,25 +66,38 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
 
 export class TestHarness {
     readonly mock: MockProvider;
-    readonly opencode: SpawnedOpencode;
-    readonly client: SdkClient;
-    /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
-    readonly rustStack: SpawnedOpencode["rustStack"];
 
+    private opencodeInstance: SpawnedOpencode;
+    private clientInstance: SdkClient;
     private contextDbCached: Database | null = null;
     private readonly expectMagicContext: boolean;
+    private readonly spawnOptions: SpawnOptions;
 
     private constructor(
         mock: MockProvider,
         opencode: SpawnedOpencode,
         client: SdkClient,
         expectMagicContext: boolean,
+        spawnOptions: SpawnOptions,
     ) {
         this.mock = mock;
-        this.opencode = opencode;
-        this.client = client;
-        this.rustStack = opencode.rustStack;
+        this.opencodeInstance = opencode;
+        this.clientInstance = client;
         this.expectMagicContext = expectMagicContext;
+        this.spawnOptions = spawnOptions;
+    }
+
+    get opencode(): SpawnedOpencode {
+        return this.opencodeInstance;
+    }
+
+    get client(): SdkClient {
+        return this.clientInstance;
+    }
+
+    /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
+    get rustStack(): SpawnedOpencode["rustStack"] {
+        return this.opencodeInstance.rustStack;
     }
 
     static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {
@@ -108,11 +121,33 @@ export class TestHarness {
             opencode = await spawnOpencode(spawnOpts);
             const sdk = await import("@opencode-ai/sdk");
             const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
-            return new TestHarness(mock, opencode, client, expectMagicContext);
+            return new TestHarness(mock, opencode, client, expectMagicContext, spawnOpts);
         } catch (error) {
             await Promise.allSettled([opencode?.kill() ?? Promise.resolve(), mock.stop()]);
             throw error;
         }
+    }
+
+    /** Restart OpenCode with the same isolated files and user config. */
+    async restart(): Promise<void> {
+        if (this.contextDbCached) {
+            try {
+                this.contextDbCached.close();
+            } catch {
+                // ignore close errors in test helpers
+            }
+            this.contextDbCached = null;
+        }
+        const env = this.opencodeInstance.env;
+        await this.opencodeInstance.kill();
+        this.opencodeInstance = await spawnOpencode({
+            ...this.spawnOptions,
+            existingEnv: env,
+        });
+        const sdk = await import("@opencode-ai/sdk");
+        this.clientInstance = sdk.createOpencodeClient({
+            baseUrl: this.opencodeInstance.url,
+        }) as unknown as SdkClient;
     }
 
     /** Create a session bound to the isolated workdir. Throws on failure. */

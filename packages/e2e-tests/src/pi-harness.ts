@@ -212,6 +212,12 @@ export class PiTestHarness {
     if (data?.cancelled) throw new Error("Pi new_session was cancelled by an extension");
   }
 
+  /** Restart Pi against the same isolated session, data, and config roots. */
+  async restart(): Promise<void> {
+    this.closeContextDb();
+    await this.rpc.restart();
+  }
+
   get lastTurn(): PiRunResult | null {
     return this.turns[this.turns.length - 1] ?? null;
   }
