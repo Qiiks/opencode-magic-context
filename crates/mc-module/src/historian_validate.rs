@@ -1650,6 +1650,26 @@ full narrative
     }
 
     #[test]
+    fn emergency_recovery_keeps_the_provisional_last_compartment() {
+        let text = xml(&[(1, 2, "first"), (3, 4, "provisional")], 5, "");
+        let validated = validate_historian_output(
+            &text,
+            &chunk(1, 4),
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect("emergency output remains publishable");
+
+        assert!(!validated.discarded_last);
+        assert_eq!(validated.compartments.len(), 2);
+        assert_eq!(validated.compartments[1].title, "provisional");
+        assert_eq!(validated.unprocessed_from, 5);
+    }
+
+    #[test]
     fn parser_requires_one_complete_output_root() {
         let rootless = r#"<compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments><meta><unprocessed_from>2</unprocessed_from></meta>"#;
         let truncated = r#"<output><compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments>"#;

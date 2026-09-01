@@ -20674,8 +20674,15 @@ mod tests {
     async fn handler_delta_d5_lineage_descent_forces_full_projection() {
         let target = "projection-lineage-target";
         let source = "projection-lineage-source";
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let resolver = FakeSessionResolver::with(&[
+            (target, FakeResolve::Hit(target.to_string())),
+            (source, FakeResolve::Hit(source.to_string())),
+        ]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
         handler.bind_route(7, binding(project.to_str().unwrap(), target));
         handler.bind_route(8, binding(project.to_str().unwrap(), source));
         let source_messages = (1..=10)
@@ -20705,6 +20712,41 @@ mod tests {
                 ],
             )
             .unwrap();
+        let project_path = project.to_str().unwrap();
+        let seeded_note_ids = store
+            .seed_authority_rows(
+                "context-db",
+                project_path,
+                "notes",
+                &[AuthoritySeedRow {
+                    source_row_id: 52,
+                    snapshot: json!({
+                        "type": "session",
+                        "project_path": project_path,
+                        "session_id": source,
+                        "content": "compiled note inherited by the successor",
+                        "status": "active",
+                        "surface_condition": "when descent completes",
+                        "compiled_provider": "retina-local-fs",
+                        "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}",
+                        "compiled_at": 5200,
+                        "compile_status": "compiled",
+                        "status_version": 3,
+                        "created_at": 5100,
+                        "updated_at": 5200,
+                    }),
+                }],
+            )
+            .unwrap();
+        let source_note = store
+            .get_note_by_id(project_path, source, seeded_note_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source_note.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(source_note.compiled_at, Some(5200));
         let source_epoch = store.load(source).unwrap().meta.revert_epoch;
         let summary = "This session is being continued from a previous conversation.\n\nSummary:\nDurable summary alpha\n\nFull transcript: /tmp/session.jsonl";
         let compaction_user = CkIngressMessage {
@@ -20783,6 +20825,30 @@ mod tests {
         assert_eq!(descended["timings"]["projection_reused_messages"], 0);
         assert_eq!(descended["timings"]["projection_projected_messages"], 2);
         assert!(store.load(target).unwrap().meta.descent_completed);
+
+        let inherited_notes = store
+            .search_notes_like(project_path, target, "compiled note inherited")
+            .unwrap();
+        assert_eq!(inherited_notes.len(), 1);
+        let inherited = store
+            .get_note_by_id(project_path, target, inherited_notes[0].id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(inherited.id, source_note.id);
+        assert_eq!(
+            inherited.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            inherited.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}")
+        );
+        assert_eq!(inherited.compiled_at, Some(5200));
+        assert_eq!(inherited.compile_status.as_deref(), Some("compiled"));
+        let successor_facade = tool_text(
+            call_facade_on_channel(&handler, 7, "ctx_note", json!({ "action": "read" })).await,
+        );
+        assert!(successor_facade.contains("compiled note inherited by the successor"));
     }
 
     #[tokio::test(flavor = "current_thread")]

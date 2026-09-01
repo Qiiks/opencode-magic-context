@@ -20623,6 +20623,132 @@ mod tests {
     }
 
     #[test]
+    fn migration_51_defaults_legacy_mappings_and_seed_upserts_mapping_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_context| Ok(String::new()),
+            )
+            .unwrap();
+        for function in ["mc_facade_authority_domain", "mc_facade_authority_route"] {
+            connection
+                .create_scalar_function(function, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                    Ok(String::new())
+                })
+                .unwrap();
+        }
+        connection
+            .execute(
+                "CREATE TABLE cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 )",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 50)
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version(namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO mc_memories(
+                     id, project_path, category, content, normalized_hash, status,
+                     first_seen_at, created_at, updated_at, last_seen_at
+                 ) VALUES (1, 'legacy-project', 'CONSTRAINTS', 'legacy', 'legacy-hash',
+                           'active', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
+                 VALUES (1, 'legacy-project', '[\"src/legacy.rs\"]', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let legacy_origin = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mapping_origin FROM mc_memory_mappings WHERE memory_id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(legacy_origin, "mapper");
+
+        let snapshot = |origin: &str, mapping: Value, updated_at: i64| AuthoritySeedRow {
+            source_row_id: 51,
+            snapshot: serde_json::json!({
+                "id": 51,
+                "project_path": "seed-project",
+                "category": "CONSTRAINTS",
+                "content": "seeded mapping",
+                "normalized_hash": "seed-hash",
+                "status": "active",
+                "mapping": mapping,
+                "mapping_origin": origin,
+                "updated_at": updated_at,
+            }),
+        };
+        store
+            .seed_authority_rows(
+                "context-seed",
+                "seed-project",
+                "memories",
+                &[snapshot("host_rejected_fallback", serde_json::json!([]), 2)],
+            )
+            .unwrap();
+        store
+            .seed_authority_rows(
+                "context-seed",
+                "seed-project",
+                "memories",
+                &[snapshot("mapper", serde_json::json!(["src/lib.rs"]), 3)],
+            )
+            .unwrap();
+        let seeded_mapping = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mapping.mapped_files_json, mapping.mapping_origin
+                       FROM mc_memory_mappings mapping
+                       JOIN mc_memories memory ON memory.id = mapping.memory_id
+                      WHERE memory.context_store_uuid = 'context-seed'
+                        AND memory.context_row_id = 51",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            seeded_mapping,
+            ("[\"src/lib.rs\"]".to_string(), "mapper".to_string())
+        );
+    }
+
+    #[test]
     fn migration_52_preserves_legacy_notes_and_durably_stores_compilation_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
