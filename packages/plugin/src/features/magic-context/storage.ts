@@ -213,6 +213,7 @@ export {
     resetLastNudgeCycle,
     resetLastNudgeCycleIfTailShrank,
     resetProtectedTailNoEligibleHead,
+    retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
     rollbackProtectedTailDrainReservation,
     setChannel1NudgeState,

@@ -2,7 +2,11 @@ import { describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase } from "../features/magic-context/storage";
+import { recordSessionProjectIdentity } from "../features/magic-context/session-project-storage";
+import {
+    markSessionCleanupPending,
+    openDatabase,
+} from "../features/magic-context/storage";
 import { startDreamScheduleTimer } from "./dream-timer";
 
 /**
@@ -80,6 +84,66 @@ describe("dream-timer registration cleanup", () => {
             cleanupReplacement?.();
             setIntervalSpy.mockRestore();
             clearIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    test("retries a durable Rust deletion through the matching project registration", async () => {
+        const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-rust-delete-"));
+        const timerHandle = {
+            unref: mock(() => {}),
+        } as unknown as ReturnType<typeof setInterval>;
+        const timeoutHandle = {
+            unref: mock(() => {}),
+        } as unknown as ReturnType<typeof setTimeout>;
+        const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+            (() => timeoutHandle) as typeof setTimeout,
+        );
+        let intervalCallback: (() => void) | undefined;
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+            callback: () => void,
+        ) => {
+            intervalCallback = callback;
+            return timerHandle;
+        }) as typeof setInterval);
+        const deleteSession = mock(async () => {});
+        const closeSession = mock(() => {});
+        const projectIdentity = "git:dream-timer-rust-delete";
+        const sessionId = "ses-dream-timer-rust-delete";
+        const db = openDatabase();
+        if (!db) throw new Error("test database unavailable");
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        markSessionCleanupPending(db, sessionId, true);
+        let cleanup: (() => void) | undefined;
+
+        try {
+            cleanup = await startDreamScheduleTimer({
+                directory,
+                projectIdentity,
+                harness: "opencode",
+                client: {} as never,
+                ensureRegistered: async () => undefined,
+                sessionCleanupModuleClient: { deleteSession, closeSession },
+            });
+            intervalCallback?.();
+            const pendingCount = () =>
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                    )
+                    .get(sessionId) as { count: number };
+            for (let attempt = 0; attempt < 100; attempt += 1) {
+                if (pendingCount().count === 0) break;
+                await Promise.resolve();
+            }
+
+            expect(deleteSession).toHaveBeenCalledWith(sessionId, directory);
+            expect(closeSession).toHaveBeenCalledWith(sessionId);
+            expect(pendingCount()).toEqual({ count: 0 });
+        } finally {
+            cleanup?.();
+            setTimeoutSpy.mockRestore();
+            setIntervalSpy.mockRestore();
             rmSync(directory, { recursive: true, force: true });
         }
     });

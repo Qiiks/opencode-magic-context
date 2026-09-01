@@ -50,6 +50,7 @@ import {
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
 import {
     openDatabase,
+    retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
     runSqliteOptimize,
 } from "../features/magic-context/storage";
@@ -128,6 +129,10 @@ interface ProjectRegistration {
             projectRoot?: string;
             domain: "memories" | "notes";
         }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
+    };
+    sessionCleanupModuleClient?: {
+        deleteSession(sessionId: string, projectRoot: string): Promise<void>;
+        closeSession?(sessionId: string): void;
     };
 }
 
@@ -293,7 +298,7 @@ function runTick(origin: "startup" | "interval"): void {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
             if (!db) return;
-            runMessageHistoryMaintenance(db);
+            await runMessageHistoryMaintenance(db);
             // Per-project work — git commit indexing, dream schedule check,
             // dream queue processing. We iterate all registered projects so
             // Desktop's "open all projects at once" workflow indexes every one,
@@ -316,12 +321,33 @@ function runTick(origin: "startup" | "interval"): void {
     })();
 }
 
-function runMessageHistoryMaintenance(db: Database): void {
+async function runMessageHistoryMaintenance(db: Database): Promise<void> {
     const cleanup = retryPendingSessionCleanups(db);
     if (cleanup.cleared > 0 || cleanup.failedSessionIds.length > 0) {
         log(
             `[message-index] pending session cleanup: cleared=${cleanup.cleared} failed=${cleanup.failedSessionIds.length}`,
         );
+    }
+
+    for (const registration of registeredProjects.values()) {
+        const moduleClient = registration.sessionCleanupModuleClient;
+        if (!moduleClient) continue;
+        const rustCleanup = await retryPendingRustSessionCleanupsForProject(
+            db,
+            registration.projectIdentity,
+            async (sessionId) => {
+                try {
+                    await moduleClient.deleteSession(sessionId, registration.directory);
+                } finally {
+                    moduleClient.closeSession?.(sessionId);
+                }
+            },
+        );
+        if (rustCleanup.cleared > 0 || rustCleanup.failedSessionIds.length > 0) {
+            log(
+                `[message-index] pending Rust session cleanup: cleared=${rustCleanup.cleared} failed=${rustCleanup.failedSessionIds.length}`,
+            );
+        }
     }
 
     const sweep = sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb);

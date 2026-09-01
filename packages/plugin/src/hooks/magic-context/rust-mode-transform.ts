@@ -3079,21 +3079,21 @@ export function createRustModeTransform(
 
     return {
         run,
-        clearSession(sessionId: string): void {
+        async clearSession(sessionId: string): Promise<void> {
             const projectRoot =
                 states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
             dropSlot(sessionId, "session-deleted");
             states.delete(sessionId);
             wireCaches.delete(sessionId);
             clearCompartmentMirrorCursor(sessionId);
-            if (projectRoot && options.moduleClient.deleteSession) {
-                void options.moduleClient
-                    .deleteSession(sessionId, projectRoot)
-                    .catch((error) => {
-                        sessionLog(sessionId, "rust module session deletion failed:", error);
-                    })
-                    .finally(() => options.moduleClient.closeSession?.(sessionId));
-            } else {
+            try {
+                if (projectRoot && options.moduleClient.deleteSession) {
+                    await options.moduleClient.deleteSession(sessionId, projectRoot);
+                }
+            } catch (error) {
+                sessionLog(sessionId, "rust module session deletion failed:", error);
+                throw error;
+            } finally {
                 options.moduleClient.closeSession?.(sessionId);
             }
         },

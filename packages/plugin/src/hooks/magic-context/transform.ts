@@ -2585,8 +2585,8 @@ export function createTransform(deps: TransformDeps) {
         invalidateRustWireState(sessionId: string): void {
             rustModeTransform?.invalidateWireState(sessionId);
         },
-        clearRustSession(sessionId: string): void {
-            rustModeTransform?.clearSession(sessionId);
+        async clearRustSession(sessionId: string): Promise<void> {
+            await rustModeTransform?.clearSession(sessionId);
         },
     });
 }

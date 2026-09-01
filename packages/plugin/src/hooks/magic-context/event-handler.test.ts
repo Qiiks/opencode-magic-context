@@ -9,6 +9,7 @@ import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     closeDatabase,
     getHistorianFailureState,
@@ -20,6 +21,7 @@ import {
     incrementHistorianFailure,
     insertTag,
     openDatabase,
+    retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
     setStrippedPlaceholderIds,
     updateSessionMeta,
@@ -949,6 +951,61 @@ describe("createEventHandler", () => {
                     "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
                 )
                 .get("ses-delete-retry"),
+        ).toEqual({ count: 0 });
+    });
+
+    it("keeps a failed Rust deletion durable until a project-scoped retry succeeds", async () => {
+        useTempDataHome("context-event-rust-delete-retry-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-retry";
+        const projectPath = "git:rust-delete-retry";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        const onSessionDeleted = mock(async () => {
+            throw new Error("module unavailable");
+        });
+        const handler = createEventHandler({
+            ...deps,
+            onSessionDeleted,
+            rustSessionCleanup: true,
+        });
+
+        await handler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: sessionId } },
+            },
+        });
+
+        expect(onSessionDeleted).toHaveBeenCalledWith(sessionId);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(retryPendingSessionCleanups(deps.db)).toEqual({
+            attempted: 0,
+            cleared: 0,
+            failedSessionIds: [],
+        });
+
+        const deleteSession = mock(async () => {});
+        await expect(
+            retryPendingRustSessionCleanupsForProject(
+                deps.db,
+                projectPath,
+                deleteSession,
+            ),
+        ).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+        expect(deleteSession).toHaveBeenCalledWith(sessionId);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
         ).toEqual({ count: 0 });
     });
 

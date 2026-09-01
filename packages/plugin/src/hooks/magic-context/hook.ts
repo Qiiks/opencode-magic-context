@@ -1219,32 +1219,31 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustWireInvalidated: (sessionId: string) => {
             transform.invalidateRustWireState(sessionId);
         },
-        // Clean up per-session state the system-prompt handler maintains so
-        // these module/closure-scope maps don't accumulate entries over the
-        // plugin's lifetime (Finding #3).
-        onSessionDeleted: (sessionId: string) => {
+        rustSessionCleanup: rustModeModuleClient !== undefined,
+        // Remove module-owned state before the context database drops the durable
+        // session→project binding needed to retry a failed module deletion.
+        onSessionDeleted: async (sessionId: string) => {
             dropSlot(sessionId, "session-deleted");
-            transform.clearRustSession(sessionId);
-            systemPromptHash.clearSession(sessionId);
-            // Prune every per-session map this hook closure owns. These
-            // accumulate one entry per session for the plugin process lifetime
-            // (which can span days/weeks across many sessions and subagents);
-            // without this, a long-lived process leaks memory steadily. Some
-            // maps are shared via liveSessionState — clearing on the terminal
-            // session.deleted event is correct since the session is gone.
-            lastHeuristicsTurnId.delete(sessionId);
-            clearToolPermissionDenied(sessionId);
-            commitSeenLastPass.delete(sessionId);
-            variantBySession.delete(sessionId);
-            liveModelBySession.delete(sessionId);
-            agentBySession.delete(sessionId);
-            sessionDirectoryBySession.delete(sessionId);
-            recompProgressBySession.delete(sessionId);
-            internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
-            channel1StateBySession.delete(sessionId);
-            channel2DirectiveTextBySession.delete(sessionId);
-            clearEmbedSessionState(sessionId);
+            try {
+                await transform.clearRustSession(sessionId);
+            } finally {
+                systemPromptHash.clearSession(sessionId);
+                // Prune every per-session map this hook closure owns. These maps
+                // otherwise accumulate for the lifetime of a long-running plugin process.
+                lastHeuristicsTurnId.delete(sessionId);
+                clearToolPermissionDenied(sessionId);
+                commitSeenLastPass.delete(sessionId);
+                variantBySession.delete(sessionId);
+                liveModelBySession.delete(sessionId);
+                agentBySession.delete(sessionId);
+                sessionDirectoryBySession.delete(sessionId);
+                recompProgressBySession.delete(sessionId);
+                internalChildSessions.delete(sessionId);
+                rustMemorySyncRequestedSessions.delete(sessionId);
+                channel1StateBySession.delete(sessionId);
+                channel2DirectiveTextBySession.delete(sessionId);
+                clearEmbedSessionState(sessionId);
+            }
         },
     });
 
