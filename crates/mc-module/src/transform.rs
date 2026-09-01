@@ -30158,6 +30158,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn caveman_age_tiers_cross_exact_boundaries_only_when_the_marker_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "caveman-age-tier-boundaries";
+        store
+            .replace_compartments(session, &[comp(1, 1, 1, "anchor", "covered")])
+            .unwrap();
+        let mut messages = vec![item("anchor", 1, "covered")];
+        messages.extend((1..=5u64).map(|index| {
+            item(
+                &format!("aged-{index}"),
+                index + 1,
+                &caveman_test_source(&format!("aged-{index}")),
+            )
+        }));
+        let mut request = req(session, "cfg", messages.clone());
+
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT+");
+        store.arm_soft_refresh(session).unwrap();
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT");
+        let first_units = stored_caveman_units(&store, session);
+        assert_eq!(
+            first_units
+                .iter()
+                .map(caveman_depth)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "five eligible rows place positions 0, 1, and 2 on the exact 20/40/60 percent tiers"
+        );
+        let first_basis = store.load(session).unwrap().meta.caveman_age_basis_tag;
+
+        messages.push(item("aged-6", 7, &caveman_test_source("aged-6")));
+        request.messages = messages;
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT+");
+        assert_eq!(
+            stored_caveman_units(&store, session),
+            first_units,
+            "tag minting beyond the frozen age basis must not retier on a defer"
+        );
+        assert_eq!(
+            store.load(session).unwrap().meta.caveman_age_basis_tag,
+            first_basis
+        );
+
+        store.arm_soft_refresh(session).unwrap();
+        assert_eq!(run(&store, &request, &spine()).action, "SOFT");
+        let advanced = stored_caveman_units(&store, session);
+        assert_eq!(advanced.len(), 4);
+        assert_eq!(
+            advanced.iter().map(caveman_depth).collect::<Vec<_>>(),
+            vec![3, 3, 2, 1],
+            "advancing the marker from five to six eligible rows crosses every exact tier boundary once"
+        );
+        assert_eq!(store.load(session).unwrap().meta.caveman_age_basis_tag, 7);
+    }
+
+    #[test]
     fn caveman_restart_replays_frozen_basis_until_an_independent_bust() {
         let dir = tempfile::tempdir().unwrap();
         let session = "caveman-restart-basis";

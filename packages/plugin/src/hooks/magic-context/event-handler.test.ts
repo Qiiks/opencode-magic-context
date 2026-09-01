@@ -44,6 +44,7 @@ import {
 import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
 import { createEventHandler } from "./event-handler";
 
 type ContextUsageCacheEntry = {
@@ -1136,6 +1137,45 @@ describe("createEventHandler", () => {
 
         const firstDelivery = handler(event);
         const secondDelivery = handler(event);
+        await Promise.resolve();
+        expect(calls).toBe(2);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        first.reject(new Error("first module delete failed"));
+        second.resolve();
+        await Promise.all([firstDelivery, secondDelivery]);
+
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("serializes two same-tick session.deleted events through the plugin event bus", async () => {
+        useTempDataHome("context-event-bus-rust-delete-concurrent-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-event-bus-concurrent";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        const first = deferred<void>();
+        const second = deferred<void>();
+        let calls = 0;
+        const magicEvent = createEventHandler({
+            ...deps,
+            rustSessionCleanup: true,
+            onSessionDeleted: mock(() => (calls++ === 0 ? first.promise : second.promise)),
+        });
+        const eventBus = createPluginEventHandler({
+            magicContext: { event: magicEvent as never },
+        });
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        const firstDelivery = eventBus(event as never);
+        const secondDelivery = eventBus(event as never);
         await Promise.resolve();
         expect(calls).toBe(2);
         expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);

@@ -3,6 +3,14 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	clearSession,
+	getOrCreateSessionMeta,
+	getTagsBySession,
+	insertTag,
+	openDatabase,
+	updateSessionMeta,
+} from "@magic-context/core/features/magic-context/storage";
+import {
 	cleanupTestTempDir,
 	createTestTempDir,
 } from "@magic-context/core/shared/test-temp-dir";
@@ -322,6 +330,36 @@ describe("Pi in-process child guard (#247)", () => {
 			);
 		}
 	}, 20_000);
+
+	it("Pi lifecycle adjudication: reversible switch and shutdown preserve durable session state", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		const sessionId = "ses-pi-reversible-lifecycle-pin";
+		const db = openDatabase();
+		try {
+			await magicContextPiExtension(runtime.pi);
+			insertTag(db, sessionId, "m-1", "message", 100, 1);
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 61,
+				lastInputTokens: 61_000,
+			});
+			const ctx = {
+				sessionManager: { getSessionId: () => sessionId },
+				ui: { setStatus: () => undefined },
+			};
+
+			await runtime.emitPiEvent("session_before_switch", {}, ctx);
+			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(61_000);
+
+			await runtime.emitPiEvent("session_shutdown", {}, ctx);
+			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(61_000);
+		} finally {
+			clearSession(db, sessionId);
+		}
+	}, 15_000);
 
 	it("unsubscribes child lifecycle listeners on session shutdown", async () => {
 		isolateXdgEnv();
