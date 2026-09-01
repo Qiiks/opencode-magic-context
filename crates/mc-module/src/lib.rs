@@ -15266,10 +15266,19 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     // verification a queryable build identity instead of binary archaeology.
     // build_provenance is the subc-protocol library call (re-exported through
     // subc-client-rs); it normalizes sentinel/empty values to field omission.
-    .provenance(Some(
-        build_provenance(option_env!("MC_BUILD_SHA"), None, None)
-            .expect("compile-time MC build provenance is valid"),
-    ))
+    // Provenance is a deploy marker, not a load-bearing capability: a
+    // non-canonical stamp (subc-protocol 0.17 requires full lowercase 40-hex;
+    // short `rev-parse --short` stamps fail its form check) must degrade to
+    // omission, never panic the module at boot. Deploy verification greps for
+    // the marker and fails loudly on absence, which is the correct failure
+    // surface for a malformed stamp.
+    .provenance(match build_provenance(option_env!("MC_BUILD_SHA"), None, None) {
+        Ok(provenance) => Some(provenance),
+        Err(err) => {
+            eprintln!("mc-module: MC_BUILD_SHA rejected by provenance form check, omitting deploy marker: {err}");
+            None
+        }
+    })
     .provides(vec![ProviderRole::ToolProvider {
         tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -32108,5 +32117,24 @@ mod tests {
         for property in ["message", "start", "end"] {
             assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_form_degradation {
+    use subc_client_rs::build_provenance;
+
+    // Short 8-hex deploy stamps (the pre-0.17 ladder convention) must fail the
+    // canonical form check — this pins WHY the manifest call site degrades to
+    // omission instead of unwrapping.
+    #[test]
+    fn short_sha_is_rejected_by_form_check_and_full_sha_is_accepted() {
+        assert!(build_provenance(Some("22464bf2"), None, None).is_err());
+        let ok = build_provenance(Some("22464bf25db24c4037f5efda72c8bb02d64baf51"), None, None)
+            .expect("full lowercase 40-hex sha is canonical");
+        assert_eq!(
+            ok.build_git_sha.as_deref(),
+            Some("22464bf25db24c4037f5efda72c8bb02d64baf51")
+        );
     }
 }
