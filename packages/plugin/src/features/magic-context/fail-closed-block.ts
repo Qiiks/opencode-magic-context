@@ -225,8 +225,8 @@ export function formatFailClosedBlockingMessage(reason: FailClosedReason): strin
             ].join(" ");
         }
         return [
-            `Magic Context cannot migrate the shared database because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
-            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
+            `Magic Context cannot migrate the shared database (one database serves every project on this machine) because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
+            "Restart the blocking process — even one from a different project — and it will pick up the new build and migrate on start; or shut it down and retry.",
             `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
         ].join(" ");
     }

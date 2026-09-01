@@ -53,8 +53,9 @@ describe("formatFailClosedBlockingMessage", () => {
         expect(message).toContain("OpenCode instance (TUI/CLI) (PID 5737)");
         expect(message).toContain("an older Magic Context build");
         expect(message).toContain("would fail against the migrated database");
+        expect(message).toContain("one database serves every project on this machine");
         expect(message).toContain(
-            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
+            "Restart the blocking process — even one from a different project — and it will pick up the new build and migrate on start; or shut it down and retry.",
         );
         expect(message).not.toContain("OpenCode server (PID 5737)");
         expect(message).not.toContain("fence");
