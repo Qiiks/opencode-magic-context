@@ -15266,11 +15266,19 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     // verification a queryable build identity instead of binary archaeology.
     // build_provenance is the subc-protocol library call (re-exported through
     // subc-client-rs); it normalizes sentinel/empty values to field omission.
-    .provenance(Some(build_provenance(
-        option_env!("MC_BUILD_SHA"),
-        None,
-        None,
-    )))
+    // Provenance is a deploy marker, not a load-bearing capability: a
+    // non-canonical stamp (subc-protocol 0.17 requires full lowercase 40-hex;
+    // short `rev-parse --short` stamps fail its form check) must degrade to
+    // omission, never panic the module at boot. Deploy verification greps for
+    // the marker and fails loudly on absence, which is the correct failure
+    // surface for a malformed stamp.
+    .provenance(match build_provenance(option_env!("MC_BUILD_SHA"), None, None) {
+        Ok(provenance) => Some(provenance),
+        Err(err) => {
+            eprintln!("mc-module: MC_BUILD_SHA rejected by provenance form check, omitting deploy marker: {err}");
+            None
+        }
+    })
     .provides(vec![ProviderRole::ToolProvider {
         tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -16890,6 +16898,72 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
         (handler, store, dir, project)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_mural_write_family_is_hash_gated_and_claude_code_inherits_by_project() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+        let mural_a = "data:image/png;base64,YQ==";
+
+        let mut first = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        first["serializer_profile"] = json!("opencode-aisdk");
+        first["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": mural_a,
+            "content_hash": "mural-a",
+        });
+        let first_response = call_transform_request(&handler, first).await;
+        assert_eq!(first_response["status"], "ok", "{first_response}");
+        let artifact = store
+            .load_project_mural_artifact(&project_path)
+            .unwrap()
+            .expect("OpenCode host artifact");
+        assert_eq!(artifact.data_url, mural_a.as_bytes());
+        assert_eq!(artifact.content_hash, "mural-a");
+
+        let mut same_hash = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        same_hash["serializer_profile"] = json!("opencode-aisdk");
+        same_hash["render_config"] = json!("cfg1");
+        same_hash["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,c2FtZS1oYXNoLWRyaWZ0",
+            "content_hash": "mural-a",
+        });
+        let same_hash_response = call_transform_request(&handler, same_hash).await;
+        assert_eq!(same_hash_response["status"], "ok", "{same_hash_response}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(&project_path)
+                .unwrap()
+                .expect("hash-gated artifact"),
+            artifact,
+        );
+
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "claude-code", "cc-ses"),
+        );
+        let mut claude_code = request(vec![ck("cc-1", 1, "Claude Code tail")]);
+        claude_code["serializer_profile"] = json!("claude-code-anthropic");
+        claude_code["session_id"] = json!("cc-ses");
+        claude_code["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,dW50cnVzdGVkLWNjLWJ5dGVz",
+            "content_hash": "untrusted-cc-hash",
+        });
+        let claude_code_response = call_transform_request(&handler, claude_code).await;
+        assert_eq!(
+            claude_code_response["status"], "ok",
+            "{claude_code_response}"
+        );
+        let response_bytes = serde_json::to_string(&claude_code_response).unwrap();
+        assert!(response_bytes.contains(mural_a));
+        assert!(!response_bytes.contains("dW50cnVzdGVkLWNjLWJ5dGVz"));
     }
 
     #[test]
@@ -32043,5 +32117,24 @@ mod tests {
         for property in ["message", "start", "end"] {
             assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_form_degradation {
+    use subc_client_rs::build_provenance;
+
+    // Short 8-hex deploy stamps (the pre-0.17 ladder convention) must fail the
+    // canonical form check — this pins WHY the manifest call site degrades to
+    // omission instead of unwrapping.
+    #[test]
+    fn short_sha_is_rejected_by_form_check_and_full_sha_is_accepted() {
+        assert!(build_provenance(Some("22464bf2"), None, None).is_err());
+        let ok = build_provenance(Some("22464bf25db24c4037f5efda72c8bb02d64baf51"), None, None)
+            .expect("full lowercase 40-hex sha is canonical");
+        assert_eq!(
+            ok.build_git_sha.as_deref(),
+            Some("22464bf25db24c4037f5efda72c8bb02d64baf51")
+        );
     }
 }
