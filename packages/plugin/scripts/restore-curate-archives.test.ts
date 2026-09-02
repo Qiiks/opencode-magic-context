@@ -17,7 +17,7 @@ afterEach(() => {
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(): { db: Database; path: string; affectedIds: number[] } {
+function fixture(): { db: Database; path: string; affectedIds: number[]; legacyId: number } {
     const root = mkdtempSync(join(tmpdir(), "restore-curate-archives-"));
     roots.push(root);
     const path = join(root, "context.db");
@@ -104,6 +104,17 @@ function fixture(): { db: Database; path: string; affectedIds: number[] } {
             ).lastInsertRowid,
         ),
     ];
+    const legacyId = Number(
+        insert.run(
+            "project-a",
+            "USER_PREFERENCES",
+            "Prefer concise responses.",
+            90,
+            "archived",
+            null,
+            JSON.stringify({ archive_reason: reason }),
+        ).lastInsertRowid,
+    );
     insert.run(
         "project-a",
         "ARCHITECTURE",
@@ -145,11 +156,17 @@ function fixture(): { db: Database; path: string; affectedIds: number[] } {
     db.prepare(
         "INSERT INTO project_state (project_path, project_memory_epoch, project_user_profile_version, updated_at) VALUES (?, ?, 0, 1)",
     ).run("project-a", 4);
-    return { db, path, affectedIds };
+    return { db, path, affectedIds, legacyId };
 }
 
 function count(db: Database, sql: string): number {
     return (db.prepare(sql).get() as { count: number }).count;
+}
+
+function getMemoryStatus(db: Database, id: number): string | undefined {
+    return (db.prepare("SELECT status FROM memories WHERE id = ?").get(id) as
+        | { status: string }
+        | undefined)?.status;
 }
 
 describe("restore-curate-archives", () => {
@@ -175,8 +192,8 @@ describe("restore-curate-archives", () => {
         }
     });
 
-    test("dry-run reports grouped casualties and exact high-importance ids without writes", () => {
-        const { db, affectedIds } = fixture();
+    test("dry-run reports canonical-category casualties and excludes legacy categories", () => {
+        const { db, affectedIds, legacyId } = fixture();
         try {
             const before = db.serialize();
             const report = restoreCurateArchives(db, { apply: false, now: 1_788_336_000_000 });
@@ -188,6 +205,8 @@ describe("restore-curate-archives", () => {
                 affectedIds[1],
                 affectedIds[3],
             ]);
+            expect(report.highImportanceIds).not.toContain(legacyId);
+            expect(report.groups.some((group) => group.category === "USER_PREFERENCES")).toBe(false);
             expect(report.groups).toEqual([
                 {
                     project: "project-a",
@@ -225,7 +244,7 @@ describe("restore-curate-archives", () => {
     });
 
     test("apply restores rows, logs updates, bumps each project epoch once, and is idempotent", () => {
-        const { db, affectedIds } = fixture();
+        const { db, affectedIds, legacyId } = fixture();
         try {
             const first = restoreCurateArchives(db, { apply: true, now: 1_788_336_000_000 });
             expect(first.total).toBe(4);
@@ -244,6 +263,7 @@ describe("restore-curate-archives", () => {
                 metadata_json: string;
             }>;
             expect(rows.every((row) => row.status === "active")).toBe(true);
+            expect(getMemoryStatus(db, legacyId)).toBe("archived");
             expect(rows.every((row) => row.superseded_by_memory_id === null)).toBe(true);
             expect(
                 rows.every((row) => {

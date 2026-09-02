@@ -441,12 +441,16 @@ const ctxMemoryArgsShape = {
         .string()
         .optional()
         .describe("Why the memory is being archived (optional, recommended)"),
-    superseded_by: tool.schema
-        .number()
-        .optional()
-        .describe("Active same-project/category memory that survives a curate consolidation"),
 };
-const ctxMemoryArgsSchema = tool.schema.object(ctxMemoryArgsShape).passthrough();
+const ctxMemoryArgsSchema = tool.schema
+    .object({
+        ...ctxMemoryArgsShape,
+        // The scheduled Curate integration is the only caller that uses this
+        // field. Exclude it from the standard provider schema, but validate its
+        // type when Curate sends it.
+        superseded_by: tool.schema.number().optional(),
+    })
+    .passthrough();
 
 function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
     const allowedActions = getAllowedActions(deps);

@@ -109,48 +109,53 @@ const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
 
 const GET_MAX_IDS = 20;
 
-const ParamsSchema = Type.Object(
+const ParamsShape = {
+	action: Type.Optional(
+		Type.Union(
+			ALL_ACTIONS.map((a) => Type.Literal(a)),
+			{
+				description: "What to do: write, update, archive, merge, get, or list",
+			},
+		),
+	),
+	content: Type.Optional(
+		Type.String({
+			description:
+				"The memory text — one standalone fact (required for write, update, merge)",
+		}),
+	),
+	category: Type.Optional(
+		Type.Union(
+			V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
+			{
+				description:
+					"What kind of fact this is (required for write; optional merge override)",
+			},
+		),
+	),
+	ids: Type.Optional(
+		Type.Array(Type.Number(), {
+			description:
+				"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+		}),
+	),
+	limit: Type.Optional(
+		Type.Number({
+			description: "Max results for list (default: 10)",
+		}),
+	),
+	reason: Type.Optional(
+		Type.String({
+			description: "Why the memory is being archived (optional, recommended)",
+		}),
+	),
+};
+const PrimaryParamsSchema = Type.Object(ParamsShape, {
+	additionalProperties: true,
+});
+const DreamerParamsSchema = Type.Object(
 	{
-		action: Type.Optional(
-			Type.Union(
-				ALL_ACTIONS.map((a) => Type.Literal(a)),
-				{
-					description:
-						"What to do: write, update, archive, merge, get, or list",
-				},
-			),
-		),
-		content: Type.Optional(
-			Type.String({
-				description:
-					"The memory text — one standalone fact (required for write, update, merge)",
-			}),
-		),
-		category: Type.Optional(
-			Type.Union(
-				V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
-				{
-					description:
-						"What kind of fact this is (required for write; optional merge override)",
-				},
-			),
-		),
-		ids: Type.Optional(
-			Type.Array(Type.Number(), {
-				description:
-					"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
-			}),
-		),
-		limit: Type.Optional(
-			Type.Number({
-				description: "Max results for list (default: 10)",
-			}),
-		),
-		reason: Type.Optional(
-			Type.String({
-				description: "Why the memory is being archived (optional, recommended)",
-			}),
-		),
+		...ParamsShape,
 		superseded_by: Type.Optional(
 			Type.Number({
 				description:
@@ -161,7 +166,7 @@ const ParamsSchema = Type.Object(
 	{ additionalProperties: true },
 );
 
-type CtxMemoryParams = Static<typeof ParamsSchema>;
+type CtxMemoryParams = Static<typeof DreamerParamsSchema>;
 
 function ok(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
@@ -357,7 +362,7 @@ export interface CtxMemoryToolDeps {
 
 export function createCtxMemoryTool(
 	deps: CtxMemoryToolDeps,
-): ToolDefinition<typeof ParamsSchema> {
+): ToolDefinition<typeof PrimaryParamsSchema | typeof DreamerParamsSchema> {
 	const dreamerAllowed = deps.allowDreamerActions === true;
 	const resolveProject =
 		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
@@ -369,7 +374,7 @@ export function createCtxMemoryTool(
 		name: "ctx_memory",
 		label: "Magic Context: Memory",
 		description,
-		parameters: ParamsSchema,
+		parameters: dreamerAllowed ? DreamerParamsSchema : PrimaryParamsSchema,
 		async execute(
 			_toolCallId,
 			params: CtxMemoryParams,

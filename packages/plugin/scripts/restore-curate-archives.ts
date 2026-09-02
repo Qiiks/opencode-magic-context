@@ -37,6 +37,13 @@ export interface RestoreReport {
 
 const PROFILE_REFERENCE = /\buser(?:[\s_-]+)(?:profile|preferences?)\b/i;
 const REDUNDANCY_SHAPE = /\b(?:redundan\w*|duplicat\w*|overlap\w*|subsum\w*|same\s+as)\b/i;
+const CANONICAL_PROJECT_CATEGORIES = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+] as const;
 
 function matchesCurateUserProfileArchive(reason: string): boolean {
     return PROFILE_REFERENCE.test(reason) && REDUNDANCY_SHAPE.test(reason);
@@ -92,10 +99,11 @@ function loadCandidates(db: Database): ArchivedMemoryRow[] {
                FROM memories AS m
                LEFT JOIN memories AS successor
                  ON successor.id = m.superseded_by_memory_id
-              WHERE m.status = 'archived'
-              ORDER BY m.project_path, m.category, m.id`,
+               WHERE m.status = 'archived'
+                 AND m.category IN (?, ?, ?, ?, ?)
+               ORDER BY m.project_path, m.category, m.id`,
         )
-        .all() as ArchivedMemoryRow[];
+        .all(...CANONICAL_PROJECT_CATEGORIES) as ArchivedMemoryRow[];
     return rows.filter(
         (row) =>
             row.successor_status !== "active" &&

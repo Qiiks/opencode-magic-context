@@ -26,6 +26,9 @@ describe("createCtxMemoryTool", () => {
 				allowDreamerActions: true,
 			});
 
+			expect(primary.parameters.properties).not.toHaveProperty("superseded_by");
+			expect(dreamer.parameters.properties).toHaveProperty("superseded_by");
+
 			const ctx = fakeContext("ses-memory") as never;
 			const primaryResult = await primary.execute(
 				"call-1",

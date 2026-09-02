@@ -58,11 +58,11 @@
       "ctx_reduce": { "chars": 91, "tokens": 31 },
       "ctx_expand": { "chars": 791, "tokens": 177 },
       "ctx_note": { "chars": 1366, "tokens": 317 },
-      "ctx_memory": { "chars": 963, "tokens": 228 },
+      "ctx_memory": { "chars": 840, "tokens": 201 },
       "ctx_search": { "chars": 777, "tokens": 184 },
-      "totalTokens": 937
+      "totalTokens": 910
     },
-    "builtInProviderVisibleTotal": 4587
+    "builtInProviderVisibleTotal": 4560
   },
   "mutableProseBaseline": 3650,
   "integerLightCeiling": 1825,
