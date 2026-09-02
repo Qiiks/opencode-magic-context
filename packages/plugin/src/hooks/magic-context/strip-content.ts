@@ -705,12 +705,13 @@ export function findTrailingBlankDecisionCandidates(
 /**
  * Replay persisted choices after all other message mutations. Keep decisions
  * preserve the canonical blank suffix first served for that message; strip decisions
- * remove a later blank suffix unless that would expose terminal reasoning. Never
- * delete the newest assistant's suffix in either message representation.
+ * remove a blank suffix unless that would expose terminal reasoning. Applying strip
+ * while the assistant is newest keeps its suffix unchanged from streaming, which has
+ * no step-finish sentinel, through completion and later historical replays.
  */
 export function applyFrozenTrailingBlankDecisions(
     messages: MessageLike[],
-    newestAssistantId: string | undefined,
+    _newestAssistantId: string | undefined,
     frozenDecisions: ReadonlyMap<string, TrailingBlankDecision>,
 ): number {
     let mutations = 0;
@@ -770,7 +771,7 @@ export function applyFrozenTrailingBlankDecisions(
             continue;
         }
 
-        if (id === newestAssistantId || trailingCount === 0) continue;
+        if (trailingCount === 0) continue;
         const lastMeaningfulPart = message.parts[lastMeaningfulIndex];
         if (
             isRecord(lastMeaningfulPart) &&
