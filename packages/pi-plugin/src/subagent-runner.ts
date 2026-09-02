@@ -31,6 +31,7 @@ import {
 	resolveModelRefForPi,
 } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import type { ResolvedModelEntry } from "@magic-context/core/shared/model-resolution";
 import type {
 	SubagentProgressEvent,
@@ -1348,7 +1349,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				stderr += text;
 				// Cap to prevent unbounded growth on chatty failures.
 				if (stderr.length > 16_000) {
-					stderr = `${stderr.slice(0, 16_000)}…[truncated]`;
+					stderr = `…[truncated]${stderr.slice(-16_000)}`;
 				}
 				emitProgress({ type: "stderr", chunk: text });
 			});
@@ -1598,7 +1599,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					settle({
 						ok: false,
 						reason: "timeout",
-						error: `pi subagent timed out after ${options.timeoutMs}ms${progressSuffix}${stderr.length > 0 ? ` | stderr: ${stderr.slice(0, 500)}` : ""}`,
+						error: `pi subagent timed out after ${options.timeoutMs}ms${progressSuffix}${stderr.length > 0 ? ` | stderr: ${summarizeChildStderr(stderr)}` : ""}`,
 						durationMs: Date.now() - startTime,
 						meta: {
 							stderr: stderr.length > 0 ? stderr : undefined,
@@ -1734,7 +1735,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					settle({
 						ok: false,
 						reason: "non_zero_exit",
-						error: `pi exited (code=${code}, signal=${signal}) without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+						error: `pi exited (code=${code}, signal=${signal}) without emitting agent_end. stderr: ${summarizeChildStderr(stderr) || "(empty)"}`,
 						durationMs: Date.now() - startTime,
 						meta: {
 							stderr: stderr.length > 0 ? stderr : undefined,
@@ -1748,7 +1749,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				settle({
 					ok: false,
 					reason: "no_assistant",
-					error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+					error: `pi exited successfully without emitting agent_end. stderr: ${summarizeChildStderr(stderr) || "(empty)"}`,
 					durationMs: Date.now() - startTime,
 					meta: {
 						stderr: stderr.length > 0 ? stderr : undefined,

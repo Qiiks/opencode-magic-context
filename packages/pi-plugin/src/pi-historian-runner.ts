@@ -112,6 +112,7 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import type {
 	ModelInput,
 	ResolvedModelEntry,
@@ -777,11 +778,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 								`historian[${passLabel}] terminal @${event.ms}ms stopReason=${event.stopReason ?? "?"} textLen=${event.textLength} hasToolCall=${event.hasToolCall}`,
 							);
 						} else if (event.type === "stderr") {
-							const cleaned = event.chunk.replace(/\s+/g, " ").trim();
+							const cleaned = summarizeChildStderr(event.chunk)
+								.replace(/\s+/g, " ")
+								.trim();
 							if (cleaned.length > 0) {
 								sessionLog(
 									sessionId,
-									`historian[${passLabel}] stderr: ${cleaned.slice(0, 500)}`,
+									`historian[${passLabel}] stderr: ${cleaned}`,
 								);
 							}
 						} else if (event.type === "child_exit") {
