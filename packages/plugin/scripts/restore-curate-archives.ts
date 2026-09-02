@@ -171,7 +171,12 @@ export function restoreCurateArchives(
         );
         for (const row of candidates) {
             const result = update.run(restoredMetadata(row.metadata_json), now, row.id);
-            if (result.changes !== 1) continue;
+            // bun:sqlite reports trigger-fired writes in `changes` (a one-row memories
+            // UPDATE reads 5 on the production schema: FTS delete+insert plus the
+            // authority mirror triggers), so equality against 1 silently skips every
+            // row after its UPDATE has already committed. Any positive count means
+            // the guarded UPDATE matched.
+            if (Number(result.changes) < 1) continue;
             logMutation.run(row.project_path, row.id, row.category, row.content, now);
             restored.push(row);
             projects.add(row.project_path);

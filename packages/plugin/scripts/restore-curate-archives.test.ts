@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { initializeDatabase } from "../src/features/magic-context/storage-db";
 import {
     formatRestoreReport,
     RESTORE_REASON,
@@ -22,40 +23,45 @@ function fixture(): { db: Database; path: string; affectedIds: number[]; legacyI
     roots.push(root);
     const path = join(root, "context.db");
     const db = new Database(path);
-    db.exec(`
-        CREATE TABLE memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_path TEXT NOT NULL,
-            category TEXT NOT NULL,
-            content TEXT NOT NULL,
-            importance INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            superseded_by_memory_id INTEGER,
-            metadata_json TEXT,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE memory_mutation_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_path TEXT NOT NULL,
-            mutation_type TEXT NOT NULL CHECK (mutation_type IN ('archive', 'delete', 'update', 'superseded')),
-            target_memory_id INTEGER NOT NULL,
-            superseded_by_id INTEGER,
-            category TEXT,
-            new_content TEXT,
-            queued_at INTEGER NOT NULL
-        );
-        CREATE TABLE project_state (
-            project_path TEXT PRIMARY KEY,
-            project_memory_epoch INTEGER NOT NULL DEFAULT 0,
-            project_user_profile_version INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL
-        );
-    `);
-    const insert = db.prepare(`
+    // The production schema, not a hand-rolled subset: the memories table carries
+    // AFTER UPDATE triggers (FTS maintenance, authority mirror) and bun:sqlite
+    // folds trigger-fired writes into `changes`, so a one-row UPDATE reads well
+    // above 1. A trigger-free fixture let an equality check on `changes` pass here
+    // while skipping every row against the live database.
+    initializeDatabase(db);
+    const triggerCount = count(
+        db,
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'memories'",
+    );
+    if (triggerCount === 0) throw new Error("fixture must carry the production memories triggers");
+    let seq = 0;
+    const insertStatement = db.prepare(`
         INSERT INTO memories
-            (project_path, category, content, importance, status, superseded_by_memory_id, metadata_json, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            (project_path, category, content, normalized_hash, importance, status, superseded_by_memory_id, metadata_json,
+             first_seen_at, created_at, updated_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, 1)
     `);
+    const insert = {
+        run: (
+            project: string,
+            category: string,
+            content: string,
+            importance: number,
+            status: string,
+            successor: number | null,
+            metadata: string | null,
+        ) =>
+            insertStatement.run(
+                project,
+                category,
+                content,
+                `hash-${seq++}`,
+                importance,
+                status,
+                successor,
+                metadata,
+            ),
+    };
     const reason =
         "Redundant with global user profile directives (U2, U3) or superseded by canonical memory entries.";
     const affectedIds = [
@@ -154,7 +160,7 @@ function fixture(): { db: Database; path: string; affectedIds: number[]; legacyI
         JSON.stringify({ archive_reason: reason }),
     );
     db.prepare(
-        "INSERT INTO project_state (project_path, project_memory_epoch, project_user_profile_version, updated_at) VALUES (?, ?, 0, 1)",
+        "INSERT INTO project_state (project_path, project_memory_epoch, project_user_profile_version, updated_at) VALUES (?, ?, 0, 1) ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = excluded.project_memory_epoch",
     ).run("project-a", 4);
     return { db, path, affectedIds, legacyId };
 }
