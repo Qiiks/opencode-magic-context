@@ -25,6 +25,28 @@ import { createCtxSearchTool } from "./ctx-search";
 import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
+const CTX_MEMORY_TOOL_NAME = "ctx_memory";
+
+/**
+ * Keep Pi's active tool set aligned with the current project's memory policy.
+ * The definition stays registered so a later session can re-enable it without
+ * restarting the Pi process; the ctx_memory call-time guard remains in place.
+ */
+export function syncCtxMemoryToolEnabled(
+	pi: Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">,
+	memoryEnabled: boolean,
+): void {
+	const activeTools = pi.getActiveTools();
+	const isActive = activeTools.includes(CTX_MEMORY_TOOL_NAME);
+	if (memoryEnabled === isActive) return;
+
+	pi.setActiveTools(
+		memoryEnabled
+			? [...activeTools, CTX_MEMORY_TOOL_NAME]
+			: activeTools.filter((toolName) => toolName !== CTX_MEMORY_TOOL_NAME),
+	);
+}
+
 export interface RegisterToolsOptions {
 	db: ContextDatabase;
 	ensureProjectRegistered?: (

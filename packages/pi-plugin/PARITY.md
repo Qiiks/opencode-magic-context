@@ -763,31 +763,28 @@ firmly outside this edge. If it ever surfaces, the clean Pi fix is
 
 ---
 
-## 24. `ctx_memory` registration: OpenCode gates on launch config; Pi always registers + relies on the per-call guard
+## 24. `ctx_memory` visibility: OpenCode omits registration; Pi enables it per session
 
 When `memory.enabled` is false, the `<project-memory>` block is never injected,
-so an agent's `ctx_memory` writes can never resurface. Both harnesses drop the
-ctx_memory PROMPT guidance for a memory-off project, but they register the TOOL
-differently:
+so an agent's `ctx_memory` writes can never resurface. Both harnesses remove
+`ctx_memory` guidance from the system prompt and keep the call-time memory gate,
+but they control model visibility through their host-specific tool lifecycle:
 
-- **OpenCode** gates tool registration on `memory.enabled` in
-  `tool-registry.ts`. This is consistent because the registry and the system
-  prompt both read the SAME launch-resolved config for a given session, so the
-  tool's presence always matches the prompt's guidance.
-- **Pi** must ALWAYS register `ctx_memory` in the main extension entry
-  (`index.ts`, `memoryToolEnabled: true`). Pi is a single long-lived REPL that
-  can `/cd` between projects: tool registration happens once at boot, but the
-  system prompt re-resolves `memory.enabled` per project every pass. Gating
-  registration on the boot project would mismatch after a switch (tool absent
-  while prompt advertises it, or vice-versa). Instead Pi leans on the tool's own
-  per-call guard (`ctx-memory.ts` → `getProjectEmbeddingSnapshot(projectIdentity)`),
-  which refuses with "Cross-session memory is disabled for this project" when the
-  CURRENT project has memory off. OpenCode's handler carries the identical guard,
-  so behavior matches; only the registration strategy differs.
+- **OpenCode** omits `ctx_memory` from registration in `tool-registry.ts` when
+  the launch-resolved project config disables memory. The registry and prompt
+  read the same session config, so the tool is absent with its guidance.
+- **Pi** registers the `ctx_memory` definition once, then calls Pi's
+  `getActiveTools()` / `setActiveTools()` at every `session_start` using that
+  session's resolved project config. A memory-off session removes it from the
+  enabled set; a memory-on session restores it. `session_start` also covers Pi
+  reloads, and its config cache is invalidated first, so a config flip applies
+  to the next session without restarting Pi. A `/cd` change inside an already
+  active session waits for the next session/reload; the existing call-time guard
+  still refuses a stale enabled tool in the meantime.
 
-Note: Pi's `memoryToolEnabled` flag still exists and is still used by the
-SUBAGENT entry (`subagent-entry.ts`) to keep `ctx_memory` off the retrieval-only
-sidekick, a separate security concern, unaffected by this divergence.
+Pi's `memoryToolEnabled` registration flag remains for the lean SUBAGENT entry
+(`subagent-entry.ts`) to keep `ctx_memory` off the retrieval-only sidekick, a
+separate security boundary unaffected by the main-session activation behavior.
 
 ---
 
