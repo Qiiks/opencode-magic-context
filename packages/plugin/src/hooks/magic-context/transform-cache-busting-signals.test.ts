@@ -24,12 +24,15 @@ import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
+    getPendingOps,
     openDatabase,
+    queuePendingOp,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { registerActiveCompartmentRun } from "./compartment-runner";
+import { createChatMessageHook } from "./hook-handlers";
 import { createTransform } from "./transform";
 
 /**
@@ -520,6 +523,67 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         expect(JSON.stringify(secondMessages[0])).toBe(firstWire);
         expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
         expect(deferredMaterializationSessions.has(sessionId)).toBe(true);
+    });
+
+    it("Fable 5.1 variant change keeps the next pass deferred and pending ops untouched", async () => {
+        useTempDataHome("ctx-fable-variant-defer-");
+        const sessionId = "ses-fable-variant-defer";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const lastHeuristicsTurnId = new Map<string, string>();
+        const liveModelBySession = new Map<string, { providerID: string; modelID: string }>();
+        const shouldExecute = mock(() => "defer" as const);
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            liveModelBySession,
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+            clearReasoningAge: 50,
+            protectedTags: 0,
+        });
+        await transform({}, { messages: buildSimpleMessages(sessionId) });
+        shouldExecute.mockClear();
+        queuePendingOp(db, sessionId, 1, "drop");
+
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession,
+            variantBySession: new Map<string, string | undefined>(),
+            agentBySession: new Map<string, string>(),
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "high",
+            model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "medium",
+            model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+        });
+
+        expect(historyRefreshSessions.size).toBe(0);
+        expect(systemPromptRefreshSessions.size).toBe(0);
+        expect(pendingMaterializationSessions.size).toBe(0);
+        const nextPass = buildSimpleMessages(sessionId);
+        await transform({}, { messages: nextPass });
+        expect(shouldExecute).toHaveBeenCalled();
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
     });
 
     it("keeps ignored Desktop command output byte-stable across three quiet passes", async () => {

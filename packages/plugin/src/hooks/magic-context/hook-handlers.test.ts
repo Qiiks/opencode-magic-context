@@ -570,6 +570,31 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
+    test("Fable 5.1 variant flip signals nothing and leaves pending materialization untouched", async () => {
+        const sets = freshSets();
+        sets.lastHeuristicsTurnId.set("ses", "turn-1");
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "medium",
+                model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+            });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
+            expect(sets.lastHeuristicsTurnId.get("ses")).toBe("turn-1");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("bedrock provider: variant flip signals all three sets (thinking config rendered into prompt)", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
@@ -667,18 +692,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
-    // Unknown provider (no model info on the hook input) takes the
-    // conservative TRUE arm = today's behavior.
-    test("unknown provider (no model info): variant flip takes the TRUE arm (all three sets signaled)", async () => {
+    test("unknown model tuple: variant flip defers rather than manufacturing a bust", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
         try {
             await hook({ sessionID: "ses", variant: "low" });
             await hook({ sessionID: "ses", variant: "high" });
 
-            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
-            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
-            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
         } finally {
             closeQuietly(db);
         }

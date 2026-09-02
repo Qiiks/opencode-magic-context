@@ -260,27 +260,14 @@ export function createChatMessageHook(args: {
             input.variant !== undefined &&
             previousVariant !== input.variant
         ) {
-            // A reasoning-variant change maps to a thinking-config change
-            // (effort / budget_tokens / toggle — see OpenCode's
-            // `reasoningVariants`). Whether that busts the provider's prompt
-            // cache on its own depends on the provider's cache model: the
-            // Anthropic family renders the thinking config into the prompt
-            // (so the provider itself invalidates message blocks on a change
-            // and our queued ops drain on that natural bust), while
-            // OpenAI-compatible providers carry reasoning_effort / budget as
-            // a request parameter outside the cache key, so a variant flip
-            // is a full cache HIT and our flush would be the ONLY bust — a
-            // gratuitous one. See `variantChangeBustsProviderCache` for the
-            // full rationale and the safety asymmetry.
-            //
-            // providerID comes from the hook input (the live request's
-            // model) with `liveModelBySession` as a fallback for sessions
-            // whose first chat.message predates a model-bearing event. When
-            // no provider is known yet we take the conservative TRUE arm
-            // (today's behavior) so we never silently drop a needed drain.
-            const providerID =
-                input.model?.providerID ?? args.liveModelBySession.get(sessionId)?.providerID;
-            if (variantChangeBustsProviderCache(providerID)) {
+            // Variant changes alter cached thinking blocks on some models. Fable
+            // 5.1 instead applies effort only at message boundaries, leaving the
+            // existing prefix unchanged. Use both live IDs to decide; if either is
+            // unknown, leave the cache unchanged rather than flushing speculatively.
+            const liveModel = args.liveModelBySession.get(sessionId);
+            const providerID = input.model?.providerID ?? liveModel?.providerID;
+            const modelID = input.model?.modelID ?? liveModel?.modelID;
+            if (variantChangeBustsProviderCache(providerID, modelID)) {
                 sessionLog(
                     sessionId,
                     `variant changed (${previousVariant} -> ${input.variant}), triggering flush`,
@@ -299,7 +286,7 @@ export function createChatMessageHook(args: {
                 // but the flush was deferred, not triggered.
                 sessionLog(
                     sessionId,
-                    `variant changed (${previousVariant} -> ${input.variant}) on provider ${providerID} whose cache ignores request params; deferring flush to next natural bust`,
+                    `variant changed (${previousVariant} -> ${input.variant}) on ${providerID ?? "unknown"}/${modelID ?? "unknown"} without a proven natural cache bust; deferring flush to next natural bust`,
                 );
             }
         }
