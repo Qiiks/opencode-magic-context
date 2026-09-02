@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { Database } from "bun:sqlite";
+import { Database } from "../src/shared/sqlite";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 
