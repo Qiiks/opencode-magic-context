@@ -2890,6 +2890,32 @@ export const MIGRATIONS: Migration[] = [
             );
         },
     },
+    {
+        version: 83,
+        description: "add indexed rowid access for message FTS content",
+        up(db: Database): void {
+            // Schema migration only: legacy FTS rows are deliberately mapped by the
+            // bounded asynchronous runtime backfill, never inside migration startup.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+                    session_id TEXT NOT NULL,
+                    message_ordinal INTEGER NOT NULL,
+                    fts_rowid INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, message_ordinal)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    watermark_rowid INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+                    (id, watermark_rowid, completed, updated_at)
+                VALUES (1, 0, 0, 0);
+            `);
+        },
+    },
 ];
 
 /**

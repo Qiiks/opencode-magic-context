@@ -10,6 +10,7 @@ import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
@@ -40,11 +41,16 @@ function seedIndexedSession(db: Database, sessionId: string, updatedAt: number):
             (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
          VALUES (?, 1, 0, ?, 'opencode')`,
     ).run(sessionId, updatedAt);
-    db.prepare(
-        `INSERT INTO message_history_fts
-            (session_id, message_ordinal, message_id, role, content)
-         VALUES (?, 1, ?, 'user', ?)`,
-    ).run(sessionId, `${sessionId}-message`, `searchable ${sessionId}`);
+    const result = db
+        .prepare(
+            `INSERT INTO message_history_fts
+                (session_id, message_ordinal, message_id, role, content)
+             VALUES (?, 1, ?, 'user', ?)`,
+        )
+        .run(sessionId, `${sessionId}-message`, `searchable ${sessionId}`) as {
+        lastInsertRowid: number | bigint;
+    };
+    recordMessageFtsRowid(db, sessionId, 1, result.lastInsertRowid);
 }
 
 function seedSessionScopedRows(db: Database, sessionId: string, updatedAt: number): void {

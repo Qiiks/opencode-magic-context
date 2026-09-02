@@ -35,6 +35,7 @@ import {
     type FailClosedBlockingProcess,
     type FailClosedProcessKind,
 } from "./fail-closed-block";
+import { startMessageFtsRowidMapBackfill } from "./message-fts-rowid-map";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -96,7 +97,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 82;
+export const LATEST_SUPPORTED_VERSION = 83;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -808,7 +809,7 @@ function finishDatabaseOpen(
     // never fail-close the plugin. Lazy adoption covers rows the backfill could
     // not reach.
     if (!explicitDbPath) {
-        const runBackfill = () => {
+        const runBackfills = () => {
             try {
                 runToolOwnerBackfill(db);
             } catch (error) {
@@ -816,9 +817,14 @@ function finishDatabaseOpen(
                     `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
                 );
             }
+            void startMessageFtsRowidMapBackfill(db).catch((error) => {
+                log(
+                    `[magic-context] message FTS rowid-map backfill failed (will resume next startup): ${getErrorMessage(error)}`,
+                );
+            });
         };
-        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfill);
-        else runBackfill();
+        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfills);
+        else runBackfills();
     }
     // Wire the persistence-backed tool-definition measurement store and
     // rehydrate the in-memory map from any prior writes. Doing this here
@@ -1372,6 +1378,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       content,
       tokenize='porter unicode61'
     );
+
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+      session_id TEXT NOT NULL,
+      message_ordinal INTEGER NOT NULL,
+      fts_rowid INTEGER NOT NULL,
+      PRIMARY KEY(session_id, message_ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      watermark_rowid INTEGER NOT NULL DEFAULT 0,
+      completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+      (id, watermark_rowid, completed, updated_at)
+    VALUES (1, 0, 0, 0);
 
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,

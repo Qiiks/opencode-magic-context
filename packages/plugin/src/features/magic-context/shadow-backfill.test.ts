@@ -18,6 +18,7 @@ import {
 } from "./git-commits/storage-git-commit-embeddings";
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { insertMemory } from "./memory/storage-memory";
 import { loadAllEmbeddings, saveEmbedding } from "./memory/storage-memory-embeddings";
 import {
@@ -527,9 +528,14 @@ describe("shadow embedding historical backfill", () => {
             [2, "stale shadow transcript"],
             [3, "clean shadow transcript"],
         ] as const) {
-            db.prepare(
-                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, 'user', ?)",
-            ).run(sessionId, ordinal, `u${ordinal}`, content);
+            const result = db
+                .prepare(
+                    "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, 'user', ?)",
+                )
+                .run(sessionId, ordinal, `u${ordinal}`, content) as {
+                lastInsertRowid: number | bigint;
+            };
+            recordMessageFtsRowid(db, sessionId, ordinal, result.lastInsertRowid);
         }
 
         const compartments = getCompartments(db, sessionId);
@@ -544,7 +550,7 @@ describe("shadow embedding historical backfill", () => {
                         sessionId,
                         compartment.startMessage,
                         compartment.endMessage,
-                    ),
+                    ) ?? "",
                     compartment.startMessage,
                     compartment.endMessage,
                     10_000,

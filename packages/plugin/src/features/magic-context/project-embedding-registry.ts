@@ -12,7 +12,7 @@ import {
     chunkEmbeddingWindowsAreCurrent,
     countSessionCompartmentEmbedCoverage,
     countUnembeddedSessionCompartments,
-    loadUnembeddedCompartmentChunkCandidates,
+    loadUnembeddedCompartmentChunkCandidatesPolite,
     loadUnembeddedSessionChunkCandidates,
     normalizeCompartmentChunkMaxInputTokens,
     replaceCompartmentChunkEmbeddings,
@@ -66,7 +66,7 @@ const SWEEP_MAX_CONSECUTIVE_EMPTY = 3;
 const COMMIT_DRAIN_BATCH_SIZE = 16;
 const COMMIT_DRAIN_MAX_PER_SWEEP = 500;
 const CHUNK_DRAIN_BATCH_SIZE = 8;
-const CHUNK_DRAIN_MAX_PER_SWEEP = 200;
+const CHUNK_DRAIN_MAX_PER_SWEEP = CHUNK_DRAIN_BATCH_SIZE;
 const EMBEDDING_IDENTITY_GC_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
 const STALE_EMBEDDING_GC_BATCH_SIZE = 250;
 // Hard cap on embedding-window texts sent in ONE provider call. Deliberately
@@ -1622,23 +1622,29 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
         start_message: number;
         end_message: number;
     }>;
-    const prepared = candidates.flatMap((candidate) => {
-        const text =
-            buildCanonicalChunkTextFromFts(
-                db,
-                candidate.session_id,
-                candidate.start_message,
-                candidate.end_message,
-            ) || buildCompartmentSummaryFallbackText(db, candidate.id);
-        if (!text) return [];
-        const windows = chunkCanonicalText(
-            text,
+    const prepared: Array<{
+        candidate: (typeof candidates)[number];
+        windows: ReturnType<typeof chunkCanonicalText>;
+    }> = [];
+    for (const candidate of candidates) {
+        const mappedText = buildCanonicalChunkTextFromFts(
+            db,
+            candidate.session_id,
             candidate.start_message,
             candidate.end_message,
-            SYNAPSE_MAX_INPUT_TOKENS,
         );
-        return windows.length > 0 ? [{ candidate, windows }] : [];
-    });
+        if (mappedText !== null) {
+            const text = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
+            const windows = chunkCanonicalText(
+                text,
+                candidate.start_message,
+                candidate.end_message,
+                SYNAPSE_MAX_INPUT_TOKENS,
+            );
+            if (windows.length > 0) prepared.push({ candidate, windows });
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
     const items = prepared.flatMap((item) =>
         item.windows.map((window) => ({
             id: `chunk:${item.candidate.id}:${window.windowIndex}`,
@@ -2167,7 +2173,7 @@ async function embedCompartmentChunkBatch(
     if (!snapshot?.enabled || snapshot.chunkModelId === "off") return 0;
 
     repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
-    const candidates = loadUnembeddedCompartmentChunkCandidates(
+    const candidates = await loadUnembeddedCompartmentChunkCandidatesPolite(
         db,
         projectIdentity,
         snapshot.chunkModelId,
@@ -2231,17 +2237,19 @@ async function embedCandidateChunkBatch(
     };
     const prepared: Prepared[] = [];
     for (const candidate of candidates) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         // Raw-span text first; fall back to the compartment's summary (title+p1)
         // when the span has no indexable content (notification/tool-only beat),
         // so such compartments still get a real embedding row instead of being
         // re-counted as "remaining" forever (the desktop auto-embed loop).
-        const canonicalText =
-            buildCanonicalChunkTextFromFts(
-                db,
-                candidate.sessionId,
-                candidate.startMessage,
-                candidate.endMessage,
-            ) || buildCompartmentSummaryFallbackText(db, candidate.id);
+        const mappedText = buildCanonicalChunkTextFromFts(
+            db,
+            candidate.sessionId,
+            candidate.startMessage,
+            candidate.endMessage,
+        );
+        if (mappedText === null) continue;
+        const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
         if (canonicalText.length === 0) {
             noWork.push(candidate.id);
             continue;

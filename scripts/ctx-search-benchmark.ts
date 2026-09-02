@@ -574,6 +574,11 @@ function validateGolds(
 					row.startOrdinal,
 					row.endOrdinal,
 				);
+				if (transcript === null) {
+					throw new Error(
+						`Message FTS rowid map is still backfilling for compartment ${gold.id} (${query.id})`,
+					);
+				}
 				if (transcript.trim().length === 0) {
 					throw new Error(
 						`Empty canonical transcript for compartment ${gold.id} (${query.id})`,
@@ -1360,7 +1365,7 @@ function auditFullContext(db: DatabaseType, fixture: Fixture) {
 				row.sessionId,
 				row.startOrdinal,
 				row.endOrdinal,
-			),
+			) ?? "",
 			false,
 		);
 	}

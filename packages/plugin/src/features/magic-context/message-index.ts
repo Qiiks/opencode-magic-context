@@ -10,6 +10,10 @@ import type { Database, Statement as PreparedStatement } from "../../shared/sqli
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { removeSystemReminders } from "../../shared/system-directive";
 import { clearCompressionDepth } from "./compression-depth-storage";
+import {
+    messageFtsOrdinalRangeIsMapped,
+    recordMessageFtsRowid,
+} from "./message-fts-rowid-map";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 interface MessageHistoryIndexRow {
@@ -62,6 +66,9 @@ const upsertMessageSourceStatements = new WeakMap<Database, PreparedStatement>()
 const deleteMessageSourceStatements = new WeakMap<Database, PreparedStatement>();
 const deleteMessageSourceRangeStatements = new WeakMap<Database, PreparedStatement>();
 const deleteMessageFtsStatements = new WeakMap<Database, PreparedStatement>();
+const deleteFtsMapStatements = new WeakMap<Database, PreparedStatement>();
+const deleteFtsMapRangeStatements = new WeakMap<Database, PreparedStatement>();
+const deleteMessageFtsMapStatements = new WeakMap<Database, PreparedStatement>();
 
 function normalizeIndexText(text: string): string {
     return text.replace(/\s+/g, " ").trim();
@@ -114,7 +121,12 @@ function getUpsertDirtyFloorStatement(db: Database): PreparedStatement {
 function getDeleteFtsStatement(db: Database): PreparedStatement {
     let stmt = deleteFtsStatements.get(db);
     if (!stmt) {
-        stmt = db.prepare("DELETE FROM message_history_fts WHERE session_id = ?");
+        stmt = db.prepare(
+            `DELETE FROM message_history_fts
+             WHERE rowid IN (
+                 SELECT fts_rowid FROM message_fts_rowid_map WHERE session_id = ?
+             )`,
+        );
         deleteFtsStatements.set(db, stmt);
     }
     return stmt;
@@ -124,7 +136,12 @@ function getDeleteFtsRangeStatement(db: Database): PreparedStatement {
     let stmt = deleteFtsRangeStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "DELETE FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) BETWEEN ? AND ?",
+            `DELETE FROM message_history_fts
+             WHERE rowid IN (
+                 SELECT fts_rowid
+                 FROM message_fts_rowid_map
+                 WHERE session_id = ? AND message_ordinal BETWEEN ? AND ?
+             )`,
         );
         deleteFtsRangeStatements.set(db, stmt);
     }
@@ -144,7 +161,12 @@ function getCountIndexedMessageStatement(db: Database): PreparedStatement {
     let stmt = countIndexedMessageStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT COUNT(*) AS count FROM message_history_fts WHERE session_id = ? AND message_id = ?",
+            `SELECT COUNT(*) AS count
+             FROM message_history_source AS source
+             JOIN message_fts_rowid_map AS map
+               ON map.session_id = source.session_id
+              AND map.message_ordinal = source.message_ordinal
+             WHERE source.session_id = ? AND source.message_id = ?`,
         );
         countIndexedMessageStatements.set(db, stmt);
     }
@@ -207,11 +229,74 @@ function getDeleteMessageFtsStatement(db: Database): PreparedStatement {
     let stmt = deleteMessageFtsStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "DELETE FROM message_history_fts WHERE session_id = ? AND message_id = ?",
+            `DELETE FROM message_history_fts
+             WHERE rowid IN (
+                 SELECT map.fts_rowid
+                 FROM message_history_source AS source
+                 JOIN message_fts_rowid_map AS map
+                   ON map.session_id = source.session_id
+                  AND map.message_ordinal = source.message_ordinal
+                 WHERE source.session_id = ? AND source.message_id = ?
+             )`,
         );
         deleteMessageFtsStatements.set(db, stmt);
     }
     return stmt;
+}
+
+function getDeleteFtsMapStatement(db: Database): PreparedStatement {
+    let stmt = deleteFtsMapStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare("DELETE FROM message_fts_rowid_map WHERE session_id = ?");
+        deleteFtsMapStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getDeleteFtsMapRangeStatement(db: Database): PreparedStatement {
+    let stmt = deleteFtsMapRangeStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "DELETE FROM message_fts_rowid_map WHERE session_id = ? AND message_ordinal BETWEEN ? AND ?",
+        );
+        deleteFtsMapRangeStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getDeleteMessageFtsMapStatement(db: Database): PreparedStatement {
+    let stmt = deleteMessageFtsMapStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `DELETE FROM message_fts_rowid_map
+             WHERE session_id = ?
+               AND message_ordinal = (
+                   SELECT message_ordinal
+                   FROM message_history_source
+                   WHERE session_id = ? AND message_id = ?
+               )`,
+        );
+        deleteMessageFtsMapStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function insertMessageFtsRow(
+    db: Database,
+    sessionId: string,
+    messageOrdinal: number,
+    messageId: string,
+    role: string,
+    content: string,
+): void {
+    const result = getInsertMessageStatement(db).run(
+        sessionId,
+        messageOrdinal,
+        messageId,
+        role,
+        content,
+    ) as { lastInsertRowid: number | bigint };
+    recordMessageFtsRowid(db, sessionId, messageOrdinal, result.lastInsertRowid);
 }
 
 interface CountRow {
@@ -378,6 +463,7 @@ export function deleteIndexedMessage(db: Database, sessionId: string, messageId:
 export function clearIndexedMessages(db: Database, sessionId: string): void {
     db.transaction(() => {
         getDeleteFtsStatement(db).run(sessionId);
+        getDeleteFtsMapStatement(db).run(sessionId);
         getDeleteMessageSourceStatement(db).run(sessionId);
         getDeleteIndexStatement(db).run(sessionId);
         clearCompressionDepth(db, sessionId);
@@ -422,13 +508,21 @@ function indexSingleMessageInTransaction(
         if (isMessageIndexSourceCurrent(db, sessionId, message)) {
             return false;
         }
+        // Replacing before the legacy row is mapped would insert the revision while
+        // leaving the old FTS document unreachable by rowid. The dirty marker keeps
+        // the revision queued until the bounded map backfill reaches this ordinal.
+        if (!messageFtsOrdinalRangeIsMapped(db, sessionId, message.ordinal, message.ordinal)) {
+            return false;
+        }
 
         // A covered ordinal is a same-ID edit/redaction. Replace that one FTS
         // document without moving the contiguous watermark.
         getDeleteMessageFtsStatement(db).run(sessionId, message.id);
+        getDeleteMessageFtsMapStatement(db).run(sessionId, sessionId, message.id);
         const content = setMessageSource(db, sessionId, message, now);
         if (content.length > 0 && (message.role === "user" || message.role === "assistant")) {
-            getInsertMessageStatement(db).run(
+            insertMessageFtsRow(
+                db,
                 sessionId,
                 message.ordinal,
                 message.id,
@@ -463,7 +557,8 @@ function indexSingleMessageInTransaction(
         (message.role === "user" || message.role === "assistant") &&
         !isMessageAlreadyIndexed(db, sessionId, message.id)
     ) {
-        getInsertMessageStatement(db).run(
+        insertMessageFtsRow(
+            db,
             sessionId,
             message.ordinal,
             message.id,
@@ -549,10 +644,28 @@ export function indexMessagesAfterOrdinal(
                 ? currentWatermark
                 : Math.min(currentWatermark, Math.max(0, dirtyFloor - 1));
 
+        // A dirty rewind may delete only rowid-mapped documents. Deferring keeps the
+        // existing prefix intact instead of duplicating legacy rows during startup.
+        if (
+            dirtyFloor !== null &&
+            dirtyFloor <= currentWatermark &&
+            !messageFtsOrdinalRangeIsMapped(
+                db,
+                sessionId,
+                dirtyFloor,
+                Math.min(currentWatermark, finalWatermark),
+            )
+        ) {
+            db.exec("COMMIT");
+            committed = true;
+            return 0;
+        }
+
         if (dirtyFloor !== null && dirtyFloor <= finalWatermark) {
             // Rebuild only the portion represented by this source snapshot. A
             // stale snapshot must never delete newer live rows beyond its end.
             getDeleteFtsRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
+            getDeleteFtsMapRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
             getDeleteMessageSourceRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
         }
 
@@ -580,7 +693,8 @@ export function indexMessagesAfterOrdinal(
             ) {
                 continue;
             }
-            getInsertMessageStatement(db).run(
+            insertMessageFtsRow(
+                db,
                 sessionId,
                 message.ordinal,
                 message.id,

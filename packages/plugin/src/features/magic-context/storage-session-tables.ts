@@ -38,6 +38,7 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "embedding_measurement_corpus" },
     { table: "pending_session_cleanup", harnessScoped: true },
     { table: "message_history_fts" },
+    { table: "message_fts_rowid_map" },
     { table: "message_history_source", harnessScoped: true },
     { table: "message_history_index", harnessScoped: true },
     { table: "lkg_slots" },
@@ -85,6 +86,18 @@ export function deleteSessionScopedRows(
     const placeholders = deletableSessionIds.map(() => "?").join(", ");
 
     for (const definition of SESSION_SCOPED_TABLES) {
+        if (definition.table === "message_history_fts") {
+            db.prepare(
+                `DELETE FROM message_history_fts
+                 WHERE rowid IN (
+                     SELECT fts_rowid
+                     FROM message_fts_rowid_map
+                     WHERE session_id IN (${placeholders})
+                 )`,
+            ).run(...deletableSessionIds);
+            continue;
+        }
+
         const predicates = [`session_id IN (${placeholders})`];
         if (definition.extraPredicate) predicates.push(definition.extraPredicate);
         const bindHarness = harness !== undefined && definition.harnessScoped === true;

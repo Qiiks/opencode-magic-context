@@ -19,6 +19,10 @@ import {
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import {
+    backfillMessageFtsRowidMapBatch,
+    recordMessageFtsRowid,
+} from "./message-fts-rowid-map";
 import { runMigrations } from "./migrations";
 import {
     _resetProjectEmbeddingRegistryForTests,
@@ -72,6 +76,7 @@ function createDb(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
+    backfillMessageFtsRowidMapBatch(db);
     return db;
 }
 
@@ -82,9 +87,14 @@ function insertFtsRow(
     role: "user" | "assistant",
     content: string,
 ): void {
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, ordinal, `${role}-${ordinal}`, role, content);
+    const result = db
+        .prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(sessionId, ordinal, `${role}-${ordinal}`, role, content) as {
+        lastInsertRowid: number | bigint;
+    };
+    recordMessageFtsRowid(db, sessionId, ordinal, result.lastInsertRowid);
 }
 
 function currentChunkModelId(projectIdentity: string): string {
@@ -499,7 +509,7 @@ describe("compartment chunk embedding core", () => {
                         sessionId,
                         compartment.startMessage,
                         compartment.endMessage,
-                    ),
+                    ) ?? "",
                     compartment.startMessage,
                     compartment.endMessage,
                     maxInputTokens,
