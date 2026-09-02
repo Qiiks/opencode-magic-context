@@ -1,24 +1,16 @@
 #!/usr/bin/env bun
 /**
  * analyze-cache-busts.ts — walk a session's anthropic-auth request dumps in
- * order and locate exactly WHERE the Anthropic prompt cache busts.
+ * order and attribute prompt changes while using the provider's usage meter
+ * as the cache-hit verdict.
  *
  * The opencode-anthropic-auth plugin dumps every outbound request body to a
  * temp dir (`<tmpdir>/opencode-anthropic-auth-dumps/*.body.json`) alongside a
- * `.meta.json`. This tool reconstructs the wire-order segment list for each
- * request (system blocks, then every message), hashes each segment, and finds
- * the FIRST segment whose content changed vs the previous same-session request.
- * Anthropic serves a cache hit only up to the longest matching prefix that ends
- * at a `cache_control` breakpoint, so the first-diverging segment is the bust
- * origin and the last breakpoint at-or-before it is the effective cached prefix.
- *
- * Normalization (so we measure REAL content drift, not provider noise):
- *   - The `cch=<nonce>` in the `x-anthropic-billing-header` system block is a
- *     per-request nonce Anthropic ignores for cache-keying → normalized out.
- *   - `cache_control` markers move every turn (they sit on the last/second-last
- *     message) → stripped before hashing, since marker movement is not content.
- *   - `§N§` tag prefixes ARE on-wire content the model sees → kept (a changed
- *     tag number is a genuine bust we want to catch).
+ * `.meta.json` and, when available, a `.response.json`. This tool reconstructs
+ * the wire-order segment list for each request and finds the first segment
+ * whose content changed versus the preceding same-session request. That byte
+ * comparison is attribution only: Anthropic's cache usage meter determines
+ * whether the request actually busted the cache.
  *
  * Usage:
  *   bun scripts/analyze-cache-busts.ts <sessionIdPrefix> [options]
@@ -31,8 +23,7 @@
  *   --limit <N>      only the last N requests in range
  *   --show-diff      print before/after snippet of the first-diverging segment
  *   --all-busts      list every diverging segment, not just the first
- *   --all-rows       also print STABLE/SAME rows (default: only BUST rows, so a
- *                    real prefix bust is never buried under ordinary tail growth)
+ *   --all-rows       also print STABLE and UNMETERED rows
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -40,6 +31,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 type Json = Record<string, unknown>;
+type ByteVerdict = "BUST" | "STABLE";
+type MeterVerdict = ByteVerdict | "UNMETERED";
+type MeterVsBytes = "AGREE" | "BYTES-ONLY" | "METER-ONLY" | "UNMETERED";
 
 interface Segment {
     id: string;
@@ -48,14 +42,38 @@ interface Segment {
     breakpoint: boolean;
 }
 
+interface MeterUsage {
+    cacheRead: number;
+    cacheCreation: number;
+    input: number;
+    total: number;
+    source: string;
+}
+
 interface Snapshot {
     file: string;
+    bodyPath: string;
     createdAt: string;
     session: string;
     messagesCount: number;
     segments: Segment[];
+    usage?: MeterUsage;
     orderCreatedAt: string;
     sequence: number;
+}
+
+interface AnalysisRow {
+    current: Snapshot;
+    previous?: Snapshot;
+    divergenceIndex: number;
+    byteVerdict?: ByteVerdict;
+    verdict: MeterVerdict | "BASE";
+    meterVsBytes?: MeterVsBytes;
+    prevTotal?: number;
+    writeSlack?: number;
+    meterFloor?: number;
+    comparableRead?: number;
+    rewrittenTokens?: number;
 }
 
 function sha(s: string): string {
@@ -139,7 +157,7 @@ function sessionMatches(candidate: string, prefix: string): boolean {
     return candidate.startsWith(prefix) || prefix.startsWith(visibleHead);
 }
 
-/** Recursively strip `cache_control` fields — marker movement is not content. */
+/** Recursively strip `cache_control` fields because marker movement is not content. */
 function stripCacheControl(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(stripCacheControl);
     if (value && typeof value === "object") {
@@ -159,9 +177,7 @@ function hasCacheControl(block: unknown): boolean {
 
 function messageHasBreakpoint(msg: Json): boolean {
     const content = msg.content;
-    if (Array.isArray(content)) {
-        return content.some((p) => hasCacheControl(p));
-    }
+    if (Array.isArray(content)) return content.some((part) => hasCacheControl(part));
     return hasCacheControl(msg);
 }
 
@@ -177,30 +193,125 @@ function blockText(block: unknown): string {
     return JSON.stringify(stripCacheControl(block));
 }
 
+function normalizedSystemSegment(block: unknown): string {
+    return normalizeSystemText(blockText(block));
+}
+
+function normalizedMessageSegment(message: Json): string {
+    return JSON.stringify({ role: message.role, content: stripCacheControl(message.content) });
+}
+
 function buildSegments(body: Json): Segment[] {
     const segs: Segment[] = [];
     const system = body.system;
     const sysBlocks = Array.isArray(system) ? system : system != null ? [system] : [];
-    sysBlocks.forEach((b, i) => {
-        const raw = blockText(b);
+    sysBlocks.forEach((block, index) => {
+        const raw = blockText(block);
         segs.push({
-            id: `system[${i}]`,
-            hash: sha(normalizeSystemText(raw)),
+            id: `system[${index}]`,
+            hash: sha(normalizedSystemSegment(block)),
             bytes: Buffer.byteLength(raw),
-            breakpoint: hasCacheControl(b),
+            breakpoint: hasCacheControl(block),
         });
     });
     const messages = Array.isArray(body.messages) ? (body.messages as Json[]) : [];
-    messages.forEach((m, i) => {
-        const norm = JSON.stringify({ role: m.role, content: stripCacheControl(m.content) });
+    messages.forEach((message, index) => {
         segs.push({
-            id: `message[${i}](${String(m.role)})`,
-            hash: sha(norm),
-            bytes: Buffer.byteLength(JSON.stringify(m)),
-            breakpoint: messageHasBreakpoint(m),
+            id: `message[${index}](${String(message.role)})`,
+            hash: sha(normalizedMessageSegment(message)),
+            bytes: Buffer.byteLength(JSON.stringify(message)),
+            breakpoint: messageHasBreakpoint(message),
         });
     });
     return segs;
+}
+
+function asJson(value: unknown): Json | undefined {
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Json) : undefined;
+}
+
+function meterUsage(value: unknown, source: string): MeterUsage | undefined {
+    const usage = asJson(value);
+    if (!usage || typeof usage.input_tokens !== "number" || !Number.isFinite(usage.input_tokens)) {
+        return undefined;
+    }
+    const cacheRead = usage.cache_read_input_tokens;
+    const cacheCreation = usage.cache_creation_input_tokens;
+    if (
+        (cacheRead !== undefined && (typeof cacheRead !== "number" || !Number.isFinite(cacheRead))) ||
+        (cacheCreation !== undefined &&
+            (typeof cacheCreation !== "number" || !Number.isFinite(cacheCreation)))
+    ) {
+        return undefined;
+    }
+    return {
+        cacheRead: cacheRead ?? 0,
+        cacheCreation: cacheCreation ?? 0,
+        input: usage.input_tokens,
+        total: (cacheRead ?? 0) + (cacheCreation ?? 0) + usage.input_tokens,
+        source,
+    };
+}
+
+/** Collect usage from completed JSON responses and from message_start/message_delta stream events. */
+function collectUsageCandidates(value: unknown, source: string, candidates: MeterUsage[]): void {
+    if (Array.isArray(value)) {
+        value.forEach((entry, index) => collectUsageCandidates(entry, `${source}[${index}]`, candidates));
+        return;
+    }
+    const object = asJson(value);
+    if (!object) return;
+
+    const eventType = typeof object.type === "string" ? object.type : source;
+    const direct = meterUsage(object.usage, `${eventType}.usage`);
+    if (direct) candidates.push(direct);
+    const message = asJson(object.message);
+    const messageUsage = meterUsage(message?.usage, `${eventType}.message.usage`);
+    if (messageUsage) candidates.push(messageUsage);
+
+    for (const [key, child] of Object.entries(object)) {
+        if (key === "usage" || key === "message") continue;
+        if (typeof child === "string" && key === "data") {
+            try {
+                collectUsageCandidates(JSON.parse(child), `${source}.data`, candidates);
+            } catch {
+                // A non-JSON SSE data line cannot contain the usage meter.
+            }
+        } else if (child && typeof child === "object") {
+            collectUsageCandidates(child, `${source}.${key}`, candidates);
+        }
+    }
+}
+
+function parseResponsePayloads(raw: string): unknown[] {
+    try {
+        return [JSON.parse(raw)];
+    } catch {
+        const payloads: unknown[] = [];
+        for (const line of raw.split(/\r?\n/)) {
+            const data = line.startsWith("data:") ? line.slice("data:".length).trim() : line.trim();
+            if (!data || data === "[DONE]") continue;
+            try {
+                payloads.push(JSON.parse(data));
+            } catch {
+                // Ignore SSE event labels and incomplete/non-JSON lines.
+            }
+        }
+        return payloads;
+    }
+}
+
+function loadMeterUsage(responsePath: string | undefined): MeterUsage | undefined {
+    if (!responsePath || !existsSync(responsePath)) return undefined;
+    try {
+        const candidates: MeterUsage[] = [];
+        for (const payload of parseResponsePayloads(readFileSync(responsePath, "utf8"))) {
+            collectUsageCandidates(payload, "response", candidates);
+        }
+        return candidates.at(-1);
+    } catch {
+        return undefined;
+    }
 }
 
 function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
@@ -226,13 +337,9 @@ function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
         if (since && createdAt < since) continue;
         if (until && createdAt > until) continue;
 
-        const files = meta.files as Json | undefined;
-        const referencedBodyPath =
-            files && typeof files.body === "string" ? files.body : undefined;
-        const adjacentBodyPath = join(
-            opts.dir,
-            metaFile.replace(/\.meta\.json$/, ".body.json"),
-        );
+        const files = asJson(meta.files);
+        const referencedBodyPath = typeof files?.body === "string" ? files.body : undefined;
+        const adjacentBodyPath = join(opts.dir, metaFile.replace(/\.meta\.json$/, ".body.json"));
         const bodyPath =
             referencedBodyPath && existsSync(referencedBodyPath)
                 ? referencedBodyPath
@@ -247,14 +354,23 @@ function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
         } catch {
             continue;
         }
-        const bodyMeta = meta.body as Json | undefined;
+        const referencedResponsePath = typeof files?.response === "string" ? files.response : undefined;
+        const adjacentResponsePath = join(opts.dir, metaFile.replace(/\.meta\.json$/, ".response.json"));
+        const responsePath =
+            referencedResponsePath && existsSync(referencedResponsePath)
+                ? referencedResponsePath
+                : existsSync(adjacentResponsePath)
+                  ? adjacentResponsePath
+                  : undefined;
+        const bodyMeta = asJson(meta.body);
         snaps.push({
             file: metaFile,
+            bodyPath,
             createdAt,
             session,
-            messagesCount:
-                typeof bodyMeta?.messagesCount === "number" ? bodyMeta.messagesCount : -1,
+            messagesCount: typeof bodyMeta?.messagesCount === "number" ? bodyMeta.messagesCount : -1,
             segments: buildSegments(body),
+            usage: loadMeterUsage(responsePath),
             orderCreatedAt: dumpName?.createdAt ?? createdAt,
             sequence: dumpName?.sequence ?? 0,
         });
@@ -265,17 +381,14 @@ function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
             a.sequence - b.sequence ||
             a.file.localeCompare(b.file),
     );
-    if (opts.limit && snaps.length > opts.limit) {
-        return snaps.slice(snaps.length - opts.limit);
-    }
-    return snaps;
+    return opts.limit && snaps.length > opts.limit ? snaps.slice(snaps.length - opts.limit) : snaps;
 }
 
 /** First wire-order segment index where prev/cur diverge (added/removed/changed). */
 function firstDivergence(prev: Segment[], cur: Segment[]): number {
     const n = Math.min(prev.length, cur.length);
-    for (let i = 0; i < n; i += 1) {
-        if (prev[i].hash !== cur[i].hash || prev[i].id !== cur[i].id) return i;
+    for (let index = 0; index < n; index += 1) {
+        if (prev[index].hash !== cur[index].hash || prev[index].id !== cur[index].id) return index;
     }
     return prev.length === cur.length ? -1 : n;
 }
@@ -286,34 +399,125 @@ function cachedPrefixBytes(segs: Segment[], divergeIdx: number): { bytes: number
     let lastBreakpointBytes = 0;
     let lastBreakpointId = "(none)";
     const limit = divergeIdx < 0 ? segs.length : divergeIdx;
-    for (let i = 0; i < segs.length; i += 1) {
-        if (i < limit && segs[i].breakpoint) {
-            // breakpoint content is unchanged up to here
-            lastBreakpointBytes = bytes + segs[i].bytes;
-            lastBreakpointId = segs[i].id;
+    for (let index = 0; index < segs.length; index += 1) {
+        if (index < limit && segs[index].breakpoint) {
+            lastBreakpointBytes = bytes + segs[index].bytes;
+            lastBreakpointId = segs[index].id;
         }
-        bytes += segs[i].bytes;
+        bytes += segs[index].bytes;
     }
     return { bytes: lastBreakpointBytes, at: lastBreakpointId };
 }
 
+function lastBreakpointIndex(segs: Segment[]): number {
+    let last = -1;
+    for (let index = 0; index < segs.length; index += 1) {
+        if (segs[index].breakpoint) last = index;
+    }
+    return last;
+}
+
+function analyzeSnapshots(snaps: Snapshot[]): AnalysisRow[] {
+    return snaps.map((current, index) => {
+        if (index === 0) return { current, divergenceIndex: -1, verdict: "BASE" };
+        const previous = snaps[index - 1];
+        const divergenceIndex = firstDivergence(previous.segments, current.segments);
+        const byteVerdict: ByteVerdict =
+            divergenceIndex !== -1 && divergenceIndex <= lastBreakpointIndex(previous.segments)
+                ? "BUST"
+                : "STABLE";
+        if (!current.usage || !previous.usage) {
+            return {
+                current,
+                previous,
+                divergenceIndex,
+                byteVerdict,
+                verdict: "UNMETERED",
+                meterVsBytes: "UNMETERED",
+            };
+        }
+        // The preceding request's newest cache write can still overlap this stream,
+        // so it cannot be required to appear in this request's cache-read meter.
+        const prevTotal = previous.usage.total;
+        const writeSlack = previous.usage.cacheCreation;
+        const meterFloor = prevTotal - writeSlack;
+        // input_tokens are direct, non-cacheable tokens. Add the current direct input
+        // back to cache_read before comparing it with a previous total that includes it.
+        const comparableRead = current.usage.cacheRead + current.usage.input;
+        const verdict: ByteVerdict = comparableRead < meterFloor ? "BUST" : "STABLE";
+        const meterVsBytes: MeterVsBytes =
+            verdict === byteVerdict ? "AGREE" : verdict === "BUST" ? "METER-ONLY" : "BYTES-ONLY";
+        return {
+            current,
+            previous,
+            divergenceIndex,
+            byteVerdict,
+            verdict,
+            meterVsBytes,
+            prevTotal,
+            writeSlack,
+            meterFloor,
+            comparableRead,
+            rewrittenTokens: verdict === "BUST" ? prevTotal - current.usage.cacheRead : undefined,
+        };
+    });
+}
+
 function fmtTime(iso: string): string {
-    // Dumps are UTC; the dashboard renders local time (UTC+2), so include the date
-    // here to keep multi-day dump sets unambiguous when correlating views.
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const dd = String(d.getUTCDate()).padStart(2, "0");
-    const hh = String(d.getUTCHours()).padStart(2, "0");
-    const mi = String(d.getUTCMinutes()).padStart(2, "0");
-    const ss = String(d.getUTCSeconds()).padStart(2, "0");
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return iso;
+    const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(date.getUTCDate()).padStart(2, "0");
+    const hh = String(date.getUTCHours()).padStart(2, "0");
+    const mi = String(date.getUTCMinutes()).padStart(2, "0");
+    const ss = String(date.getUTCSeconds()).padStart(2, "0");
     return `${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
 }
 
-function lastBreakpointIndex(segs: Segment[]): number {
-    let last = -1;
-    for (let i = 0; i < segs.length; i += 1) if (segs[i].breakpoint) last = i;
-    return last;
+function segmentText(snapshot: Snapshot, index: number): string | undefined {
+    if (index < 0) return undefined;
+    try {
+        const body = JSON.parse(readFileSync(snapshot.bodyPath, "utf8")) as Json;
+        const system = body.system;
+        const systemBlocks = Array.isArray(system) ? system : system != null ? [system] : [];
+        if (index < systemBlocks.length) return normalizedSystemSegment(systemBlocks[index]);
+        const messages = Array.isArray(body.messages) ? (body.messages as Json[]) : [];
+        const message = messages[index - systemBlocks.length];
+        return message ? normalizedMessageSegment(message) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function clippedDiff(text: string, start: number, end: number): string {
+    const before = text.slice(Math.max(0, start - 120), start);
+    const changed = text.slice(start, Math.min(end, start + 240));
+    const after = text.slice(end, end + 120);
+    return `${start > 120 ? "…" : ""}${before}[${changed}${end - start > 240 ? "…" : ""}]${after}${end + 120 < text.length ? "…" : ""}`;
+}
+
+function printSegmentDiff(previous: Snapshot, current: Snapshot, index: number): void {
+    const prevText = segmentText(previous, index) ?? "(segment absent)";
+    const curText = segmentText(current, index) ?? "(segment absent)";
+    let start = 0;
+    while (start < prevText.length && start < curText.length && prevText[start] === curText[start]) start += 1;
+    let prevEnd = prevText.length;
+    let curEnd = curText.length;
+    while (prevEnd > start && curEnd > start && prevText[prevEnd - 1] === curText[curEnd - 1]) {
+        prevEnd -= 1;
+        curEnd -= 1;
+    }
+    console.log(`          └─ segment diff @char ${start}:`);
+    console.log(`             prev: ${clippedDiff(prevText, start, prevEnd)}`);
+    console.log(`             cur:  ${clippedDiff(curText, start, curEnd)}`);
+}
+
+function meterCell(row: AnalysisRow): string {
+    if (row.verdict === "UNMETERED") return `unavailable; bytes=${row.byteVerdict}`;
+    const read = row.current.usage?.cacheRead ?? 0;
+    const rewritten = row.rewrittenTokens === undefined ? "" : `; rewritten≈${row.rewrittenTokens.toLocaleString()}`;
+    const directInput = row.current.usage?.input ?? 0;
+    return `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, writeSlack=${row.writeSlack?.toLocaleString()})${rewritten}`;
 }
 
 function main(): void {
@@ -329,87 +533,91 @@ function main(): void {
         console.error(`No dumps found for session prefix "${opts.sessionPrefix}" in ${opts.dir}`);
         process.exit(1);
     }
+    const rows = analyzeSnapshots(snaps);
     console.log(`Session: ${snaps[0].session}`);
     console.log(`Dumps:   ${snaps.length}  (dir: ${opts.dir})`);
     console.log("");
     console.log("Dashboard times are local (UTC+2); table times are UTC.");
+    console.log("Meter rule: BUST when cacheRead + current input < prevTotal - writeSlack; prevTotal=previous read+creation+input, writeSlack=previous creation.");
     console.log(
-        "time(UTC)          | segs | verdict | first-divergence        | prevBytes → curBytes        | cachedPrefix@breakpoint",
+        "time(UTC)          | segs | verdict          | meter                                                  | meterVsBytes | first-divergence                | prevBytes → curBytes        | cachedPrefix@breakpoint",
     );
     console.log(
-        "-------------------|------|---------|-------------------------|-----------------------------|------------------------",
+        "-------------------|------|------------------|--------------------------------------------------------|--------------|---------------------------------|-----------------------------|------------------------",
     );
 
-    // By default only BUST rows are printed so a genuine prefix bust is never
-    // buried under ordinary tail-growth (STABLE) or no-op (SAME) rows. STABLE =
-    // divergence is past prev's last breakpoint (pure tail addition, still a
-    // cache hit). --all-rows restores the full per-request table.
     let bustCount = 0;
-    for (let k = 0; k < snaps.length; k += 1) {
-        const cur = snaps[k];
-        if (k === 0) {
+    let unmeteredBustCount = 0;
+    for (const row of rows) {
+        if (row.verdict === "BASE") {
             if (opts.allRows) {
-                console.log(
-                    `${fmtTime(cur.createdAt)} | ${String(cur.segments.length).padStart(4)} | BASE    | (first request)         |                             |`,
-                );
+                console.log(`${fmtTime(row.current.createdAt)} | ${String(row.current.segments.length).padStart(4)} | BASE             |                                                        |              | (first request)                 |                             |`);
             }
             continue;
         }
-        const prev = snaps[k - 1];
-        const idx = firstDivergence(prev.segments, cur.segments);
-        if (idx === -1) {
-            if (opts.allRows) {
-                console.log(
-                    `${fmtTime(cur.createdAt)} | ${String(cur.segments.length).padStart(4)} | SAME    | (identical to prev)     |                             |`,
-                );
-            }
-            continue;
-        }
-        const seg = cur.segments[idx] ?? prev.segments[idx];
-        // The reusable cache was written at PREV's breakpoints. OpenCode moves the
-        // tail breakpoint forward every request, so judging against CUR's final
-        // breakpoint mislabels ordinary tail growth as a bust.
-        const prevLastBreakpoint = lastBreakpointIndex(prev.segments);
-        const verdict = idx > prevLastBreakpoint ? "STABLE" : "BUST";
-        if (verdict === "BUST") bustCount += 1;
-        if (verdict !== "BUST" && !opts.allRows) continue;
-        const prevPrefix = cachedPrefixBytes(prev.segments, prev.segments.length);
-        const cp = cachedPrefixBytes(cur.segments, idx);
-        const byteDelta = `${prevPrefix.bytes.toLocaleString()}B → ${cp.bytes.toLocaleString()}B`;
-        const segId = seg?.id ?? `seg[${idx}]`;
+        const shouldPrint =
+            opts.allRows ||
+            row.verdict === "BUST" ||
+            (row.verdict === "UNMETERED" && row.byteVerdict === "BUST");
+        if (!shouldPrint) continue;
+        if (row.verdict === "BUST") bustCount += 1;
+        if (row.verdict === "UNMETERED" && row.byteVerdict === "BUST") unmeteredBustCount += 1;
+
+        const previous = row.previous as Snapshot;
+        const index = row.divergenceIndex;
+        const segment = index < 0 ? undefined : row.current.segments[index] ?? previous.segments[index];
+        const attribution = segment
+            ? `${segment.id} (bytes ${row.byteVerdict})`
+            : `(identical; bytes ${row.byteVerdict})`;
+        const previousPrefix = cachedPrefixBytes(previous.segments, previous.segments.length);
+        const currentPrefix = cachedPrefixBytes(row.current.segments, index);
+        const byteDelta = `${previousPrefix.bytes.toLocaleString()}B → ${currentPrefix.bytes.toLocaleString()}B`;
+        const verdictLabel =
+            row.verdict === "UNMETERED"
+                ? `UNMETERED (bytes ${row.byteVerdict})`
+                : `${row.verdict} (meter)`;
         console.log(
-            `${fmtTime(cur.createdAt)} | ${String(cur.segments.length).padStart(4)} | ${verdict.padEnd(7)} | ${segId.padEnd(23)} | ${byteDelta.padEnd(27)} | ${cp.at} (${cp.bytes.toLocaleString()}B)`,
+            `${fmtTime(row.current.createdAt)} | ${String(row.current.segments.length).padStart(4)} | ${verdictLabel.padEnd(16)} | ${meterCell(row).padEnd(54)} | ${(row.meterVsBytes ?? "").padEnd(12)} | ${attribution.padEnd(31)} | ${byteDelta.padEnd(27)} | ${currentPrefix.at} (${currentPrefix.bytes.toLocaleString()}B)`,
         );
 
-        if ((opts.showDiff || opts.allBusts) && verdict === "BUST") {
-            const allDiffs: number[] = [];
-            const n = Math.max(prev.segments.length, cur.segments.length);
-            for (let i = idx; i < n; i += 1) {
-                if (prev.segments[i]?.hash !== cur.segments[i]?.hash || prev.segments[i]?.id !== cur.segments[i]?.id) {
-                    allDiffs.push(i);
-                    if (!opts.allBusts && allDiffs.length >= 1) break;
+        if ((opts.showDiff || opts.allBusts) && index >= 0 && (row.verdict === "BUST" || opts.allRows)) {
+            if (opts.allBusts) {
+                const diffs: number[] = [];
+                const count = Math.max(previous.segments.length, row.current.segments.length);
+                for (let diffIndex = index; diffIndex < count; diffIndex += 1) {
+                    if (
+                        previous.segments[diffIndex]?.hash !== row.current.segments[diffIndex]?.hash ||
+                        previous.segments[diffIndex]?.id !== row.current.segments[diffIndex]?.id
+                    ) {
+                        diffs.push(diffIndex);
+                    }
+                }
+                for (const diffIndex of diffs) {
+                    console.log(`          └─ diverge @${diffIndex}: prev=${previous.segments[diffIndex]?.id ?? "—"}/${previous.segments[diffIndex]?.hash ?? "—"}  cur=${row.current.segments[diffIndex]?.id ?? "—"}/${row.current.segments[diffIndex]?.hash ?? "—"}`);
                 }
             }
-            for (const di of allDiffs) {
-                console.log(
-                    `          └─ diverge @${di}: prev=${prev.segments[di]?.id ?? "—"}/${prev.segments[di]?.hash ?? "—"}  cur=${cur.segments[di]?.id ?? "—"}/${cur.segments[di]?.hash ?? "—"}`,
-                );
-            }
+            if (opts.showDiff) printSegmentDiff(previous, row.current, index);
         }
     }
 
     console.log("");
     if (bustCount === 0) {
-        console.log(
-            `No busts across ${snaps.length} request(s) — the cached prefix held (only tail growth).`,
-        );
+        console.log(`No metered busts across ${snaps.length} request(s).`);
     } else {
-        console.log(
-            `${bustCount} bust(s) across ${snaps.length} request(s).${opts.allRows ? "" : " (STABLE/SAME rows hidden; pass --all-rows to show them.)"}`,
-        );
+        console.log(`${bustCount} metered bust(s) across ${snaps.length} request(s).${opts.allRows ? "" : " (STABLE rows hidden; pass --all-rows to show them.)"}`);
+    }
+    if (unmeteredBustCount > 0) {
+        console.log(`${unmeteredBustCount} unmetered byte-attributed bust candidate(s); response usage was unavailable.`);
     }
 }
 
-export const __test = { loadSnapshots, parseArgs, parseDumpFilename, resolveTimeBound };
+export const __test = {
+    analyzeSnapshots,
+    loadMeterUsage,
+    loadSnapshots,
+    parseArgs,
+    parseDumpFilename,
+    resolveTimeBound,
+};
 
 if (import.meta.main) main();
