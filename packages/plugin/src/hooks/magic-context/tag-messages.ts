@@ -3,8 +3,12 @@ import { getSourceContents, saveSourceContent } from "../../features/magic-conte
 import {
     adoptNullOwnerToolTag,
     getCandidateToolOwners,
+    getInertWhitespaceAssistantTags,
     getNullOwnerToolTag,
+    getTagById,
+    getTagNumberByMessageId,
     getToolTagNumberByOwner,
+    markWhitespaceAssistantTagInert,
     pickNearestPriorOwner,
 } from "../../features/magic-context/storage-tags";
 import { makeToolCompositeKey, type Tagger } from "../../features/magic-context/tagger";
@@ -426,6 +430,11 @@ export function tagMessages(
     // (the same `unknown` instance walked twice in the loop).
     const ownerByPartKey = new Map<unknown, { ownerMsgId: string; callId: string }>();
     const batch = new ToolMutationBatch(messages);
+    const inertWhitespaceTagNumbers = new Set<number>();
+    for (const tag of getInertWhitespaceAssistantTags(db, sessionId)) {
+        inertWhitespaceTagNumbers.add(tag.tagNumber);
+        tagger.bindTag(sessionId, tag.contentId, tag.tagNumber);
+    }
     const assignments = tagger.getAssignments(sessionId);
     const resolver = createExistingTagResolver(sessionId, tagger, db);
     const tGetSourceContents = performance.now();
@@ -615,17 +624,74 @@ export function tagMessages(
 
             if (messageId && isTextPart(part)) {
                 const textPart = part;
-                // Empty assistant text is provider framing, not reclaimable content. Prefixing
-                // it would hide a trailing-blank suffix from the frozen-shape finalizer.
-                if (message.info.role === "assistant" && textPart.text.trim().length === 0) {
-                    continue;
-                }
                 const thinkingParts = messageThinkingParts;
                 const contentId = `${messageId}:p${partIndex}`;
-                // Resolver pre-warms any tag-id-fallback bindings (e.g. when
-                // OpenCode re-assigns part IDs); the assigned tag below uses
-                // those bindings if the resolver populated them.
-                resolver.resolve(messageId, "message", contentId, textOrdinal);
+                const whitespaceOnlyAssistant =
+                    message.info.role === "assistant" &&
+                    stripTagPrefix(textPart.text).trim().length === 0;
+                // New whitespace-only assistant parts are provider framing, not reclaimable
+                // content. A pre-deploy row is different: replay its existing prefix forever
+                // so deployment never changes signed-adjacent bytes, but retire the row from
+                // active accounting because ctx_reduce cannot reclaim provider framing.
+                let existingTagId: number | undefined;
+                if (whitespaceOnlyAssistant) {
+                    existingTagId = resolver.resolve(messageId, "message", contentId, textOrdinal, {
+                        accept: (tagNumber) =>
+                            inertWhitespaceTagNumbers.has(tagNumber) ||
+                            !sourceContents.has(tagNumber),
+                    });
+                    if (existingTagId === undefined) {
+                        const persisted = getTagNumberByMessageId(db, sessionId, contentId);
+                        if (
+                            persisted !== null &&
+                            !getSourceContents(db, sessionId, [persisted]).has(persisted)
+                        ) {
+                            tagger.bindTag(sessionId, contentId, persisted);
+                            existingTagId = persisted;
+                        }
+                    }
+                    if (existingTagId === undefined) {
+                        // Preserve text ordinals even when framing is not tagged. Otherwise an
+                        // old whitespace row can be rebound to a later real text part by the
+                        // part-id fallback on the next pass.
+                        textOrdinal += 1;
+                        continue;
+                    }
+                    const existingTag = getTagById(db, sessionId, existingTagId);
+                    if (!existingTag || existingTag.type !== "message") {
+                        tagger.unbindTag(sessionId, contentId);
+                        textOrdinal += 1;
+                        continue;
+                    }
+                    if (existingTag.status === "active") {
+                        markWhitespaceAssistantTagInert(
+                            db,
+                            sessionId,
+                            existingTagId,
+                            contentId,
+                        );
+                        inertWhitespaceTagNumbers.add(existingTagId);
+                    }
+                } else {
+                    // Resolver pre-warms any tag-id-fallback bindings (e.g. when OpenCode
+                    // re-assigns part IDs); the assigned tag below uses those bindings. Inert
+                    // whitespace rows are replay-only and must never migrate onto real text.
+                    const resolved = resolver.resolve(
+                        messageId,
+                        "message",
+                        contentId,
+                        textOrdinal,
+                        { accept: (tagNumber) => !inertWhitespaceTagNumbers.has(tagNumber) },
+                    );
+                    if (
+                        resolved === undefined &&
+                        inertWhitespaceTagNumbers.has(
+                            tagger.getTag(sessionId, contentId, "message") ?? -1,
+                        )
+                    ) {
+                        tagger.unbindTag(sessionId, contentId);
+                    }
+                }
                 const reasoningBytes = textOrdinal === 0 ? getReasoningByteSize(thinkingParts) : 0;
                 const reasoningTokens =
                     textOrdinal === 0 ? getReasoningTokenCount(thinkingParts) : 0;

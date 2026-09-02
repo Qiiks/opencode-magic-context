@@ -24,6 +24,7 @@ export interface ExistingTagResolver {
         type: TaggableContentType,
         currentContentId: string,
         ordinal: number,
+        options?: { accept?: (tagNumber: number) => boolean },
     ) => number | undefined;
 }
 
@@ -80,15 +81,21 @@ export function createExistingTagResolver(
     }
 
     return {
-        resolve(messageId, type, currentContentId, ordinal) {
+        resolve(messageId, type, currentContentId, ordinal, options) {
+            const accept = options?.accept ?? (() => true);
             const exactTagId = assignments.get(currentContentId);
             if (exactTagId !== undefined) {
+                if (!accept(exactTagId)) return undefined;
                 usedTagNumbers.add(exactTagId);
                 return exactTagId;
             }
 
             const fallback = getScopedAssignments().get(messageId)?.[type][ordinal];
-            if (!fallback || usedTagNumbers.has(fallback.tagNumber)) {
+            if (
+                !fallback ||
+                usedTagNumbers.has(fallback.tagNumber) ||
+                !accept(fallback.tagNumber)
+            ) {
                 return undefined;
             }
 
