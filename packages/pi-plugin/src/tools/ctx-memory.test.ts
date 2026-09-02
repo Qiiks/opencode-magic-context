@@ -183,6 +183,45 @@ describe("createCtxMemoryTool", () => {
 		}
 	});
 
+	it("refuses a curate user-profile archive without a surviving successor", async () => {
+		const db = createTestDb();
+		try {
+			const dreamer = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+			const ctx = fakeContext("ses-curate-safety") as never;
+			const projectIdentity = resolveProjectIdentity(
+				(ctx as { cwd: string }).cwd,
+			);
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "PROJECT_RULES",
+				content: "Always run the cache-bust analyzer before drawing conclusions.",
+			});
+
+			const result = await dreamer.execute(
+				"call-curate-archive",
+				{
+					action: "archive",
+					ids: [memory.id],
+					reason: "Redundant with global user profile directive U2.",
+				},
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+
+			expect(result.isError).toBeUndefined();
+			expect(result.content[0]?.text).toContain("Skipped archive");
+			expect(getMemoryById(db, memory.id)?.status).toBe("active");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("rejects updating a foreign workspace memory even when the category is shared", async () => {
 		const db = createTestDb();
 		try {

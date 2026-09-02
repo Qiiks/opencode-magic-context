@@ -52,6 +52,10 @@ import {
 	V2_MEMORY_CATEGORIES,
 } from "@magic-context/core/features/magic-context/memory";
 import {
+	assessCurateMutationSafety,
+	recordCurateSafetyRefusal,
+} from "@magic-context/core/features/magic-context/dreamer/curate-memory-safety";
+import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
@@ -145,6 +149,12 @@ const ParamsSchema = Type.Object(
 		reason: Type.Optional(
 			Type.String({
 				description: "Why the memory is being archived (optional, recommended)",
+			}),
+		),
+		superseded_by: Type.Optional(
+			Type.Number({
+				description:
+					"Active same-project/category memory that survives a curate consolidation",
 			}),
 		),
 	},
@@ -374,6 +384,7 @@ export function createCtxMemoryTool(
 				ids: { type: "array", items: "number", maxItems: 100 },
 				limit: "number",
 				reason: "string",
+				superseded_by: "number",
 			});
 			if (params.action === undefined) {
 				return err("Error: Action 'undefined' is not allowed in this context.");
@@ -460,6 +471,57 @@ export function createCtxMemoryTool(
 				return err("Cross-session memory is disabled for this project.");
 			}
 			const sessionId = ctx.sessionManager.getSessionId();
+			let curateSuccessor: Memory | null = null;
+			if (
+				dreamerAllowed &&
+				(params.action === "archive" || params.action === "update")
+			) {
+				const verdict = params.action;
+				const ids = params.ids;
+				const content = params.content?.trim();
+				const validShape =
+					ids &&
+					ids.length > 0 &&
+					ids.every(Number.isInteger) &&
+					(verdict !== "update" || (ids.length === 1 && Boolean(content)));
+				if (validShape) {
+					const uniqueIds = [...new Set(ids)];
+					const memories = uniqueIds.map((id) => getMemoryById(deps.db, id));
+					if (memories.every((memory) => memory && memoryVisibleToTool(memory))) {
+						curateSuccessor = Number.isInteger(params.superseded_by)
+							? getMemoryById(deps.db, params.superseded_by as number)
+							: null;
+						const refusals = memories.flatMap((memory) => {
+							if (!memory) return [];
+							const refusal = assessCurateMutationSafety({
+								memory,
+								verdict,
+								reason: params.reason,
+								replacementContent: content,
+								successor: curateSuccessor,
+								projectIdentity: (candidate) =>
+									targetIdentityForStoredPath(candidate.projectPath),
+							});
+							return refusal ? [refusal] : [];
+						});
+						if (refusals.length > 0) {
+							let refused = 0;
+							for (const refusal of refusals) {
+								refused = recordCurateSafetyRefusal(sessionId, refusal);
+							}
+							const memoryIds = refusals
+								.map((refusal) => refusal.memoryId)
+								.join(", ");
+							const reasons = [
+								...new Set(refusals.map((refusal) => refusal.reason)),
+							].join(",");
+							return ok(
+								`Skipped ${verdict} for memory [ID: ${memoryIds}]: curate safety refusal (${reasons}); refused=${refused}.`,
+							);
+						}
+					}
+				}
+			}
 
 			if (params.action === "write") {
 				const content = params.content?.trim();
@@ -872,14 +934,24 @@ export function createCtxMemoryTool(
 						projectIdentity: targetIdentityForStoredPath(memory.projectPath),
 					};
 				});
-				runImmediateTransaction(deps.db, () => {
+					runImmediateTransaction(deps.db, () => {
 					for (const target of targets) {
 						archiveMemory(deps.db, target.memoryId, params.reason);
-						queueMemoryMutation(deps.db, {
-							projectPath: target.projectIdentity,
-							mutationType: "archive",
-							targetMemoryId: target.memoryId,
-						});
+						if (dreamerAllowed && curateSuccessor) {
+							supersededMemory(deps.db, target.memoryId, curateSuccessor.id);
+							queueMemoryMutation(deps.db, {
+								projectPath: target.projectIdentity,
+								mutationType: "superseded",
+								targetMemoryId: target.memoryId,
+								supersededById: curateSuccessor.id,
+							});
+						} else {
+							queueMemoryMutation(deps.db, {
+								projectPath: target.projectIdentity,
+								mutationType: "archive",
+								targetMemoryId: target.memoryId,
+							});
+						}
 					}
 				});
 				const reasonSuffix = params.reason ? ` (${params.reason})` : "";

@@ -27,8 +27,8 @@ import {
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
-import { getActiveUserMemories } from "../user-memory/storage-user-memory";
 import { type ClassifyModuleClient, runClassify } from "./classify";
+import { takeCurateSafetyRefusalCount } from "./curate-memory-safety";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import {
     acquireLeaseWithAcquisition,
@@ -697,6 +697,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 parent,
                 recordRun,
                 computeMemoryDelta,
+                reportProgress,
             });
         } catch (error) {
             const { transient, brief } = classifyFailure(error);
@@ -1147,11 +1148,13 @@ async function runAgenticTask(
                     archived: number;
                     merged: number;
                 } | null;
+                progress?: string | null;
             },
         ) => void;
         computeMemoryDelta: (
             before: ReturnType<typeof getMemoryCountsByStatus>,
         ) => { written: number; deleted: number; archived: number; merged: number } | null;
+        reportProgress: (processed: number, refused?: number) => void;
     },
 ): Promise<TaskExecOutcome> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
@@ -1172,11 +1175,6 @@ async function runAgenticTask(
                   structure: existsSync(`${docsDir}/STRUCTURE.md`),
               }
             : undefined;
-    const userMemories =
-        task === "curate"
-            ? getActiveUserMemories(db).map((um) => ({ id: um.id, content: um.content }))
-            : undefined;
-
     // verify / verify-broad / classify-memories now run via their own non-agentic
     // manifest runners and never reach runAgenticTask. The agentic path handles
     // curate / maintain-docs only.
@@ -1190,7 +1188,6 @@ async function runAgenticTask(
         projectPath: projectIdentity,
         lastDreamAt: lastRunAt ? String(lastRunAt) : null,
         existingDocs,
-        userMemories,
         curate: curateMemories ? { memories: curateMemories } : undefined,
     });
 
@@ -1275,6 +1272,13 @@ async function runAgenticTask(
 
         if (leaseLost) throw new Error("Dream lease lost during task");
 
+        const curateRefused =
+            task === "curate" ? takeCurateSafetyRefusalCount(sessionId) : 0;
+        if (curateRefused > 0) {
+            helpers.reportProgress(curateRefused, curateRefused);
+            log(`[dreamer] curate safety summary: refused=${curateRefused}`);
+        }
+
         if (parent) {
             recordChildInvocation({
                 db,
@@ -1298,10 +1302,15 @@ async function runAgenticTask(
 
         helpers.recordRun("completed", null, {
             memoryChanges: helpers.computeMemoryDelta(memoryBefore),
+            progress:
+                curateRefused > 0
+                    ? `curate: refused ${curateRefused} unsafe mutation(s)`
+                    : null,
         });
         return { status: "completed" };
     } finally {
         heartbeat.stop();
+        if (childSessionId) takeCurateSafetyRefusalCount(childSessionId);
         // These children contain full memory-pool snapshots or generated project
         // docs context, so debug-retention must not keep them on disk after a run.
         if (childSessionId) {
