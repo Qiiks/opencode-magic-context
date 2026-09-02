@@ -14,7 +14,7 @@ import {
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { ensureProjectState, getProjectState } from "../storage-project-state";
-import { getUserMemoryCandidates, insertUserMemory } from "../user-memory/storage-user-memory";
+import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { MAP_BATCH_FLOOR_MS } from "./map-memories";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
@@ -24,6 +24,7 @@ import {
     seedTaskScheduleState,
     writeTaskScheduleState,
 } from "./storage-task-schedule";
+import { recordCurateSafetyRefusal } from "./curate-memory-safety";
 import { createDreamTaskExecutor } from "./task-executor";
 import { type DreamTaskProgress, leaseKeyFor } from "./task-registry";
 import { type DreamTaskRuntimeConfig, runDueTasksForProject } from "./task-scheduler";
@@ -87,8 +88,6 @@ describe("createDreamTaskExecutor — curate", () => {
             content: "Second memory is a project workflow rule.",
         });
         recordMemoryVerifications(db, first.id, ["src/first.ts"], Date.now());
-        insertUserMemory(db, "Prefer concise answers globally.", []);
-
         let capturedPrompt = "";
         const client = {
             session: {
@@ -125,10 +124,66 @@ describe("createDreamTaskExecutor — curate", () => {
         expect(capturedPrompt).toContain(first.content);
         expect(capturedPrompt).toContain(second.content);
         expect(capturedPrompt).toContain("Mapped files: src/first.ts");
-        expect(capturedPrompt).toContain("### Global user profile (for the redundancy check)");
-        expect(capturedPrompt).toContain("Prefer concise answers globally.");
+        expect(capturedPrompt).toContain(
+            "global user profile describes the operator and is never a substitute",
+        );
+        expect(capturedPrompt).not.toContain("### Global user profile");
         expect(capturedPrompt).not.toContain('ctx_memory(action="verified"');
         expect(capturedPrompt).not.toContain("verified_files");
+    });
+
+    test("reports host-side curate refusal progress without failing the task", async () => {
+        db = freshDb();
+        const project = "/repo/curate-refusal-progress";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "The registry owns startup ordering.",
+        });
+        const progress: DreamTaskProgress[] = [];
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "dream-child-refusal" } })),
+                prompt: mock(async () => {
+                    recordCurateSafetyRefusal("dream-child-refusal", {
+                        memoryId: memory.id,
+                        verdict: "archive",
+                        reason: "missing-active-same-category-successor",
+                    });
+                    return {};
+                }),
+                messages: mock(async () => ({ data: assistantMessages("curation complete") })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            onProgress: (update) => {
+                if (update) progress.push(update);
+            },
+        });
+
+        const result = await executor(
+            { task: "curate", schedule: "0 4 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-curate-refusal",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+
+        expect(result).toEqual({ status: "completed", schedulePatch: undefined });
+        expect(progress).toContainEqual(
+            expect.objectContaining({ task: "curate", processed: 1, refused: 1 }),
+        );
+        const tasks = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]") as Array<{
+            progress?: string;
+        }>;
+        expect(tasks[0]?.progress).toBe("curate: refused 1 unsafe mutation(s)");
     });
 
     test("rejects a textual pseudo-tool-call and retries with the fallback model", async () => {

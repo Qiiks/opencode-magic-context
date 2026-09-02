@@ -3,6 +3,10 @@ import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import {
+    assessCurateMutationSafety,
+    recordCurateSafetyRefusal,
+} from "../../features/magic-context/dreamer/curate-memory-safety";
+import {
     archiveMemory,
     CATEGORY_PRIORITY,
     clearMemoryVerifications,
@@ -319,6 +323,62 @@ function memoryBelongsToProject(memory: Memory, projectPath: string): boolean {
     return storedPathBelongsToIdentity(memory.projectPath, projectPath);
 }
 
+function preflightCurateMutation(args: {
+    db: CtxMemoryToolDeps["db"];
+    params: CtxMemoryArgs;
+    sessionId: string;
+}): { skip: string | null; successor: Memory | null } {
+    const { params } = args;
+    if (params.action !== "archive" && params.action !== "update") {
+        return { skip: null, successor: null };
+    }
+
+    const ids = params.ids;
+    const content = params.content?.trim();
+    if (
+        !ids ||
+        ids.length === 0 ||
+        !ids.every(Number.isInteger) ||
+        (params.action === "update" && (ids.length !== 1 || !content))
+    ) {
+        return { skip: null, successor: null };
+    }
+
+    const uniqueIds = [...new Set(ids)];
+    const memories = uniqueIds.map((id) => getMemoryById(args.db, id));
+    if (memories.some((memory) => !memory)) {
+        return { skip: null, successor: null };
+    }
+
+    const successor = Number.isInteger(params.superseded_by)
+        ? getMemoryById(args.db, params.superseded_by as number)
+        : null;
+    const refusals = memories.flatMap((memory) => {
+        if (!memory) return [];
+        const refusal = assessCurateMutationSafety({
+            memory,
+            verdict: params.action as "archive" | "update",
+            reason: params.reason,
+            replacementContent: content,
+            successor,
+            projectIdentity: (candidate) => projectIdentityForStoredPath(candidate.projectPath),
+        });
+        return refusal ? [refusal] : [];
+    });
+    if (refusals.length === 0) return { skip: null, successor };
+
+    let refused = 0;
+    for (const refusal of refusals) {
+        refused = recordCurateSafetyRefusal(args.sessionId, refusal);
+    }
+    const memoryIds = refusals.map((refusal) => refusal.memoryId).join(", ");
+    const reasons = [...new Set(refusals.map((refusal) => refusal.reason))].join(",");
+    return {
+        skip: `Skipped ${params.action} for memory [ID: ${memoryIds}]: curate safety refusal (${reasons}); refused=${refused}.`,
+        successor,
+    };
+}
+
 function isPrimaryMutableMemory(memory: Memory): boolean {
     return (
         (memory.status === "active" || memory.status === "permanent") &&
@@ -382,7 +442,15 @@ const ctxMemoryArgsShape = {
         .optional()
         .describe("Why the memory is being archived (optional, recommended)"),
 };
-const ctxMemoryArgsSchema = tool.schema.object(ctxMemoryArgsShape).passthrough();
+const ctxMemoryArgsSchema = tool.schema
+    .object({
+        ...ctxMemoryArgsShape,
+        // The scheduled Curate integration is the only caller that uses this
+        // field. Exclude it from the standard provider schema, but validate its
+        // type when Curate sends it.
+        superseded_by: tool.schema.number().optional(),
+    })
+    .passthrough();
 
 function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
     const allowedActions = getAllowedActions(deps);
@@ -400,6 +468,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 ids: { type: "array", items: "number", maxItems: 100 },
                 limit: "number",
                 reason: "string",
+                superseded_by: "number",
             });
             // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
             // fail closed even if a future permission list accidentally exposes this tool.
@@ -422,6 +491,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 return "Error: Could not resolve project identity for memory action.";
             }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+            const curatePreflight =
+                toolContext.agent === DREAMER_AGENT
+                    ? preflightCurateMutation({
+                          db: deps.db,
+                          params: args,
+                          sessionId: toolContext.sessionID,
+                      })
+                    : { skip: null, successor: null };
+            if (curatePreflight.skip) return curatePreflight.skip;
+
             if (args.action !== "list") {
                 const marker = getAuthorityManagedMarker(deps.db, projectPath);
                 let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
@@ -448,6 +527,20 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     }
                     try {
                         const commandId = toolCallIdFromContext(toolContext);
+                        const moduleArgs: CtxMemoryArgs =
+                            args.action === "archive" && curatePreflight.successor
+                                ? {
+                                      action: "merge",
+                                      ids: [
+                                          ...new Set([
+                                              ...(args.ids ?? []),
+                                              curatePreflight.successor.id,
+                                          ]),
+                                      ],
+                                      content: curatePreflight.successor.content,
+                                      category: curatePreflight.successor.category,
+                                  }
+                                : args;
                         const text = moduleMemoryText(
                             await memoryBackend({
                                 ...(commandId ? { commandId } : {}),
@@ -455,13 +548,18 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 projectRoot: toolContext.directory,
                                 projectPath,
                                 memoryProject: projectPath,
-                                action: args.action,
-                                content: args.content,
-                                category: args.category,
-                                ids: args.ids,
-                                reason: args.reason,
+                                action: moduleArgs.action as
+                                    | "write"
+                                    | "update"
+                                    | "archive"
+                                    | "merge"
+                                    | "get",
+                                content: moduleArgs.content,
+                                category: moduleArgs.category,
+                                ids: moduleArgs.ids,
+                                reason: moduleArgs.reason,
                             }),
-                            args,
+                            moduleArgs,
                         );
                         return (
                             text ?? "Error: Rust module returned an invalid ctx_memory response."
@@ -944,11 +1042,25 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 runImmediateTransaction(deps.db, () => {
                     for (const target of targets) {
                         archiveMemory(deps.db, target.memoryId, args.reason);
-                        queueMemoryMutation(deps.db, {
-                            projectPath: target.projectIdentity,
-                            mutationType: "archive",
-                            targetMemoryId: target.memoryId,
-                        });
+                        if (toolContext.agent === DREAMER_AGENT && curatePreflight.successor) {
+                            supersededMemory(
+                                deps.db,
+                                target.memoryId,
+                                curatePreflight.successor.id,
+                            );
+                            queueMemoryMutation(deps.db, {
+                                projectPath: target.projectIdentity,
+                                mutationType: "superseded",
+                                targetMemoryId: target.memoryId,
+                                supersededById: curatePreflight.successor.id,
+                            });
+                        } else {
+                            queueMemoryMutation(deps.db, {
+                                projectPath: target.projectIdentity,
+                                mutationType: "archive",
+                                targetMemoryId: target.memoryId,
+                            });
+                        }
                     }
                 });
                 requestRustMemorySync(deps, toolContext.sessionID);

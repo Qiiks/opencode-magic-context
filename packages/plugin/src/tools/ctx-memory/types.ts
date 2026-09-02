@@ -35,6 +35,8 @@ export interface CtxMemoryArgs extends ImitatedReducedArgs {
     ids?: number[];
     limit?: number;
     reason?: string;
+    /** ID of the memory that replaces this one after duplicate memories are consolidated. */
+    superseded_by?: number;
 }
 
 export interface CtxMemoryToolDeps {

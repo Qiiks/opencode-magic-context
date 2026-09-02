@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
+import { takeCurateSafetyRefusalCount } from "../../features/magic-context/dreamer/curate-memory-safety";
 import {
     computeNormalizedHash,
     getMemoriesByProject,
@@ -220,8 +221,8 @@ function createTestDb(dbPath = ":memory:"): Database {
 const toolContext = (sessionID = "ses-memory", agent = "general") =>
     ({ sessionID, agent, directory: "/repo/project" }) as never;
 
-const dreamerToolContext = (directory: string) =>
-    ({ sessionID: "ses-dream", agent: DREAMER_AGENT, directory }) as never;
+const dreamerToolContext = (directory: string, sessionID = "ses-dream") =>
+    ({ sessionID, agent: DREAMER_AGENT, directory }) as never;
 
 function wait(ms = 0): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1194,6 +1195,241 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, foreignShared.id)?.status).toBe("archived");
     });
 
+    describe("#given curate safety gates", () => {
+        it("REFUSES the #14125 user-profile redundancy archive specimen", async () => {
+            const content =
+                "CACHE-BUST TRIAGE FLOW (Ufuk directive, 2026-08-15 — use the tool FIRST, never reason from screenshots/log vibes): when told to check a cache bust: (1) resolve the session id (session_projects for a project name, peer roster for peer sessions); (2) run `bun packages/plugin/scripts/analyze-cache-busts.ts <sessionIdPrefix> --show-diff` (supports --since/--until/--limit/--all-busts) — it identifies the bust passes and the causing region; (3) read the req-vs-req diff it produces to name the exact diverging bytes. This is the purpose-built instrument; hand-theorizing mechanisms before running it wastes the primary's turns and was called out explicitly. Investigation masons for busts must be briefed to run this script as step 1.";
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content,
+                importance: 75,
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [memory.id],
+                    reason: "Redundant with global user profile directives (U2, U3, U4, U11, U23, U24, U26) or superseded by canonical memory entries.",
+                },
+                dreamerToolContext("/repo/project", "ses-curate-14125"),
+            );
+
+            expect(result).toContain("Skipped archive");
+            expect(result).toContain("refused=1");
+            expect(result).not.toContain("Error:");
+            expect(takeCurateSafetyRefusalCount("ses-curate-14125")).toBe(1);
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+            expect(getMutationRows(db, "/repo/project", [memory.id])).toHaveLength(0);
+        });
+
+        it("allows an archive consolidation only with a named active same-category successor", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The legacy loader initializes the project registry.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project loader initializes and validates the project registry.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: `Consolidated into memory ${successor.id}.`,
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Archived memory");
+            expect(getMemoryById(db, source.id)).toMatchObject({
+                status: "archived",
+                supersededByMemoryId: successor.id,
+            });
+            expect(getMutationRows(db, "/repo/project", [source.id])).toMatchObject([
+                {
+                    mutationType: "superseded",
+                    targetMemoryId: source.id,
+                    supersededById: successor.id,
+                },
+            ]);
+        });
+
+        it("routes an allowed module-authority archive as consolidation into its named survivor", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The old loader initializes the registry.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The loader initializes and validates the registry.",
+            });
+            const routed: Array<{ action: string; ids?: number[]; content?: string }> = [];
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async (request) => {
+                        routed.push({
+                            action: request.action,
+                            ids: request.ids,
+                            content: request.content,
+                        });
+                        return { content: [{ type: "text", text: `module ${request.action}` }] };
+                    },
+                },
+            });
+
+            const result = await moduleTools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Consolidated into the canonical loader memory.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("module merge");
+            expect(routed).toEqual([
+                {
+                    action: "merge",
+                    ids: [source.id, successor.id],
+                    content: successor.content,
+                },
+            ]);
+        });
+
+        it("allows a user-profile reason for a legacy user category when consolidation is valid", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "USER_PREFERENCES",
+                content: "The user prefers concise summaries.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "USER_PREFERENCES",
+                content: "The user prefers concise summaries with exact verification commands.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Redundant with the global user profile preference U2.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Archived memory");
+            expect(getMemoryById(db, source.id)?.supersededByMemoryId).toBe(successor.id);
+        });
+
+        it("REFUSES a user-profile archive reason for a project-scoped category", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project uses a generated registry for deterministic startup.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project registry is generated to make startup deterministic.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Redundant with user preferences in directive U7.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Skipped archive");
+            expect(getMemoryById(db, source.id)?.status).toBe("active");
+        });
+
+        it("REFUSES directive-shaped PROJECT_RULES archives despite a valid successor", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "Always run the release checklist before publishing.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "The release checklist lives at docs/release.md.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "archive",
+                    ids: [source.id],
+                    superseded_by: successor.id,
+                    reason: "Consolidated into the release checklist location memory.",
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Skipped archive");
+            expect(getMemoryById(db, source.id)?.status).toBe("active");
+        });
+
+        it("REFUSES rewrites that lose more than half the content without a consolidation target", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                { action: "update", ids: [source.id], content: "The registry loads." },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Skipped update");
+            expect(getMemoryById(db, source.id)?.content).toBe(source.content);
+        });
+
+        it("allows a content-loss rewrite when it names a valid consolidation target", async () => {
+            const source = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
+            });
+            const successor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The validator details live in the canonical registry memory.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                {
+                    action: "update",
+                    ids: [source.id],
+                    content: "The registry loads.",
+                    superseded_by: successor.id,
+                },
+                dreamerToolContext("/repo/project"),
+            );
+
+            expect(result).toContain("Updated memory");
+            expect(getMemoryById(db, source.id)?.content).toBe("The registry loads.");
+        });
+    });
+
     describe("#given update action", () => {
         it("rejects updating a foreign workspace memory even when the category is shared", async () => {
             db.exec(`
@@ -1642,7 +1878,7 @@ describe("createCtxMemoryTools", () => {
     });
 
     describe("#given archive action", () => {
-        it("archives the memory and stores the archive reason in metadata", async () => {
+        it("lets a primary agent archive a memory and stores the reason in metadata", async () => {
             const memory = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "KNOWN_ISSUES",
@@ -1655,7 +1891,7 @@ describe("createCtxMemoryTools", () => {
                     ids: [memory.id],
                     reason: "Removed subsystem no longer exists",
                 },
-                toolContext("ses-dreamer", DREAMER_AGENT),
+                toolContext("ses-primary", "general"),
             );
 
             expect(result).toContain("Archived memory");

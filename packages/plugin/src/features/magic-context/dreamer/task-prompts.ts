@@ -28,7 +28,7 @@ Project memory uses exactly 5 categories. Every memory belongs to one:
 - **CONFIG_VALUES** — stable configuration keys/values and conventions. Not transient measurements (test counts, sizes, versions).
 - **NAMING** — naming conventions and canonical names. Not inventories.
 
-**Legacy categories during transition:** older memories may still carry pre-v2 category names. When you touch one, map it to its 5-category home with \`action="update"\` (or \`merge\`): WORKFLOW_RULES→PROJECT_RULES, ARCHITECTURE_DECISIONS→ARCHITECTURE, CONFIG_DEFAULTS→CONFIG_VALUES, ENVIRONMENT→CONFIG_VALUES (paths) or CONSTRAINTS, KNOWN_ISSUES→CONSTRAINTS only if it's an external-system limit (otherwise archive — our own fixed bugs are not world facts). USER_DIRECTIVES / USER_PREFERENCES are NOT project categories — they live in the global user profile; archive project copies only when they add zero project-specific detail.`;
+**Legacy categories during transition:** older memories may still carry pre-v2 category names. When you touch one, map it to its 5-category home with \`action="update"\` (or \`merge\`): WORKFLOW_RULES→PROJECT_RULES, ARCHITECTURE_DECISIONS→ARCHITECTURE, CONFIG_DEFAULTS→CONFIG_VALUES, ENVIRONMENT→CONFIG_VALUES (paths) or CONSTRAINTS, KNOWN_ISSUES→CONSTRAINTS only if it's an external-system limit. USER_DIRECTIVES / USER_PREFERENCES are NOT project categories. Do not compare project memories with the global user profile or use it to justify an archive.`;
 
 // curate: memory-pool hygiene only. It edits the memory store via ctx_memory and
 // never reads code (a separate verify task owns memory-vs-code correctness), so
@@ -38,9 +38,9 @@ export const CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic
 ## Memory operations (ctx_memory)
 - \`action="list"\` — browse active memories, optionally filter by category
 - \`action="merge", ids=[N,M,...], content="...", category="..."\` — consolidate duplicates into one canonical memory
-- \`action="update", ids=[N], content="..."\` — rewrite a memory's content
+- \`action="update", ids=[N], content="...", superseded_by=M\` — rewrite content; name where removed detail survives when cutting more than half
 - \`action="write", category="...", content="..."\` — create a memory (SPLITS ONLY — never mint new facts)
-- \`action="archive", ids=[N], reason="..."\` — soft-archive a stale or low-value memory
+- \`action="archive", ids=[N], superseded_by=M, reason="..."\` — consolidate a redundant memory into the named active same-category survivor
 
 ## Rules
 1. **Assume the pool is accurate.** A separate verify task checks memories against code. You handle QUALITY only — duplicates, wording, low-value entries — never correctness, and you do NOT read the codebase.
@@ -100,37 +100,29 @@ function renderMemoryList(memories: CuratePromptMemory[]): string {
         .join("\n\n");
 }
 
-function formatUserProfileList(
-    userMemories?: Array<{ id: number; content: string }>,
-): string | undefined {
-    if (!userMemories || userMemories.length === 0) return undefined;
-    return userMemories.map((um) => `- [U${um.id}] ${um.content}`).join("\n");
-}
-
 export function buildCuratePrompt(args: {
     projectPath: string;
     memories: CuratePromptMemory[];
-    userProfile?: string;
 }): string {
     // adapted from validated shadow-trial prompt; further tuning happens in the harness
     return `## Task: Curate Project Memory Pool (hygiene)
 
 **Project:** ${args.projectPath}
 
-The memories below are assumed ACCURATE (a separate verify task keeps them true). Your job is pool QUALITY: remove duplicates, tighten wording, and archive low-value entries that waste the ~6000-token injection budget. Explain each action in one line first. Do NOT mint new facts (that is the historian's job).
+The memories below are assumed ACCURATE (a separate verify task keeps them true). Your job is pool QUALITY: remove duplicates, tighten wording, and consolidate redundant entries that waste the ~6000-token injection budget. Explain each action in one line first. Do NOT mint new facts (that is the historian's job).
 
 Work ALL THREE phases below in order (A → B → C) over the whole pool. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
 
 ### Phase A — Consolidate duplicates
-Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with \`ctx_memory(action="merge", ids=[...], content="...", category="...")\`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates (one is miscategorized — archive the redundant one in Phase C instead). One fact per memory.
+Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with \`ctx_memory(action="merge", ids=[...], content="...", category="...")\`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates; do not archive either as a consolidation. One fact per memory.
 
 ### Phase B — Improve wording
-Rewrite narrative/historical → operational present tense ("X uses Y because Z", not "we switched to Y"); drop session-local context and commit hashes (unless the hash is the point); add specifics where vague. \`write\` is for SPLITS ONLY (update the original down to its first fact, write the second) — a healthy run is net-neutral or net-shrinking, never net-adds facts.
+Rewrite narrative/historical → operational present tense ("X uses Y because Z", not "we switched to Y"); drop session-local context and commit hashes (unless the hash is the point); add specifics where vague. A rewrite that removes more than half the content must name the active same-category memory preserving that detail with \`superseded_by\`. \`write\` is for SPLITS ONLY (update the original down to its first fact, write the second) — a healthy run is net-neutral or net-shrinking, never net-adds facts.
 
-### Phase C — Archive stale / low-value
-Archive (with a specific reason) memories that: restate code without rationale · are redundant with a better memory · are stale implementation detail (line numbers/internals) · low signal (seen_count=1, retrieval_count=0, no constraint language) · bare config value · transient measurement · a solved bug in OUR OWN code · redundant with the global user profile (zero added project detail).
+### Phase C — Archive only into a surviving project memory
+Archive a redundant memory only when a better ACTIVE memory in the same project and category preserves its information; name that survivor with \`superseded_by\`. A bare "redundant" verdict is deletion and will be refused. Leave standalone low-value or stale entries unchanged for a human to review. The global user profile describes the operator and is never a substitute for project knowledge, so it cannot justify an archive.
 KEEP (overrides archive): constraint/rule language (must/never/always) · explains WHY (because/so that/to prevent) · EXTERNAL-system limit (CONSTRAINTS: archive only if word-for-word duplicated) · path/config WITH context · retrieval_count>0 · priority/philosophy.
-${args.userProfile ? `\n### Global user profile (for the redundancy check)\n${args.userProfile}\n` : ""}
+
 ### Memory pool
 ${renderMemoryList(args.memories)}`;
 }
@@ -382,7 +374,6 @@ export function buildDreamTaskPrompt(
         projectPath: string;
         lastDreamAt?: string | null;
         existingDocs?: { architecture: boolean; structure: boolean };
-        userMemories?: Array<{ id: number; content: string }>;
         curate?: {
             memories: CuratePromptMemory[];
         };
@@ -393,7 +384,6 @@ export function buildDreamTaskPrompt(
             return buildCuratePrompt({
                 projectPath: args.projectPath,
                 memories: args.curate?.memories ?? [],
-                userProfile: formatUserProfileList(args.userMemories),
             });
         case "maintain-docs":
             return buildMaintainDocsPrompt(
