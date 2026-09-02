@@ -4,6 +4,7 @@ import { estimateTokens } from "../../hooks/magic-context/read-session-formattin
 import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { messageFtsOrdinalRangeIsMapped } from "./message-fts-rowid-map";
 import { recursiveCharacterSplit } from "./recursive-text-splitter";
 
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
@@ -108,6 +109,15 @@ export interface SaveCompartmentChunkEmbeddingInput {
     createdAt?: number;
 }
 
+export const MESSAGE_FTS_CHUNK_LOAD_SQL = `SELECT map.message_ordinal AS messageOrdinal, fts.role, fts.content
+ FROM message_fts_rowid_map AS map
+ CROSS JOIN message_history_fts AS fts
+   ON fts.rowid = map.fts_rowid
+ WHERE map.session_id = ?
+   AND map.message_ordinal BETWEEN ? AND ?
+   AND fts.role IN ('user', 'assistant')
+ ORDER BY map.message_ordinal ASC`;
+
 const loadFtsRowsStatements = new WeakMap<Database, PreparedStatement>();
 const existingHashStatements = new WeakMap<Database, PreparedStatement>();
 const existingHashByProjectStatements = new WeakMap<Database, PreparedStatement>();
@@ -126,15 +136,7 @@ let decodedSearchPoolBytes = 0;
 function getLoadFtsRowsStatement(db: Database): PreparedStatement {
     let stmt = loadFtsRowsStatements.get(db);
     if (!stmt) {
-        stmt = db.prepare(
-            `SELECT message_ordinal AS messageOrdinal, role, content
-             FROM message_history_fts
-             WHERE session_id = ?
-               AND message_ordinal >= ?
-               AND message_ordinal <= ?
-               AND role IN ('user', 'assistant')
-             ORDER BY message_ordinal ASC`,
-        );
+        stmt = db.prepare(MESSAGE_FTS_CHUNK_LOAD_SQL);
         loadFtsRowsStatements.set(db, stmt);
     }
     return stmt;
@@ -406,8 +408,9 @@ export function buildCanonicalChunkTextFromFts(
     sessionId: string,
     startOrdinal: number,
     endOrdinal: number,
-): string {
+): string | null {
     if (endOrdinal < startOrdinal) return "";
+    if (!messageFtsOrdinalRangeIsMapped(db, sessionId, startOrdinal, endOrdinal)) return null;
     const rows = getLoadFtsRowsStatement(db)
         .all(sessionId, startOrdinal, endOrdinal)
         .map((row) => row as FtsChunkRow);
@@ -874,6 +877,33 @@ export function loadUnembeddedCompartmentChunkCandidates(
     );
 }
 
+/** Auto-drain selector that gives the host a turn after every mapped span read. */
+export async function loadUnembeddedCompartmentChunkCandidatesPolite(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+    limit: number,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+): Promise<CompartmentChunkBackfillCandidate[]> {
+    const rows = getBackfillCandidateStatement(db).all(projectPath) as unknown[];
+    const candidates = mapBackfillCandidateRows(rows);
+    const missing: CompartmentChunkBackfillCandidate[] = [];
+    const stale: CompartmentChunkBackfillCandidate[] = [];
+    for (const candidate of candidates) {
+        const defect = classifyChunkCoverageDefect(
+            db,
+            projectPath,
+            modelId,
+            candidate,
+            maxInputTokens,
+        );
+        if (defect === "missing") missing.push(candidate);
+        else if (defect === "stale") stale.push(candidate);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    return [...missing, ...stale].slice(0, Math.max(1, limit));
+}
+
 function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCandidate[] {
     return rows
         .filter((row): row is BackfillCandidateRow => {
@@ -896,7 +926,7 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
         }));
 }
 
-type ChunkCoverageDefect = "missing" | "stale" | null;
+type ChunkCoverageDefect = "missing" | "stale" | "deferred" | null;
 
 /** Classify one compartment against the transcript bytes the current model would embed. */
 function classifyChunkCoverageDefect(
@@ -906,13 +936,14 @@ function classifyChunkCoverageDefect(
     candidate: CompartmentChunkBackfillCandidate,
     maxInputTokens: number,
 ): ChunkCoverageDefect {
-    const canonicalText =
-        buildCanonicalChunkTextFromFts(
-            db,
-            candidate.sessionId,
-            candidate.startMessage,
-            candidate.endMessage,
-        ) || buildCompartmentSummaryFallbackText(db, candidate.id);
+    const mappedText = buildCanonicalChunkTextFromFts(
+        db,
+        candidate.sessionId,
+        candidate.startMessage,
+        candidate.endMessage,
+    );
+    if (mappedText === null) return "deferred";
+    const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
     const windows = chunkCanonicalText(
         canonicalText,
         candidate.startMessage,

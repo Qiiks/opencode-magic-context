@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { recordMessageFtsRowid } from "../../features/magic-context/message-fts-rowid-map";
 import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
@@ -967,11 +968,12 @@ describe("createEventHandler", () => {
         const deps = createDeps(new Map());
         const handler = createEventHandler(deps);
         insertTag(deps.db, "ses-delete-retry", "m-1", "message", 100, 1);
-        deps.db
+        const privateRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'm-1', 'user', 'private bytes')",
             )
-            .run("ses-delete-retry");
+            .run("ses-delete-retry") as { lastInsertRowid: number | bigint };
+        recordMessageFtsRowid(deps.db, "ses-delete-retry", 1, privateRow.lastInsertRowid);
         deps.db
             .prepare(
                 "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, 1, ?)",
@@ -1282,16 +1284,22 @@ describe("createEventHandler", () => {
         insertTag(deps.db, "ses-removed", "msg-removed:p0", "message", 32, 1);
         insertTag(deps.db, "ses-removed", "msg-removed:file1", "file", 48, 2);
         insertTag(deps.db, "ses-removed", "msg-keep:p0", "message", 64, 3);
-        deps.db
+        const removedRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             )
-            .run("ses-removed", 1, "msg-removed", "assistant", "removed");
-        deps.db
+            .run("ses-removed", 1, "msg-removed", "assistant", "removed") as {
+            lastInsertRowid: number | bigint;
+        };
+        recordMessageFtsRowid(deps.db, "ses-removed", 1, removedRow.lastInsertRowid);
+        const keptRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             )
-            .run("ses-removed", 2, "msg-keep", "assistant", "keep");
+            .run("ses-removed", 2, "msg-keep", "assistant", "keep") as {
+            lastInsertRowid: number | bigint;
+        };
+        recordMessageFtsRowid(deps.db, "ses-removed", 2, keptRow.lastInsertRowid);
         deps.db
             .prepare(
                 "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, ?, ?)",

@@ -18,6 +18,7 @@ import {
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { insertMemory } from "./memory/storage-memory";
 import {
     getStoredModelId,
@@ -119,6 +120,24 @@ function countRows(
     return (db.prepare(sql).get(...params) as { count: number }).count;
 }
 
+function insertMappedFtsRow(
+    db: NonNullable<ReturnType<typeof openDatabase>>,
+    sessionId: string,
+    ordinal: number,
+    messageId: string,
+    role: "user" | "assistant",
+    content: string,
+): void {
+    const result = db
+        .prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(sessionId, ordinal, messageId, role, content) as {
+        lastInsertRowid: number | bigint;
+    };
+    recordMessageFtsRowid(db, sessionId, ordinal, result.lastInsertRowid);
+}
+
 function seedCompartmentWithFts(
     db: NonNullable<ReturnType<typeof openDatabase>>,
     sessionId: string,
@@ -135,12 +154,22 @@ function seedCompartmentWithFts(
             p1: "P1 content",
         },
     ]);
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, 1, `${sessionId}-u1`, "user", "How do we avoid saturating the queue?");
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, 2, `${sessionId}-a2`, "assistant", "Use backpressure and bounded drains.");
+    insertMappedFtsRow(
+        db,
+        sessionId,
+        1,
+        `${sessionId}-u1`,
+        "user",
+        "How do we avoid saturating the queue?",
+    );
+    insertMappedFtsRow(
+        db,
+        sessionId,
+        2,
+        `${sessionId}-a2`,
+        "assistant",
+        "Use backpressure and bounded drains.",
+    );
     return getCompartments(db, sessionId)[0].id;
 }
 
@@ -164,12 +193,22 @@ function seedManyCompartmentsWithFts(
                 p1: `P1 content ${i}`,
             },
         ]);
-        db.prepare(
-            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-        ).run(sessionId, start, `${sessionId}-u${start}`, "user", `Question ${i}?`);
-        db.prepare(
-            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-        ).run(sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
+        insertMappedFtsRow(
+            db,
+            sessionId,
+            start,
+            `${sessionId}-u${start}`,
+            "user",
+            `Question ${i}?`,
+        );
+        insertMappedFtsRow(
+            db,
+            sessionId,
+            end,
+            `${sessionId}-a${end}`,
+            "assistant",
+            `Answer ${i}.`,
+        );
     }
 }
 
@@ -197,9 +236,7 @@ function seedOversizedCompartmentWithFts(
     // ~6000 words ≈ thousands of tokens » the default chunk budget, all in one
     // assistant message → one oversized canonical line.
     const huge = Array.from({ length: 6000 }, (_, i) => `word${i}`).join(" ");
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, 1, `${sessionId}-a1`, "assistant", huge);
+    insertMappedFtsRow(db, sessionId, 1, `${sessionId}-a1`, "assistant", huge);
     return getCompartments(db, sessionId)[0].id;
 }
 
@@ -1115,6 +1152,38 @@ describe("project embedding registry", () => {
         expect(batchCalls).toBe(1);
     });
 
+    it("caps each automatic chunk-drain tick and yields before provider work", async () => {
+        let timerRan = false;
+        let providerCalls = 0;
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        providerCalls += 1;
+                        expect(timerRan).toBe(true);
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        seedManyCompartmentsWithFts(db, "ses-tick-cap", 9);
+        recordSessionProjectIdentity(db, "ses-tick-cap", "git:tick-cap");
+        registerProjectEmbedding(
+            db,
+            "git:tick-cap",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/tick-cap",
+        );
+        setTimeout(() => {
+            timerRan = true;
+        }, 0);
+
+        expect(await embedUnembeddedCompartmentChunksForProject(db, "git:tick-cap")).toBe(8);
+        expect(await embedUnembeddedCompartmentChunksForProject(db, "git:tick-cap")).toBe(1);
+        expect(providerCalls).toBeGreaterThan(1);
+    });
+
     it("bounds provider call size even when one compartment has many windows (#207)", async () => {
         const callSizes: number[] = [];
         _setTestProviderFactoryForProject(
@@ -1377,6 +1446,57 @@ describe("project embedding registry", () => {
                 currentChunkModelId("git:window"),
             ),
         ).toHaveLength(1);
+    });
+
+    it("auto chunk drain defers compartments whose legacy FTS span is not mapped", async () => {
+        let providerCalls = 0;
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        providerCalls += 1;
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        db.prepare(
+            "UPDATE message_fts_rowid_map_backfill_state SET completed = 0, watermark_rowid = 0 WHERE id = 1",
+        ).run();
+        appendCompartments(db, "ses-unmapped", [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "u1",
+                endMessageId: "u1",
+                title: "Deferred legacy span",
+                content: "summary must not hide an unmapped transcript",
+                p1: "summary must not hide an unmapped transcript",
+            },
+        ]);
+        db.prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES ('ses-unmapped', 1, 'u1', 'user', 'legacy transcript')",
+        ).run();
+        registerProjectEmbedding(
+            db,
+            "git:unmapped",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/unmapped",
+        );
+        recordSessionProjectIdentity(db, "ses-unmapped", "git:unmapped");
+
+        expect(await embedUnembeddedCompartmentChunksForProject(db, "git:unmapped")).toBe(0);
+        expect(providerCalls).toBe(0);
+        expect(
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-unmapped",
+                "git:unmapped",
+                currentChunkModelId("git:unmapped"),
+            ),
+        ).toHaveLength(0);
     });
 
     it("embedSessionCompartmentChunks drains a whole session and reports progress", async () => {

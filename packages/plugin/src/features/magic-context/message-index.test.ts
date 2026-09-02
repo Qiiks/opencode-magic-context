@@ -14,6 +14,7 @@ import {
     indexSingleMessage,
     markMessageIndexDirty,
 } from "./message-index";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { initializeDatabase } from "./storage-db";
 
 function createTestDb(): Database {
@@ -51,6 +52,16 @@ describe("message-index", () => {
         expect(indexSingleMessage(db, "ses-1", message)).toBe(false);
 
         expect(indexedRows(db, "ses-1")).toEqual([{ message_id: "m-1" }]);
+        expect(
+            db
+                .prepare(
+                    `SELECT map.fts_rowid AS mappedRowid, fts.rowid AS actualRowid
+                     FROM message_fts_rowid_map AS map
+                     JOIN message_history_fts AS fts ON fts.rowid = map.fts_rowid
+                     WHERE map.session_id = ? AND map.message_ordinal = ?`,
+                )
+                .get("ses-1", 1),
+        ).toEqual({ mappedRowid: 1, actualRowid: 1 });
     });
 
     it("preserves an unrelated later dirty floor across a same-ID replacement", () => {
@@ -118,11 +129,12 @@ describe("message-index", () => {
             ];
             indexMessagesAfterOrdinal(first, "ses-gap", [messages[0]!], 0, 1);
             markMessageIndexDirty(second, "ses-gap", 2);
-            second
+            const newer = second
                 .prepare(
                     "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES ('ses-gap', 3, 'm-3', 'user', 'newer live row')",
                 )
-                .run();
+                .run() as { lastInsertRowid: number | bigint };
+            recordMessageFtsRowid(second, "ses-gap", 3, newer.lastInsertRowid);
             second
                 .prepare(
                     "UPDATE message_history_index SET last_indexed_ordinal = 3 WHERE session_id = 'ses-gap'",

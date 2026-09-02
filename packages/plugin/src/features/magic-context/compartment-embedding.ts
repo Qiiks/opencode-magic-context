@@ -64,15 +64,16 @@ export async function embedAndStoreCompartmentChunks(
                       compartment.endMessage,
                   )
                 : "";
-            const canonicalText =
-                fromMemory ||
-                buildCanonicalChunkTextFromFts(
-                    db,
-                    sessionId,
-                    compartment.startMessage,
-                    compartment.endMessage,
-                ) ||
-                buildCompartmentSummaryFallbackText(db, compartment.id);
+            const mappedText = fromMemory
+                ? fromMemory
+                : buildCanonicalChunkTextFromFts(
+                      db,
+                      sessionId,
+                      compartment.startMessage,
+                      compartment.endMessage,
+                  );
+            if (mappedText === null) continue;
+            const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, compartment.id);
             if (canonicalText.length === 0) continue;
 
             const windows = chunkCanonicalText(
@@ -144,6 +145,8 @@ export async function embedAndStoreCompartmentChunks(
                 `compartment chunk embedding failed for compartment ${compartment.id}:`,
                 error,
             );
+        } finally {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
         }
     }
 }
