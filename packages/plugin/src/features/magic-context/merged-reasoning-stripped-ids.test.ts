@@ -85,10 +85,11 @@ describe("trailing_blank_decisions", () => {
         );
     });
 
-    it("refreshes only the explicitly live newest assistant", () => {
+    it("refreshes a live keep without reopening an absorbing strip", () => {
         addTrailingBlankDecisions(db, sessionId, [
             ["assistant-historical", "strip"],
-            ["assistant-newest", "strip"],
+            ["assistant-newest-strip", "strip"],
+            ["assistant-newest-keep", "keep"],
         ]);
 
         expect(
@@ -97,15 +98,21 @@ describe("trailing_blank_decisions", () => {
                 sessionId,
                 [
                     ["assistant-historical", "keep"],
-                    ["assistant-newest", "keep"],
+                    ["assistant-newest-strip", "keep"],
                 ],
-                { overwriteMessageId: "assistant-newest" },
+                { overwriteMessageId: "assistant-newest-strip" },
             ),
+        ).toBe(true);
+        expect(
+            addTrailingBlankDecisions(db, sessionId, [["assistant-newest-keep", "keep:3"]], {
+                overwriteMessageId: "assistant-newest-keep",
+            }),
         ).toBe(true);
         expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
             new Map([
                 ["assistant-historical", "strip"],
-                ["assistant-newest", "keep"],
+                ["assistant-newest-strip", "strip"],
+                ["assistant-newest-keep", "keep:3"],
             ]),
         );
     });

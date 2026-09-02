@@ -5402,15 +5402,16 @@ fn apply_once(
     // Recheck trailing blanks on every pass, including deferred passes. Decisions come only from
     // the immutable ingress snapshot and are intersected with the served projection. On a deferred
     // pass, record only the newest assistant because no cached message follows it.
-    let (trailing_blank_decisions_updated, newest_keep_updated) = refresh_trailing_blank_decisions(
-        &mut core,
-        req,
-        &trailing_blank_source_decisions,
-        &built_output.messages,
-        is_provider_prefix_mutation_pass,
-    );
+    let (trailing_blank_decisions_updated, newest_replay_required) =
+        refresh_trailing_blank_decisions(
+            &mut core,
+            req,
+            &trailing_blank_source_decisions,
+            &built_output.messages,
+            is_provider_prefix_mutation_pass,
+        );
     if trailing_blank_decisions_updated > 0
-        && (is_provider_prefix_mutation_pass || newest_keep_updated)
+        && (is_provider_prefix_mutation_pass || newest_replay_required)
     {
         built_output = build_output_with_tags(
             &core,
@@ -5728,7 +5729,6 @@ fn trailing_blank_identity_replays_stored(
         core,
         profile,
         req.provider_id.as_deref(),
-        false,
         mid,
         &mut normalized.ck,
     ) == 0
@@ -5760,23 +5760,33 @@ fn enforce_block_identity(
         if stored == vector {
             continue;
         }
+        let newest_keep_refresh = latest_assistant_mid(&req.messages) == Some(mid.as_str())
+            && frozen_trailing_blank_decision(core, mid) == Some(FrozenTrailingBlankDecision::Keep)
+            && req
+                .messages
+                .iter()
+                .find(|message| message.mid == mid.as_str())
+                .and_then(trailing_blank_source_decision)
+                .is_some_and(|(source, count)| {
+                    source == FrozenTrailingBlankDecision::Strip
+                        || frozen_trailing_blank_keep_count(core, mid) != Some(count)
+                });
+        if newest_keep_refresh {
+            // The refresh and this identity adoption commit atomically. This permits only
+            // keep-count changes and keep-to-strip demotion; an absorbing strip never adopts
+            // a late suffix from the live source.
+            re_adoptions.push(TailIdentityReAdoption {
+                mid: mid.clone(),
+                old_hash_prefix: block_identity_hash_prefix(stored),
+                new_hash_prefix: block_identity_hash_prefix(vector),
+            });
+            continue;
+        }
         // A provider may append an invisible suffix after a message was stored.
         // Accept it only when the stored strip/keep decision reconstructs the full
-        // message identity that was previously served.
+        // message identity that was previously served. The frozen decision remains
+        // authoritative, so an absorbing strip never re-adopts the late source suffix.
         if trailing_blank_identity_replays_stored(req, core, mid, stored) {
-            if latest_assistant_mid(&req.messages) == Some(mid.as_str())
-                && frozen_trailing_blank_decision(core, mid)
-                    == Some(FrozenTrailingBlankDecision::Strip)
-            {
-                // Keep a trailing blank visible while the newest assistant may still
-                // change, and update its stored identity as the decision becomes keep.
-                // Older assistants replay strip and retain their prior identity.
-                re_adoptions.push(TailIdentityReAdoption {
-                    mid: mid.clone(),
-                    old_hash_prefix: block_identity_hash_prefix(stored),
-                    new_hash_prefix: block_identity_hash_prefix(vector),
-                });
-            }
             continue;
         }
         if identity_drift_requires_reject(meta, req, core, mid) {
@@ -11768,7 +11778,6 @@ fn message_output_identity(
     full_drop_ids: &HashSet<String>,
     mutation_exempt: bool,
     reasoning_mutation_exempt: bool,
-    trailing_blank_mutation_exempt: bool,
     first_assistant_in_run: bool,
     frozen_unit_scan_ms: &mut f64,
 ) -> String {
@@ -11799,7 +11808,6 @@ fn message_output_identity(
     digest_field(&mut hasher, &[request_accepts_empty_content(req) as u8]);
     digest_field(&mut hasher, &[mutation_exempt as u8]);
     digest_field(&mut hasher, &[reasoning_mutation_exempt as u8]);
-    digest_field(&mut hasher, &[trailing_blank_mutation_exempt as u8]);
     digest_field(&mut hasher, &[first_assistant_in_run as u8]);
     let message_tag = message_tag_number(message, tag_numbers);
     digest_field(&mut hasher, &message_tag.to_le_bytes());
@@ -12291,7 +12299,6 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
     core: &CoreState,
     profile: SerializerProfile,
     provider_id: Option<&str>,
-    _newest_assistant_exempt: bool,
     mid: &str,
     message: &mut CkWireMessage,
 ) -> usize {
@@ -12448,21 +12455,27 @@ fn refresh_trailing_blank_decisions(
         let frozen_matches = frozen == Some(decision)
             && (decision == FrozenTrailingBlankDecision::Strip
                 || frozen_trailing_blank_keep_count(core, mid) == Some(keep_count));
-        if frozen.is_some() && (newest_assistant_mid != Some(mid) || frozen_matches) {
+        // A strip is absorbing. If a harness blank arrives after the first serve, stripping it
+        // forever makes streaming, completion, and historical projections suffix-monotonic.
+        // A live keep may still change count or demote to strip when its source suffix disappears.
+        if frozen == Some(FrozenTrailingBlankDecision::Strip)
+            || (frozen.is_some() && (newest_assistant_mid != Some(mid) || frozen_matches))
+        {
             continue;
         }
         if frozen.is_none() && !record_historical && newest_assistant_mid != Some(mid) {
             continue;
         }
-        updates.push((mid.to_string(), decision, keep_count));
+        updates.push((mid.to_string(), decision, keep_count, frozen.is_some()));
     }
 
-    let newest_keep_updated = updates.iter().any(|(mid, decision, _)| {
-        newest_assistant_mid == Some(mid.as_str()) && *decision == FrozenTrailingBlankDecision::Keep
+    let newest_replay_required = updates.iter().any(|(mid, decision, _, had_frozen)| {
+        newest_assistant_mid == Some(mid.as_str())
+            && (*had_frozen || *decision == FrozenTrailingBlankDecision::Keep)
     });
     let replaced_keys = updates
         .iter()
-        .flat_map(|(mid, _, _)| {
+        .flat_map(|(mid, _, _, _)| {
             [
                 format!("strip:trailing_blank_keep:{mid}"),
                 format!("strip:trailing_blank_strip:{mid}"),
@@ -12471,7 +12484,7 @@ fn refresh_trailing_blank_decisions(
         .collect::<HashSet<_>>();
     core.frozen_units
         .retain(|unit| !replaced_keys.contains(&unit.key));
-    for (mid, decision, keep_count) in &updates {
+    for (mid, decision, keep_count, _) in &updates {
         let (kind, payload) = match decision {
             FrozenTrailingBlankDecision::Keep if *keep_count > 1 => {
                 ("trailing_blank_keep", keep_count.to_string())
@@ -12481,7 +12494,7 @@ fn refresh_trailing_blank_decisions(
         };
         core.frozen_units.push(strip_unit(kind, mid, &payload));
     }
-    (updates.len(), newest_keep_updated)
+    (updates.len(), newest_replay_required)
 }
 
 fn apply_serializer_residual_to_message(
@@ -12823,8 +12836,6 @@ fn build_output_with_tags_inner(
             mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
         let reasoning_mutation_exempt =
             reasoning_mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
-        let trailing_blank_mutation_exempt =
-            reasoning_mutation_exempt_mid == Some(msg.mid.as_str());
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
@@ -12844,7 +12855,6 @@ fn build_output_with_tags_inner(
             &full_drop_ids,
             mutation_exempt,
             reasoning_mutation_exempt,
-            trailing_blank_mutation_exempt,
             first_assistant_in_run,
             &mut build_timings.frozen_unit_scan,
         );
@@ -13004,7 +13014,6 @@ fn build_output_with_tags_inner(
                         core,
                         profile,
                         req.provider_id.as_deref(),
-                        trailing_blank_mutation_exempt,
                         &msg.mid,
                         &mut rendered,
                     );
@@ -19066,7 +19075,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                true,
                 "target",
                 &mut first_without_trailing,
             ),
@@ -19079,7 +19087,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut late_trailing,
             ),
@@ -19101,7 +19108,6 @@ pub(crate) mod tests {
                 &keep_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut missing_trailing,
             ),
@@ -19118,7 +19124,6 @@ pub(crate) mod tests {
                 &keep_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut empty,
             ),
@@ -19131,7 +19136,6 @@ pub(crate) mod tests {
             &keep_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            true,
             "target",
             &mut newest_with_trailing,
         );
@@ -19141,7 +19145,6 @@ pub(crate) mod tests {
             &keep_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            false,
             "target",
             &mut historical_with_trailing,
         );
@@ -19169,7 +19172,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                true,
                 "target",
                 &mut newest_reasoning_terminal,
             );
@@ -19178,7 +19180,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut historical_reasoning_terminal,
             );
@@ -19207,7 +19208,6 @@ pub(crate) mod tests {
             &strip_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            false,
             "target",
             &mut adjacent_reasoning,
         );
@@ -19227,7 +19227,6 @@ pub(crate) mod tests {
             &keep_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            true,
             "target",
             &mut wholly_blank,
         );
@@ -19239,7 +19238,6 @@ pub(crate) mod tests {
             &strip_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            true,
             "target",
             &mut newest_strip,
         );
@@ -19248,7 +19246,6 @@ pub(crate) mod tests {
             &strip_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            false,
             "target",
             &mut historical_strip,
         );
@@ -19270,7 +19267,6 @@ pub(crate) mod tests {
             &keep_two_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            true,
             "target",
             &mut newest_keep_two,
         );
@@ -19279,7 +19275,6 @@ pub(crate) mod tests {
             &keep_two_core,
             SerializerProfile::OpencodeAiSdk,
             Some("anthropic"),
-            false,
             "target",
             &mut historical_keep_two,
         );
@@ -19294,7 +19289,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::Pi,
                 Some("anthropic"),
-                false,
                 "target",
                 &mut pi_replay,
             ),
@@ -19307,7 +19301,6 @@ pub(crate) mod tests {
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("openai"),
-                false,
                 "target",
                 &mut non_anthropic,
             ),
@@ -19708,6 +19701,7 @@ pub(crate) mod tests {
             Some(FrozenTrailingBlankDecision::Strip)
         );
 
+        let first_target_bytes = message_bytes(&first, "target");
         let still_newest = run(
             &newest_store,
             &request(
@@ -19721,13 +19715,13 @@ pub(crate) mod tests {
             &spine(),
         );
         assert_eq!(still_newest.action, "SOFT+");
-        let last_newest_bytes = message_bytes(&still_newest, "target");
+        assert_eq!(message_bytes(&still_newest, "target"), first_target_bytes);
         assert_eq!(
             frozen_trailing_blank_decision(
                 &newest_store.load(newest_session).unwrap().core,
                 "target"
             ),
-            Some(FrozenTrailingBlankDecision::Keep)
+            Some(FrozenTrailingBlankDecision::Strip)
         );
 
         let historical = run(
@@ -19745,7 +19739,7 @@ pub(crate) mod tests {
             &spine(),
         );
         assert_eq!(historical.action, "SOFT+");
-        assert_eq!(message_bytes(&historical, "target"), last_newest_bytes);
+        assert_eq!(message_bytes(&historical, "target"), first_target_bytes);
 
         let structural_dir = tempfile::tempdir().unwrap();
         let structural_store = store(structural_dir.path());
@@ -19796,6 +19790,276 @@ pub(crate) mod tests {
         assert_eq!(
             message_bytes(&structural_replay, "structural"),
             structural_bytes
+        );
+    }
+
+    #[test]
+    fn newest_keep_demotes_to_an_absorbing_strip_through_transform() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-newest-demotion";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+
+        let first = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    trailing_regression_assistant("target", 2, Some(""), false),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "target"),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+        assert_eq!(
+            first
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .content
+                .len(),
+            2
+        );
+
+        let mut recounted_target = trailing_regression_assistant("target", 2, Some(""), false);
+        recounted_target
+            .ck
+            .content
+            .extend([canonical_blank_block(), canonical_blank_block()]);
+        let recounted = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![item("user-0", 1, "start"), recounted_target],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            frozen_trailing_blank_keep_count(&store.load(session).unwrap().core, "target"),
+            Some(3)
+        );
+        assert_eq!(
+            recounted
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .content
+                .len(),
+            4
+        );
+
+        let demoted = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    trailing_regression_assistant("target", 2, None, false),
+                ],
+            ),
+            &spine(),
+        );
+        let demoted_bytes = trailing_regression_message_bytes(&demoted, "target");
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "target"),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+
+        let late_blank = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    trailing_regression_assistant("target", 2, Some(""), false),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(
+            trailing_regression_message_bytes(&late_blank, "target"),
+            demoted_bytes
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "target"),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+    }
+
+    #[test]
+    fn frozen_strip_ck_transform_path_is_position_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-ck-position";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+        let mut loaded = store.load(session).unwrap();
+        loaded
+            .core
+            .frozen_units
+            .push(strip_unit("trailing_blank_strip", "target", ""));
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let target = || trailing_regression_assistant("target", 2, Some(""), false);
+        let newest = run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start"), target()]),
+            &spine(),
+        );
+        let newest_bytes = trailing_regression_message_bytes(&newest, "target");
+        let newest_target = newest
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+            .unwrap();
+        assert_eq!(newest_target.content.len(), 1);
+        assert!(matches!(
+            &newest_target.content[0].kind,
+            ck_wire::CkKind::Text { text } if text == "answer-target"
+        ));
+        let historical = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    target(),
+                    item("user-1", 3, "continue"),
+                    trailing_regression_assistant("newest", 4, None, false),
+                ],
+            ),
+            &spine(),
+        );
+
+        assert_eq!(
+            trailing_regression_message_bytes(&historical, "target"),
+            newest_bytes,
+            "the CK transform path must not depend on assistant position"
+        );
+    }
+
+    #[test]
+    fn deployment_replay_changes_only_the_newest_frozen_strip_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "trailing-blank-deployment-replay";
+        run(
+            &store,
+            &trailing_regression_request(session, vec![item("user-0", 1, "start")]),
+            &spine(),
+        );
+        let mut loaded = store.load(session).unwrap();
+        loaded.core.frozen_units.extend([
+            strip_unit("trailing_blank_strip", "historical-strip", ""),
+            strip_unit("trailing_blank_keep", "historical-keep", ""),
+            strip_unit("trailing_blank_keep", "historical-keep-three", "3"),
+            strip_unit("trailing_blank_strip", "newest-strip", ""),
+        ]);
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let historical_strip = CkIngressMessage {
+            mid: "historical-strip".to_string(),
+            ordinal: 2,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: "terminal reasoning".to_string(),
+                        signature: Some("sig".to_string()),
+                    }),
+                    canonical_blank_block(),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("historical-strip".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let historical_keep = trailing_regression_assistant("historical-keep", 4, Some(""), false);
+        let mut historical_keep_three =
+            trailing_regression_assistant("historical-keep-three", 6, Some(""), false);
+        historical_keep_three
+            .ck
+            .content
+            .extend([canonical_blank_block(), canonical_blank_block()]);
+        let newest_strip = trailing_regression_assistant("newest-strip", 8, Some(""), false);
+        let unchanged = [&historical_strip, &historical_keep, &historical_keep_three]
+            .into_iter()
+            .map(|message| {
+                (
+                    message.mid.clone(),
+                    ServedMessage::from_message(message.ck.clone())
+                        .canonical_bytes()
+                        .to_vec(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let newest_before = ServedMessage::from_message(newest_strip.ck.clone())
+            .canonical_bytes()
+            .to_vec();
+        let response = run(
+            &store,
+            &trailing_regression_request(
+                session,
+                vec![
+                    item("user-0", 1, "start"),
+                    historical_strip,
+                    item("user-1", 3, "continue"),
+                    historical_keep,
+                    item("user-2", 5, "continue"),
+                    historical_keep_three,
+                    item("user-3", 7, "continue"),
+                    newest_strip,
+                ],
+            ),
+            &spine(),
+        );
+
+        for (mid, bytes) in unchanged {
+            assert_eq!(trailing_regression_message_bytes(&response, &mid), bytes);
+        }
+        let newest = response
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("newest-strip"))
+            .unwrap();
+        assert_ne!(newest.canonical_bytes(), newest_before);
+        assert!(matches!(
+            &newest.content.last().unwrap().kind,
+            ck_wire::CkKind::Text { text } if text == "answer-newest-strip"
+        ));
+        let historical_reasoning = response
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("historical-strip"))
+            .unwrap();
+        assert_eq!(
+            historical_reasoning.content.last(),
+            Some(&canonical_blank_block())
+        );
+        assert_eq!(
+            frozen_trailing_blank_decision(&store.load(session).unwrap().core, "newest-strip"),
+            Some(FrozenTrailingBlankDecision::Strip),
+            "a live source keep must not reopen a frozen strip"
         );
     }
 

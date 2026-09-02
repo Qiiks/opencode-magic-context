@@ -809,7 +809,6 @@ export function finalizeMessageRepresentation(
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
-        trailingBlankNewestAssistant?: MessageLike;
         mergedReasoningStrippedIds?: ReadonlySet<string>;
         thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
         trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
@@ -837,15 +836,6 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    let newestAssistant = options?.trailingBlankNewestAssistant;
-    if (!newestAssistant) {
-        for (let index = messages.length - 1; index >= 0; index -= 1) {
-            const message = messages[index];
-            if (message.info.role !== "assistant") continue;
-            newestAssistant = message;
-            break;
-        }
-    }
     const bindingRecoveryParts = options?.skipMergedReasoningStrip
         ? 0
         : stripReasoningFromAssistantIds(
@@ -862,11 +852,7 @@ export function finalizeMessageRepresentation(
                   frozenMessageIds: options?.mergedReasoningStrippedIds,
               }));
     if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
-        applyFrozenTrailingBlankDecisions(
-            messages,
-            typeof newestAssistant?.info.id === "string" ? newestAssistant.info.id : undefined,
-            options?.trailingBlankDecisions ?? new Map(),
-        );
+        applyFrozenTrailingBlankDecisions(messages, options?.trailingBlankDecisions ?? new Map());
     }
     return { clearedParts, mergedReasoningParts };
 }
@@ -2370,44 +2356,12 @@ export async function runPostTransformPhase(
         }
     }
 
-    const servedTrailingBlankDecisions = new Map(trailingBlankDecisions);
-    if (newestAssistantId) {
-        const frozenNewestDecision = trailingBlankDecisions.get(newestAssistantId);
-        const sourceNewestDecision = trailingBlankSourceDecisions.get(newestAssistantId);
-        if (
-            frozenNewestDecision !== undefined &&
-            sourceNewestDecision !== undefined &&
-            frozenNewestDecision !== sourceNewestDecision
-        ) {
-            // The live source can gain or lose a genuine blank before its frozen choice is
-            // refreshed below. Serve that observed choice now so replay does not erase source
-            // bytes on the same pass that persists them as the new stable representation.
-            servedTrailingBlankDecisions.set(newestAssistantId, sourceNewestDecision);
-        }
-    }
-
-    const tFinalRepresentation = performance.now();
-    const finalRepresentation = finalizeMessageRepresentation(
-        args.messages,
-        args.resolvedProviderID,
-        {
-            prependedMessageCount,
-            reasoningMutatedMessages,
-            reasoningMutationExemptMessage,
-            trailingBlankNewestAssistant,
-            mergedReasoningStrippedIds,
-            thinkingBindingRecoveryMessageIds,
-            trailingBlankDecisions: servedTrailingBlankDecisions,
-            skipMergedReasoningStrip: compactionOff,
-            skipTrailingWhitespaceStrip: compactionOff,
-        },
-    );
-
     if (canUseEmptySentinels && !compactionOff) {
-        // Observe every served pass, including defers. A newly completed assistant is
-        // recorded while it is newest, before a provider can append a blank to the
-        // rebuilt historical message. If a late blank arrives while it is still newest,
-        // refresh and replay its choice so the live and historical suffixes stay identical.
+        // Observe every pass, including defers. A new decision or an allowed newest keep
+        // refresh is persisted before finalization, so a served demotion cannot outlive a
+        // failed compare-and-swap. An established strip never refreshes to keep: a harness
+        // blank arriving after the first serve stays stripped, and streaming, completion,
+        // and historical projections can only lose suffix bytes, never reintroduce them.
         const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
@@ -2430,27 +2384,16 @@ export async function runPostTransformPhase(
                 });
                 if (persisted) {
                     const committed = getTrailingBlankDecisions(args.db, args.sessionId);
-                    const newlyFrozen = new Map<string, TrailingBlankDecision>();
                     for (const [id] of candidates) {
                         const decision = committed.get(id);
-                        if (!decision) continue;
-                        trailingBlankDecisions.set(id, decision);
-                        newlyFrozen.set(id, decision);
+                        if (decision) trailingBlankDecisions.set(id, decision);
                     }
-                    // Replay a new decision while the assistant is still newest. Keeps
-                    // canonicalize the recorded suffix length; strips remove a completion
-                    // sentinel before it can differ from the later historical replay.
-                    applyFrozenTrailingBlankDecisions(
-                        args.messages,
-                        newestAssistantId,
-                        newlyFrozen,
-                    );
                     if (isCacheBustingPass) bustedThisPass = true;
                 } else {
                     args.passOutcome?.record("trailing-blank-decision-persistence-failure");
                     sessionLog(
                         args.sessionId,
-                        "trailing blank decision: persistence failed; leaving newly observed assistants intact",
+                        "trailing blank decision: persistence failed; serving the frozen decisions",
                     );
                 }
             } catch (error) {
@@ -2463,6 +2406,22 @@ export async function runPostTransformPhase(
             }
         }
     }
+
+    const tFinalRepresentation = performance.now();
+    const finalRepresentation = finalizeMessageRepresentation(
+        args.messages,
+        args.resolvedProviderID,
+        {
+            prependedMessageCount,
+            reasoningMutatedMessages,
+            reasoningMutationExemptMessage,
+            mergedReasoningStrippedIds,
+            thinkingBindingRecoveryMessageIds,
+            trailingBlankDecisions,
+            skipMergedReasoningStrip: compactionOff,
+            skipTrailingWhitespaceStrip: compactionOff,
+        },
+    );
 
     sessionLog(
         args.sessionId,

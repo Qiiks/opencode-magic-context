@@ -2426,7 +2426,11 @@ export function getTrailingBlankDecisions(
     return parseTrailingBlankDecisions(row?.trailing_blank_decisions);
 }
 
-/** Persist new decisions, optionally refreshing the still-live newest assistant. */
+/**
+ * Persist new decisions, optionally refreshing the still-live newest assistant.
+ * A persisted strip is absorbing; only keep decisions may refresh their count or
+ * demote to strip.
+ */
 export function addTrailingBlankDecisions(
     db: Database,
     sessionId: string,
@@ -2448,7 +2452,9 @@ export function addTrailingBlankDecisions(
             const currentDecision = current.get(id);
             if (
                 currentDecision === undefined ||
-                (id === options?.overwriteMessageId && currentDecision !== decision)
+                (id === options?.overwriteMessageId &&
+                    currentDecision !== decision &&
+                    currentDecision !== "strip")
             ) {
                 current.set(id, decision);
                 changed = true;

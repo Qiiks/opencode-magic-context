@@ -18138,6 +18138,114 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frozen_strip_native_transform_path_is_position_independent() {
+        fn assistant(mid: &str, ordinal: u64, trailing: bool) -> CkIngressMessage {
+            let mut content = vec![CkWireBlock::bare(CkKind::Text {
+                text: format!("answer-{mid}"),
+            })];
+            if trailing {
+                content.push(CkWireBlock::bare(CkKind::Text {
+                    text: String::new(),
+                }));
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn native(mid: &str, role: &str, text: &str, trailing: bool) -> Value {
+            let mut parts = vec![json!({ "type": "text", "text": text })];
+            if trailing {
+                parts.push(json!({ "type": "text", "text": "" }));
+            }
+            json!({
+                "info": { "id": mid, "sessionID": "ses", "role": role },
+                "parts": parts,
+            })
+        }
+
+        fn rust_mode_request(
+            messages: Vec<CkIngressMessage>,
+            native_messages: Vec<Value>,
+        ) -> Value {
+            let mut value = request(messages);
+            value["serializer_profile"] = json!("opencode-aisdk");
+            value["provider_id"] = json!("anthropic");
+            value["serve_native"] = json!(true);
+            value["native_messages"] = Value::Array(native_messages);
+            value
+        }
+
+        fn native_target_bytes(response: &Value) -> Vec<u8> {
+            let target = response["native_messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["info"]["id"] == "target")
+                .expect("native target must be served");
+            serde_json::to_vec(target).unwrap()
+        }
+
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![assistant("target", 1, false)],
+                vec![native("target", "assistant", "answer-target", false)],
+            ),
+        )
+        .await;
+
+        let newest = call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![assistant("target", 1, true)],
+                vec![native("target", "assistant", "answer-target", true)],
+            ),
+        )
+        .await;
+        let newest_bytes = native_target_bytes(&newest);
+        let historical = call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![
+                    assistant("target", 1, true),
+                    ck_with_role("user-next", 2, "user", "continue"),
+                    assistant("newest", 3, false),
+                ],
+                vec![
+                    native("target", "assistant", "answer-target", true),
+                    native("user-next", "user", "continue", false),
+                    native("newest", "assistant", "answer-newest", false),
+                ],
+            ),
+        )
+        .await;
+
+        assert_eq!(historical["status"], "ok");
+        assert_eq!(native_target_bytes(&historical), newest_bytes);
+        let target = historical["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == "target")
+            .unwrap();
+        assert_eq!(target["parts"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn native_response_release_guard_full_serializes_without_frontier() {
         let request = native_cache_request(
