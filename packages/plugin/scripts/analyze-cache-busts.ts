@@ -32,8 +32,8 @@ import { join } from "node:path";
 
 type Json = Record<string, unknown>;
 type ByteVerdict = "BUST" | "STABLE";
-type MeterVerdict = ByteVerdict | "UNMETERED";
-type MeterVsBytes = "AGREE" | "BYTES-ONLY" | "METER-ONLY" | "UNMETERED";
+type MeterVerdict = ByteVerdict | "LATENCY" | "UNMETERED";
+type MeterVsBytes = "AGREE" | "BYTES-ONLY" | "LATENCY" | "UNMETERED";
 
 interface Segment {
     id: string;
@@ -70,9 +70,10 @@ interface AnalysisRow {
     verdict: MeterVerdict | "BASE";
     meterVsBytes?: MeterVsBytes;
     prevTotal?: number;
-    writeSlack?: number;
+    epsilon?: number;
     meterFloor?: number;
     comparableRead?: number;
+    shortRead?: boolean;
     rewrittenTokens?: number;
 }
 
@@ -422,8 +423,10 @@ function analyzeSnapshots(snaps: Snapshot[]): AnalysisRow[] {
         if (index === 0) return { current, divergenceIndex: -1, verdict: "BASE" };
         const previous = snaps[index - 1];
         const divergenceIndex = firstDivergence(previous.segments, current.segments);
+        // Only a change at or before the current tail breakpoint can rewrite the
+        // reusable prefix. Ordinary appended tail growth is attribution, not a bust.
         const byteVerdict: ByteVerdict =
-            divergenceIndex !== -1 && divergenceIndex <= lastBreakpointIndex(previous.segments)
+            divergenceIndex !== -1 && divergenceIndex <= lastBreakpointIndex(current.segments)
                 ? "BUST"
                 : "STABLE";
         if (!current.usage || !previous.usage) {
@@ -436,17 +439,24 @@ function analyzeSnapshots(snaps: Snapshot[]): AnalysisRow[] {
                 meterVsBytes: "UNMETERED",
             };
         }
-        // The preceding request's newest cache write can still overlap this stream,
-        // so it cannot be required to appear in this request's cache-read meter.
         const prevTotal = previous.usage.total;
-        const writeSlack = previous.usage.cacheCreation;
-        const meterFloor = prevTotal - writeSlack;
+        const epsilon = Math.max(64, previous.usage.input);
+        const meterFloor = prevTotal - epsilon;
         // input_tokens are direct, non-cacheable tokens. Add the current direct input
         // back to cache_read before comparing it with a previous total that includes it.
         const comparableRead = current.usage.cacheRead + current.usage.input;
-        const verdict: ByteVerdict = comparableRead < meterFloor ? "BUST" : "STABLE";
+        const shortRead = comparableRead < meterFloor;
+        const verdict: MeterVerdict = shortRead
+            ? byteVerdict === "BUST"
+                ? "BUST"
+                : "LATENCY"
+            : "STABLE";
         const meterVsBytes: MeterVsBytes =
-            verdict === byteVerdict ? "AGREE" : verdict === "BUST" ? "METER-ONLY" : "BYTES-ONLY";
+            verdict === "LATENCY"
+                ? "LATENCY"
+                : verdict === "STABLE" && byteVerdict === "BUST"
+                  ? "BYTES-ONLY"
+                  : "AGREE";
         return {
             current,
             previous,
@@ -455,10 +465,14 @@ function analyzeSnapshots(snaps: Snapshot[]): AnalysisRow[] {
             verdict,
             meterVsBytes,
             prevTotal,
-            writeSlack,
+            epsilon,
             meterFloor,
             comparableRead,
-            rewrittenTokens: verdict === "BUST" ? prevTotal - current.usage.cacheRead : undefined,
+            shortRead,
+            rewrittenTokens:
+                verdict === "BUST" || verdict === "LATENCY"
+                    ? prevTotal - current.usage.cacheRead
+                    : undefined,
         };
     });
 }
@@ -517,7 +531,7 @@ function meterCell(row: AnalysisRow): string {
     const read = row.current.usage?.cacheRead ?? 0;
     const rewritten = row.rewrittenTokens === undefined ? "" : `; rewritten≈${row.rewrittenTokens.toLocaleString()}`;
     const directInput = row.current.usage?.input ?? 0;
-    return `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, writeSlack=${row.writeSlack?.toLocaleString()})${rewritten}`;
+    return `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}`;
 }
 
 function main(): void {
@@ -538,7 +552,7 @@ function main(): void {
     console.log(`Dumps:   ${snaps.length}  (dir: ${opts.dir})`);
     console.log("");
     console.log("Dashboard times are local (UTC+2); table times are UTC.");
-    console.log("Meter rule: BUST when cacheRead + current input < prevTotal - writeSlack; prevTotal=previous read+creation+input, writeSlack=previous creation.");
+    console.log("Meter rule: shortRead when cacheRead + current input < prevTotal - ε, where ε=max(64, previous input). A short read is BUST only when bytes diverge before the current tail breakpoint; otherwise it is LATENCY.");
     console.log(
         "time(UTC)          | segs | verdict          | meter                                                  | meterVsBytes | first-divergence                | prevBytes → curBytes        | cachedPrefix@breakpoint",
     );
@@ -547,6 +561,7 @@ function main(): void {
     );
 
     let bustCount = 0;
+    let latencyCount = 0;
     let unmeteredBustCount = 0;
     for (const row of rows) {
         if (row.verdict === "BASE") {
@@ -558,9 +573,11 @@ function main(): void {
         const shouldPrint =
             opts.allRows ||
             row.verdict === "BUST" ||
+            row.verdict === "LATENCY" ||
             (row.verdict === "UNMETERED" && row.byteVerdict === "BUST");
         if (!shouldPrint) continue;
         if (row.verdict === "BUST") bustCount += 1;
+        if (row.verdict === "LATENCY") latencyCount += 1;
         if (row.verdict === "UNMETERED" && row.byteVerdict === "BUST") unmeteredBustCount += 1;
 
         const previous = row.previous as Snapshot;
@@ -605,6 +622,9 @@ function main(): void {
         console.log(`No metered busts across ${snaps.length} request(s).`);
     } else {
         console.log(`${bustCount} metered bust(s) across ${snaps.length} request(s).${opts.allRows ? "" : " (STABLE rows hidden; pass --all-rows to show them.)"}`);
+    }
+    if (latencyCount > 0) {
+        console.log(`${latencyCount} latency-only short read(s) had no reusable-prefix byte divergence.`);
     }
     if (unmeteredBustCount > 0) {
         console.log(`${unmeteredBustCount} unmetered byte-attributed bust candidate(s); response usage was unavailable.`);

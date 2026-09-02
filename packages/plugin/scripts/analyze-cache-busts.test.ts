@@ -79,6 +79,22 @@ function bodyWithTail(text: string, tailBreakpoint = false): unknown {
     };
 }
 
+function bodyWithTailCheckpoint(text: string): unknown {
+    return {
+        messages: [
+            {
+                role: "user",
+                content: [{ type: "text", text: "cached prefix", cache_control: { type: "ephemeral" } }],
+            },
+            { role: "assistant", content: [{ type: "text", text }] },
+            {
+                role: "user",
+                content: [{ type: "text", text: "current tail checkpoint", cache_control: { type: "ephemeral" } }],
+            },
+        ],
+    };
+}
+
 function snapshotsFor(dir: string, session: string) {
     return __test.loadSnapshots(
         __test.parseArgs(["bun", "analyze-cache-busts.ts", "--session", session, "--dir", dir]),
@@ -155,7 +171,6 @@ describe("analyze-cache-bust provider meter verdicts", () => {
         const session = "ses_falsePositiveFixture";
         const priorUsage = {
             cache_read_input_tokens: 411_287,
-            cache_creation_input_tokens: 1_771,
             input_tokens: 4,
         };
         writeDump(
@@ -171,7 +186,7 @@ describe("analyze-cache-bust provider meter verdicts", () => {
             `2026-09-02T09-17-52-000Z-000002-${session}`,
             "2026-09-02T09:17:52.000Z",
             session,
-            bodyWithTail("new tail payload"),
+            bodyWithTailCheckpoint("new tail payload"),
             streamedUsage({
                 cache_read_input_tokens: 411_287,
                 cache_creation_input_tokens: 1_771,
@@ -181,14 +196,78 @@ describe("analyze-cache-bust provider meter verdicts", () => {
 
         const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
 
-        // Replacing the meter verdict with byte geometry makes this assertion red:
-        // the previous request's tail breakpoint makes the changed tail look like a bust.
+        // The provider meter remains authoritative when a changed segment is within
+        // the current tail breakpoint but the read is not materially short.
         expect(row.verdict).toBe("STABLE");
         expect(row.byteVerdict).toBe("BUST");
         expect(row.meterVsBytes).toBe("BYTES-ONLY");
-        expect(row.meterFloor).toBe(411_291);
+        expect(row.meterFloor).toBe(411_227);
         expect(row.comparableRead).toBe(411_291);
         expect(row.current.usage?.source).toBe("message_delta.usage");
+    });
+
+    test("classifies the CKIOS cold-write follow-up as a metered bust", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-bust-meter-"));
+        tempDirs.push(dir);
+        const session = "ses_ckiosFixture";
+        writeDump(
+            dir,
+            `2026-09-02T10-00-24-000Z-000001-${session}`,
+            "2026-09-02T10:00:24.000Z",
+            session,
+            bodyWithTailCheckpoint("before cold write"),
+            responseUsage({ cache_creation_input_tokens: 312_913, input_tokens: 4 }),
+        );
+        writeDump(
+            dir,
+            `2026-09-02T10-01-43-000Z-000002-${session}`,
+            "2026-09-02T10:01:43.000Z",
+            session,
+            bodyWithTailCheckpoint("rewritten after cold write"),
+            responseUsage({
+                cache_read_input_tokens: 224_224,
+                cache_creation_input_tokens: 91_447,
+                input_tokens: 2,
+            }),
+        );
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
+
+        expect(row.verdict).toBe("BUST");
+        expect(row.shortRead).toBe(true);
+        expect(row.byteVerdict).toBe("BUST");
+        expect(row.rewrittenTokens).toBe(88_693);
+    });
+
+    test("labels a short read without reusable-prefix byte divergence as latency", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-bust-meter-"));
+        tempDirs.push(dir);
+        const session = "ses_latencyFixture";
+        const unchangedBody = bodyWithTailCheckpoint("unchanged tail");
+        writeDump(
+            dir,
+            `2026-09-02T10-10-00-000Z-000001-${session}`,
+            "2026-09-02T10:10:00.000Z",
+            session,
+            unchangedBody,
+            responseUsage({ cache_creation_input_tokens: 300_000, input_tokens: 2 }),
+        );
+        writeDump(
+            dir,
+            `2026-09-02T10-10-01-000Z-000002-${session}`,
+            "2026-09-02T10:10:01.000Z",
+            session,
+            unchangedBody,
+            responseUsage({ cache_read_input_tokens: 100_000, input_tokens: 2 }),
+        );
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
+
+        expect(row.shortRead).toBe(true);
+        expect(row.verdict).toBe("LATENCY");
+        expect(row.byteVerdict).toBe("STABLE");
+        expect(row.meterVsBytes).toBe("LATENCY");
+        expect(row.rewrittenTokens).toBe(200_002);
     });
 
     test("reports an unmetered byte-attributed candidate when a response has no usage", () => {
