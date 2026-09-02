@@ -81,6 +81,25 @@ describe("buildMagicContextBlock v2 system-prompt parity", () => {
 		}
 	});
 
+	it("removes ctx_memory guidance when memory is disabled", () => {
+		const db = createTestDb();
+		try {
+			const block = buildMagicContextBlock({
+				db,
+				cwd: tempDir("pi-memory-off-guidance-"),
+				sessionId: "ses-memory-off-guidance",
+				memoryEnabled: false,
+				includeGuidance: true,
+			});
+
+			expect(block).toContain("ctx_search");
+			expect(block).not.toContain("ctx_memory");
+			expect(block).not.toContain("Save to memory proactively");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("does not render project-docs, user-profile, or key-files in the system prompt", () => {
 		const db = createTestDb();
 		const cwd = tempDir("pi-system-v2-");

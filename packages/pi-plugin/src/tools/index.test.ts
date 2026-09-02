@@ -11,9 +11,30 @@ import {
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestDb } from "../test-utils.test";
-import { registerMagicContextTools } from "./index";
+import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./index";
 
 describe("registerMagicContextTools", () => {
+	it("removes ctx_memory from Pi's enabled tools when memory is off and restores it after a config reload", () => {
+		let activeTools = ["read", "ctx_search", "ctx_memory", "ctx_note"];
+		const pi = {
+			getActiveTools: () => activeTools,
+			setActiveTools: (tools: string[]) => {
+				activeTools = tools;
+			},
+		} as never;
+
+		syncCtxMemoryToolEnabled(pi, false);
+		expect(activeTools).toEqual(["read", "ctx_search", "ctx_note"]);
+
+		syncCtxMemoryToolEnabled(pi, true);
+		expect(activeTools).toEqual([
+			"read",
+			"ctx_search",
+			"ctx_note",
+			"ctx_memory",
+		]);
+	});
+
 	it("can omit ctx_memory for retrieval-only sidekick subagents", () => {
 		const db = createTestDb();
 		try {

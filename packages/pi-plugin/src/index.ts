@@ -176,7 +176,7 @@ import {
 	processSystemPromptForCache,
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
-import { registerMagicContextTools } from "./tools";
+import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
 	parseTodos,
 	registerTodoOverlay,
@@ -956,7 +956,8 @@ async function startPiMagicContextRuntime(
 
 	// Capture boot project for initial config load and logging only. Runtime
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
-	// switches follow the active project without reloading config.
+	// switches follow the active project. Session starts invalidate their cwd's
+	// cached dependencies so changed project config is visible in the next session.
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
 	const dreamerRegistrationOwner = {};
@@ -1250,16 +1251,11 @@ async function startPiMagicContextRuntime(
 		// loaded via subagent-entry.ts with the
 		// `--magic-context-dreamer-actions` flag.
 		allowDreamerActions: false,
-		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
-		// can `/cd` between projects, but tool registration happens once at boot,
-		// so gating registration on the BOOT project's memory.enabled would
-		// mismatch the per-project prompt (which re-resolves memory.enabled each
-		// pass): start in a memory-off project and switch to a memory-on one and
-		// the tool would be absent while the prompt advertises it. The tool's
-		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
-		// when the CURRENT project has memory off, so always-register is correct.
-		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
-		// the retrieval-only sidekick, a separate security concern.)
+		// Keep the definition registered so Pi can activate it in a later session
+		// after a project config flip. session_start below removes it from the
+		// active tool set when the resolved project disables memory. (The subagent
+		// entry still uses memoryToolEnabled to keep ctx_memory off the retrieval-
+		// only sidekick, a separate security concern.)
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
@@ -1288,6 +1284,13 @@ async function startPiMagicContextRuntime(
 	);
 
 	pi.on("session_start", async (event, ctx) => {
+		// Pi emits session_start for new, resumed, and reloaded sessions. Re-read
+		// this cwd's config before setting the active tools so a memory.enabled
+		// change takes effect at the next session without restarting Pi.
+		projectDepsByDir.delete(ctx.cwd);
+		const current = resolveCurrentProjectDeps(ctx);
+		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
+
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
