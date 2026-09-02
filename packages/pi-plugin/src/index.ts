@@ -20,7 +20,6 @@
  *   Falls back to schema defaults when neither file exists.
  */
 
-import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
@@ -103,6 +102,7 @@ import {
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
+import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import {

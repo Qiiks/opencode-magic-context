@@ -31,7 +31,6 @@ import {
 	resolveModelRefForPi,
 } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog } from "@magic-context/core/shared/logger";
-import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import type { ResolvedModelEntry } from "@magic-context/core/shared/model-resolution";
 import type {
 	SubagentProgressEvent,
@@ -39,6 +38,7 @@ import type {
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
+import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
 const PI_CODING_AGENT_PACKAGE_NAMES = new Set([

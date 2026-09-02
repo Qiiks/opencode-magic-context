@@ -51,10 +51,7 @@ export function modelAcceptsEmptyContent(providerID?: string): boolean {
  * costs a full suffix rewrite on every effort change. Unknown provider/model
  * combinations therefore defer rather than opening an unproven bust.
  */
-export function variantChangeBustsProviderCache(
-    providerID?: string,
-    modelID?: string,
-): boolean {
+export function variantChangeBustsProviderCache(providerID?: string, modelID?: string): boolean {
     if (!providerID || !modelID) return false;
     const normalizedProviderID = providerID.toLowerCase();
     const isAnthropicFamily =

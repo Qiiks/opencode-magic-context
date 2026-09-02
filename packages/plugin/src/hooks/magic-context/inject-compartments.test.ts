@@ -2985,12 +2985,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(lateSource.id).toBeGreaterThan(hard.snapshotMarkers.maxMemoryId);
         supersededMemory(db, foldedSource.id, mergeTarget.id);
         supersededMemory(db, lateSource.id, mergeTarget.id);
-        updateMemoryContent(
-            db,
-            mergeTarget.id,
-            "merged <delta> & sources",
-            "merged-delta-sources",
-        );
+        updateMemoryContent(db, mergeTarget.id, "merged <delta> & sources", "merged-delta-sources");
         for (const source of [foldedSource, lateSource]) {
             queueMemoryMutation(db, {
                 projectPath: PROJECT_PATH,

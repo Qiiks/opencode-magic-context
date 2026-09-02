@@ -202,7 +202,8 @@ describe("createCtxMemoryTool", () => {
 			const memory = insertMemory(db, {
 				projectPath: projectIdentity,
 				category: "PROJECT_RULES",
-				content: "Always run the cache-bust analyzer before drawing conclusions.",
+				content:
+					"Always run the cache-bust analyzer before drawing conclusions.",
 			});
 
 			const result = await dreamer.execute(

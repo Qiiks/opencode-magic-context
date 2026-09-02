@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { EmbeddingConfig } from "@magic-context/core/config/schema/magic-context";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { backfillMessageFtsRowidMapBatch } from "@magic-context/core/features/magic-context/message-fts-rowid-map";
 import type { EmbeddingFailure } from "@magic-context/core/features/magic-context/memory/embedding-failure";
 import type {
 	EmbeddingProvider,
 	EmbeddingPurpose,
 } from "@magic-context/core/features/magic-context/memory/embedding-provider";
+import { backfillMessageFtsRowidMapBatch } from "@magic-context/core/features/magic-context/message-fts-rowid-map";
 import {
 	_resetProjectEmbeddingRegistryForTests,
 	_setTestProviderFactoryForProject,

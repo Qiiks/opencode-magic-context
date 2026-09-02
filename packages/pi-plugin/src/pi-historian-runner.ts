@@ -112,7 +112,6 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { sessionLog } from "@magic-context/core/shared/logger";
-import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import type {
 	ModelInput,
 	ResolvedModelEntry,
@@ -124,6 +123,7 @@ import type {
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
+import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import {

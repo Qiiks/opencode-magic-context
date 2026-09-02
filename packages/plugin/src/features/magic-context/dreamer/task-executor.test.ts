@@ -15,6 +15,7 @@ import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { ensureProjectState, getProjectState } from "../storage-project-state";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
+import { recordCurateSafetyRefusal } from "./curate-memory-safety";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { MAP_BATCH_FLOOR_MS } from "./map-memories";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
@@ -24,7 +25,6 @@ import {
     seedTaskScheduleState,
     writeTaskScheduleState,
 } from "./storage-task-schedule";
-import { recordCurateSafetyRefusal } from "./curate-memory-safety";
 import { createDreamTaskExecutor } from "./task-executor";
 import { type DreamTaskProgress, leaseKeyFor } from "./task-registry";
 import { type DreamTaskRuntimeConfig, runDueTasksForProject } from "./task-scheduler";

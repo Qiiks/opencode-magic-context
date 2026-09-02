@@ -17,9 +17,7 @@ describe("model-resolution", () => {
         ] as const;
         for (const fixture of fixtures) {
             const resolved = resolveHistorianAgentOverrides({
-                ...(fixture.temperature !== undefined
-                    ? { temperature: fixture.temperature }
-                    : {}),
+                ...(fixture.temperature !== undefined ? { temperature: fixture.temperature } : {}),
                 maxTokens: 16_000,
                 opencode: { model: "google/flash", variant: "low" },
                 pi: { model: "pi/must-not-leak", thinking_level: "high" },

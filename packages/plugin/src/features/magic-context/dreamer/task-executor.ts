@@ -1272,8 +1272,7 @@ async function runAgenticTask(
 
         if (leaseLost) throw new Error("Dream lease lost during task");
 
-        const curateRefused =
-            task === "curate" ? takeCurateSafetyRefusalCount(sessionId) : 0;
+        const curateRefused = task === "curate" ? takeCurateSafetyRefusalCount(sessionId) : 0;
         if (curateRefused > 0) {
             helpers.reportProgress(curateRefused, curateRefused);
             log(`[dreamer] curate safety summary: refused=${curateRefused}`);
@@ -1303,9 +1302,7 @@ async function runAgenticTask(
         helpers.recordRun("completed", null, {
             memoryChanges: helpers.computeMemoryDelta(memoryBefore),
             progress:
-                curateRefused > 0
-                    ? `curate: refused ${curateRefused} unsafe mutation(s)`
-                    : null,
+                curateRefused > 0 ? `curate: refused ${curateRefused} unsafe mutation(s)` : null,
         });
         return { status: "completed" };
     } finally {

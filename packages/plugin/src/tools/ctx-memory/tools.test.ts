@@ -5,7 +5,6 @@ import { join } from "node:path";
 
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
-import { takeCurateSafetyRefusalCount } from "../../features/magic-context/dreamer/curate-memory-safety";
 import {
     computeNormalizedHash,
     getMemoriesByProject,
@@ -20,6 +19,7 @@ import {
     recordMemoryMapping,
     setMemoryClassification,
 } from "../../features/magic-context";
+import { takeCurateSafetyRefusalCount } from "../../features/magic-context/dreamer/curate-memory-safety";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -1391,7 +1391,8 @@ describe("createCtxMemoryTools", () => {
             const source = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "ARCHITECTURE",
-                content: "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
+                content:
+                    "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
             });
 
             const result = await tools.ctx_memory.execute(
@@ -1407,7 +1408,8 @@ describe("createCtxMemoryTools", () => {
             const source = insertMemory(db, {
                 projectPath: "/repo/project",
                 category: "ARCHITECTURE",
-                content: "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
+                content:
+                    "The project registry loader validates every generated entry before startup so malformed configuration cannot enter the runtime.",
             });
             const successor = insertMemory(db, {
                 projectPath: "/repo/project",

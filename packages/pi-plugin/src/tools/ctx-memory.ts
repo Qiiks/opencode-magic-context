@@ -34,6 +34,10 @@
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
+	assessCurateMutationSafety,
+	recordCurateSafetyRefusal,
+} from "@magic-context/core/features/magic-context/dreamer/curate-memory-safety";
+import {
 	archiveMemory,
 	getMemoriesByIds,
 	getMemoriesByProject,
@@ -51,10 +55,6 @@ import {
 	updateMemorySeenCount,
 	V2_MEMORY_CATEGORIES,
 } from "@magic-context/core/features/magic-context/memory";
-import {
-	assessCurateMutationSafety,
-	recordCurateSafetyRefusal,
-} from "@magic-context/core/features/magic-context/dreamer/curate-memory-safety";
 import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
@@ -492,7 +492,9 @@ export function createCtxMemoryTool(
 				if (validShape) {
 					const uniqueIds = [...new Set(ids)];
 					const memories = uniqueIds.map((id) => getMemoryById(deps.db, id));
-					if (memories.every((memory) => memory && memoryVisibleToTool(memory))) {
+					if (
+						memories.every((memory) => memory && memoryVisibleToTool(memory))
+					) {
 						curateSuccessor = Number.isInteger(params.superseded_by)
 							? getMemoryById(deps.db, params.superseded_by as number)
 							: null;
@@ -939,7 +941,7 @@ export function createCtxMemoryTool(
 						projectIdentity: targetIdentityForStoredPath(memory.projectPath),
 					};
 				});
-					runImmediateTransaction(deps.db, () => {
+				runImmediateTransaction(deps.db, () => {
 					for (const target of targets) {
 						archiveMemory(deps.db, target.memoryId, params.reason);
 						if (dreamerAllowed && curateSuccessor) {

@@ -831,9 +831,9 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			const compartments = getCompartments(db, "ses-historian");
-			expect(compartments.map((compartment) => compartment.endMessage)).toEqual([
-				2, 4,
-			]);
+			expect(compartments.map((compartment) => compartment.endMessage)).toEqual(
+				[2, 4],
+			);
 			expect(compartments.map((compartment) => compartment.title)).toEqual([
 				"Initial Pi slice",
 				"Provisional Pi slice",

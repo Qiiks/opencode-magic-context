@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     getDirtyIndexFloor,
     getLastIndexedOrdinal,
@@ -14,7 +15,6 @@ import {
     indexSingleMessage,
     markMessageIndexDirty,
 } from "./message-index";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { initializeDatabase } from "./storage-db";
 
 function createTestDb(): Database {

@@ -1378,9 +1378,9 @@ describe("runCompartmentAgent", () => {
             directory: "/tmp",
         });
 
-        expect(getCompartments(db, sessionId).map((compartment) => compartment.endMessage)).toEqual([
-            2, 4,
-        ]);
+        expect(getCompartments(db, sessionId).map((compartment) => compartment.endMessage)).toEqual(
+            [2, 4],
+        );
         expect(
             db
                 .prepare(

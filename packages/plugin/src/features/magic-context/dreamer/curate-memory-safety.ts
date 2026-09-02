@@ -101,10 +101,7 @@ export function assessCurateMutationSafety(args: {
     return null;
 }
 
-export function recordCurateSafetyRefusal(
-    sessionId: string,
-    refusal: CurateSafetyRefusal,
-): number {
+export function recordCurateSafetyRefusal(sessionId: string, refusal: CurateSafetyRefusal): number {
     const count = (refusalCountsBySession.get(sessionId) ?? 0) + 1;
     refusalCountsBySession.set(sessionId, count);
     const lengths =

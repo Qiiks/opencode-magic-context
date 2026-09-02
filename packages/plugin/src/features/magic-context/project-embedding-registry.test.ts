@@ -18,13 +18,13 @@ import {
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { insertMemory } from "./memory/storage-memory";
 import {
     getStoredModelId,
     loadAllEmbeddings,
     saveEmbedding,
 } from "./memory/storage-memory-embeddings";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -201,14 +201,7 @@ function seedManyCompartmentsWithFts(
             "user",
             `Question ${i}?`,
         );
-        insertMappedFtsRow(
-            db,
-            sessionId,
-            end,
-            `${sessionId}-a${end}`,
-            "assistant",
-            `Answer ${i}.`,
-        );
+        insertMappedFtsRow(db, sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
     }
 }
 

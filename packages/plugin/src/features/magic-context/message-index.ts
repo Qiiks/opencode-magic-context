@@ -10,10 +10,7 @@ import type { Database, Statement as PreparedStatement } from "../../shared/sqli
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { removeSystemReminders } from "../../shared/system-directive";
 import { clearCompressionDepth } from "./compression-depth-storage";
-import {
-    messageFtsOrdinalRangeIsMapped,
-    recordMessageFtsRowid,
-} from "./message-fts-rowid-map";
+import { messageFtsOrdinalRangeIsMapped, recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 interface MessageHistoryIndexRow {
@@ -521,14 +518,7 @@ function indexSingleMessageInTransaction(
         getDeleteMessageFtsMapStatement(db).run(sessionId, sessionId, message.id);
         const content = setMessageSource(db, sessionId, message, now);
         if (content.length > 0 && (message.role === "user" || message.role === "assistant")) {
-            insertMessageFtsRow(
-                db,
-                sessionId,
-                message.ordinal,
-                message.id,
-                message.role,
-                content,
-            );
+            insertMessageFtsRow(db, sessionId, message.ordinal, message.id, message.role, content);
         }
         setIndexProgress(
             db,
@@ -557,14 +547,7 @@ function indexSingleMessageInTransaction(
         (message.role === "user" || message.role === "assistant") &&
         !isMessageAlreadyIndexed(db, sessionId, message.id)
     ) {
-        insertMessageFtsRow(
-            db,
-            sessionId,
-            message.ordinal,
-            message.id,
-            message.role,
-            content,
-        );
+        insertMessageFtsRow(db, sessionId, message.ordinal, message.id, message.role, content);
         inserted = true;
     }
 
@@ -693,14 +676,7 @@ export function indexMessagesAfterOrdinal(
             ) {
                 continue;
             }
-            insertMessageFtsRow(
-                db,
-                sessionId,
-                message.ordinal,
-                message.id,
-                message.role,
-                content,
-            );
+            insertMessageFtsRow(db, sessionId, message.ordinal, message.id, message.role, content);
             inserted += 1;
         }
 

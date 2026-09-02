@@ -6,11 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 

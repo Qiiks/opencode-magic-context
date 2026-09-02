@@ -18,9 +18,9 @@ import {
 } from "./git-commits/storage-git-commit-embeddings";
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { insertMemory } from "./memory/storage-memory";
 import { loadAllEmbeddings, saveEmbedding } from "./memory/storage-memory-embeddings";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,

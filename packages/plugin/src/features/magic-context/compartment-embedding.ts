@@ -73,7 +73,8 @@ export async function embedAndStoreCompartmentChunks(
                       compartment.endMessage,
                   );
             if (mappedText === null) continue;
-            const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, compartment.id);
+            const canonicalText =
+                mappedText || buildCompartmentSummaryFallbackText(db, compartment.id);
             if (canonicalText.length === 0) continue;
 
             const windows = chunkCanonicalText(

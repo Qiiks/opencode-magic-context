@@ -351,11 +351,15 @@ describe("Pi in-process child guard (#247)", () => {
 
 			await runtime.emitPiEvent("session_before_switch", {}, ctx);
 			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
-			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(61_000);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(
+				61_000,
+			);
 
 			await runtime.emitPiEvent("session_shutdown", {}, ctx);
 			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
-			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(61_000);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(
+				61_000,
+			);
 		} finally {
 			clearSession(db, sessionId);
 		}

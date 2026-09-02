@@ -19,10 +19,7 @@ import {
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
-import {
-    backfillMessageFtsRowidMapBatch,
-    recordMessageFtsRowid,
-} from "./message-fts-rowid-map";
+import { backfillMessageFtsRowidMapBatch, recordMessageFtsRowid } from "./message-fts-rowid-map";
 import { runMigrations } from "./migrations";
 import {
     _resetProjectEmbeddingRegistryForTests,

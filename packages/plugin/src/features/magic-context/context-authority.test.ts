@@ -29,8 +29,8 @@ import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/stora
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
-import { getNotes } from "./storage-notes";
 import { initializeDatabase } from "./storage-db";
+import { getNotes } from "./storage-notes";
 
 function db(): Database {
     const value = new Database(":memory:");

@@ -63,7 +63,11 @@ describe("message FTS rowid map", () => {
             completed: false,
         });
         expect(
-            db.prepare("SELECT message_ordinal, fts_rowid FROM message_fts_rowid_map ORDER BY message_ordinal").all(),
+            db
+                .prepare(
+                    "SELECT message_ordinal, fts_rowid FROM message_fts_rowid_map ORDER BY message_ordinal",
+                )
+                .all(),
         ).toEqual([
             { message_ordinal: 1, fts_rowid: 1 },
             { message_ordinal: 2, fts_rowid: 2 },
@@ -85,9 +89,9 @@ describe("message FTS rowid map", () => {
             watermarkRowid: 5,
             completed: true,
         });
-        expect(
-            db.prepare("SELECT COUNT(*) AS count FROM message_fts_rowid_map").get(),
-        ).toEqual({ count: 5 });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM message_fts_rowid_map").get()).toEqual({
+            count: 5,
+        });
         closeQuietly(db);
     });
 
@@ -120,11 +124,13 @@ describe("message FTS rowid map", () => {
             console.log(`[message-fts-rowid-map] chunk loader plan: ${details.join(" | ")}`);
 
             expect(details.some((detail) => detail.includes("message_fts_rowid_map"))).toBe(true);
-            expect(details.some((detail) => detail.includes("fts") && detail.includes("INDEX 0:="))).toBe(
-                true,
-            );
             expect(
-                details.some((detail) => /^SCAN (?:message_history_fts|fts) VIRTUAL TABLE INDEX 0:$/.test(detail)),
+                details.some((detail) => detail.includes("fts") && detail.includes("INDEX 0:=")),
+            ).toBe(true);
+            expect(
+                details.some((detail) =>
+                    /^SCAN (?:message_history_fts|fts) VIRTUAL TABLE INDEX 0:$/.test(detail),
+                ),
             ).toBe(false);
         } finally {
             closeQuietly(db);

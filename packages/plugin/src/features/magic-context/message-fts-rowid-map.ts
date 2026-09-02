@@ -212,9 +212,7 @@ export function messageFtsOrdinalRangeIsMapped(
         | { sourceOrdinalCount?: number; expectedMapCount?: number; mappedCount?: number }
         | undefined;
     const ordinalCount = endOrdinal - startOrdinal + 1;
-    return (
-        row?.sourceOrdinalCount === ordinalCount && row.expectedMapCount === row.mappedCount
-    );
+    return row?.sourceOrdinalCount === ordinalCount && row.expectedMapCount === row.mappedCount;
 }
 
 export function getMessageFtsRowidMapBackfillProgress(
