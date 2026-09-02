@@ -461,7 +461,13 @@ export function runRustModePostprocess(args: {
             sessionLog(args.sessionId, "rust trailing blank decision failed:", error);
         }
     }
-    applyFrozenTrailingBlankDecisions(args.messages, trailingBlankDecisions);
+    // The Rust module's core.frozen_units store owns keep shape and canonical blank counts.
+    // The host may only enforce the absorbing strip direction: replaying keep here could
+    // manufacture a suffix the module intentionally omitted or normalize bytes it already chose.
+    const absorbingStripDecisions = new Map(
+        [...trailingBlankDecisions].filter(([, decision]) => decision === "strip"),
+    );
+    applyFrozenTrailingBlankDecisions(args.messages, absorbingStripDecisions);
 
     const currentUserMessageId = findLastUserMessageId(args.messages);
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
