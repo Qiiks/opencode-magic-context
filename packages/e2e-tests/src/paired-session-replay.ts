@@ -127,6 +127,39 @@ export type PairedReplayResult = {
     unadjudicated_divergence_count: number;
 };
 
+export type TrailingBlankReplayStage =
+    | "streaming"
+    | "next_turn_pass_1"
+    | "next_turn_pass_2"
+    | "late_blank";
+
+export type TrailingBlankSequenceReplayResult = {
+    fixture: "trailing-blank-incident-geometry";
+    stages: Record<
+        TrailingBlankReplayStage,
+        {
+            ts: {
+                bytes: number;
+                sha256: string;
+                decision: string | null;
+                source_parts: string[];
+                blocks: string[];
+            };
+            rust: {
+                bytes: number;
+                sha256: string;
+                decision: string | null;
+                source_parts: string[];
+                blocks: string[];
+            };
+            equal: boolean;
+        }
+    >;
+    ts_stable: boolean;
+    rust_stable: boolean;
+    parity: boolean;
+};
+
 type ValueSpace = {
     empty_content_shapes: string[];
     dropped_placeholder_shapes: string[];
@@ -612,6 +645,239 @@ async function driveLane(
         );
     }
     return { sessionId, wires };
+}
+
+type TrailingBlankLaneCapture = Record<
+    TrailingBlankReplayStage,
+    { wire: string; decision: string | null; sourceParts: string[] }
+>;
+
+function stripProviderCacheControls(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(stripProviderCacheControls);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+            .filter(([key]) => key !== "cache_control")
+            .map(([key, nested]) => [key, stripProviderCacheControls(nested)]),
+    );
+}
+
+function trailingBlankTargetMessage(requestBody: unknown): unknown {
+    if (!requestBody || typeof requestBody !== "object") {
+        throw new Error("trailing-blank replay emitted an invalid request body");
+    }
+    const messages = (requestBody as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) {
+        throw new Error("trailing-blank replay expected an Anthropic messages request");
+    }
+    const target = messages.find((message) => {
+        if (!message || typeof message !== "object") return false;
+        const candidate = message as { role?: unknown; content?: unknown };
+        return (
+            candidate.role === "assistant" &&
+            Array.isArray(candidate.content) &&
+            candidate.content.some(
+                (block) =>
+                    block !== null &&
+                    typeof block === "object" &&
+                    (block as { id?: unknown }).id === "call_trailing_blank_replay",
+            )
+        );
+    });
+    if (!target) throw new Error("trailing-blank replay target was absent from provider wire");
+    return target;
+}
+
+async function driveTrailingBlankLane(
+    harness: RustTestHarness,
+): Promise<TrailingBlankLaneCapture> {
+    const sessionId = await harness.createSession();
+    let emitted = false;
+    harness.mock.addMatcher((body) => {
+        if (emitted || body.model !== "mock-sonnet" || !Array.isArray(body.tools)) return null;
+        const hasBash = body.tools.some(
+            (tool) =>
+                tool !== null &&
+                typeof tool === "object" &&
+                (tool as WireEntry).name === "bash",
+        );
+        if (!hasBash) return null;
+        emitted = true;
+        return {
+            content: [
+                {
+                    type: "thinking",
+                    thinking: "signed thinking from the replay evidence turn",
+                    signature: "sig-trailing-blank-replay",
+                },
+                {
+                    type: "tool_use",
+                    id: "call_trailing_blank_replay",
+                    name: "bash",
+                    input: { command: "printf trailing-blank-replay" },
+                },
+            ],
+            stop_reason: "tool_use",
+            usage: { input_tokens: 31_000, output_tokens: 64 },
+        };
+    });
+    harness.mock.setDefault({
+        error: {
+            status: 500,
+            type: "api_error",
+            message: "stop after the replay tool step",
+        },
+    });
+    try {
+        await harness.sendPrompt(sessionId, "Create the trailing-blank replay evidence turn.");
+    } catch {
+        // The fixture intentionally terminates the provider after the completed tool step.
+    }
+    if (!emitted) throw new Error("trailing-blank replay setup tool was not advertised");
+    harness.mock.setDefault({
+        text: "trailing blank replay continuation",
+        usage: { input_tokens: 31_200, output_tokens: 24 },
+    });
+    const targetMessageId = harness.prepareTrailingBlankReplay(sessionId);
+    const readDecision = (): string | null => {
+        const row = harness
+            .contextDb()
+            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
+        if (!row?.trailing_blank_decisions) return null;
+        const decisions = JSON.parse(row.trailing_blank_decisions) as Record<string, string>;
+        return decisions[targetMessageId] ?? null;
+    };
+    const sourceParts = async (): Promise<string[]> =>
+        (await harness.listMessages(sessionId))
+            .find((message) => message.info?.id === targetMessageId)
+            ?.parts?.map((part) => part.type ?? "unknown") ?? [];
+    const captures = {} as TrailingBlankLaneCapture;
+    const streamingRequest = [...harness.mainRequests()].reverse().find((request) => {
+        try {
+            trailingBlankTargetMessage(request.body);
+            return true;
+        } catch {
+            return false;
+        }
+    });
+    if (!streamingRequest) throw new Error("trailing-blank streaming request was not captured");
+    captures.streaming = {
+        wire: JSON.stringify(
+            stripProviderCacheControls(trailingBlankTargetMessage(streamingRequest.body)),
+        ),
+        decision: readDecision(),
+        sourceParts: await sourceParts(),
+    };
+
+    for (const stage of [
+        "next_turn_pass_1",
+        "next_turn_pass_2",
+        "late_blank",
+    ] as const) {
+        if (stage === "late_blank") harness.appendTrailingBlankReplayPart(targetMessageId);
+        const beforeMessages = await harness.listMessages(sessionId);
+        const beforeIds = new Set(beforeMessages.map((message) => message.info?.id));
+        const stageSourceParts = await sourceParts();
+        const requestCount = harness.mainRequests().length;
+        await harness.sendPrompt(sessionId, `Replay stage: ${stage}.`);
+        const request = harness
+            .mainRequests()
+            .slice(requestCount)
+            .reverse()
+            .find((candidate) => {
+                try {
+                    trailingBlankTargetMessage(candidate.body);
+                    return true;
+                } catch {
+                    return false;
+                }
+            });
+        if (!request) throw new Error(`replay stage ${stage} emitted no target request`);
+        captures[stage] = {
+            wire: JSON.stringify(stripProviderCacheControls(trailingBlankTargetMessage(request.body))),
+            decision: readDecision(),
+            sourceParts: stageSourceParts,
+        };
+
+        const addedUser = (await harness.listMessages(sessionId)).find(
+            (message) =>
+                message.info?.role === "user" &&
+                typeof message.info.id === "string" &&
+                !beforeIds.has(message.info.id),
+        )?.info?.id;
+        if (!addedUser) throw new Error(`replay stage ${stage} did not persist its user turn`);
+        await harness.revertMessage(sessionId, addedUser);
+        await harness.waitFor(async () => {
+            const messages = await harness.listMessages(sessionId);
+            return messages.some((message) => message.info?.id === addedUser) ? null : true;
+        });
+    }
+    return captures;
+}
+
+export async function runPairedTrailingBlankSequenceReplay(): Promise<TrailingBlankSequenceReplayResult> {
+    const config = {
+        execute_threshold_percentage: 95,
+        memory: { auto_search: { enabled: false } },
+        compressor: { enabled: false },
+    };
+    const harness = await RustTestHarness.create({
+        startInTsMode: true,
+        startHistorianProducer: false,
+        providerID: "anthropic",
+        providerAPI: "@ai-sdk/anthropic",
+        modelID: "mock-sonnet",
+        modelContextLimit: 200_000,
+        magicContextConfig: config,
+    });
+    try {
+        const ts = await driveTrailingBlankLane(harness);
+        harness.mock.reset();
+        await harness.restart({ rust: true, magicContextConfig: config });
+        const rust = await driveTrailingBlankLane(harness);
+        const stageNames: TrailingBlankReplayStage[] = [
+            "streaming",
+            "next_turn_pass_1",
+            "next_turn_pass_2",
+            "late_blank",
+        ];
+        const stages = {} as TrailingBlankSequenceReplayResult["stages"];
+        for (const stage of stageNames) {
+            stages[stage] = {
+                ts: {
+                    bytes: Buffer.byteLength(ts[stage].wire),
+                    sha256: createHash("sha256").update(ts[stage].wire).digest("hex"),
+                    decision: ts[stage].decision,
+                    source_parts: ts[stage].sourceParts,
+                    blocks: wireStructure(`[${ts[stage].wire}]`)[0]?.blocks ?? [],
+                },
+                rust: {
+                    bytes: Buffer.byteLength(rust[stage].wire),
+                    sha256: createHash("sha256").update(rust[stage].wire).digest("hex"),
+                    decision: rust[stage].decision,
+                    source_parts: rust[stage].sourceParts,
+                    blocks: wireStructure(`[${rust[stage].wire}]`)[0]?.blocks ?? [],
+                },
+                equal: ts[stage].wire === rust[stage].wire,
+            };
+        }
+        const tsStable = new Set(stageNames.map((stage) => ts[stage].wire)).size === 1;
+        const rustStable = new Set(stageNames.map((stage) => rust[stage].wire)).size === 1;
+        return {
+            fixture: "trailing-blank-incident-geometry",
+            stages,
+            ts_stable: tsStable,
+            rust_stable: rustStable,
+            // TypeScript adds a leading text sentinel before signed reasoning while
+            // Rust preserves the provider-native ordering. Verify that each lane keeps
+            // its initially served assistant bytes stable rather than comparing that
+            // already-adjudicated representation difference again.
+            parity: tsStable && rustStable,
+        };
+    } finally {
+        await harness.dispose();
+    }
 }
 
 export async function runPairedSessionReplay(options: {

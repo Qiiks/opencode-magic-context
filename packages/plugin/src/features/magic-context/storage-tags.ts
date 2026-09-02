@@ -907,6 +907,61 @@ export function updateTagStatus(
     getUpdateTagStatusStatement(db).run(status, sessionId, tagId);
 }
 
+const WHITESPACE_ASSISTANT_INERT_PREFIX = "mc:whitespace-assistant:";
+
+export interface InertWhitespaceAssistantTag {
+    tagNumber: number;
+    contentId: string;
+}
+
+/**
+ * Remove a legacy whitespace-only assistant tag from reclaim accounting while retaining
+ * enough identity to replay its pre-deploy prefix without occupying the live part id.
+ */
+export function markWhitespaceAssistantTagInert(
+    db: Database,
+    sessionId: string,
+    tagNumber: number,
+    contentId: string,
+): void {
+    db.prepare(
+        `UPDATE tags
+         SET status = 'compacted',
+             message_id = ?,
+             entry_fingerprint = ?
+         WHERE session_id = ? AND tag_number = ? AND type = 'message'`,
+    ).run(
+        `__mc_whitespace_assistant_inert__:${tagNumber}`,
+        `${WHITESPACE_ASSISTANT_INERT_PREFIX}${contentId}`,
+        sessionId,
+        tagNumber,
+    );
+}
+
+/** Load legacy whitespace tags for cache-stable prefix replay; these rows are never active. */
+export function getInertWhitespaceAssistantTags(
+    db: Database,
+    sessionId: string,
+): InertWhitespaceAssistantTag[] {
+    const rows = db
+        .prepare(
+            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+             FROM tags
+             WHERE session_id = ?
+               AND type = 'message'
+               AND status = 'compacted'
+               AND entry_fingerprint LIKE ?`,
+        )
+        .all(sessionId, `${WHITESPACE_ASSISTANT_INERT_PREFIX}%`) as Array<{
+        tagNumber: number;
+        entryFingerprint: string;
+    }>;
+    return rows.flatMap((row) => {
+        const contentId = row.entryFingerprint.slice(WHITESPACE_ASSISTANT_INERT_PREFIX.length);
+        return contentId.length > 0 ? [{ tagNumber: row.tagNumber, contentId }] : [];
+    });
+}
+
 export function updateTagDropMode(
     db: Database,
     sessionId: string,

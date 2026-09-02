@@ -3343,6 +3343,125 @@ describe("final message representation", () => {
         );
     });
 
+    it("recovers a bound thinking block through Rust-mode host postprocess", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-recovery-rust";
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: "assistant-bound", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "thinking",
+                            thinking: "signed thinking bound to the rejected prefix",
+                            signature: "bound-signature",
+                        },
+                        { type: "text", text: "completed answer" },
+                    ],
+                },
+                {
+                    info: { id: "retry-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+        const postprocess = (messages: MessageLike[]) =>
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: true,
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: true, frozen: true },
+            });
+
+        armThinkingBindingRecovery(db, sessionId);
+        const recoveryMessages = buildMessages();
+        const recovery = postprocess(recoveryMessages);
+
+        expect(recovery.thinkingBindingRecovery).toEqual({
+            flagTarget: "newest_reasoning_bearing_assistant",
+            messageId: "assistant-bound",
+        });
+        expect(findMessage(recoveryMessages, "assistant-bound").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(
+            clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                recovery.thinkingBindingRecovery.flagTarget,
+            ),
+        ).toBe(true);
+
+        const replayMessages = buildMessages();
+        const replay = postprocess(replayMessages);
+        expect(replay.thinkingBindingRecovery).toBeNull();
+        expect(serializeAnthropicWirePrefix(replayMessages)).toBe(
+            serializeAnthropicWirePrefix(recoveryMessages),
+        );
+    });
+
+    it("lets Rust module trailing-blank output outrank host keep decisions", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-trailing-blank-authority";
+        addTrailingBlankDecisions(db, sessionId, [
+            ["assistant-stripped", "keep"],
+            ["assistant-kept", "keep:2"],
+            ["assistant-absorbing", "strip"],
+        ]);
+        const messages = [
+            {
+                info: { id: "assistant-stripped", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "module stripped suffix" }],
+            },
+            {
+                info: { id: "assistant-kept", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "text", text: "module kept suffix" },
+                    { type: "text", text: " " },
+                ],
+            },
+            {
+                info: { id: "assistant-absorbing", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "text", text: "strip stays absorbing" },
+                    { type: "text", text: "" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const beforeStripped = JSON.stringify(messages[0]?.parts);
+        const beforeKept = JSON.stringify(messages[1]?.parts);
+
+        runRustModePostprocess({
+            db,
+            sessionId,
+            messages,
+            fullFeatureMode: true,
+            resolvedProviderID: "anthropic",
+            trailingBlankSourceDecisions: new Map([
+                ["assistant-stripped", "strip"],
+                ["assistant-kept", "keep:2"],
+                ["assistant-absorbing", "keep"],
+            ]),
+            trailingBlankNewestAssistantId: "assistant-absorbing",
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+
+        expect(JSON.stringify(messages[0]?.parts)).toBe(beforeStripped);
+        expect(JSON.stringify(messages[1]?.parts)).toBe(beforeKept);
+        expect(messages[2]?.parts).toEqual([{ type: "text", text: "strip stays absorbing" }]);
+        expect(getTrailingBlankDecisions(db, sessionId).get("assistant-absorbing")).toBe("strip");
+    });
+
     it("leaves newest thinking byte-identical when no binding recovery was classified", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

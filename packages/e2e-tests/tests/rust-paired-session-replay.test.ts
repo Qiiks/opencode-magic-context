@@ -1,7 +1,10 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { runPairedSessionReplay } from "../src/paired-session-replay";
+import {
+    runPairedSessionReplay,
+    runPairedTrailingBlankSequenceReplay,
+} from "../src/paired-session-replay";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
 describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
@@ -28,6 +31,22 @@ describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
         expect(droppedPass?.dropped_placeholder_shapes.shared).toContain(
             "assistant:isolated_dropped_placeholder",
         );
+    }, 600_000);
+
+    it("freezes the same tool-ending assistant across the trailing-blank ingress race", async () => {
+        const result = await runPairedTrailingBlankSequenceReplay();
+
+        expect(result.ts_stable).toBe(true);
+        expect(result.rust_stable).toBe(true);
+        expect(result.parity).toBe(true);
+        expect(result.stages.late_blank.ts.sha256).toBe(
+            result.stages.next_turn_pass_1.ts.sha256,
+        );
+        expect(result.stages.late_blank.rust.sha256).toBe(
+            result.stages.next_turn_pass_1.rust.sha256,
+        );
+        expect(result.stages.late_blank.ts.decision).toBe("strip");
+        expect(result.stages.late_blank.rust.decision).toBe("strip");
     }, 600_000);
 
     it("keeps MC-synthetic non-Anthropic sentinels non-empty in both lanes", async () => {

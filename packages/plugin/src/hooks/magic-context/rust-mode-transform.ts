@@ -19,12 +19,14 @@ import {
 } from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
     clearPersistedTodoSyntheticAnchor,
+    clearThinkingBindingRecoveryIf,
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
@@ -102,12 +104,16 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
-import { runRustModePostprocess } from "./transform-postprocess-phase";
+import {
+    replayRustModeBindingMismatchStrips,
+    runRustModePostprocess,
+} from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
 
 export class MemoryAuthorityUnavailableError extends Error {
@@ -313,6 +319,8 @@ export interface RustModeTransformOptions {
     allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
+    /** Override only to exercise a failure at the native-output installation boundary. */
+    installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
 }
@@ -1446,6 +1454,7 @@ export function createRustModeTransform(
     const wireCaches = new Map<string, RustWireCache>();
     const scheduleLkgCapture =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
+    const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
     const rawFallbackEstimator =
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
@@ -1566,6 +1575,12 @@ export function createRustModeTransform(
         }
         const replayModel =
             modelFromMessages(currentMessages) ?? findLastAssistantModelFromOpenCodeDb(sessionId);
+        replayRustModeBindingMismatchStrips({
+            db: deps.db,
+            sessionId,
+            messages: replay.messages as MessageLike[],
+            resolvedProviderID: replayModel?.providerID,
+        });
         const trustedReplayLimit = replayModel
             ? resolveTrustedContextLimit(replayModel.providerID, replayModel.modelID, {
                   db: deps.db,
@@ -1613,13 +1628,13 @@ export function createRustModeTransform(
     const prepareRustCapture = (
         state: RustSessionState,
         sessionId: string,
-        input: MessageLike[],
+        inputIds: readonly unknown[],
+        inputKeys: ReturnType<typeof resolveLkgModelKeys>,
         inputSnapshots: readonly MessageContentSnapshot[],
         nativeMessages: readonly unknown[],
         responseRowVersion: number,
     ): RustLkgCapturePlan | null => {
         state.lkgCaptureSequence += 1;
-        const inputIds = input.map((message) => message.info.id);
         if (
             inputIds.some((id) => typeof id !== "string") ||
             new Set(inputIds).size !== inputIds.length ||
@@ -1630,14 +1645,13 @@ export function createRustModeTransform(
         }
         const jsonPrefix = JSON.stringify(nativeMessages);
         if (typeof jsonPrefix !== "string") return null;
-        const keys = resolveLkgModelKeys(input);
         return {
             sessionId,
             inputIds: inputIds as string[],
             inputSnapshots,
             jsonPrefix,
-            modelKey: keys.modelKey,
-            providerKey: keys.providerKey,
+            modelKey: inputKeys.modelKey,
+            providerKey: inputKeys.providerKey,
             capturedAt: Date.now(),
             rowVersion: responseRowVersion,
             captureSequence: state.lkgCaptureSequence,
@@ -1707,6 +1721,10 @@ export function createRustModeTransform(
         const passStartedAt = performance.now();
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
+        const trailingBlankNewestAssistantId = [...messages]
+            .reverse()
+            .find((message) => message.info.role === "assistant")?.info.id;
         const timings = emptyRustPassTimings();
         state.passCount += 1;
         const syntheticTurn = observeSyntheticTurn(state, messages);
@@ -2719,6 +2737,7 @@ export function createRustModeTransform(
                 decisionUpper === "SOFT" ||
                 !explicitDecision;
             let appliedMessages: unknown[];
+            let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
             const applyStartedAt = performance.now();
             try {
                 // Validate and postprocess the module result before touching the caller-owned
@@ -2759,16 +2778,26 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
-                    runRustModePostprocess({
+                    thinkingBindingRecovery = runRustModePostprocess({
                         db: deps.db,
                         sessionId,
                         messages: appliedMessages as MessageLike[],
                         projectPath: memoryProjectPath,
                         fullFeatureMode: !sessionMeta.isSubagent,
                         compactionOff: deps.compactionOff,
+                        resolvedProviderID: model?.providerID,
+                        thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                            model?.providerID,
+                            model?.modelID,
+                        ),
+                        trailingBlankSourceDecisions,
+                        trailingBlankNewestAssistantId:
+                            typeof trailingBlankNewestAssistantId === "string"
+                                ? trailingBlankNewestAssistantId
+                                : undefined,
                         tagger: deps.tagger,
                         ctxReduceAvailability: reduceAvailability,
-                    });
+                    }).thinkingBindingRecovery;
                 }
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
@@ -2792,21 +2821,41 @@ export function createRustModeTransform(
                     });
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
+                // output.messages commonly aliases the raw input array, so preserve the entry ids
+                // before installation replaces that array with native output.
+                const lkgInputIds = messages.map((message) => message.info.id);
+                const lkgInputKeys = resolveLkgModelKeys(messages);
+                const applyReplaceStartedAt = performance.now();
+                installNativeMessages(output, appliedMessages);
+                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
+                if (thinkingBindingRecovery) {
+                    const cleared = clearThinkingBindingRecoveryIf(
+                        deps.db,
+                        sessionId,
+                        thinkingBindingRecovery.flagTarget,
+                    );
+                    sessionLog(
+                        sessionId,
+                        `rust thinking binding recovery: stripped bound reasoning from assistant ${thinkingBindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+                    );
+                }
+
                 const lkgSnapshotStartedAt = performance.now();
-                // When the response changes the served bytes, discard the previous last-known-good
-                // snapshot before scheduling the new capture. Otherwise, a transport failure on the
-                // next turn could replay obsolete output.
+                // A cache-busting replacement invalidates the previous snapshot only after the
+                // replacement is installed. If installation fails, the prior LKG remains available
+                // and its replay still applies durable binding-mismatch strips.
                 if (cacheBustingPass) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
                 }
-                // Reuse the wire-cache field snapshots for this input. Serialize the served
-                // response here, but defer hashing so LKG work does not block installing the result.
+                // Build the capture from the installed array, then defer hashing and persistence so
+                // LKG work stays off the output-installation critical path.
                 const capturePlan = prepareRustCapture(
                     state,
                     sessionId,
-                    messages,
+                    lkgInputIds,
+                    lkgInputKeys,
                     pendingWireCache.rawContentSnapshots,
-                    appliedMessages,
+                    output.messages,
                     rowVersion,
                 );
                 let captureMode = "async";
@@ -2863,9 +2912,6 @@ export function createRustModeTransform(
                     timings,
                     `mode=${captureMode} row_version=${rowVersion}`,
                 );
-                const applyReplaceStartedAt = performance.now();
-                replaceMessagesInPlace(output, appliedMessages);
-                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
             } catch (error) {
                 logStage(sessionId, "apply", applyStartedAt, timings, "failed=true");
                 try {
