@@ -375,6 +375,27 @@ export async function applyTodoSynthesis(args: {
     return 0;
 }
 
+/** Reapply durable binding-mismatch strips when a Rust LKG snapshot is replayed. */
+export function replayRustModeBindingMismatchStrips(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    resolvedProviderID?: string;
+}): void {
+    if (!modelAcceptsEmptyContent(args.resolvedProviderID)) return;
+    const recoveryMessageIds = new Set<string>();
+    for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+        if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+        const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+        if (messageId.length > 0) recoveryMessageIds.add(messageId);
+    }
+    stripReasoningFromAssistantIds(
+        args.messages,
+        args.resolvedProviderID,
+        recoveryMessageIds,
+    );
+}
+
 /**
  * Rebuild host-owned canonical representation after native Rust serving.
  * The persisted compaction summary is restored with the same canonicalizer as the

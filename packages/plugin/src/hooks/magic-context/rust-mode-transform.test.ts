@@ -18,8 +18,11 @@ import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/mag
 import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
+    armThinkingBindingRecovery,
     getEmergencyRecoveryArmedAt,
+    getMergedReasoningStrippedIds,
     getOverflowState,
+    getThinkingBindingRecoveryTarget,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
@@ -2464,6 +2467,90 @@ describe("Rust mode authority adapter", () => {
 
         scheduled.shift()?.();
         expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 2");
+    });
+
+    it("keeps binding recovery armed and replay-stable when native output installation fails", async () => {
+        const sessionId = `rust-binding-install-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let moduleUnavailable = false;
+        let rejectInstall = false;
+        let rowVersion = 0;
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    model: { providerID: "anthropic", modelID: "fable-5-1" },
+                },
+                parts: [
+                    { type: "thinking", thinking: "bound thinking", signature: "sig" },
+                    { type: "text", text: "answer" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const nativeMessages = () => structuredClone(input) as unknown[];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (moduleUnavailable) throw new Error("module unavailable after install failure");
+                rowVersion += 1;
+                return {
+                    decision: "HARD",
+                    row_version: rowVersion,
+                    native_messages: nativeMessages(),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+            installNativeMessagesForTests: (output, messages) => {
+                if (rejectInstall) {
+                    rejectInstall = false;
+                    expect(JSON.stringify(messages)).not.toContain("bound thinking");
+                    throw new Error("simulated native output installation failure");
+                }
+                output.messages.splice(0, output.messages.length, ...messages);
+            },
+        });
+        const run = async () => {
+            const output = { messages: structuredClone(input) as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return output.messages;
+        };
+
+        const baseline = await run();
+        expect(JSON.stringify(baseline)).toContain("bound thinking");
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("bound thinking");
+
+        armThinkingBindingRecovery(db, sessionId);
+        rejectInstall = true;
+        const failedInstallReplay = await run();
+        const frozenId = "binding_mismatch:m1";
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(frozenId);
+        expect(JSON.stringify(failedInstallReplay)).not.toContain("bound thinking");
+        expect(scheduled).toHaveLength(0);
+
+        moduleUnavailable = true;
+        const outageReplay = await run();
+        expect(JSON.stringify(outageReplay)).toBe(JSON.stringify(failedInstallReplay));
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).not.toBeNull();
+
+        moduleUnavailable = false;
+        const recovered = await run();
+        expect(JSON.stringify(recovered)).toBe(JSON.stringify(failedInstallReplay));
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBeNull();
+        expect(scheduled).toHaveLength(1);
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).not.toContain("bound thinking");
     });
 
     it("does not let an older async capture overwrite a newer model-switch capture", async () => {
