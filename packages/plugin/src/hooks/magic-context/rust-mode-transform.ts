@@ -25,8 +25,8 @@ import type { getOrCreateSessionMeta } from "../../features/magic-context/storag
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
-    clearThinkingBindingRecoveryIf,
     clearPersistedTodoSyntheticAnchor,
+    clearThinkingBindingRecoveryIf,
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
@@ -103,8 +103,8 @@ import {
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
-import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
@@ -320,10 +320,7 @@ export interface RustModeTransformOptions {
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
     /** Override only to exercise a failure at the native-output installation boundary. */
-    installNativeMessagesForTests?: (
-        output: { messages: unknown[] },
-        messages: unknown[],
-    ) => void;
+    installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
 }
@@ -1457,8 +1454,7 @@ export function createRustModeTransform(
     const wireCaches = new Map<string, RustWireCache>();
     const scheduleLkgCapture =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
-    const installNativeMessages =
-        options.installNativeMessagesForTests ?? replaceMessagesInPlace;
+    const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
     const rawFallbackEstimator =
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);

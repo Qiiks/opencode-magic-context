@@ -389,11 +389,7 @@ export function replayRustModeBindingMismatchStrips(args: {
         const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
         if (messageId.length > 0) recoveryMessageIds.add(messageId);
     }
-    stripReasoningFromAssistantIds(
-        args.messages,
-        args.resolvedProviderID,
-        recoveryMessageIds,
-    );
+    stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
 }
 
 /**
@@ -459,12 +455,9 @@ export function runRustModePostprocess(args: {
                 { sourceDecisions: args.trailingBlankSourceDecisions },
             ).filter(([id]) => id === args.trailingBlankNewestAssistantId);
             if (candidates.length > 0) {
-                const persisted = addTrailingBlankDecisions(
-                    args.db,
-                    args.sessionId,
-                    candidates,
-                    { overwriteMessageId: args.trailingBlankNewestAssistantId },
-                );
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
+                    overwriteMessageId: args.trailingBlankNewestAssistantId,
+                });
                 if (persisted) {
                     const committed = getTrailingBlankDecisions(args.db, args.sessionId);
                     for (const [id] of candidates) {
@@ -555,11 +548,7 @@ export function runRustModePostprocess(args: {
         } catch (error) {
             sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
         }
-        stripReasoningFromAssistantIds(
-            args.messages,
-            args.resolvedProviderID,
-            recoveryMessageIds,
-        );
+        stripReasoningFromAssistantIds(args.messages, args.resolvedProviderID, recoveryMessageIds);
     }
     return { thinkingBindingRecovery };
 }

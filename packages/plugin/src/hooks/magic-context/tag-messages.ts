@@ -664,12 +664,7 @@ export function tagMessages(
                         continue;
                     }
                     if (existingTag.status === "active") {
-                        markWhitespaceAssistantTagInert(
-                            db,
-                            sessionId,
-                            existingTagId,
-                            contentId,
-                        );
+                        markWhitespaceAssistantTagInert(db, sessionId, existingTagId, contentId);
                         inertWhitespaceTagNumbers.add(existingTagId);
                     }
                 } else {

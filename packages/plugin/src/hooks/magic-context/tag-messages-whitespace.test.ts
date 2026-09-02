@@ -6,8 +6,8 @@ import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     getActiveTagsBySession,
-    getTailHygieneTags,
     getTagsBySession,
+    getTailHygieneTags,
     insertTag,
 } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
@@ -74,11 +74,7 @@ describe("whitespace-only assistant tag transition", () => {
         for (let pass = 0; pass < 2; pass += 1) {
             const tagger = createTagger();
             tagger.initFromDb(sessionId, db);
-            const message = assistant(
-                "assistant-blank",
-                [{ type: "text", text: " " }],
-                sessionId,
-            );
+            const message = assistant("assistant-blank", [{ type: "text", text: " " }], sessionId);
             tagMessages(sessionId, [message], tagger, db);
             served.push(textOf(message));
 
