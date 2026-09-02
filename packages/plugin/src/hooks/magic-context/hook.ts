@@ -411,6 +411,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const liveModelBySession =
         deps.liveSessionState?.liveModelBySession ??
         new Map<string, { providerID: string; modelID: string }>();
+    const latestAssistantMessageIdBySession =
+        deps.liveSessionState?.latestAssistantMessageIdBySession ?? new Map<string, string>();
     const agentBySession = deps.liveSessionState?.agentBySession ?? new Map<string, string>();
     const sessionDirectoryBySession =
         deps.liveSessionState?.sessionDirectoryBySession ?? new Map<string, string>();
@@ -498,6 +500,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // shared live state — and the next transform pass + RPC sidebar see them.
         liveSessionState: {
             liveModelBySession,
+            latestAssistantMessageIdBySession,
             channel1StateBySession,
             variantBySession,
             agentBySession,
@@ -1521,6 +1524,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         db,
         liveModelBySession,
+        latestAssistantMessageIdBySession,
         variantBySession,
         agentBySession,
         sessionDirectoryBySession,

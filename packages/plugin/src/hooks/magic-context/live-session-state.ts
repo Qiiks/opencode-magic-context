@@ -1,7 +1,12 @@
 import type { DreamTaskProgress } from "../../features/magic-context/dreamer/task-registry";
 import type { RecompProgress } from "./compartment-runner-types";
 import type { Channel1State } from "./ctx-reduce-nudge";
-import type { AgentBySession, LiveModelBySession, VariantBySession } from "./hook-handlers";
+import type {
+    AgentBySession,
+    LatestAssistantMessageIdBySession,
+    LiveModelBySession,
+    VariantBySession,
+} from "./hook-handlers";
 
 /**
  * Plugin-process-scoped shared state. Lives in `index.ts` and is threaded into
@@ -21,6 +26,8 @@ import type { AgentBySession, LiveModelBySession, VariantBySession } from "./hoo
  */
 export interface LiveSessionState {
     liveModelBySession: LiveModelBySession;
+    /** Tracks the greatest assistant message ID so older or id-less events cannot overwrite the live model. */
+    latestAssistantMessageIdBySession: LatestAssistantMessageIdBySession;
     variantBySession: VariantBySession;
     agentBySession: AgentBySession;
     /** Cached U/T token measurement of each rendered conversation tail, shared with display RPCs. */
@@ -70,6 +77,7 @@ export interface LiveSessionState {
 export function createLiveSessionState(): LiveSessionState {
     return {
         liveModelBySession: new Map<string, { providerID: string; modelID: string }>(),
+        latestAssistantMessageIdBySession: new Map<string, string>(),
         variantBySession: new Map<string, string | undefined>(),
         agentBySession: new Map<string, string>(),
         channel1StateBySession: new Map<string, Channel1State>(),
