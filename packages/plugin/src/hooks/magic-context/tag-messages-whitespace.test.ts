@@ -13,6 +13,7 @@ import {
 import { createTagger } from "../../features/magic-context/tagger";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database } from "../../shared/sqlite";
+import { stripDroppedPlaceholderMessages } from "./strip-content";
 import { type MessageLike, tagMessages } from "./tag-messages";
 import { measureTailHygiene } from "./tail-hygiene-walk";
 
@@ -130,5 +131,48 @@ describe("whitespace-only assistant tag transition", () => {
             { tagNumber: 1, status: "compacted" },
             { tagNumber: 2, status: "active" },
         ]);
+    });
+
+    it("keeps leading whitespace before signed thinking byte-identical for both provider shapes", () => {
+        for (const providerID of ["anthropic", "github-copilot"]) {
+            const db = openTestDb();
+            const sessionId = `ses-leading-whitespace-${providerID}`;
+            const message = assistant(
+                "assistant-leading",
+                [
+                    { type: "text", text: " " },
+                    { type: "thinking", thinking: "signed", signature: "sig" },
+                ],
+                sessionId,
+            );
+            const before = JSON.stringify(message.parts);
+
+            tagMessages(sessionId, [message], createTagger(), db);
+            stripDroppedPlaceholderMessages([message], providerID);
+
+            expect(JSON.stringify(message.parts)).toBe(before);
+            expect(getTagsBySession(db, sessionId)).toEqual([]);
+        }
+    });
+
+    it("preserves provider-specific wholly blank assistant canonicalization", () => {
+        for (const [providerID, expected] of [
+            ["anthropic", ""],
+            ["github-copilot", "[dropped]"],
+        ] as const) {
+            const db = openTestDb();
+            const sessionId = `ses-wholly-blank-${providerID}`;
+            const message = assistant(
+                "assistant-wholly-blank",
+                [{ type: "text", text: " \t" }],
+                sessionId,
+            );
+
+            tagMessages(sessionId, [message], createTagger(), db);
+            stripDroppedPlaceholderMessages([message], providerID);
+
+            expect(message.parts).toEqual([{ type: "text", text: expected }]);
+            expect(getTagsBySession(db, sessionId)).toEqual([]);
+        }
     });
 });
