@@ -9,7 +9,7 @@ describe("variantChangeBustsProviderCache", () => {
         ["bedrock", "anthropic.claude-fable-5-1-v1:0", false],
         ["google-vertex-anthropic", "claude-fable-5.1", false],
         ["openai", "claude-fable-5-1", false],
-        [undefined, undefined, false],
+        [undefined, "claude-fable-5-1", false],
     ] as const)("provider=%s model=%s returns %s", (providerID, modelID, expected) => {
         expect(variantChangeBustsProviderCache(providerID, modelID)).toBe(expected);
     });
