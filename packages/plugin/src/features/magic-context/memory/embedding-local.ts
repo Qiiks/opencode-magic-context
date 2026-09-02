@@ -44,16 +44,21 @@ export type LocalEmbeddingHost = {
 
 function currentLocalEmbeddingHost(): LocalEmbeddingHost {
     const bun = (globalThis as { Bun?: unknown }).Bun;
+    const hasProcess = typeof process !== "undefined";
     const bunVersion =
-        typeof process !== "undefined" && typeof process.versions?.bun === "string"
+        hasProcess && typeof process.versions?.bun === "string"
             ? process.versions.bun
             : undefined;
     return {
-        isElectron: typeof process !== "undefined" && Boolean(process.versions?.electron),
+        isElectron: hasProcess && Boolean(process.versions?.electron),
         // Check both globals because Bun hosts have exposed each form across releases.
         isBun: Boolean(bun) || Boolean(bunVersion),
         bunVersion,
-        hasNodeFilesystem: true,
+        // Only the Node-target twin may evaluate real node:fs. Browser-like hosts
+        // keep the existing web bundle, while Electron retains its injected path.
+        hasNodeFilesystem:
+            hasProcess &&
+            (typeof process.versions?.node === "string" || typeof bunVersion === "string"),
     };
 }
 

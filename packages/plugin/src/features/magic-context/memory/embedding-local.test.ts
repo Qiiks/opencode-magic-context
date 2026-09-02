@@ -385,6 +385,41 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
         }
     });
 
+    test("keeps the browser-target fallback for hosts without Node filesystem access", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-browser-wasm-"));
+        let browserFallbackImports = 0;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({
+                    isElectron: false,
+                    isBun: false,
+                    hasNodeFilesystem: false,
+                }),
+                injectWasmOrt: async () => true,
+                importTransformersWasmFallback: async () => {
+                    browserFallbackImports++;
+                    return fakeTransformersModule();
+                },
+                importTransformersNodeWasmFallback: async () => {
+                    throw new Error("browser-like hosts must not load the Node filesystem twin");
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            const provider = new LocalEmbeddingProvider(
+                "Xenova/all-MiniLM-L6-v2",
+                512,
+                "fp32",
+                "wasm",
+            );
+            expect(await provider.initialize()).toBe(true);
+            expect(await provider.embed("fixture text")).toEqual(new Float32Array([0, 1]));
+            expect(browserFallbackImports).toBe(1);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
     test("classifies a Node WASM bundle without filesystem caching instead of returning an unexplained null", async () => {
         const cacheDir = mkdtempSync(join(tmpdir(), "mc-node-wasm-no-fs-"));
         try {
