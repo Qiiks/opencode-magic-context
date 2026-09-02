@@ -22,10 +22,12 @@
  *
  * Usage:
  *   bun scripts/analyze-cache-busts.ts <sessionIdPrefix> [options]
+ *   bun scripts/analyze-cache-busts.ts --session <sessionIdPrefix> [options]
  * Options:
+ *   --session <id>   session id or prefix (positional form is also supported)
  *   --dir <path>     dump dir (default: <tmpdir>/opencode-anthropic-auth-dumps)
- *   --since <ISO>    only requests created at/after this time
- *   --until <ISO>    only requests created at/before this time
+ *   --since <time>   created at/after ISO time or duration ago (for example 30m)
+ *   --until <time>   created at/before ISO time or duration ago
  *   --limit <N>      only the last N requests in range
  *   --show-diff      print before/after snippet of the first-diverging segment
  *   --all-busts      list every diverging segment, not just the first
@@ -33,7 +35,7 @@
  *                    real prefix bust is never buried under ordinary tail growth)
  */
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,6 +54,8 @@ interface Snapshot {
     session: string;
     messagesCount: number;
     segments: Segment[];
+    orderCreatedAt: string;
+    sequence: number;
 }
 
 function sha(s: string): string {
@@ -69,17 +73,27 @@ function parseArgs(argv: string[]): {
     allRows: boolean;
 } {
     const args = argv.slice(2);
-    const sessionPrefix = args.find((a) => !a.startsWith("--")) ?? "";
     const getOpt = (name: string): string | undefined => {
         const i = args.indexOf(name);
         return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
     };
-    const dir =
-        getOpt("--dir") ?? join(tmpdir(), "opencode-anthropic-auth-dumps");
+    const valueOptions = new Set(["--session", "--dir", "--since", "--until", "--limit"]);
+    let positionalSession = "";
+    for (let index = 0; index < args.length; index += 1) {
+        const arg = args[index];
+        if (valueOptions.has(arg)) {
+            index += 1;
+            continue;
+        }
+        if (!arg.startsWith("--")) {
+            positionalSession = arg;
+            break;
+        }
+    }
     const limitRaw = getOpt("--limit");
     return {
-        sessionPrefix,
-        dir,
+        sessionPrefix: getOpt("--session") ?? positionalSession,
+        dir: getOpt("--dir") ?? join(tmpdir(), "opencode-anthropic-auth-dumps"),
         since: getOpt("--since"),
         until: getOpt("--until"),
         limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
@@ -87,6 +101,42 @@ function parseArgs(argv: string[]): {
         allBusts: args.includes("--all-busts"),
         allRows: args.includes("--all-rows"),
     };
+}
+
+function resolveTimeBound(value: string | undefined, nowMs = Date.now()): string | undefined {
+    if (!value) return undefined;
+    const duration = /^(\d+)(ms|s|m|h|d)$/.exec(value);
+    if (duration) {
+        const unitMs = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[
+            duration[2] as "ms" | "s" | "m" | "h" | "d"
+        ];
+        return new Date(nowMs - Number.parseInt(duration[1], 10) * unitMs).toISOString();
+    }
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) throw new Error(`Invalid time bound: ${value}`);
+    return new Date(parsed).toISOString();
+}
+
+function parseDumpFilename(file: string): {
+    createdAt: string;
+    sequence: number;
+    session: string;
+} | null {
+    const timestamp = /(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(file);
+    const session = /(?:^|-)(ses_[A-Za-z0-9]+)(?=-|\.meta\.json$)/.exec(file);
+    if (!timestamp || !session) return null;
+    const rest = file.slice(timestamp.index + timestamp[0].length);
+    const sequence = /^-(\d+)(?=-ses_)/.exec(rest);
+    return {
+        createdAt: `${timestamp[1]}:${timestamp[2]}:${timestamp[3]}.${timestamp[4]}Z`,
+        sequence: sequence ? Number.parseInt(sequence[1], 10) : 0,
+        session: session[1],
+    };
+}
+
+function sessionMatches(candidate: string, prefix: string): boolean {
+    const visibleHead = candidate.replace(/[….]+$/, "");
+    return candidate.startsWith(prefix) || prefix.startsWith(visibleHead);
 }
 
 /** Recursively strip `cache_control` fields — marker movement is not content. */
@@ -154,28 +204,43 @@ function buildSegments(body: Json): Segment[] {
 }
 
 function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
-    const metas = readdirSync(opts.dir).filter((f) => f.endsWith(".meta.json"));
+    const since = resolveTimeBound(opts.since);
+    const until = resolveTimeBound(opts.until);
+    const metas = readdirSync(opts.dir).filter((file) => file.endsWith(".meta.json"));
     const snaps: Snapshot[] = [];
     for (const metaFile of metas) {
+        const dumpName = parseDumpFilename(metaFile);
+        if (dumpName && !sessionMatches(dumpName.session, opts.sessionPrefix)) continue;
+
         let meta: Json;
         try {
             meta = JSON.parse(readFileSync(join(opts.dir, metaFile), "utf8")) as Json;
         } catch {
             continue;
         }
-        const session = String(meta.session ?? "");
-        // The dump truncates session ids with an ellipsis ("ses_31366057…"); match
-        // on the visible head so a full id or a head fragment both work.
-        const head = session.replace(/[….]+$/, "");
-        if (!session.startsWith(opts.sessionPrefix) && !opts.sessionPrefix.startsWith(head)) {
-            continue;
-        }
-        const createdAt = String(meta.createdAt ?? "");
-        if (opts.since && createdAt < opts.since) continue;
-        if (opts.until && createdAt > opts.until) continue;
+        const metadataSession = String(meta.session ?? "");
+        if (!dumpName && !sessionMatches(metadataSession, opts.sessionPrefix)) continue;
+
+        const session = dumpName?.session ?? metadataSession;
+        const createdAt = dumpName?.createdAt ?? String(meta.createdAt ?? "");
+        if (since && createdAt < since) continue;
+        if (until && createdAt > until) continue;
+
         const files = meta.files as Json | undefined;
-        const bodyPath = files && typeof files.body === "string" ? files.body : undefined;
+        const referencedBodyPath =
+            files && typeof files.body === "string" ? files.body : undefined;
+        const adjacentBodyPath = join(
+            opts.dir,
+            metaFile.replace(/\.meta\.json$/, ".body.json"),
+        );
+        const bodyPath =
+            referencedBodyPath && existsSync(referencedBodyPath)
+                ? referencedBodyPath
+                : existsSync(adjacentBodyPath)
+                  ? adjacentBodyPath
+                  : undefined;
         if (!bodyPath) continue;
+
         let body: Json;
         try {
             body = JSON.parse(readFileSync(bodyPath, "utf8")) as Json;
@@ -190,9 +255,16 @@ function loadSnapshots(opts: ReturnType<typeof parseArgs>): Snapshot[] {
             messagesCount:
                 typeof bodyMeta?.messagesCount === "number" ? bodyMeta.messagesCount : -1,
             segments: buildSegments(body),
+            orderCreatedAt: dumpName?.createdAt ?? createdAt,
+            sequence: dumpName?.sequence ?? 0,
         });
     }
-    snaps.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    snaps.sort(
+        (a, b) =>
+            a.orderCreatedAt.localeCompare(b.orderCreatedAt) ||
+            a.sequence - b.sequence ||
+            a.file.localeCompare(b.file),
+    );
     if (opts.limit && snaps.length > opts.limit) {
         return snaps.slice(snaps.length - opts.limit);
     }
@@ -248,7 +320,7 @@ function main(): void {
     const opts = parseArgs(process.argv);
     if (!opts.sessionPrefix) {
         console.error(
-            "usage: bun scripts/analyze-cache-busts.ts <sessionIdPrefix> [--dir <path>] [--since ISO] [--until ISO] [--limit N] [--show-diff] [--all-busts]",
+            "usage: bun scripts/analyze-cache-busts.ts <sessionIdPrefix> | --session <sessionIdPrefix> [--dir <path>] [--since ISO|duration] [--until ISO|duration] [--limit N] [--show-diff] [--all-busts]",
         );
         process.exit(1);
     }
@@ -338,4 +410,6 @@ function main(): void {
     }
 }
 
-main();
+export const __test = { loadSnapshots, parseArgs, parseDumpFilename, resolveTimeBound };
+
+if (import.meta.main) main();
