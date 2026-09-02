@@ -789,6 +789,34 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("persists and reports a marker that must wait for a future kept entry", async () => {
+		const notifyIssue = mock(async () => undefined);
+		const entries = Array.from({ length: 2 }, (_, index) => ({
+			type: "message",
+			id: `entry-${index + 1}`,
+			message: { role: index % 2 === 0 ? "user" : "assistant" },
+		}));
+		const { db } = await runHistorianWith({
+			outputs: [successXml()],
+			readBranchEntries: () => entries,
+			notifyIssue,
+		});
+		try {
+			expect(getPendingPiCompactionMarkerState(db, "ses-historian")).toEqual(
+				expect.objectContaining({
+					firstKeptEntryId: null,
+					endMessageId: "m2",
+					ordinal: 2,
+				}),
+			);
+			expect(notifyIssue).toHaveBeenCalledWith(
+				expect.stringContaining("waiting for a resolvable kept entry"),
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("does not let Pi discard-last reopen a completed invocation/result arc", async () => {
 		const { db } = await runHistorianWith({
 			outputs: [twoCompartmentSuccessXml()],

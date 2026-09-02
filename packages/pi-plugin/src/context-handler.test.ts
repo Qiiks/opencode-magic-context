@@ -4022,6 +4022,88 @@ describe("registerPiContextHandler", () => {
 		});
 	});
 
+	describe("Pi wrapup then flush boundary adoption", () => {
+		it("trims a first m[1] compartment on the busting pass and keeps the defer replay byte-identical", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-wrapup-flush-boundary";
+			try {
+				updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					injection: { injectionBudgetTokens: 10_000 },
+					scheduler: { executeThresholdPercentage: 80 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const buildMessages = () =>
+					[
+						userMessage("covered request", 1),
+						assistantMessage("covered answer", 2),
+						userMessage("live tail", 3),
+					] as never[];
+				const runPass = async () => {
+					const messages = buildMessages();
+					return handler(
+						{ messages },
+						fakeContext(
+							sessionId,
+							process.cwd(),
+							["entry-1", "entry-2", "entry-3"],
+							messages,
+						) as never,
+					);
+				};
+
+				// Prime an empty m[0] baseline before wrapup publishes the first
+				// compartment. Its max-compartment watermark is therefore -1.
+				await runPass();
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 0,
+						startMessage: 1,
+						endMessage: 2,
+						startMessageId: "entry-1",
+						endMessageId: "entry-2",
+						title: "Wrapped history",
+						content: "U: covered request\nA: covered answer",
+						p1: "U: covered request\nA: covered answer",
+					},
+				]);
+				// /ctx-wrapup queues deferred publication signals; /ctx-flush upgrades
+				// the next provider call to the priced busting/materializing pass.
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				signalPiHistoryRefresh(sessionId);
+				signalPiPendingMaterialization(sessionId);
+
+				const busting = await runPass();
+				const deferred = await runPass();
+				expect(JSON.stringify(deferred.messages)).toBe(
+					JSON.stringify(busting.messages),
+				);
+
+				const bustingText = busting.messages.map((message) =>
+					textOf(message as never),
+				);
+				expect(bustingText.join("\n")).toContain("Wrapped history");
+				const rawTailText = bustingText.slice(2);
+				expect(rawTailText).not.toContainEqual(
+					expect.stringContaining("covered request"),
+				);
+				expect(rawTailText).not.toContainEqual(
+					expect.stringContaining("covered answer"),
+				);
+				expect(rawTailText).toEqual([expect.stringContaining("live tail")]);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	});
+
 	describe("Pi deferred compaction marker drain", () => {
 		function seedCompartment(
 			db: ReturnType<typeof createTestDb>,
@@ -4105,6 +4187,40 @@ describe("registerPiContextHandler", () => {
 				expect(appendCompaction).toHaveBeenCalledTimes(1);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("re-derives an unresolved kept entry on the next materializing pass", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-rederive";
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: null,
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				signalPiPendingMaterialization(sessionId);
+				const appendCompaction = mock(() => "compact-rederived");
+
+				await runDrainPass({ db, sessionId, appendCompaction });
+
+				expect(appendCompaction).toHaveBeenCalledWith(
+					"summary",
+					"entry-3",
+					10,
+					expect.objectContaining({ lastCompactedOrdinal: 2 }),
+					true,
+				);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);

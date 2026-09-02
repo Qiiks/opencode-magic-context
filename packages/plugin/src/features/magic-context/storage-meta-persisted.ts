@@ -2752,7 +2752,8 @@ export function clearPendingCompactionMarkerStateIf(
  * Stored with `stableStringify` so CAS clear can compare byte-for-byte.
  */
 export interface PendingPiCompactionMarker {
-    firstKeptEntryId: string;
+    /** Null until a later Pi context projection exposes a replayable kept entry. */
+    firstKeptEntryId: string | null;
     endMessageId: string;
     ordinal: number;
     tokensBefore: number;
@@ -2764,7 +2765,8 @@ function isPendingPiCompactionMarker(value: unknown): value is PendingPiCompacti
     return (
         typeof value === "object" &&
         value !== null &&
-        typeof (value as { firstKeptEntryId?: unknown }).firstKeptEntryId === "string" &&
+        ((value as { firstKeptEntryId?: unknown }).firstKeptEntryId === null ||
+            typeof (value as { firstKeptEntryId?: unknown }).firstKeptEntryId === "string") &&
         typeof (value as { endMessageId?: unknown }).endMessageId === "string" &&
         typeof (value as { ordinal?: unknown }).ordinal === "number" &&
         typeof (value as { tokensBefore?: unknown }).tokensBefore === "number" &&

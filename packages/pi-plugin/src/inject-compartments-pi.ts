@@ -2577,6 +2577,10 @@ export function injectM0M1Pi(
 		currentCompartments,
 		boundaryId,
 	);
+	// lastBaselineEndMessageId can come from either m[0] or m[1]. Since the first
+	// compartment may be in m[1] while m[0] is still empty, use the latest baseline
+	// end message id for trimming instead of the m[0] coverage boundary.
+	const trimBoundaryId = markers.lastBaselineEndMessageId;
 	// m[1]-side coverage watermark for the deferred-marker drain (liveness
 	// fix): fresh publications render their compartment into the m[1] delta —
 	// m[0] folds new compartments only on a HARD bust — so the m[0] snapshot
@@ -2609,8 +2613,8 @@ export function injectM0M1Pi(
 			};
 		}
 	}
-	const skippedVisibleMessages = boundaryId
-		? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId)
+	const skippedVisibleMessages = trimBoundaryId
+		? trimPiMessagesToBoundary(piMessages, entryIds, trimBoundaryId)
 		: 0;
 	const muralWire = m0.includes("<memory-mural>")
 		? muralForWire(state.sessionId)

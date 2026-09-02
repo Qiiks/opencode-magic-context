@@ -5638,7 +5638,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.sessionId,
 					pending,
 				);
-				if (outcome.kind === "retryable-failure") {
+				if (outcome.kind === "waiting-for-entry") {
+					suppressDeferredHistoryDrain = true;
+					preserveDeferredMaterializationForMarkerDrain = true;
+				} else if (outcome.kind === "retryable-failure") {
 					sessionLog(
 						args.sessionId,
 						`Pi compaction-marker drain retryable failure: ${outcome.error.message}`,
