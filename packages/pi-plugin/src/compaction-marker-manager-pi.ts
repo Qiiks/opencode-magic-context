@@ -2,6 +2,7 @@ import { getCompartmentsByEndMessageId } from "@magic-context/core/features/magi
 import type { PendingPiCompactionMarker } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { findFirstKeptEntryId } from "./pi-historian-runner";
 
 export type PiMarkerUpdateOutcome =
 	| { kind: "applied"; firstKeptEntryId: string }
@@ -10,6 +11,7 @@ export type PiMarkerUpdateOutcome =
 			kind: "stale-skip";
 			reason: "compartment-removed" | "target-superseded" | "entry-removed";
 	  }
+	| { kind: "waiting-for-entry" }
 	| { kind: "retryable-failure"; error: Error };
 
 export interface ApplyDeferredPiCompactionMarkerDeps {
@@ -49,9 +51,19 @@ export function applyDeferredPiCompactionMarker(
 		}
 
 		const branchEntries = deps.readBranchEntries();
+		const firstKeptEntryId =
+			pending.firstKeptEntryId ??
+			findFirstKeptEntryId(branchEntries, pending.ordinal);
+		if (!firstKeptEntryId) {
+			sessionLog(
+				sessionId,
+				`Pi compaction-marker drain: still waiting for a resolvable kept entry at or after ordinal ${pending.ordinal + 1}`,
+			);
+			return { kind: "waiting-for-entry" };
+		}
 		const pendingFirstKeptIndex = findEntryIndex(
 			branchEntries,
-			pending.firstKeptEntryId,
+			firstKeptEntryId,
 		);
 		if (pendingFirstKeptIndex < 0) {
 			return { kind: "stale-skip", reason: "entry-removed" };
@@ -70,7 +82,7 @@ export function applyDeferredPiCompactionMarker(
 
 		const compactionId = deps.appendCompaction(
 			pending.summary,
-			pending.firstKeptEntryId,
+			firstKeptEntryId,
 			pending.tokensBefore,
 			{
 				source: "magic-context",
@@ -86,9 +98,9 @@ export function applyDeferredPiCompactionMarker(
 		}
 		sessionLog(
 			sessionId,
-			`Pi compaction-marker drain: applied compactionId=${compactionId} firstKept=${pending.firstKeptEntryId} endMessageId=${pending.endMessageId} ordinal=${pending.ordinal} tokensBefore=${pending.tokensBefore}`,
+			`Pi compaction-marker drain: applied compactionId=${compactionId} firstKept=${firstKeptEntryId} endMessageId=${pending.endMessageId} ordinal=${pending.ordinal} tokensBefore=${pending.tokensBefore}`,
 		);
-		return { kind: "applied", firstKeptEntryId: pending.firstKeptEntryId };
+		return { kind: "applied", firstKeptEntryId };
 	} catch (err) {
 		const error = err instanceof Error ? err : new Error(String(err));
 		sessionLog(

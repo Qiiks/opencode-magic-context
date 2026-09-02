@@ -1131,7 +1131,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					if (!firstKeptEntryId) {
 						sessionLog(
 							sessionId,
-							`historian: native compaction queue skipped; no firstKeptEntryId after ordinal ${lastNewEnd}`,
+							`historian: native compaction marker waiting; no resolvable firstKeptEntryId at or after ordinal ${lastNewEnd + 1}`,
 						);
 					}
 				} catch (error) {
@@ -1257,7 +1257,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// (best-effort, below), not inside this publish transaction. An
 				// auxiliary user_memory_candidates failure must never roll back
 				// compartment publication. Mirrors OpenCode.
-				if (firstKeptEntryId && lastNewEndMessageId) {
+				if (lastNewEndMessageId) {
 					setPendingPiCompactionMarkerState(db, sessionId, {
 						firstKeptEntryId,
 						endMessageId: lastNewEndMessageId,
@@ -1291,6 +1291,17 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				sessionId,
 				`historian: published ${newCompartments.length} compartment(s), ${validatedPass.facts?.length ?? 0} fact(s) covering messages ${chunk.startIndex}-${lastNewEnd}`,
 			);
+			if (!firstKeptEntryId && notifyIssue) {
+				try {
+					await notifyIssue(
+						"Magic Context compacted history, but Pi's native compaction marker is waiting for a resolvable kept entry. It will retry on the next materializing pass.",
+					);
+				} catch (error) {
+					sessionLog(sessionId, "historian marker-wait status failed", {
+						error: describeError(error).brief,
+					});
+				}
+			}
 
 			// Note-nudge trigger #1 (of 3): historian publication is a natural
 			// work boundary, so signal that deferred notes should surface on
@@ -1633,81 +1644,25 @@ export function buildPiCompactionSummary(
 }
 
 /**
- * Find the Pi SessionEntry id whose RawMessage ordinal corresponds to
- * `lastCompactedOrdinal + 1` — i.e., the first entry whose content
- * should survive a Pi-native compaction marker placed after the
- * compartment that ends at `lastCompactedOrdinal`.
+ * Resolve the first real Pi SessionEntry id at or after the raw ordinal that
+ * follows the newest compartment. Historian boundaries use RawMessage ordinals,
+ * so this must use the same conversion rather than counting branch entries.
  *
- * # Why this routes through convertEntriesToRawMessages
- *
- * Historian publishes compartments whose `endMessage` ordinal comes
- * from `read-session-pi.ts:convertEntriesToRawMessages` — the
- * canonical Pi ordinal source. Pi's `appendCompaction` API expects
- * `firstKeptEntryId` as a real SessionEntry id.
- *
- * A previous implementation walked `entries` with its own counter
- * that incremented only on user|assistant roles. That counter
- * diverged from `convertEntriesToRawMessages`, which also emits
- * synthetic-user RawMessages for `toolResult→assistant` transitions
- * (the common pattern in tool-heavy sessions: ~3,005 such transitions
- * out of ~7,423 ordinals in a 2-week tool-heavy session).
- *
- * When the counters diverged, the function could never count past
- * `(user_count + assistant_count)` ordinals, returned null for any
- * `lastCompactedOrdinal` beyond that point, and Pi's native compaction
- * marker was silently never written. The Pi JSONL grew unbounded
- * while magic-context kept publishing compartments to its DB
- * (cortexkit issue #X1, surfaced by pi-deferred-compaction-marker
- * e2e test).
- *
- * Now the function delegates to the canonical ordinal source. The
- * RawMessage at ordinal `N` carries `id` populated from either the
- * real underlying entry (user|assistant|unknown role) or the first
- * folded toolResult entry (synthetic user) — never empty.
- *
- * # Why we DEFER (not advance) when the kept-start ordinal is synthetic
- *
- * A folded-toolResult run is emitted as a synthetic-user RawMessage whose id is
- * `${SYNTH_USER_ID_PREFIX}<realToolResultId>` — NOT a real SessionEntry id. Pi's
- * compaction replay (`getBranch`/`buildSessionContext`) starts the kept tail at
- * the entry whose real `entry.id === compaction.firstKeptEntryId`; a synthetic
- * id matches nothing, so the deferred drain would treat the marker as stale,
- * CAS-clear the pending blob, and the native marker would never be written.
- *
- * `target = lastCompactedOrdinal + 1` is BY CONSTRUCTION the first KEPT-tail
- * raw message (everything at ordinal ≤ lastCompactedOrdinal is summarized). So
- * if the message AT `target` is a synthetic-user (folded toolResult run), it is
- * un-summarized kept-tail content. We must NOT advance past it to a later
- * assistant: that would drop the folded toolResult run entirely (it is neither
- * in the summary — ordinal > the compartment's endMessage — nor in the kept
- * tail). We also cannot cut the boundary AT a toolResult, because the kept tail
- * must not start with an orphaned tool result whose tool_use was summarized
- * (provider 400). Both unsafe options collapse to one correct action: return
- * null and DEFER the marker. The caller stages no marker this pass; the next
- * historian pass re-resolves the boundary once a real, replay-safe entry (the
- * following assistant/user) heads the kept tail — exactly Pi's native behavior
- * of never choosing a tool-result tail as a cut point. Deferring loses no
- * content (nothing is trimmed until a safe boundary exists) and the branch keeps
- * accumulating safely until then.
- *
- * If the boundary message resolves to a real (non-synthetic) entry id, use it
- * directly. An empty-id slot (unknown role with no entry id) is also unsafe to
- * cut at, so defer there too.
+ * Empty-id slots cannot anchor Pi's native compaction marker, but may be followed
+ * by a real entry that can. Folded tool-result slots are different: their
+ * synthesized id represents kept-tail content, so advancing past one would drop
+ * that content; leave the marker pending until a safe boundary is available.
  */
 export function findFirstKeptEntryId(
 	entries: readonly unknown[],
 	lastCompactedOrdinal: number,
 ): string | null {
-	const rawMessages = convertEntriesToRawMessages(entries);
 	const target = lastCompactedOrdinal + 1;
-	const boundary = rawMessages.find((m) => m.ordinal === target);
-	if (!boundary) return null;
-	// The kept tail must START at this exact message. If it carries a real,
-	// replay-safe entry id, use it. If it is synthetic (folded toolResult run)
-	// or has no id, cutting here is unsafe and advancing past it would drop
-	// kept-tail content — defer the marker until a later pass when a real entry
-	// heads the kept tail.
-	if (boundary.id.length === 0) return null;
-	if (boundary.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
-	return boundary.id;
+	for (const message of convertEntriesToRawMessages(entries)) {
+		if (message.ordinal < target) continue;
+		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
+		if (message.id.length === 0) continue;
+		return message.id;
+	}
+	return null;
 }

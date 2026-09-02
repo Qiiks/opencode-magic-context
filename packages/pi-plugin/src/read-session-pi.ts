@@ -79,9 +79,8 @@ import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-se
  * SessionEntry id. Pi's `getBranch()`/compaction replay matches against real
  * `entry.id`, so any consumer that needs a replay-safe real entry id must detect
  * this prefix and handle it — but the handling differs by consumer:
- *   • compaction-boundary selection (`findFirstKeptEntryId`) DEFERS — it returns
- *     null when the kept-start lands on a synthetic-user fold, so the marker is
- *     re-tried next pass rather than cutting the tail at an orphaned toolResult.
+ *   • compaction-boundary selection (`findFirstKeptEntryId`) defers when the
+ *     kept start is synthetic, because advancing would drop folded tool results.
  *   • boundary trimming (`trimPiMessagesToBoundary`) RESOLVES — it strips the
  *     prefix to recover the underlying real toolResult entry id and trims there.
  * Exported so those consumers share one definition instead of re-deriving the

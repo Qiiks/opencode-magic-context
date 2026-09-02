@@ -25,10 +25,9 @@ import {
  * native marker that trims `getBranch()`; those are separate mechanisms.)
  *
  * No-ops safely when the Pi session manager exposes neither appendCompaction nor
- * getBranch, when there is no compartment yet, or when the boundary cannot be
- * resolved to a real replay-safe entry id (findFirstKeptEntryId defers on
- * folded-toolResult boundaries — returning null — so we never stage an
- * unmatchable synthetic marker).
+ * getBranch, when there is no compartment yet, or when no real replay-safe
+ * entry exists at or after the boundary (so we never stage an unmatchable
+ * synthetic marker).
  */
 /**
  * Stage the Pi compaction marker WITHOUT applying it, then signal a deferred
@@ -40,8 +39,8 @@ import {
  * background task could land mid-turn. Staging + deferred drain mirrors the
  * background historian's `onPublished` (signalPiDeferredHistoryRefresh /
  * signalPiDeferredMaterialization) so the marker materializes only on the next
- * cache-busting pass, never mid-turn. No-ops safely when the boundary can't be
- * resolved to a replay-safe entry id (same guards as the eager path).
+ * cache-busting pass, never mid-turn. No-ops safely when the boundary has no
+ * replay-safe entry at or after it (same guards as the eager path).
  */
 export function stagePiRecompMarker(args: {
 	db: ContextDatabase;

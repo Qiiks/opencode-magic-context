@@ -114,6 +114,7 @@ function createCloneFilter(
 		): string | null => {
 			const pending = parsePendingMarker(rawState);
 			if (!pending) return null;
+			if (pending.firstKeptEntryId === null) return null;
 			const pendingFirstKeptPosition = branchPosition(
 				entries,
 				pending.firstKeptEntryId,

@@ -422,14 +422,20 @@ describe("findFirstKeptEntryId — replay-safe boundary resolution", () => {
 		expect(findFirstKeptEntryId(entries, 1)).toBe("asst-1");
 	});
 
-	it("DEFERS (null) when the kept-start ordinal is a folded-toolResult synthetic user", () => {
-		// boundary after ordinal 2 (asst-1) → ordinal 3 (the FIRST kept-tail
-		// message) is the synthetic user folding tr-1. That folded toolResult run
-		// is un-summarized kept-tail content: advancing past it to asst-2 would
-		// DROP it (neither summarized nor kept), and cutting at the toolResult
-		// would orphan it. The only safe action is to defer the marker until a
-		// later pass when a real entry heads the kept tail.
+	it("defers when the kept-start ordinal is a folded-toolResult synthetic user", () => {
+		// The folded toolResult is kept-tail content. Advancing past it to asst-2
+		// would drop that content, while cutting at it would orphan the result.
 		expect(findFirstKeptEntryId(entries, 2)).toBeNull();
+	});
+
+	it("falls forward when an unresolvable slot is followed by a real entry", () => {
+		const entriesWithUnresolvableSlot = [
+			messageEntry("u-0", { role: "user", content: "go" }),
+			messageEntry("", { role: "status", content: "non-replayable noise" }),
+			messageEntry("u-2", { role: "user", content: "keep this" }),
+		];
+
+		expect(findFirstKeptEntryId(entriesWithUnresolvableSlot, 1)).toBe("u-2");
 	});
 
 	it("defers (null) when only folded tool-result tails remain after the boundary", () => {
