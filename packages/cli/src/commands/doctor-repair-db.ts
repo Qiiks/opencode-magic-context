@@ -84,11 +84,14 @@ function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     const blockers =
         rpc.state === "live" ? rpc.serverPids.map((pid) => `OpenCode server (PID ${pid})`) : [];
     const pi = inspectLivePiProcesses();
-    if (pi.state === "unreadable") {
+    if (pi.state === "unreadable" || pi.state === "inconclusive") {
         return {
             safe: false,
             blockers,
-            uncertainty: `Pi/OMP process liveness could not be determined: ${pi.error ?? "process list unavailable"}`,
+            uncertainty:
+                pi.state === "inconclusive"
+                    ? `Pi/OMP process image or command line was ambiguous (PID ${(pi.inconclusivePids ?? []).join(", ")})`
+                    : `Pi/OMP process liveness could not be determined: ${pi.error ?? "process list unavailable"}`,
         };
     }
     blockers.push(...pi.processIds.map((pid) => `Pi/OMP harness (PID ${pid})`));

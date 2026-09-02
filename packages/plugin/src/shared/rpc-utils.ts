@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { log } from "./logger";
+
 export type ProcessKind = "OpenCode server" | "OpenCode instance (TUI/CLI)" | "Pi" | "process";
 
 /** Best-effort process details captured while validating a migration blocker. */
@@ -86,9 +88,21 @@ export function isPidAlive(pid: number): PidLiveness {
 const RPC_IDENTITY_SKEW_TOLERANCE_MS = 120_000;
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 const PS_PROBE_TIMEOUT_MS = 1_000;
+const WINDOWS_CIM_PROBE_TIMEOUT_MS = 5_000;
+const MAX_ANCESTOR_WALK_DEPTH = 16;
 const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
 const TASKLIST_NO_TASKS_PATTERN =
     /^INFO:\s+No tasks are running which match the specified criteria\.?$/im;
+const WINDOWS_CIM_COMMAND =
+    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress";
+const PI_HARNESS_ARC_MARKERS = [
+    "pi-coding-agent",
+    "oh-my-pi",
+    "@oh-my-pi",
+    "cljs/dist",
+    "dist/bundle/cli",
+];
+const PI_IMAGE_NAMES = new Set(["pi", "pi.cmd", "omp", "oh-my-pi"]);
 
 let rpcIdentityReadFileSync: typeof readFileSync = readFileSync;
 let rpcIdentityExecFileSync: typeof execFileSync = execFileSync;
@@ -157,7 +171,7 @@ export function readProcessStartTime(pid: number): number | null {
     return rpcIdentityPlatform === "linux"
         ? readLinuxProcessStartTime(pid)
         : rpcIdentityPlatform === "win32"
-          ? null
+          ? readWindowsProcessStartTime(pid)
           : readPsProcessStartTime(pid);
 }
 
@@ -172,6 +186,32 @@ export function readProcessProbeEvidence(pid: number): ProcessProbeEvidence {
 interface ProcessListEntry {
     pid: number;
     command: string;
+}
+
+interface ProcessFacts {
+    pid: number;
+    parentPid: number | null;
+    commandLine: string | null;
+    imageName: string | null;
+    startTime: number | null;
+}
+
+type ProcessSnapshotSource = "cim" | "tasklist" | "ps";
+
+interface ProcessSnapshot {
+    facts: ProcessFacts[];
+    parentByPid: Map<number, number>;
+    source: ProcessSnapshotSource;
+}
+
+let windowsProcessFactsCache: Map<number, ProcessFacts> | null = null;
+
+function rememberWindowsProcessFacts(facts: ProcessFacts[]): void {
+    windowsProcessFactsCache = new Map(facts.map((fact) => [fact.pid, fact]));
+}
+
+function clearWindowsProcessFactsCache(): void {
+    windowsProcessFactsCache = null;
 }
 
 function parseCsvLine(line: string): string[] | null {
@@ -235,6 +275,15 @@ function readWindowsProcess(pid: number): { state: PidLiveness; command?: string
     }
 }
 
+function readWindowsProcessStartTime(pid: number): number | null {
+    const cached = windowsProcessFactsCache?.get(pid);
+    if (cached) return cached.startTime;
+    const snapshot = tryReadWindowsCimSnapshot(rpcIdentityExecFileSync);
+    if (!snapshot) return null;
+    rememberWindowsProcessFacts(snapshot.facts);
+    return windowsProcessFactsCache?.get(pid)?.startTime ?? null;
+}
+
 function readLinuxProcessCommand(pid: number): string | null {
     try {
         return String(rpcIdentityReadFileSync(`/proc/${pid}/cmdline`, "utf8"));
@@ -259,11 +308,13 @@ function readPsProcessCommand(pid: number): string | null {
 /** Reuse the platform-gated command probes used by PID identity checks. */
 export function readProcessCommand(pid: number): string | null {
     if (!Number.isInteger(pid) || pid <= 0) return null;
-    return rpcIdentityPlatform === "linux"
-        ? readLinuxProcessCommand(pid)
-        : rpcIdentityPlatform === "win32"
-          ? (readWindowsProcess(pid).command ?? null)
-          : readPsProcessCommand(pid);
+    if (rpcIdentityPlatform === "linux") return readLinuxProcessCommand(pid);
+    if (rpcIdentityPlatform === "win32") {
+        const cached = windowsProcessFactsCache?.get(pid);
+        if (cached?.commandLine) return cached.commandLine;
+        return readWindowsProcess(pid).command ?? null;
+    }
+    return readPsProcessCommand(pid);
 }
 
 function executableName(token: string | undefined): string {
@@ -378,6 +429,7 @@ export function __setRpcIdentityTestHooks(hooks: {
     platform?: NodeJS.Platform;
     nowMs?: () => number;
 }): void {
+    clearWindowsProcessFactsCache();
     rpcIdentityReadFileSync = hooks.readFileSync ?? readFileSync;
     rpcIdentityExecFileSync = hooks.execFileSync ?? execFileSync;
     rpcIdentityProcessKill = hooks.processKill ?? process.kill;
@@ -388,6 +440,7 @@ export function __setRpcIdentityTestHooks(hooks: {
 }
 
 export function __resetRpcIdentityTestHooks(): void {
+    clearWindowsProcessFactsCache();
     rpcIdentityReadFileSync = readFileSync;
     rpcIdentityExecFileSync = execFileSync;
     rpcIdentityProcessKill = process.kill;
@@ -397,27 +450,289 @@ export function __resetRpcIdentityTestHooks(): void {
     rpcIdentityNowMs = () => Date.now();
 }
 
-function commandLooksLikePi(command: string): boolean {
-    const normalized = command.trim().toLowerCase().replaceAll("\\", "/");
-    const tokens = normalized.split(/\s+/).filter(Boolean);
-    const executableName = (token: string | undefined): string =>
-        (token ?? "").split("/").at(-1) ?? "";
-    const first = executableName(tokens[0]).replace(/\.exe$/, "");
-    if (["pi", "pi.cmd", "omp", "oh-my-pi"].includes(first)) return true;
+function commandLooksLikePiImage(command: string): boolean {
+    const tokens = commandTokens(command);
+    const first = executableName(tokens[0]).replace(/\.(?:exe|cmd)$/, "");
+    return PI_IMAGE_NAMES.has(first);
+}
+
+/**
+ * A process is a verified Pi/OMP harness only when its command line names a
+ * known package entry (pi-coding-agent, oh-my-pi, the bun/node cli shim).
+ * Bare `omp.exe` / `pi.exe` image names are not enough: Windows tasklist
+ * reports only the image, and that matches the session's own launcher shim.
+ */
+function commandHasPiHarnessArc(command: string): boolean {
+    const normalized = command.trim().toLowerCase().replaceAll("\\", "/").replaceAll("\u0000", " ");
+    if (!normalized) return false;
+    const tokens = commandTokens(command);
+    if (tokens.length === 0) return false;
+    const hasArc = PI_HARNESS_ARC_MARKERS.some((marker) => normalized.includes(marker));
+    const first = executableName(tokens[0]).replace(/\.(?:exe|cmd)$/, "");
+    if (hasArc && ["pi", "omp", "oh-my-pi", "node", "bun", "deno", "cmd"].includes(first)) {
+        return true;
+    }
+    if (hasArc && PI_HARNESS_ARC_MARKERS.some((marker) => tokens[0].includes(marker))) {
+        return true;
+    }
     if (["node", "bun", "deno"].includes(first)) {
-        const script = executableName(tokens[1]);
-        return (
-            ["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script) ||
-            normalized.includes("pi-coding-agent")
-        );
+        const script = executableName(tokens[1]).replace(/\.(?:exe|cmd)$/, "");
+        if (["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script)) return true;
+        if (hasArc) return true;
     }
     return false;
 }
 
+function execProcessList(
+    exec: typeof execFileSync,
+    file: string,
+    args: readonly string[],
+    timeout = PS_PROBE_TIMEOUT_MS,
+): string {
+    return String(
+        exec(file, [...args], {
+            encoding: "utf8",
+            timeout,
+            stdio: ["ignore", "pipe", "pipe"],
+        }),
+    );
+}
+
+function parseWindowsCreationDate(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value > 1e12 ? value : value * 1_000;
+    }
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const wmi =
+        /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/.exec(trimmed);
+    if (wmi) {
+        const utcMs = Date.UTC(
+            Number(wmi[1]),
+            Number(wmi[2]) - 1,
+            Number(wmi[3]),
+            Number(wmi[4]),
+            Number(wmi[5]),
+            Number(wmi[6]),
+            Number(wmi[7]) / 1_000,
+        );
+        if (!Number.isFinite(utcMs)) return null;
+        const offsetMinutes = Number(wmi[9]);
+        const sign = wmi[8] === "+" ? 1 : -1;
+        return utcMs - sign * offsetMinutes * 60_000;
+    }
+    const dotNet = /^\/Date\((-?\d+)\)\/$/.exec(trimmed);
+    if (dotNet) {
+        const milliseconds = Number(dotNet[1]);
+        return Number.isFinite(milliseconds) ? milliseconds : null;
+    }
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseWindowsCimOutput(output: string): ProcessFacts[] | null {
+    const trimmed = output.trim();
+    if (!trimmed) return null;
+    const bracket = trimmed.indexOf("[");
+    const brace = trimmed.indexOf("{");
+    const start = Math.min(
+        bracket === -1 ? Number.POSITIVE_INFINITY : bracket,
+        brace === -1 ? Number.POSITIVE_INFINITY : brace,
+    );
+    if (!Number.isFinite(start)) return null;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(trimmed.slice(start));
+    } catch {
+        return null;
+    }
+    if (parsed == null) return null;
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const facts: ProcessFacts[] = [];
+    for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        const record = row as Record<string, unknown>;
+        const pid = Number(record.ProcessId);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        const parentRaw = record.ParentProcessId;
+        const parentPid =
+            parentRaw == null || parentRaw === "" ? Number.NaN : Number(parentRaw);
+        const commandLine = typeof record.CommandLine === "string" ? record.CommandLine : null;
+        facts.push({
+            pid,
+            parentPid: Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null,
+            commandLine,
+            imageName: commandLine ? executableName(commandTokens(commandLine)[0]) : null,
+            startTime: parseWindowsCreationDate(record.CreationDate),
+        });
+    }
+    return facts.length > 0 ? facts : null;
+}
+
+function snapshotFromFacts(
+    facts: ProcessFacts[],
+    source: ProcessSnapshotSource,
+): ProcessSnapshot {
+    const parentByPid = new Map<number, number>();
+    for (const fact of facts) {
+        if (fact.parentPid != null) parentByPid.set(fact.pid, fact.parentPid);
+    }
+    return { facts, parentByPid, source };
+}
+
+function tryReadWindowsCimSnapshot(exec: typeof execFileSync): ProcessSnapshot | null {
+    try {
+        const output = execProcessList(
+            exec,
+            "powershell",
+            ["-NoProfile", "-Command", WINDOWS_CIM_COMMAND],
+            WINDOWS_CIM_PROBE_TIMEOUT_MS,
+        );
+        const facts = parseWindowsCimOutput(output);
+        return facts ? snapshotFromFacts(facts, "cim") : null;
+    } catch {
+        return null;
+    }
+}
+
+function tryReadWindowsTasklistSnapshot(): ProcessSnapshot | null {
+    try {
+        const output = execProcessList(rpcProcessListExecFileSync, "tasklist", ["/FO", "CSV"]);
+        const entries = parseTasklistOutput(output);
+        if (entries === null) return null;
+        const facts = entries.map((entry) => ({
+            pid: entry.pid,
+            parentPid: null,
+            commandLine: null,
+            imageName: entry.command,
+            startTime: null,
+        }));
+        return snapshotFromFacts(facts, "tasklist");
+    } catch {
+        return null;
+    }
+}
+
+function readPosixProcessSnapshot(): ProcessSnapshot {
+    const output = execProcessList(rpcProcessListExecFileSync, "ps", ["-axo", "pid=,command="]);
+    const facts: ProcessFacts[] = [];
+    for (const line of output.split(/\r?\n/)) {
+        const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+        if (!match) continue;
+        const pid = Number(match[1]);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        facts.push({
+            pid,
+            parentPid: null,
+            commandLine: match[2],
+            imageName: executableName(commandTokens(match[2])[0]),
+            startTime: null,
+        });
+    }
+    return snapshotFromFacts(facts, "ps");
+}
+
+function readPosixParentPid(pid: number): number | null {
+    try {
+        const output = execProcessList(rpcProcessListExecFileSync, "ps", [
+            "-o",
+            "ppid=",
+            "-p",
+            String(pid),
+        ]);
+        const match = /^\s*(\d+)\s*$/.exec(output);
+        if (!match) return null;
+        const ppid = Number(match[1]);
+        return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Walk toward init from `selfPid` so the session's own launcher cannot be
+ * treated as a foreign blocker. On Windows, OMP/Pi is two processes: a
+ * long-lived `omp.exe`/`pi.exe` shim and the bun/node child where this
+ * plugin runs. Bound the walk and stop on cycles so a broken parent map
+ * cannot loop.
+ */
+function collectAncestorPids(selfPid: number, parentByPid: Map<number, number>): Set<number> {
+    const ancestors = new Set<number>();
+    let current = selfPid;
+    for (let depth = 0; depth < MAX_ANCESTOR_WALK_DEPTH; depth += 1) {
+        let ppid: number | null = null;
+        if (parentByPid.has(current)) {
+            ppid = parentByPid.get(current) ?? null;
+        } else if (rpcIdentityPlatform !== "win32") {
+            ppid = readPosixParentPid(current);
+            if (ppid == null && current === process.pid && process.ppid > 0) {
+                ppid = process.ppid;
+            }
+        } else if (current === process.pid && process.ppid > 0) {
+            ppid = process.ppid;
+        } else {
+            break;
+        }
+        if (ppid == null || ppid <= 0 || ppid === current || ancestors.has(ppid)) break;
+        ancestors.add(ppid);
+        current = ppid;
+    }
+    return ancestors;
+}
+
+function classifyLivePiSnapshot(snapshot: ProcessSnapshot): PiProcessDiscovery {
+    const ancestors = collectAncestorPids(process.pid, snapshot.parentByPid);
+    const processIds = new Set<number>();
+    const inconclusivePids = new Set<number>();
+    const skippedAncestorPids: number[] = [];
+    for (const fact of snapshot.facts) {
+        if (fact.pid === process.pid) continue;
+        const command = fact.commandLine ?? fact.imageName ?? "";
+        const looksLikeHarness =
+            commandHasPiHarnessArc(command) || commandLooksLikePiImage(command);
+        if (!looksLikeHarness) continue;
+        if (ancestors.has(fact.pid)) {
+            skippedAncestorPids.push(fact.pid);
+            log(
+                `[magic-context] Pi process scan: skipping ancestor PID ${fact.pid} (session launcher shim)`,
+            );
+            continue;
+        }
+        if (commandHasPiHarnessArc(command)) {
+            processIds.add(fact.pid);
+            continue;
+        }
+        inconclusivePids.add(fact.pid);
+        log(
+            `[magic-context] Pi process scan: PID ${fact.pid} command line is ambiguous (image-name or missing Pi/OMP arc); treating as inconclusive`,
+        );
+    }
+    skippedAncestorPids.sort((left, right) => left - right);
+    const verified = [...processIds].sort((left, right) => left - right);
+    const inconclusive = [...inconclusivePids].sort((left, right) => left - right);
+    if (verified.length === 0 && inconclusive.length > 0) {
+        return {
+            state: "inconclusive",
+            processIds: [],
+            inconclusivePids: inconclusive,
+            ...(skippedAncestorPids.length > 0 ? { skippedAncestorPids } : {}),
+        };
+    }
+    return {
+        state: "known",
+        processIds: verified,
+        ...(inconclusive.length > 0 ? { inconclusivePids: inconclusive } : {}),
+        ...(skippedAncestorPids.length > 0 ? { skippedAncestorPids } : {}),
+    };
+}
+
 /** Result of checking whether Pi/OMP processes may currently hold the shared database. */
 export interface PiProcessDiscovery {
-    state: "known" | "unreadable";
+    state: "known" | "unreadable" | "inconclusive";
     processIds: number[];
+    inconclusivePids?: number[];
+    skippedAncestorPids?: number[];
     error?: string;
 }
 
@@ -432,42 +747,23 @@ export function inspectLivePiProcesses(): PiProcessDiscovery {
         return { state: "known", processIds: [] };
     }
     try {
-        const isWindows = rpcIdentityPlatform === "win32";
-        const output = String(
-            rpcProcessListExecFileSync(
-                isWindows ? "tasklist" : "ps",
-                isWindows ? ["/FO", "CSV"] : ["-axo", "pid=,command="],
-                {
-                    encoding: "utf8",
-                    timeout: PS_PROBE_TIMEOUT_MS,
-                    stdio: ["ignore", "pipe", "pipe"],
-                },
-            ),
-        );
-        const pids = new Set<number>();
-        if (isWindows) {
-            const entries = parseTasklistOutput(output);
-            if (entries === null) {
+        if (rpcIdentityPlatform === "win32") {
+            // Prefer one CIM query (pid, parent, command line, start time).
+            // tasklist is image-name-only, so it is a fallback and never a
+            // verified live-harness source.
+            const cim = tryReadWindowsCimSnapshot(rpcProcessListExecFileSync);
+            const snapshot = cim ?? tryReadWindowsTasklistSnapshot();
+            if (!snapshot) {
                 return {
                     state: "unreadable",
                     processIds: [],
-                    error: "tasklist output unavailable",
+                    error: "process list unavailable",
                 };
             }
-            for (const entry of entries) {
-                if (entry.pid === process.pid) continue;
-                if (commandLooksLikePi(entry.command)) pids.add(entry.pid);
-            }
-        } else {
-            for (const line of output.split(/\r?\n/)) {
-                const match = /^\s*(\d+)\s+(.+)$/.exec(line);
-                if (!match) continue;
-                const pid = Number(match[1]);
-                if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
-                if (commandLooksLikePi(match[2])) pids.add(pid);
-            }
+            rememberWindowsProcessFacts(snapshot.facts);
+            return classifyLivePiSnapshot(snapshot);
         }
-        return { state: "known", processIds: [...pids].sort((left, right) => left - right) };
+        return classifyLivePiSnapshot(readPosixProcessSnapshot());
     } catch (error) {
         return {
             state: "unreadable",
