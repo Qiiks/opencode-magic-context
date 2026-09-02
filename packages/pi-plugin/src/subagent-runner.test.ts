@@ -1862,6 +1862,58 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
 	});
 
+	it("surfaces the error behind a bundled source line on non-zero exit", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const sourceLine =
+			`263 | ${"FROM cacheInterceptorV${VERSION2} ".repeat(100)}`.slice(
+				0,
+				3_000,
+			);
+		const stderr = [
+			sourceLine,
+			"^",
+			"SqliteError: database is locked",
+			"    at openDatabase (bundle.js:100:20)",
+			"    at runHistorian (runner.js:12:4)",
+		].join("\n");
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStderr(stderr);
+		child.emitClose(1);
+
+		const result = await resultPromise;
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.reason).toBe("non_zero_exit");
+			expect(result.error).toContain("SqliteError: database is locked");
+			expect(result.error).not.toContain(sourceLine);
+			expect(result.error).toContain("at openDatabase (bundle.js:100:20)");
+		}
+	});
+
+	it("keeps the tail when a chatty child exceeds the stderr buffer cap", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const stderr = `${"head-only\n".repeat(2_000)}${"tail-only\n".repeat(2_000)}`;
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStderr(stderr);
+		child.emitClose(7);
+
+		const result = await resultPromise;
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.reason).toBe("non_zero_exit");
+			expect(result.error).toContain("tail-only");
+			expect(result.error).not.toContain("head-only");
+			expect(result.meta?.stderr).toContain("tail-only");
+			expect(result.meta?.stderr).not.toContain("head-only");
+		}
+	});
+
 	it("returns non_zero_exit with stderr and exit metadata", async () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
