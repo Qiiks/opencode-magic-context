@@ -19,11 +19,13 @@ import {
 } from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
+    clearThinkingBindingRecoveryIf,
     clearPersistedTodoSyntheticAnchor,
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
@@ -101,6 +103,7 @@ import {
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
+import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
@@ -1707,6 +1710,10 @@ export function createRustModeTransform(
         const passStartedAt = performance.now();
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        const trailingBlankSourceDecisions = snapshotTrailingBlankSourceDecisions(messages);
+        const trailingBlankNewestAssistantId = [...messages]
+            .reverse()
+            .find((message) => message.info.role === "assistant")?.info.id;
         const timings = emptyRustPassTimings();
         state.passCount += 1;
         const syntheticTurn = observeSyntheticTurn(state, messages);
@@ -2719,6 +2726,7 @@ export function createRustModeTransform(
                 decisionUpper === "SOFT" ||
                 !explicitDecision;
             let appliedMessages: unknown[];
+            let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
             const applyStartedAt = performance.now();
             try {
                 // Validate and postprocess the module result before touching the caller-owned
@@ -2759,16 +2767,26 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
-                    runRustModePostprocess({
+                    thinkingBindingRecovery = runRustModePostprocess({
                         db: deps.db,
                         sessionId,
                         messages: appliedMessages as MessageLike[],
                         projectPath: memoryProjectPath,
                         fullFeatureMode: !sessionMeta.isSubagent,
                         compactionOff: deps.compactionOff,
+                        resolvedProviderID: model?.providerID,
+                        thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+                            model?.providerID,
+                            model?.modelID,
+                        ),
+                        trailingBlankSourceDecisions,
+                        trailingBlankNewestAssistantId:
+                            typeof trailingBlankNewestAssistantId === "string"
+                                ? trailingBlankNewestAssistantId
+                                : undefined,
                         tagger: deps.tagger,
                         ctxReduceAvailability: reduceAvailability,
-                    });
+                    }).thinkingBindingRecovery;
                 }
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
@@ -2874,6 +2892,17 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust note delivery nack failed (ignored):", nackError);
                 }
                 throw error;
+            }
+            if (thinkingBindingRecovery) {
+                const cleared = clearThinkingBindingRecoveryIf(
+                    deps.db,
+                    sessionId,
+                    thinkingBindingRecovery.flagTarget,
+                );
+                sessionLog(
+                    sessionId,
+                    `rust thinking binding recovery: stripped bound reasoning from assistant ${thinkingBindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+                );
             }
             if (cacheBustingPass) {
                 state.lkgRepresentationFrozen = false;

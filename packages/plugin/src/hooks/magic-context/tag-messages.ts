@@ -615,6 +615,11 @@ export function tagMessages(
 
             if (messageId && isTextPart(part)) {
                 const textPart = part;
+                // Empty assistant text is provider framing, not reclaimable content. Prefixing
+                // it would hide a trailing-blank suffix from the frozen-shape finalizer.
+                if (message.info.role === "assistant" && textPart.text.trim().length === 0) {
+                    continue;
+                }
                 const thinkingParts = messageThinkingParts;
                 const contentId = `${messageId}:p${partIndex}`;
                 // Resolver pre-warms any tag-id-fallback bindings (e.g. when

@@ -1259,6 +1259,87 @@ describe("createCtxMemoryTools", () => {
             ]);
         });
 
+        it("applies destructive curate refusals before module-authority dispatch", async () => {
+            const successorless = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE",
+                content: "The legacy loader initializes the project registry.",
+            });
+            const profileSource = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "The build cache key includes the target platform.",
+            });
+            const profileSuccessor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "The build cache key includes the target platform and runtime version.",
+            });
+            const directiveSource = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "Always run the release checklist before publishing.",
+            });
+            const directiveSuccessor = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "PROJECT_RULES",
+                content: "The release checklist lives at docs/release.md.",
+            });
+            const routed: string[] = [];
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async (request) => {
+                        routed.push(request.action);
+                        return { content: [{ type: "text", text: `module ${request.action}` }] };
+                    },
+                },
+            });
+
+            const results = await Promise.all([
+                moduleTools.ctx_memory.execute(
+                    {
+                        action: "archive",
+                        ids: [successorless.id],
+                        reason: "No longer useful.",
+                    },
+                    dreamerToolContext("/repo/project", "ses-module-successorless"),
+                ),
+                moduleTools.ctx_memory.execute(
+                    {
+                        action: "archive",
+                        ids: [profileSource.id],
+                        superseded_by: profileSuccessor.id,
+                        reason: "Redundant with the global user profile directive U7.",
+                    },
+                    dreamerToolContext("/repo/project", "ses-module-profile"),
+                ),
+                moduleTools.ctx_memory.execute(
+                    {
+                        action: "archive",
+                        ids: [directiveSource.id],
+                        superseded_by: directiveSuccessor.id,
+                        reason: "Consolidated into the release checklist location memory.",
+                    },
+                    dreamerToolContext("/repo/project", "ses-module-directive"),
+                ),
+            ]);
+
+            expect(results).toEqual([
+                expect.stringContaining("missing-active-same-category-successor"),
+                expect.stringContaining("user-profile-is-not-project-memory"),
+                expect.stringContaining("directive-shaped-project-rule"),
+            ]);
+            expect(routed).toEqual([]);
+            for (const memory of [successorless, profileSource, directiveSource]) {
+                expect(getMemoryById(db, memory.id)?.status).toBe("active");
+            }
+        });
+
         it("routes an allowed module-authority archive as consolidation into its named survivor", async () => {
             const source = insertMemory(db, {
                 projectPath: "/repo/project",
