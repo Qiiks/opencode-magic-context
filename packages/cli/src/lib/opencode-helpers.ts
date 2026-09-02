@@ -67,8 +67,14 @@ function runOpenCode(args: string[], binary?: string | null, timeoutMs?: number)
  */
 export const OPENCODE_VERSION_PROBE_TIMEOUT_MS = 2_000;
 
-export function getOpenCodeVersion(binary?: string | null): string | null {
-    return runOpenCode(["--version"], binary, OPENCODE_VERSION_PROBE_TIMEOUT_MS);
+export function getOpenCodeVersion(
+    binary?: string | null,
+    // Tests that only verify shim/binary invocation pass a generous budget: a
+    // shell spawn under a loaded host can exceed the production probe timeout,
+    // and the timeout itself has its own dedicated test.
+    timeoutMs: number = OPENCODE_VERSION_PROBE_TIMEOUT_MS,
+): string | null {
+    return runOpenCode(["--version"], binary, timeoutMs);
 }
 
 export interface OpenCodeInstallationReport extends OpenCodeInstallation {

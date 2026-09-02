@@ -127,7 +127,9 @@ describe("OpenCode command execution", () => {
         process.env.MC_OPENCODE_TEST_PATH = "expanded-to-the-wrong-path";
         const shim = fakeOpenCodeCommandShim();
 
-        expect(getOpenCodeVersion(shim)).toBe("1.18.7");
+        // Invocation shape is under test, not the probe budget (covered by the
+        // hanging-probe test below); a loaded host can take >2s just to spawn sh.
+        expect(getOpenCodeVersion(shim, 30_000)).toBe("1.18.7");
         expect(getAvailableModels(shim)).toEqual(["anthropic/claude-opus-4-8", "openai/gpt-5.5"]);
     });
 });
