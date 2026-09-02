@@ -631,7 +631,10 @@ export function formatInconclusivePiMigrationWarning(
 function logInconclusiveMigrationProbes(
     dbPath: string,
     discovery: RpcServerDiscovery,
-    piDiscovery: { state: "known" | "unreadable" | "inconclusive"; inconclusivePids?: readonly number[] },
+    piDiscovery: {
+        state: "known" | "unreadable" | "inconclusive";
+        inconclusivePids?: readonly number[];
+    },
 ): void {
     const uncertainPids = discovery.inconclusivePids ?? [];
     if (uncertainPids.length > 0) {

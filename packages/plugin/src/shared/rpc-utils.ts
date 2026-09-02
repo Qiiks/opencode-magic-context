@@ -505,8 +505,7 @@ function parseWindowsCreationDate(value: unknown): number | null {
     if (typeof value !== "string") return null;
     const trimmed = value.trim();
     if (!trimmed) return null;
-    const wmi =
-        /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/.exec(trimmed);
+    const wmi = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/.exec(trimmed);
     if (wmi) {
         const utcMs = Date.UTC(
             Number(wmi[1]),
@@ -556,8 +555,7 @@ function parseWindowsCimOutput(output: string): ProcessFacts[] | null {
         const pid = Number(record.ProcessId);
         if (!Number.isInteger(pid) || pid <= 0) continue;
         const parentRaw = record.ParentProcessId;
-        const parentPid =
-            parentRaw == null || parentRaw === "" ? Number.NaN : Number(parentRaw);
+        const parentPid = parentRaw == null || parentRaw === "" ? Number.NaN : Number(parentRaw);
         const commandLine = typeof record.CommandLine === "string" ? record.CommandLine : null;
         facts.push({
             pid,
@@ -570,10 +568,7 @@ function parseWindowsCimOutput(output: string): ProcessFacts[] | null {
     return facts.length > 0 ? facts : null;
 }
 
-function snapshotFromFacts(
-    facts: ProcessFacts[],
-    source: ProcessSnapshotSource,
-): ProcessSnapshot {
+function snapshotFromFacts(facts: ProcessFacts[], source: ProcessSnapshotSource): ProcessSnapshot {
     const parentByPid = new Map<number, number>();
     for (const fact of facts) {
         if (fact.parentPid != null) parentByPid.set(fact.pid, fact.parentPid);
