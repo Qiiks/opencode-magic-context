@@ -718,7 +718,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         autoEmbedAttemptedBySession.add(sessionId);
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         void (async () => {
-            let completedDrainWithWork = false;
+            // Latch discipline: early exits (no identity, provider off, nothing to
+            // embed yet) release the latch so a young session gets its drain once
+            // real work exists — those paths are silent and cost one coverage
+            // query. Once a drain reaches ANY terminal outcome (busy, stalled,
+            // success), the latch holds for the process lifetime: busy means the
+            // project-level passive backfill owns the backlog, and re-attempting
+            // per pass is the announce/busy livelock this shape replaced.
+            let drainReachedTerminal = false;
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -738,35 +745,41 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 if (!coverage.enabled) return;
                 const remaining = coverage.session.total - coverage.session.embedded;
                 if (remaining <= 0) return;
-                const notifyParams = getLiveNotificationParams(
-                    sessionId,
-                    liveModelBySession,
-                    variantBySession,
-                    agentBySession,
-                );
-                if (!isTuiConnected(sessionId)) {
-                    const startMsg = `Embedding ${remaining} compartment${remaining === 1 ? "" : "s"} of history in the background…`;
-                    await sendIgnoredMessage(deps.client, sessionId, startMsg, {
-                        ...notifyParams,
-                    });
-                }
-                const summary = await executeEmbedHistory(sessionId);
+                // The auto lane is a silent bootstrap trigger: no pre-announce, no
+                // busy/zero-work chatter, and the once-per-process latch never
+                // resets. Announce-then-drain looped every turn on large backlogs —
+                // the project-level passive backfill holds the drain lock for the
+                // whole (bounded, deferred-span) catch-up, so this drain returned
+                // "busy"/zero-work each pass, reset its own latch, and re-announced
+                // the same count forever. Retries belong to the passive backfill;
+                // progress lives in /ctx-embed status and the sidebar.
+                const embeddedBefore = coverage.session.embedded;
+                await executeEmbedHistory(sessionId, { silent: true });
+                drainReachedTerminal = true;
                 const completedCoverage = getEmbeddingCoverageStatus(
                     db,
                     sessionProjectIdentity,
                     sessionId,
                 );
-                completedDrainWithWork =
-                    completedCoverage.session.total - completedCoverage.session.embedded <= 0;
-                if (!isTuiConnected(sessionId)) {
-                    await sendIgnoredMessage(deps.client, sessionId, summary, {
-                        ...notifyParams,
-                    });
+                const embeddedNow = completedCoverage.session.embedded - embeddedBefore;
+                if (embeddedNow > 0 && !isTuiConnected(sessionId)) {
+                    const notifyParams = getLiveNotificationParams(
+                        sessionId,
+                        liveModelBySession,
+                        variantBySession,
+                        agentBySession,
+                    );
+                    await sendIgnoredMessage(
+                        deps.client,
+                        sessionId,
+                        `Embedded ${embeddedNow} compartment${embeddedNow === 1 ? "" : "s"} of history for semantic search.`,
+                        { ...notifyParams },
+                    );
                 }
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
             } finally {
-                if (!completedDrainWithWork) autoEmbedAttemptedBySession.delete(sessionId);
+                if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };

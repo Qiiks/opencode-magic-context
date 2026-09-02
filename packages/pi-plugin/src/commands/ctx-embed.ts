@@ -270,7 +270,13 @@ export function maybeAutoEmbedPiSession(
 	if (deps.memoryEnabled === false) return;
 	autoEmbedAttemptedBySession.add(sessionId);
 	void (async () => {
-		let completedDrainWithWork = false;
+		// Latch discipline: early exits (nothing to embed yet, provider off)
+		// release the latch so a young session drains once real work exists.
+		// Any terminal drain outcome (busy, stalled, success) holds the latch
+		// for the process lifetime — busy means the project-level passive
+		// backfill owns the backlog, and per-pass re-attempts are the
+		// announce/busy livelock this shape replaced.
+		let drainReachedTerminal = false;
 		try {
 			// Defer off the context-handler thread before any DB/config work:
 			// ensureProjectRegisteredFromPiDirectory does its config load + stale
@@ -285,21 +291,35 @@ export function maybeAutoEmbedPiSession(
 			if (!coverage.enabled) return;
 			const remaining = coverage.session.total - coverage.session.embedded;
 			if (remaining <= 0) return;
-			notify(
-				`Embedding ${remaining} compartment${remaining === 1 ? "" : "s"} of history in the background…`,
-			);
-			const { text, level } = await runEmbedDrain(
+			// Silent bootstrap trigger: no pre-announce, no busy/zero-work
+			// chatter, and the once-per-process latch never resets. The
+			// announce-then-drain shape looped every turn on large backlogs:
+			// the project-level passive backfill holds the drain lock during
+			// its (bounded) catch-up, so this drain returned "busy" each pass,
+			// reset its own latch, and re-announced the same count. Retries
+			// belong to the passive backfill; progress lives in /ctx-embed.
+			const embeddedBefore = coverage.session.embedded;
+			const { level } = await runEmbedDrain(
 				deps.db,
 				projectIdentity,
 				sessionId,
 			);
-			completedDrainWithWork = level === "success";
-			notify(text.replace(/^## \/ctx-embed\n\n/, ""));
+			drainReachedTerminal = true;
+			const after = getEmbeddingCoverageStatus(
+				deps.db,
+				projectIdentity,
+				sessionId,
+			);
+			const embeddedNow = after.session.embedded - embeddedBefore;
+			if (level === "success" && embeddedNow > 0) {
+				notify(
+					`Embedded ${embeddedNow} compartment${embeddedNow === 1 ? "" : "s"} of history for semantic search.`,
+				);
+			}
 		} catch {
 			// best-effort background drain
 		} finally {
-			if (!completedDrainWithWork)
-				autoEmbedAttemptedBySession.delete(sessionId);
+			if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
 		}
 	})();
 }
