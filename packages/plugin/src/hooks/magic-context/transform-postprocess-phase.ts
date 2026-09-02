@@ -387,10 +387,14 @@ export function runRustModePostprocess(args: {
     projectPath?: string;
     fullFeatureMode: boolean;
     compactionOff?: boolean;
+    resolvedProviderID?: string;
+    thinkingBindingRecoveryEnabledForModel?: boolean;
+    trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
+    trailingBlankNewestAssistantId?: string;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
-}): void {
-    if (!args.fullFeatureMode || args.compactionOff) return;
+}): { thinkingBindingRecovery: { flagTarget: string; messageId: string } | null } {
+    if (!args.fullFeatureMode || args.compactionOff) return { thinkingBindingRecovery: null };
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
     // those responses untouched instead of treating a missing `info` object as a failure.
@@ -402,7 +406,7 @@ export function runRustModePostprocess(args: {
                 !isRecord((message as { info?: unknown }).info),
         )
     ) {
-        return;
+        return { thinkingBindingRecovery: null };
     }
     reconcileMarkerRepresentation(
         args.messages,
@@ -422,6 +426,42 @@ export function runRustModePostprocess(args: {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
+    const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
+    if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
+        try {
+            for (const [id, decision] of getTrailingBlankDecisions(args.db, args.sessionId)) {
+                trailingBlankDecisions.set(id, decision);
+            }
+            const candidates = findTrailingBlankDecisionCandidates(
+                args.messages,
+                trailingBlankDecisions,
+                { sourceDecisions: args.trailingBlankSourceDecisions },
+            ).filter(([id]) => id === args.trailingBlankNewestAssistantId);
+            if (candidates.length > 0) {
+                const persisted = addTrailingBlankDecisions(
+                    args.db,
+                    args.sessionId,
+                    candidates,
+                    { overwriteMessageId: args.trailingBlankNewestAssistantId },
+                );
+                if (persisted) {
+                    const committed = getTrailingBlankDecisions(args.db, args.sessionId);
+                    for (const [id] of candidates) {
+                        const decision = committed.get(id);
+                        if (decision) trailingBlankDecisions.set(id, decision);
+                    }
+                } else {
+                    sessionLog(
+                        args.sessionId,
+                        "rust trailing blank decision: persistence failed; serving only frozen decisions",
+                    );
+                }
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust trailing blank decision failed:", error);
+        }
+    }
+    applyFrozenTrailingBlankDecisions(args.messages, trailingBlankDecisions);
 
     const currentUserMessageId = findLastUserMessageId(args.messages);
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
@@ -432,15 +472,69 @@ export function runRustModePostprocess(args: {
         args.projectPath,
         noteReadStillVisible,
     );
-    if (!deferredNoteText) return;
-    const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
-    const anchoredMessageId = findLastUserMessageId(args.messages);
-    const outcome = markNoteNudgeDelivered(args.db, args.sessionId, instruction, anchoredMessageId);
-    if (anchoredMessageId && outcome.ok) {
-        appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
-    } else if (anchoredMessageId && !outcome.ok) {
-        sessionLog(args.sessionId, `rust note-nudge delivery skipped wire append: ${outcome.kind}`);
+    if (deferredNoteText) {
+        const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
+        const anchoredMessageId = findLastUserMessageId(args.messages);
+        const outcome = markNoteNudgeDelivered(
+            args.db,
+            args.sessionId,
+            instruction,
+            anchoredMessageId,
+        );
+        if (anchoredMessageId && outcome.ok) {
+            appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
+        } else if (anchoredMessageId && !outcome.ok) {
+            sessionLog(
+                args.sessionId,
+                `rust note-nudge delivery skipped wire append: ${outcome.kind}`,
+            );
+        }
     }
+
+    const recoveryMessageIds = new Set<string>();
+    let thinkingBindingRecovery: { flagTarget: string; messageId: string } | null = null;
+    if (modelAcceptsEmptyContent(args.resolvedProviderID)) {
+        try {
+            for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+                const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+                if (messageId.length > 0) recoveryMessageIds.add(messageId);
+            }
+
+            const flagTarget = args.thinkingBindingRecoveryEnabledForModel
+                ? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+                : null;
+            if (flagTarget) {
+                const messageId =
+                    flagTarget === NEWEST_REASONING_BEARING_ASSISTANT
+                        ? findNewestReasoningBearingAssistantId(args.messages)
+                        : flagTarget;
+                if (messageId && assistantHasReasoningPart(args.messages, messageId)) {
+                    const frozenId = thinkingBindingRecoveryFrozenId(messageId);
+                    const persisted =
+                        recoveryMessageIds.has(messageId) ||
+                        addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId]);
+                    if (persisted) {
+                        recoveryMessageIds.add(messageId);
+                        thinkingBindingRecovery = { flagTarget, messageId };
+                    } else {
+                        sessionLog(
+                            args.sessionId,
+                            "rust thinking binding recovery: persistence failed; leaving the bound block intact",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "rust thinking binding recovery failed:", error);
+        }
+        stripReasoningFromAssistantIds(
+            args.messages,
+            args.resolvedProviderID,
+            recoveryMessageIds,
+        );
+    }
+    return { thinkingBindingRecovery };
 }
 
 function dropMarkerSummaryTag(

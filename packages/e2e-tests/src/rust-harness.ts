@@ -126,6 +126,18 @@ export interface RustPassLine {
     raw: string;
 }
 
+type TrailingBlankReplayPartRow = {
+    id: string;
+    time_created: number;
+    data: string;
+};
+
+type TrailingBlankReplayRows = {
+    sessionId: string;
+    latestTime: number;
+    blankPartId: string;
+};
+
 export class RustTestHarness {
     readonly mock: MockProvider;
     readonly env: IsolatedEnv;
@@ -142,6 +154,7 @@ export class RustTestHarness {
     private readonly providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
     private readonly modelID: string;
     private readonly historianProducerAvailable: boolean;
+    private readonly trailingBlankReplayRows = new Map<string, TrailingBlankReplayRows>();
 
     private constructor(args: {
         mock: MockProvider;
@@ -470,6 +483,68 @@ export class RustTestHarness {
         }
     }
 
+    /**
+     * Capture the persisted tool-use assistant that a replay will expose through several
+     * ingress shapes. The original rows are retained so every shape starts from identical data.
+     */
+    prepareTrailingBlankReplay(sessionId: string): string {
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            const message = db
+                .prepare(
+                    "SELECT m.id FROM message m WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'assistant' AND EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND json_extract(p.data, '$.type') = 'tool') ORDER BY m.time_created DESC LIMIT 1",
+                )
+                .get(sessionId) as { id: string } | undefined;
+            if (!message) throw new Error("trailing-blank replay did not persist a tool assistant");
+            const rawRows = db
+                .prepare(
+                    "SELECT id, time_created, data FROM part WHERE message_id = ? ORDER BY time_created, id",
+                )
+                .all(message.id) as TrailingBlankReplayPartRow[];
+            const finishPartId = rawRows.find(
+                (row) => (JSON.parse(row.data) as Record<string, unknown>).type === "step-finish",
+            )?.id;
+            if (!finishPartId) {
+                throw new Error("trailing-blank replay requires a completed tool step");
+            }
+            const blankPartId = `prt_zzzzzzzzzzzz${message.id.slice(-12)}`;
+            this.trailingBlankReplayRows.set(message.id, {
+                sessionId,
+                latestTime: Math.max(...rawRows.map((row) => row.time_created)),
+                blankPartId,
+            });
+            return message.id;
+        } finally {
+            db.close();
+        }
+    }
+
+    /** Append the late empty text part without rewriting the assistant's accepted prefix. */
+    appendTrailingBlankReplayPart(messageId: string): void {
+        const captured = this.trailingBlankReplayRows.get(messageId);
+        if (!captured) throw new Error(`trailing-blank replay assistant ${messageId} was not prepared`);
+        const latestTime = captured.latestTime + 1;
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            db.prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            ).run(
+                captured.blankPartId,
+                messageId,
+                captured.sessionId,
+                latestTime,
+                latestTime,
+                JSON.stringify({ type: "text", text: "" }),
+            );
+        } finally {
+            db.close();
+        }
+    }
+
     /** Seed the latest isolated tool result for a sanitized provider-wire replay fixture. */
     seedLatestToolOutputForReplay(sessionId: string, output: string): void {
         const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
@@ -556,10 +631,22 @@ export class RustTestHarness {
     }
 
     /** Fetch the session's messages via the SDK (for choosing a mid-session id to remove). */
-    async listMessages(sessionId: string): Promise<Array<{ info?: { id?: string; role?: string } }>> {
+    async listMessages(
+        sessionId: string,
+    ): Promise<
+        Array<{
+            info?: { id?: string; role?: string };
+            parts?: Array<{ type?: string; text?: string }>;
+        }>
+    > {
         const res = await this.clientInstance.session.messages({ path: { id: sessionId } });
         const data = (res as { data?: unknown }).data;
-        return Array.isArray(data) ? (data as Array<{ info?: { id?: string; role?: string } }>) : [];
+        return Array.isArray(data)
+            ? (data as Array<{
+                  info?: { id?: string; role?: string };
+                  parts?: Array<{ type?: string; text?: string }>;
+              }>)
+            : [];
     }
 
     // ── wire captures (from the fake provider) ────────────────────────────────

@@ -3343,6 +3343,71 @@ describe("final message representation", () => {
         );
     });
 
+    it("recovers a bound thinking block through Rust-mode host postprocess", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-fable-binding-recovery-rust";
+        const buildMessages = () =>
+            [
+                {
+                    info: { id: "assistant-bound", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "thinking",
+                            thinking: "signed thinking bound to the rejected prefix",
+                            signature: "bound-signature",
+                        },
+                        { type: "text", text: "completed answer" },
+                    ],
+                },
+                {
+                    info: { id: "retry-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+            ] as unknown as MessageLike[];
+        const postprocess = (messages: MessageLike[]) =>
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: true,
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: true, frozen: true },
+            });
+
+        armThinkingBindingRecovery(db, sessionId);
+        const recoveryMessages = buildMessages();
+        const recovery = postprocess(recoveryMessages);
+
+        expect(recovery.thinkingBindingRecovery).toEqual({
+            flagTarget: "newest_reasoning_bearing_assistant",
+            messageId: "assistant-bound",
+        });
+        expect(findMessage(recoveryMessages, "assistant-bound").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(getThinkingBindingRecoveryTarget(db, sessionId)).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+        expect(
+            clearThinkingBindingRecoveryIf(
+                db,
+                sessionId,
+                recovery.thinkingBindingRecovery.flagTarget,
+            ),
+        ).toBe(true);
+
+        const replayMessages = buildMessages();
+        const replay = postprocess(replayMessages);
+        expect(replay.thinkingBindingRecovery).toBeNull();
+        expect(serializeAnthropicWirePrefix(replayMessages)).toBe(
+            serializeAnthropicWirePrefix(recoveryMessages),
+        );
+    });
+
     it("leaves newest thinking byte-identical when no binding recovery was classified", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
