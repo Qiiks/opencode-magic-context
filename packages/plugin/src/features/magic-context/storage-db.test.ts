@@ -32,6 +32,7 @@ import {
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
     formatInconclusiveOpenCodeMigrationWarning,
+    formatInconclusivePiMigrationWarning,
     formatLiveProcessMigrationRefusal,
     getDatabasePath,
     getLiveMigrationBlockingProcesses,
@@ -690,6 +691,35 @@ describe("storage-db", () => {
                 serverPids: [process.pid],
             });
             expect(readPersistedVersion(dbPath)).toBe(0);
+        });
+
+        it("#when a Windows omp.exe command line has no Pi arc #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-omp-image-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                platform: "win32",
+                processListExecFileSync: ((file: string | URL) => {
+                    if (String(file) !== "powershell") {
+                        throw new Error(`${String(file)} must not run when CIM succeeds`);
+                    }
+                    return JSON.stringify({
+                        ProcessId: 41001,
+                        ParentProcessId: 8,
+                        CommandLine: "C:\\Users\\qiiks\\.bun\\bin\\omp.exe",
+                        CreationDate: "20260101120000.000000+000",
+                    });
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "continuing migration",
+            );
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "Pi/OMP PID 41001",
+            );
         });
 
         it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {

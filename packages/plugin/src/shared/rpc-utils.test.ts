@@ -53,6 +53,45 @@ function tasklistOutput(entries: Array<[number, string]>): string {
     ].join("\r\n");
 }
 
+const WINDOWS_LAUNCHER_PID = 42424;
+const WINDOWS_FOREIGN_PID = 41001;
+const PLUGIN_BUILD_MS = 1_700_000_000_000;
+const OLDER_THAN_PLUGIN_MS = PLUGIN_BUILD_MS - 60_000;
+const OMP_PI_ARC_COMMAND =
+    "C:\\Users\\qiiks\\.bun\\bin\\omp.exe C:\\Users\\qiiks\\AppData\\Roaming\\npm\\node_modules\\@oh-my-pi\\pi-coding-agent\\dist\\cli.js";
+const BUN_PI_CHILD_COMMAND =
+    "C:\\Users\\qiiks\\.bun\\bin\\bun.exe C:\\Users\\qiiks\\AppData\\Roaming\\npm\\node_modules\\@oh-my-pi\\pi-coding-agent\\dist\\cli.js";
+const BARE_OMP_COMMAND = "C:\\Users\\qiiks\\.bun\\bin\\omp.exe";
+
+function padWmi(value: number, width = 2): string {
+    return String(value).padStart(width, "0");
+}
+
+/** Format an epoch millisecond timestamp as a WMI CreationDate string. */
+function wmiCreationDate(ms: number, offsetMinutes = 0): string {
+    const shifted = new Date(ms + offsetMinutes * 60_000);
+    const sign = offsetMinutes >= 0 ? "+" : "-";
+    return `${shifted.getUTCFullYear()}${padWmi(shifted.getUTCMonth() + 1)}${padWmi(shifted.getUTCDate())}${padWmi(shifted.getUTCHours())}${padWmi(shifted.getUTCMinutes())}${padWmi(shifted.getUTCSeconds())}.000000${sign}${padWmi(Math.abs(offsetMinutes), 3)}`;
+}
+
+function cimOutput(
+    rows: Array<{
+        ProcessId: number;
+        ParentProcessId: number;
+        CommandLine: string | null;
+        CreationDate: string;
+    }>,
+): string {
+    return JSON.stringify(rows.length === 1 ? rows[0] : rows);
+}
+
+function windowsProcessListExec(
+    handler: (file: string, args: readonly string[]) => string,
+): typeof execFileSync {
+    return ((file: string | URL, args: readonly string[] = []) =>
+        handler(String(file), args)) as typeof execFileSync;
+}
+
 afterEach(() => {
     __resetRpcIdentityTestHooks();
 });
@@ -97,7 +136,12 @@ describe("discoverLivePiProcessIds", () => {
                 ].join("\n")) as typeof execFileSync,
         });
 
-        expect(discoverLivePiProcessIds()).toEqual([41001, 41002, 41003, 41007]);
+        expect(inspectLivePiProcesses()).toEqual({
+            state: "known",
+            processIds: [41002, 41003],
+            inconclusivePids: [41001, 41007],
+        });
+        expect(discoverLivePiProcessIds()).toEqual([41002, 41003]);
     });
 
     test("reports uncertainty instead of treating an unavailable process list as empty", () => {
@@ -114,12 +158,13 @@ describe("discoverLivePiProcessIds", () => {
         });
     });
 
-    test("uses tasklist instead of ps on Windows", () => {
+    test("tries PowerShell CIM before tasklist on Windows", () => {
         const calls: string[] = [];
         __setRpcIdentityTestHooks({
             platform: "win32",
             processListExecFileSync: ((file: string | URL) => {
                 calls.push(String(file));
+                if (String(file) === "powershell") throw new Error("powershell unavailable");
                 return tasklistOutput([
                     [process.pid, "pi.exe"],
                     [41001, "pi.exe"],
@@ -129,10 +174,197 @@ describe("discoverLivePiProcessIds", () => {
         });
 
         expect(inspectLivePiProcesses()).toEqual({
-            state: "known",
-            processIds: [41001],
+            state: "inconclusive",
+            processIds: [],
+            inconclusivePids: [41001],
         });
-        expect(calls).toEqual(["tasklist"]);
+        expect(calls).toEqual(["powershell", "tasklist"]);
+    });
+});
+
+describe("#411 Windows OMP/Pi live-process scan", () => {
+    test("(a) tasklist-only fallback skips a parent omp.exe as an ancestor", () => {
+        const calls: string[] = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            processListExecFileSync: windowsProcessListExec((file) => {
+                calls.push(file);
+                if (file === "powershell") {
+                    throw new Error("powershell unavailable");
+                }
+                return tasklistOutput([
+                    [process.ppid, "omp.exe"],
+                    [WINDOWS_FOREIGN_PID, "notepad.exe"],
+                ]);
+            }),
+        });
+
+        const discovery = inspectLivePiProcesses();
+        expect(discovery.processIds).not.toContain(process.ppid);
+        expect(discovery.skippedAncestorPids).toContain(process.ppid);
+        expect(calls[0]).toBe("powershell");
+        expect(calls).toContain("tasklist");
+    });
+
+    test("(a) CIM parent omp.exe with a Pi arc is skipped as an ancestor", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            nowMs: () => PLUGIN_BUILD_MS,
+            processListExecFileSync: windowsProcessListExec((file) => {
+                if (file !== "powershell") {
+                    throw new Error(`${file} must not run when CIM succeeds`);
+                }
+                return cimOutput([
+                    {
+                        ProcessId: process.pid,
+                        ParentProcessId: WINDOWS_LAUNCHER_PID,
+                        CommandLine: BUN_PI_CHILD_COMMAND,
+                        CreationDate: wmiCreationDate(PLUGIN_BUILD_MS),
+                    },
+                    {
+                        ProcessId: WINDOWS_LAUNCHER_PID,
+                        ParentProcessId: 4,
+                        CommandLine: OMP_PI_ARC_COMMAND,
+                        CreationDate: wmiCreationDate(OLDER_THAN_PLUGIN_MS),
+                    },
+                ]);
+            }),
+        });
+
+        const discovery = inspectLivePiProcesses();
+        expect(discovery.processIds).not.toContain(WINDOWS_LAUNCHER_PID);
+        expect(discovery.processIds).not.toContain(process.pid);
+        expect(discovery.skippedAncestorPids).toContain(WINDOWS_LAUNCHER_PID);
+        expect(discovery.state).toBe("known");
+    });
+
+    test("(b) CIM unrelated omp.exe with a Pi arc and older CreationDate is a verified blocker", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            nowMs: () => PLUGIN_BUILD_MS,
+            processListExecFileSync: windowsProcessListExec((file) => {
+                if (file !== "powershell") {
+                    throw new Error(`${file} must not run when CIM succeeds`);
+                }
+                return cimOutput([
+                    {
+                        ProcessId: process.pid,
+                        ParentProcessId: process.ppid,
+                        CommandLine: BUN_PI_CHILD_COMMAND,
+                        CreationDate: wmiCreationDate(PLUGIN_BUILD_MS),
+                    },
+                    {
+                        ProcessId: WINDOWS_FOREIGN_PID,
+                        ParentProcessId: 8,
+                        CommandLine: OMP_PI_ARC_COMMAND,
+                        CreationDate: wmiCreationDate(OLDER_THAN_PLUGIN_MS, 60),
+                    },
+                ]);
+            }),
+        });
+
+        const discovery = inspectLivePiProcesses();
+        expect(discovery.state).toBe("known");
+        expect(discovery.processIds).toEqual([WINDOWS_FOREIGN_PID]);
+        expect(readProcessProbeEvidence(WINDOWS_FOREIGN_PID)).toEqual({
+            startTime: OLDER_THAN_PLUGIN_MS,
+            commandLine: OMP_PI_ARC_COMMAND,
+        });
+    });
+
+    test("(c) CIM omp.exe with no Pi arc is inconclusive", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            processListExecFileSync: windowsProcessListExec((file) => {
+                if (file !== "powershell") {
+                    throw new Error(`${file} must not run when CIM succeeds`);
+                }
+                return cimOutput([
+                    {
+                        ProcessId: WINDOWS_FOREIGN_PID,
+                        ParentProcessId: 8,
+                        CommandLine: BARE_OMP_COMMAND,
+                        CreationDate: wmiCreationDate(OLDER_THAN_PLUGIN_MS),
+                    },
+                ]);
+            }),
+        });
+
+        const discovery = inspectLivePiProcesses();
+        expect(discovery.state).toBe("inconclusive");
+        expect(discovery.processIds).toEqual([]);
+        expect(discovery.inconclusivePids).toEqual([WINDOWS_FOREIGN_PID]);
+    });
+
+    test("(d) PowerShell unavailable falls back to tasklist as inconclusive", () => {
+        const calls: string[] = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            processListExecFileSync: windowsProcessListExec((file) => {
+                calls.push(file);
+                if (file === "powershell") {
+                    throw new Error("powershell unavailable");
+                }
+                return tasklistOutput([
+                    [WINDOWS_FOREIGN_PID, "omp.exe"],
+                    [41002, "opencode.exe"],
+                ]);
+            }),
+        });
+
+        const discovery = inspectLivePiProcesses();
+        expect(discovery.state).toBe("inconclusive");
+        expect(discovery.processIds).toEqual([]);
+        expect(discovery.inconclusivePids).toEqual([WINDOWS_FOREIGN_PID]);
+        expect(calls).toEqual(["powershell", "tasklist"]);
+    });
+
+    test("(e) POSIX ancestor exclusion skips the parent Pi harness", () => {
+        __setRpcIdentityTestHooks({
+            platform: "darwin",
+            processListExecFileSync: windowsProcessListExec((file, args) => {
+                if (file === "ps" && args.includes("ppid=")) {
+                    const pidIndex = args.indexOf("-p");
+                    const pid = Number(args[pidIndex + 1]);
+                    if (pid === process.pid) return ` ${process.ppid}\n`;
+                    if (pid === process.ppid) return " 1\n";
+                    return " 1\n";
+                }
+                return [
+                    ` ${process.pid} bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`,
+                    ` ${process.ppid} bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`,
+                    " 41001 bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+                ].join("\n");
+            }),
+        });
+
+        const discovery = inspectLivePiProcesses();
+        expect(discovery.processIds).toEqual([41001]);
+        expect(discovery.skippedAncestorPids).toContain(process.ppid);
+    });
+
+    test("(f) CIM single-object JSON shape parses", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            processListExecFileSync: windowsProcessListExec((file) => {
+                if (file !== "powershell") {
+                    throw new Error(`${file} must not run when CIM succeeds`);
+                }
+                return cimOutput([
+                    {
+                        ProcessId: WINDOWS_FOREIGN_PID,
+                        ParentProcessId: 8,
+                        CommandLine: OMP_PI_ARC_COMMAND,
+                        CreationDate: wmiCreationDate(OLDER_THAN_PLUGIN_MS),
+                    },
+                ]);
+            }),
+        });
+
+        expect(inspectLivePiProcesses()).toMatchObject({
+            state: "known",
+            processIds: [WINDOWS_FOREIGN_PID],
+        });
     });
 });
 
@@ -369,6 +601,15 @@ describe("isPidIdentityPlausible", () => {
 
         calls.length = 0;
         expect(isPidIdentityPlausible(record(NOW_MS))).toBe("inconclusive");
-        expect(calls).toEqual([]);
+        expect(calls).toEqual([
+            {
+                file: "powershell",
+                args: [
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress",
+                ],
+            },
+        ]);
     });
 });

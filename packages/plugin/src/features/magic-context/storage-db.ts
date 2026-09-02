@@ -621,19 +621,28 @@ export function formatInconclusiveOpenCodeMigrationWarning(
     return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
 }
 
+export function formatInconclusivePiMigrationWarning(
+    dbPath: string,
+    pids: readonly number[],
+): string {
+    return `[magic-context] storage warning: continuing migration for ${dbPath}; Pi/OMP PID ${pids.join(", ")} was not confirmed as a live harness because the process image or command line was ambiguous. No live Pi harness was confirmed.`;
+}
+
 function logInconclusiveMigrationProbes(
     dbPath: string,
     discovery: RpcServerDiscovery,
-    piProbeState: "known" | "unreadable",
+    piDiscovery: { state: "known" | "unreadable" | "inconclusive"; inconclusivePids?: readonly number[] },
 ): void {
     const uncertainPids = discovery.inconclusivePids ?? [];
     if (uncertainPids.length > 0) {
         log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
     }
-    if (piProbeState === "unreadable") {
+    if (piDiscovery.state === "unreadable") {
         log(
             `[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`,
         );
+    } else if ((piDiscovery.inconclusivePids?.length ?? 0) > 0) {
+        log(formatInconclusivePiMigrationWarning(dbPath, piDiscovery.inconclusivePids ?? []));
     }
 }
 
@@ -704,7 +713,7 @@ function enforceMigrationOnOpenGuard(
         piPids.length === 0
     ) {
         lastMigrationOnOpenRefusal = null;
-        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery.state);
+        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery);
         return true;
     }
     const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
