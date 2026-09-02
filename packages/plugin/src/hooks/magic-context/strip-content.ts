@@ -668,8 +668,11 @@ export function snapshotTrailingBlankSourceDecisions(
 
 /**
  * Capture the representation served for each assistant before a provider can append
- * a late blank. The newest assistant may be refreshed while it remains live; once a
- * later assistant appears, its last served choice becomes an immutable replay rule.
+ * a late blank. A newest keep may refresh to another keep count or demote to strip,
+ * but an established strip is absorbing. A harness blank that arrives after the first
+ * serve is therefore stripped forever, keeping the suffix monotonic from streaming
+ * through completion and historical replay. Once a later assistant appears, the last
+ * served choice is immutable.
  *
  * Production callers supply sourceDecisions captured from the unmodified harness
  * input. That prevents sentinels, canonical blanks, and synthetic messages added by
@@ -694,7 +697,10 @@ export function findTrailingBlankDecisionCandidates(
     for (const [id, decision] of observedDecisions) {
         if (!visibleIds.has(id)) continue;
         const frozen = frozenDecisions.get(id);
-        if (frozen !== undefined && (id !== options?.refreshMessageId || frozen === decision)) {
+        if (
+            frozen !== undefined &&
+            (id !== options?.refreshMessageId || frozen === decision || frozen === "strip")
+        ) {
             continue;
         }
         decisions.push([id, decision]);
@@ -711,7 +717,6 @@ export function findTrailingBlankDecisionCandidates(
  */
 export function applyFrozenTrailingBlankDecisions(
     messages: MessageLike[],
-    _newestAssistantId: string | undefined,
     frozenDecisions: ReadonlyMap<string, TrailingBlankDecision>,
 ): number {
     let mutations = 0;

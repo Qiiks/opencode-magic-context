@@ -105,14 +105,14 @@ describe("stripStructuralNoise", () => {
         stripStructuralNoise([firstTarget]);
         const decisions = new Map(findTrailingBlankDecisionCandidates([firstTarget], new Map()));
         expect(decisions).toEqual(new Map([["m-target", "strip"]]));
-        applyFrozenTrailingBlankDecisions([firstTarget], "m-target", decisions);
+        applyFrozenTrailingBlankDecisions([firstTarget], decisions);
         const firstBytes = JSON.stringify(firstTarget.parts);
 
         const replayTarget = buildTarget(true);
         const newest = message("m-newest", "assistant", [{ type: "text", text: "next step" }]);
         const replayMessages = [replayTarget, newest];
         stripStructuralNoise(replayMessages);
-        expect(applyFrozenTrailingBlankDecisions(replayMessages, "m-newest", decisions)).toBe(1);
+        expect(applyFrozenTrailingBlankDecisions(replayMessages, decisions)).toBe(1);
 
         expect(JSON.stringify(replayMessages[0].parts)).toBe(firstBytes);
         expect(replayMessages[0].parts[0]).toEqual({ type: "text", text: "" });
@@ -131,13 +131,13 @@ describe("stripStructuralNoise", () => {
         stripStructuralNoise([firstTarget]);
         const decisions = new Map(findTrailingBlankDecisionCandidates([firstTarget], new Map()));
         expect(decisions).toEqual(new Map([["m-target", "keep"]]));
-        applyFrozenTrailingBlankDecisions([firstTarget], "m-target", decisions);
+        applyFrozenTrailingBlankDecisions([firstTarget], decisions);
         const firstBytes = JSON.stringify(firstTarget.parts);
 
         const replayTarget = buildTarget();
         const newest = message("m-newest", "assistant", [{ type: "text", text: "next" }]);
         stripStructuralNoise([replayTarget, newest]);
-        applyFrozenTrailingBlankDecisions([replayTarget, newest], "m-newest", decisions);
+        applyFrozenTrailingBlankDecisions([replayTarget, newest], decisions);
 
         expect(JSON.stringify(replayTarget.parts)).toBe(firstBytes);
         expect(replayTarget.parts.at(-1)).toEqual({ type: "text", text: "" });
@@ -153,7 +153,6 @@ describe("stripStructuralNoise", () => {
 
         const mutations = applyFrozenTrailingBlankDecisions(
             servedMessages,
-            "newest-other",
             new Map([["target", "keep"]]),
         );
 
@@ -162,13 +161,9 @@ describe("stripStructuralNoise", () => {
 
         const emptyAssistant = message("empty", "assistant", []);
         const emptyMessages = [emptyAssistant];
-        expect(
-            applyFrozenTrailingBlankDecisions(
-                emptyMessages,
-                "newest-other",
-                new Map([["empty", "keep"]]),
-            ),
-        ).toBe(0);
+        expect(applyFrozenTrailingBlankDecisions(emptyMessages, new Map([["empty", "keep"]]))).toBe(
+            0,
+        );
         expect(emptyMessages[0].parts).toEqual([]);
     });
 
@@ -185,11 +180,7 @@ describe("stripStructuralNoise", () => {
         const newestTarget = buildTarget();
         stripStructuralNoise([newestTarget]);
         const newestMessages = [newestTarget];
-        const newestMutations = applyFrozenTrailingBlankDecisions(
-            newestMessages,
-            "target",
-            decisions,
-        );
+        const newestMutations = applyFrozenTrailingBlankDecisions(newestMessages, decisions);
         const newestBytes = JSON.stringify(newestMessages[0].parts);
 
         const historicalTarget = buildTarget();
@@ -198,7 +189,6 @@ describe("stripStructuralNoise", () => {
         stripStructuralNoise(historicalMessages);
         const historicalMutations = applyFrozenTrailingBlankDecisions(
             historicalMessages,
-            "later",
             decisions,
         );
 
@@ -236,7 +226,7 @@ describe("stripStructuralNoise", () => {
         const decisions = new Map(
             messages.map((item) => [item.info.id as string, "strip"] as const),
         );
-        applyFrozenTrailingBlankDecisions(messages, undefined, decisions);
+        applyFrozenTrailingBlankDecisions(messages, decisions);
 
         expect(messages[0].parts).toHaveLength(2);
         expect(messages[0].parts.at(-1)).toEqual({ type: "text", text: "" });
@@ -248,7 +238,7 @@ describe("stripStructuralNoise", () => {
         ]);
     });
 
-    it("serves one canonical blank after trailing reasoning in both positions", () => {
+    it("serves one canonical blank after trailing reasoning", () => {
         const buildTarget = () =>
             message("target", "assistant", [
                 { type: "step-start", snapshot: "abc" },
@@ -256,26 +246,26 @@ describe("stripStructuralNoise", () => {
                 { type: "step-finish", reason: "stop" },
             ]);
         const decisions = new Map([["target", "strip"]] as const);
-        const serve = (newestAssistantId: string) => {
+        const serve = () => {
             const target = buildTarget();
             const messages = [target];
             stripStructuralNoise(messages);
-            applyFrozenTrailingBlankDecisions(messages, newestAssistantId, decisions);
+            applyFrozenTrailingBlankDecisions(messages, decisions);
             return messages[0].parts;
         };
 
-        const newestParts = serve("target");
-        const historicalParts = serve("later");
+        const firstProjection = serve();
+        const secondProjection = serve();
 
-        expect(JSON.stringify(newestParts)).toBe(JSON.stringify(historicalParts));
-        expect(newestParts).toEqual([
+        expect(JSON.stringify(firstProjection)).toBe(JSON.stringify(secondProjection));
+        expect(firstProjection).toEqual([
             { type: "text", text: "" },
             { type: "reasoning", text: "signed thinking", signature: "sig" },
             { type: "text", text: "" },
         ]);
     });
 
-    it("keeps a keep:N suffix byte-identical in both positions", () => {
+    it("keeps a keep:N suffix byte-identical across independent projections", () => {
         const buildTarget = () =>
             message("target", "assistant", [
                 { type: "text", text: "answer" },
@@ -283,19 +273,19 @@ describe("stripStructuralNoise", () => {
                 { type: "step-finish", reason: "stop" },
             ]);
         const decisions = new Map([["target", "keep:2"]] as const);
-        const serve = (newestAssistantId: string) => {
+        const serve = () => {
             const target = buildTarget();
             const messages = [target];
             stripStructuralNoise(messages);
-            applyFrozenTrailingBlankDecisions(messages, newestAssistantId, decisions);
+            applyFrozenTrailingBlankDecisions(messages, decisions);
             return messages[0].parts;
         };
 
-        const newestParts = serve("target");
-        const historicalParts = serve("later");
+        const firstProjection = serve();
+        const secondProjection = serve();
 
-        expect(JSON.stringify(newestParts)).toBe(JSON.stringify(historicalParts));
-        expect(newestParts).toEqual([
+        expect(JSON.stringify(firstProjection)).toBe(JSON.stringify(secondProjection));
+        expect(firstProjection).toEqual([
             { type: "text", text: "answer" },
             { type: "text", text: "" },
             { type: "text", text: "" },
@@ -310,7 +300,7 @@ describe("stripStructuralNoise", () => {
         const decisions = new Map(findTrailingBlankDecisionCandidates([first], new Map()));
         expect(decisions).toEqual(new Map([["blank", "keep"]]));
         const firstMessages = [first];
-        applyFrozenTrailingBlankDecisions(firstMessages, "blank", decisions);
+        applyFrozenTrailingBlankDecisions(firstMessages, decisions);
         expect(firstMessages[0].parts).toEqual([{ type: "text", text: "" }]);
 
         const replay = message("blank", "assistant", [
@@ -319,7 +309,7 @@ describe("stripStructuralNoise", () => {
             { type: "text", text: "" },
         ]);
         const replayMessages = [replay];
-        applyFrozenTrailingBlankDecisions(replayMessages, "blank", decisions);
+        applyFrozenTrailingBlankDecisions(replayMessages, decisions);
         expect(replayMessages[0].parts).toEqual(firstMessages[0].parts);
     });
 
