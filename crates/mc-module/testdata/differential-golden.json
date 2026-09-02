@@ -2,8 +2,8 @@
   "schema": 1,
   "provenance": {
     "generator": "crates/mc-module/gen/gen-differential-golden.ts",
-    "generator_version": "dg-reference-v4",
-    "input_sha256": "c4dd5cfcbf788decc3ae0c758fdf6a3870c3c8f8e2a41a1efcf6c933e817c0fc"
+    "generator_version": "dg-reference-v5",
+    "input_sha256": "ea70bb4f72d3f86d79868e42b3becd23a0f176228ebf07408673bf277bfcaf3b"
   },
   "cases": [
     {
@@ -467,6 +467,91 @@
                     "type": "step-finish",
                     "reason": "tool-calls"
                   }
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "assistant-target"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "DG-7-trailing-blank-newest-history-stability",
+      "family": "trailing-blank-newest-history-stability",
+      "input": {
+        "session_id": "dg-trailing-blank-transition",
+        "markers": [
+          "signed-reasoning",
+          "newest-to-historical",
+          "frozen-strip"
+        ],
+        "frozen_decision": {
+          "message_id": "assistant-target",
+          "decision": "strip"
+        },
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": ""
+                }
+              },
+              {
+                "kind": {
+                  "type": "reasoning",
+                  "text": "signed thinking",
+                  "signature": "sig"
+                }
+              },
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "completed answer"
+                }
+              },
+              {
+                "kind": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            ],
+            "meta": {
+              "harness_id": "assistant-target"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "status": "ok",
+        "action": "passthrough",
+        "decision": "strip-replay-stable",
+        "wire": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": ""
+                }
+              },
+              {
+                "kind": {
+                  "type": "reasoning",
+                  "text": "signed thinking",
+                  "signature": "sig"
+                }
+              },
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "completed answer"
                 }
               }
             ],

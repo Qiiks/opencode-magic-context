@@ -872,10 +872,10 @@ describe("createTransform", () => {
             {
                 info: { id: "m-assistant", role: "assistant" },
                 parts: [
-                    { type: "text", text: "visible answer" },
                     { type: "step-start", text: "start" },
                     { type: "meta", text: "meta" },
                     { type: "reasoning", text: "[cleared]" },
+                    { type: "text", text: "visible answer" },
                     { type: "step-finish", text: "finish" },
                 ],
             },
@@ -884,16 +884,14 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — Anthropic sentinel replacement preserves array length;
-        // empty-text sentinels are dropped at the wire by OpenCode's Anthropic adapter.
-        expect(messages[1].parts).toHaveLength(5);
-        // The live text part survives unchanged
-        expect(text(messages[1], 0)).toContain("visible answer");
-        // Structural noise parts are replaced with empty-text sentinels
+        //#then — leading structural parts preserve their positions as sentinels, while
+        // the frozen strip removes the completion sentinel before it can change in history.
+        expect(messages[1].parts).toHaveLength(4);
+        expect(text(messages[1], 3)).toContain("visible answer");
         const sentineledParts = (
             messages[1].parts as Array<{ type: string; text?: string }>
         ).filter((p) => p.type === "text" && p.text === "");
-        expect(sentineledParts).toHaveLength(4);
+        expect(sentineledParts).toHaveLength(3);
     });
 
     it("keeps github-copilot tool-adjacent step-finish native instead of adding an empty sentinel", async () => {

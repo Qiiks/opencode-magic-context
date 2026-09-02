@@ -1,4 +1,4 @@
-//! DG-1..6 differential goldens: TS emits fixtures, Rust consumes them in-process.
+//! DG-1..7 differential goldens: TS emits fixtures, Rust consumes them in-process.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -100,16 +100,26 @@ fn rust_wire_for_case(case: &GoldenCase, input_wire: &[Value]) -> Vec<Value> {
             });
         }
     }
-    if case.family == "trailing-blank-keep-zero-source" {
+    if matches!(
+        case.family.as_str(),
+        "trailing-blank-keep-zero-source" | "trailing-blank-newest-history-stability"
+    ) {
         let frozen = &case.input["frozen_decision"];
         let mid = frozen["message_id"]
             .as_str()
             .expect("DG trailing-blank target id");
-        assert_eq!(frozen["decision"], "keep");
+        let decision = frozen["decision"]
+            .as_str()
+            .expect("DG trailing-blank decision");
+        let unit_kind = match decision {
+            "keep" => "trailing_blank_keep",
+            "strip" => "trailing_blank_strip",
+            other => panic!("unsupported DG trailing-blank decision: {other}"),
+        };
         let core = CoreState {
             frozen_units: vec![FrozenUnit {
-                key: format!("strip:trailing_blank_keep:{mid}"),
-                kind: "strip_trailing_blank_keep".to_string(),
+                key: format!("strip:{unit_kind}:{mid}"),
+                kind: format!("strip_{unit_kind}"),
                 frozen_payload: String::new(),
                 durability_class: DurabilityClass::Lineage,
                 reset_rule: String::new(),
@@ -120,14 +130,40 @@ fn rust_wire_for_case(case: &GoldenCase, input_wire: &[Value]) -> Vec<Value> {
             .iter_mut()
             .find(|message| message.meta.harness_id.as_deref() == Some(mid))
             .expect("DG trailing-blank target must be present");
-        apply_frozen_trailing_blank_decision(
-            &core,
-            SerializerProfile::OpencodeAiSdk,
-            Some("anthropic"),
-            false,
-            mid,
-            target,
-        );
+        if case.family == "trailing-blank-newest-history-stability" {
+            let mut newest = target.clone();
+            apply_frozen_trailing_blank_decision(
+                &core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                true,
+                mid,
+                &mut newest,
+            );
+            let mut historical = target.clone();
+            apply_frozen_trailing_blank_decision(
+                &core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                mid,
+                &mut historical,
+            );
+            assert_eq!(
+                newest, historical,
+                "DG trailing strip changed when the assistant became historical"
+            );
+            *target = newest;
+        } else {
+            apply_frozen_trailing_blank_decision(
+                &core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                mid,
+                target,
+            );
+        }
     }
     messages
         .iter()
@@ -140,9 +176,9 @@ fn dg_goldens_match_ts_wire_surface_and_gate_labels() {
     let golden: Golden = serde_json::from_str(include_str!("../testdata/differential-golden.json"))
         .expect("parse differential golden");
     assert_eq!(golden.schema, 1);
-    assert_eq!(golden.provenance.generator_version, "dg-reference-v4");
+    assert_eq!(golden.provenance.generator_version, "dg-reference-v5");
     assert_eq!(golden.provenance.input_sha256.len(), 64);
-    assert_eq!(golden.cases.len(), 6);
+    assert_eq!(golden.cases.len(), 7);
 
     for case in &golden.cases {
         let input_wire = case.input["messages"]
@@ -200,7 +236,7 @@ fn dg_golden_vacuity_guard_rejects_one_byte_fixture_perturbation_per_family() {
         );
         observed += 1;
     }
-    assert_eq!(observed, 6, "every DG family needs a vacuity mutation");
+    assert_eq!(observed, 7, "every DG family needs a vacuity mutation");
 }
 
 #[test]

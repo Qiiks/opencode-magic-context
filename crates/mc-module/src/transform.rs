@@ -12291,7 +12291,7 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
     core: &CoreState,
     profile: SerializerProfile,
     provider_id: Option<&str>,
-    newest_assistant_exempt: bool,
+    _newest_assistant_exempt: bool,
     mid: &str,
     message: &mut CkWireMessage,
 ) -> usize {
@@ -12323,12 +12323,11 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
     };
 
     let trailing_count = message.content.len() - last_meaningful_index - 1;
+    // Apply a frozen strip while the assistant is newest so the suffix is stable from
+    // streaming (no completion blank) through completion and historical replay.
     let keep_count = if decision == FrozenTrailingBlankDecision::Keep {
         frozen_trailing_blank_keep_count(core, mid).unwrap_or(1)
-    } else if !newest_assistant_exempt
-        && trailing_count > 0
-        && is_reasoning_block(&message.content[last_meaningful_index])
-    {
+    } else if trailing_count > 0 && is_reasoning_block(&message.content[last_meaningful_index]) {
         1
     } else {
         0
@@ -12356,7 +12355,7 @@ pub(crate) fn apply_frozen_trailing_blank_decision(
         return mutations;
     }
 
-    if newest_assistant_exempt || trailing_count == 0 {
+    if trailing_count == 0 {
         return 0;
     }
     message.content.truncate(last_meaningful_index + 1);
@@ -19164,18 +19163,29 @@ pub(crate) mod tests {
                 data: "redacted".to_string(),
             }),
         ] {
-            let mut reasoning_terminal = assistant(vec![terminal, canonical_blank_block()]);
+            let source = assistant(vec![terminal, canonical_blank_block()]);
+            let mut newest_reasoning_terminal = source.clone();
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                true,
+                "target",
+                &mut newest_reasoning_terminal,
+            );
+            let mut historical_reasoning_terminal = source;
             apply_frozen_trailing_blank_decision(
                 &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
                 false,
                 "target",
-                &mut reasoning_terminal,
+                &mut historical_reasoning_terminal,
             );
-            assert_eq!(reasoning_terminal.content.len(), 2);
+            assert_eq!(newest_reasoning_terminal, historical_reasoning_terminal);
+            assert_eq!(newest_reasoning_terminal.content.len(), 2);
             assert_eq!(
-                reasoning_terminal.content.last(),
+                newest_reasoning_terminal.content.last(),
                 Some(&canonical_blank_block())
             );
         }
@@ -19223,18 +19233,60 @@ pub(crate) mod tests {
         );
         assert_eq!(wholly_blank.content, vec![canonical_blank_block()]);
 
-        let mut newest_strip_exempt = assistant(stable_content(true));
+        let strip_source = assistant(stable_content(true));
+        let mut newest_strip = strip_source.clone();
+        let newest_strip_mutations = apply_frozen_trailing_blank_decision(
+            &strip_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            true,
+            "target",
+            &mut newest_strip,
+        );
+        let mut historical_strip = strip_source;
+        let historical_strip_mutations = apply_frozen_trailing_blank_decision(
+            &strip_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            false,
+            "target",
+            &mut historical_strip,
+        );
+        assert_eq!(newest_strip, historical_strip);
+        assert_eq!((newest_strip_mutations, historical_strip_mutations), (1, 1));
+        assert_eq!(newest_strip.content.len(), 3);
+
+        let keep_two_core = CoreState {
+            frozen_units: vec![strip_unit("trailing_blank_keep", "target", "2")],
+            ..Default::default()
+        };
+        let mut keep_two_source = stable_content(true);
+        keep_two_source.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+            text: "\n".to_string(),
+        }));
+        let keep_two_source = assistant(keep_two_source);
+        let mut newest_keep_two = keep_two_source.clone();
+        apply_frozen_trailing_blank_decision(
+            &keep_two_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            true,
+            "target",
+            &mut newest_keep_two,
+        );
+        let mut historical_keep_two = keep_two_source;
+        apply_frozen_trailing_blank_decision(
+            &keep_two_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            false,
+            "target",
+            &mut historical_keep_two,
+        );
+        assert_eq!(newest_keep_two, historical_keep_two);
         assert_eq!(
-            apply_frozen_trailing_blank_decision(
-                &strip_core,
-                SerializerProfile::OpencodeAiSdk,
-                Some("anthropic"),
-                true,
-                "target",
-                &mut newest_strip_exempt,
-            ),
-            0,
-            "the Rust exemption matches TypeScript and contains only the newest assistant"
+            &newest_keep_two.content[newest_keep_two.content.len() - 2..],
+            [canonical_blank_block(), canonical_blank_block()]
         );
         let mut pi_replay = assistant(stable_content(true));
         assert_eq!(

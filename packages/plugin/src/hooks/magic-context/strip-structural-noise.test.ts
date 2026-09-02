@@ -172,25 +172,43 @@ describe("stripStructuralNoise", () => {
         expect(emptyMessages[0].parts).toEqual([]);
     });
 
-    it("matches Rust's newest-only trailing-strip exemption", () => {
+    it("serves a frozen strip byte-identically while newest and historical", () => {
+        const buildTarget = () =>
+            message("target", "assistant", [
+                { type: "step-start", snapshot: "abc" },
+                { type: "reasoning", text: "signed thinking", signature: "sig" },
+                { type: "text", text: "answer" },
+                { type: "step-finish", reason: "stop" },
+            ]);
         const decisions = new Map([["target", "strip"]] as const);
-        const newestMessages = [
-            message("target", "assistant", [
-                { type: "text", text: "answer" },
-                { type: "text", text: "" },
-            ]),
-        ];
-        expect(applyFrozenTrailingBlankDecisions(newestMessages, "target", decisions)).toBe(0);
-        expect(newestMessages[0].parts).toHaveLength(2);
 
-        const historicalMessages = [
-            message("target", "assistant", [
-                { type: "text", text: "answer" },
-                { type: "text", text: "" },
-            ]),
-        ];
-        expect(applyFrozenTrailingBlankDecisions(historicalMessages, "other", decisions)).toBe(1);
-        expect(historicalMessages[0].parts).toEqual([{ type: "text", text: "answer" }]);
+        const newestTarget = buildTarget();
+        stripStructuralNoise([newestTarget]);
+        const newestMessages = [newestTarget];
+        const newestMutations = applyFrozenTrailingBlankDecisions(
+            newestMessages,
+            "target",
+            decisions,
+        );
+        const newestBytes = JSON.stringify(newestMessages[0].parts);
+
+        const historicalTarget = buildTarget();
+        const laterAssistant = message("later", "assistant", [{ type: "text", text: "next" }]);
+        const historicalMessages = [historicalTarget, laterAssistant];
+        stripStructuralNoise(historicalMessages);
+        const historicalMutations = applyFrozenTrailingBlankDecisions(
+            historicalMessages,
+            "later",
+            decisions,
+        );
+
+        expect(JSON.stringify(historicalMessages[0].parts)).toBe(newestBytes);
+        expect([newestMutations, historicalMutations]).toEqual([1, 1]);
+        expect(newestMessages[0].parts).toEqual([
+            { type: "text", text: "" },
+            { type: "reasoning", text: "signed thinking", signature: "sig" },
+            { type: "text", text: "answer" },
+        ]);
     });
 
     it("retains one trailing blank after terminal reasoning shapes", () => {
@@ -227,6 +245,60 @@ describe("stripStructuralNoise", () => {
         expect(messages[2].parts).toEqual([
             { type: "thinking", thinking: "signed", signature: "sig" },
             { type: "text", text: "answer" },
+        ]);
+    });
+
+    it("serves one canonical blank after trailing reasoning in both positions", () => {
+        const buildTarget = () =>
+            message("target", "assistant", [
+                { type: "step-start", snapshot: "abc" },
+                { type: "reasoning", text: "signed thinking", signature: "sig" },
+                { type: "step-finish", reason: "stop" },
+            ]);
+        const decisions = new Map([["target", "strip"]] as const);
+        const serve = (newestAssistantId: string) => {
+            const target = buildTarget();
+            const messages = [target];
+            stripStructuralNoise(messages);
+            applyFrozenTrailingBlankDecisions(messages, newestAssistantId, decisions);
+            return messages[0].parts;
+        };
+
+        const newestParts = serve("target");
+        const historicalParts = serve("later");
+
+        expect(JSON.stringify(newestParts)).toBe(JSON.stringify(historicalParts));
+        expect(newestParts).toEqual([
+            { type: "text", text: "" },
+            { type: "reasoning", text: "signed thinking", signature: "sig" },
+            { type: "text", text: "" },
+        ]);
+    });
+
+    it("keeps a keep:N suffix byte-identical in both positions", () => {
+        const buildTarget = () =>
+            message("target", "assistant", [
+                { type: "text", text: "answer" },
+                { type: "step-finish", reason: "stop" },
+                { type: "step-finish", reason: "stop" },
+            ]);
+        const decisions = new Map([["target", "keep:2"]] as const);
+        const serve = (newestAssistantId: string) => {
+            const target = buildTarget();
+            const messages = [target];
+            stripStructuralNoise(messages);
+            applyFrozenTrailingBlankDecisions(messages, newestAssistantId, decisions);
+            return messages[0].parts;
+        };
+
+        const newestParts = serve("target");
+        const historicalParts = serve("later");
+
+        expect(JSON.stringify(newestParts)).toBe(JSON.stringify(historicalParts));
+        expect(newestParts).toEqual([
+            { type: "text", text: "answer" },
+            { type: "text", text: "" },
+            { type: "text", text: "" },
         ]);
     });
 

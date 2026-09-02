@@ -2370,6 +2370,22 @@ export async function runPostTransformPhase(
         }
     }
 
+    const servedTrailingBlankDecisions = new Map(trailingBlankDecisions);
+    if (newestAssistantId) {
+        const frozenNewestDecision = trailingBlankDecisions.get(newestAssistantId);
+        const sourceNewestDecision = trailingBlankSourceDecisions.get(newestAssistantId);
+        if (
+            frozenNewestDecision !== undefined &&
+            sourceNewestDecision !== undefined &&
+            frozenNewestDecision !== sourceNewestDecision
+        ) {
+            // The live source can gain or lose a genuine blank before its frozen choice is
+            // refreshed below. Serve that observed choice now so replay does not erase source
+            // bytes on the same pass that persists them as the new stable representation.
+            servedTrailingBlankDecisions.set(newestAssistantId, sourceNewestDecision);
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -2381,7 +2397,7 @@ export async function runPostTransformPhase(
             trailingBlankNewestAssistant,
             mergedReasoningStrippedIds,
             thinkingBindingRecoveryMessageIds,
-            trailingBlankDecisions,
+            trailingBlankDecisions: servedTrailingBlankDecisions,
             skipMergedReasoningStrip: compactionOff,
             skipTrailingWhitespaceStrip: compactionOff,
         },
@@ -2391,7 +2407,7 @@ export async function runPostTransformPhase(
         // Observe every served pass, including defers. A newly completed assistant is
         // recorded while it is newest, before a provider can append a blank to the
         // rebuilt historical message. If a late blank arrives while it is still newest,
-        // refresh its choice; the newest exemption leaves those live bytes untouched.
+        // refresh and replay its choice so the live and historical suffixes stay identical.
         const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
@@ -2421,9 +2437,9 @@ export async function runPostTransformPhase(
                         trailingBlankDecisions.set(id, decision);
                         newlyFrozen.set(id, decision);
                     }
-                    // Apply a new keep decision while the assistant is still newest
-                    // so whitespace becomes canonical without changing the recorded
-                    // suffix length. A strip decision remains exempt while it is live.
+                    // Replay a new decision while the assistant is still newest. Keeps
+                    // canonicalize the recorded suffix length; strips remove a completion
+                    // sentinel before it can differ from the later historical replay.
                     applyFrozenTrailingBlankDecisions(
                         args.messages,
                         newestAssistantId,
