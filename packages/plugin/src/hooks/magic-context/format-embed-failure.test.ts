@@ -28,6 +28,26 @@ const failures: EmbeddingFailure[] = [
         reason: "SYNAPSE certification refused embedding: not_certified",
         retryable: false,
     },
+    {
+        class: "local_binding_missing",
+        reason: "onnxruntime-node has no darwin/x64 native binding and the WASM fallback could not complete",
+        retryable: false,
+    },
+    {
+        class: "local_fs_unavailable",
+        reason: "the WASM model cache cannot access the Node filesystem",
+        retryable: false,
+    },
+    {
+        class: "local_download_failure",
+        reason: "the embedding model download failed: fetch failed",
+        retryable: true,
+    },
+    {
+        class: "local_runtime_error",
+        reason: "the local embedding runtime failed: session creation failed",
+        retryable: false,
+    },
 ];
 
 describe("formatEmbedFailureSummary", () => {
@@ -39,6 +59,19 @@ describe("formatEmbedFailureSummary", () => {
         } else {
             expect(summary).not.toContain("Run /ctx-embed start again to retry them.");
         }
+    });
+
+    test("renders Intel native-binding guidance without claiming force reinstall repairs it", () => {
+        const summary = formatEmbedFailureSummary(0, 7, {
+            class: "local_binding_missing",
+            reason: "onnxruntime-node has no darwin/x64 native binding and the WASM fallback could not complete",
+            retryable: false,
+        });
+
+        expect(summary).toContain("darwin/x64");
+        expect(summary).toContain("onnxruntime-node@1.23.0");
+        expect(summary).not.toContain("provider returned no result");
+        expect(summary).not.toContain("doctor --force");
     });
 
     test("renders certification refusals with the cause and recovery instead of the generic stall message", () => {

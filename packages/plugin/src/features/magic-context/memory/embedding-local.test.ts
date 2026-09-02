@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { classifyLocalEmbeddingFailure } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import {
     __resetLocalEmbeddingForTests,
@@ -32,9 +33,10 @@ function missingNativeRuntimeError(): Error & { code: string } {
 
 function fakeTransformersModule(options?: {
     onPipeline?: (pipelineOptions: { dtype: string; device?: string }) => void;
+    env?: Record<string, unknown>;
 }): Record<string, unknown> {
     return {
-        env: {},
+        env: options?.env ?? {},
         LogLevel: { ERROR: "error" },
         pipeline: async (
             _task: string,
@@ -53,6 +55,19 @@ function fakeTransformersModule(options?: {
 // embedding. The discriminator must catch the missing-package shapes WITHOUT
 // swallowing transient load errors (protobuf/EBUSY) or unrelated failures.
 describe("isNativeRuntimeMissingError", () => {
+    test("classifies the missing darwin/x64 package binding with Intel-specific context", () => {
+        const error = Object.assign(
+            new Error("Cannot find module '../bin/napi-v6/darwin/x64/onnxruntime_binding.node'"),
+            { code: "ERR_MODULE_NOT_FOUND" },
+        );
+
+        expect(classifyLocalEmbeddingFailure(error, { platform: "darwin", arch: "x64" })).toEqual({
+            class: "local_binding_missing",
+            reason: "onnxruntime-node has no darwin/x64 native binding and the WASM fallback could not complete",
+            retryable: false,
+        });
+    });
+
     test("Bun resolver: Cannot find package 'onnxruntime-node'", () => {
         expect(
             isNativeRuntimeMissingError(new Error("Cannot find package 'onnxruntime-node'")),
@@ -248,26 +263,37 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
         const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
         try {
             __setLocalEmbeddingTestHooks({
-                host: () => ({ isElectron: false, isBun: true, bunVersion: "1.3.14" }),
+                host: () => ({
+                    isElectron: false,
+                    isBun: true,
+                    bunVersion: "1.3.14",
+                    hasNodeFilesystem: true,
+                }),
                 injectWasmOrt: async () => {
                     calls.push("inject");
                     return true;
                 },
                 importTransformers: async () => {
-                    calls.push("transformers");
+                    throw new Error(
+                        "selected WASM must not evaluate the native Transformers entry",
+                    );
+                },
+                importTransformersNodeWasmFallback: async () => {
+                    calls.push("node-wasm");
                     return fakeTransformersModule({
+                        env: { useFS: true, useFSCache: true },
                         onPipeline: (options) => pipelineOptions.push(options),
                     });
                 },
                 importTransformersWasmFallback: async () => {
                     fallbackImports++;
-                    throw new Error("injected Bun path must not use the load-failure fallback");
+                    throw new Error("Node with fs must not use the browser fallback");
                 },
                 modelCacheDir: () => cacheDir,
             });
 
             expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
-            expect(calls).toEqual(["inject", "transformers"]);
+            expect(calls).toEqual(["inject", "node-wasm"]);
             expect(fallbackImports).toBe(0);
             expect(pipelineOptions).toEqual([{ dtype: "fp32", device: "auto" }]);
         } finally {
@@ -319,6 +345,106 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
             expect(nativeImports).toBe(1);
             expect(wasmImports).toBe(1);
             expect(logs).toContainEqual(expect.stringContaining("using onnxruntime-web (WASM)"));
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("uses the Node filesystem WASM twin and produces embeddings after a native binding failure", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-node-fs-wasm-"));
+        let browserFallbackImports = 0;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({
+                    isElectron: false,
+                    isBun: false,
+                    hasNodeFilesystem: true,
+                }),
+                importTransformers: async () => {
+                    throw nativeBindingLoadError();
+                },
+                injectWasmOrt: async () => true,
+                importTransformersNodeWasmFallback: async () =>
+                    fakeTransformersModule({
+                        env: { useFS: true, useFSCache: true },
+                    }),
+                importTransformersWasmFallback: async () => {
+                    browserFallbackImports++;
+                    throw new Error("browser fallback must remain isolated from Node with fs");
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            const provider = new LocalEmbeddingProvider();
+            expect(await provider.initialize()).toBe(true);
+            expect(await provider.embed("fixture text")).toEqual(new Float32Array([0, 1]));
+            expect(provider.getLastFailureReason()).toBeNull();
+            expect(browserFallbackImports).toBe(0);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("keeps the browser-target fallback for hosts without Node filesystem access", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-browser-wasm-"));
+        let browserFallbackImports = 0;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({
+                    isElectron: false,
+                    isBun: false,
+                    hasNodeFilesystem: false,
+                }),
+                injectWasmOrt: async () => true,
+                importTransformersWasmFallback: async () => {
+                    browserFallbackImports++;
+                    return fakeTransformersModule();
+                },
+                importTransformersNodeWasmFallback: async () => {
+                    throw new Error("browser-like hosts must not load the Node filesystem twin");
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            const provider = new LocalEmbeddingProvider(
+                "Xenova/all-MiniLM-L6-v2",
+                512,
+                "fp32",
+                "wasm",
+            );
+            expect(await provider.initialize()).toBe(true);
+            expect(await provider.embed("fixture text")).toEqual(new Float32Array([0, 1]));
+            expect(browserFallbackImports).toBe(1);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("classifies a Node WASM bundle without filesystem caching instead of returning an unexplained null", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-node-wasm-no-fs-"));
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({
+                    isElectron: false,
+                    isBun: false,
+                    hasNodeFilesystem: true,
+                }),
+                importTransformers: async () => {
+                    throw nativeBindingLoadError();
+                },
+                injectWasmOrt: async () => true,
+                importTransformersNodeWasmFallback: async () =>
+                    fakeTransformersModule({ env: { useFS: false, useFSCache: false } }),
+                modelCacheDir: () => cacheDir,
+            });
+
+            const provider = new LocalEmbeddingProvider();
+            expect(await provider.initialize()).toBe(false);
+            expect(provider.getLastFailureReason()).toEqual({
+                class: "local_fs_unavailable",
+                reason: "the WASM model cache cannot access the Node filesystem",
+                retryable: false,
+            });
         } finally {
             rmSync(cacheDir, { recursive: true, force: true });
         }
@@ -405,6 +531,39 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
             expect(await new LocalEmbeddingProvider().initialize()).toBe(false);
             expect(nativeImports).toBe(1);
             expect(wasmImports).toBe(1);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("explicit WASM preserves Electron's existing Transformers consumer path", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-electron-explicit-wasm-"));
+        let regularImports = 0;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: true, isBun: false, hasNodeFilesystem: true }),
+                injectWasmOrt: async () => true,
+                importTransformers: async () => {
+                    regularImports++;
+                    return fakeTransformersModule();
+                },
+                importTransformersNodeWasmFallback: async () => {
+                    throw new Error("Electron must not select the Node fallback twin");
+                },
+                importTransformersWasmFallback: async () => {
+                    throw new Error("Electron must not select the browser fallback twin directly");
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            const provider = new LocalEmbeddingProvider(
+                "Xenova/all-MiniLM-L6-v2",
+                512,
+                "fp32",
+                "wasm",
+            );
+            expect(await provider.initialize()).toBe(true);
+            expect(regularImports).toBe(1);
         } finally {
             rmSync(cacheDir, { recursive: true, force: true });
         }

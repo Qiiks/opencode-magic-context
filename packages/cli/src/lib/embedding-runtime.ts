@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
 import {
@@ -14,16 +14,27 @@ import {
  *
  * The plugin's `@huggingface/transformers` Node entry statically imports
  * `onnxruntime-node`. When that package or its platform binary cannot load,
- * doctor probes `onnxruntime-web` too, so it can distinguish native success,
- * a usable slower fallback, and an installation where neither runtime works.
+ * doctor probes `onnxruntime-web` and requires the Node-target Transformers
+ * sibling that supplies real filesystem caching, so it can distinguish native
+ * success, a usable slower fallback, and an installation where neither works.
  */
+
+export interface KnownUnavailableNativeBinding {
+    kind: "darwin-x64-dropped";
+    packageVersion: string;
+}
 
 export type LocalEmbeddingRuntimeStatus =
     | { state: "ok"; binaryPath: string }
     | { state: "wasm-selected"; wasmPath: string }
     | { state: "wasm-broken"; wasmReason: string }
     | { state: "package-missing"; packageDir: string }
-    | { state: "binary-missing"; packageDir: string; expectedBinary: string }
+    | {
+          state: "binary-missing";
+          packageDir: string;
+          expectedBinary: string;
+          knownUnavailable?: KnownUnavailableNativeBinding;
+      }
     | { state: "load-failed"; packageDir: string; reason: string }
     | {
           state: "wasm-fallback";
@@ -210,8 +221,24 @@ function describeNativeFailure(status: NativeLocalEmbeddingRuntimeFailure): stri
     return status.state === "package-missing"
         ? "package is not installed"
         : status.state === "binary-missing"
-          ? "expected platform binding file is absent"
+          ? status.knownUnavailable
+              ? `onnxruntime-node ${status.knownUnavailable.packageVersion} does not ship a darwin/x64 native binding`
+              : "expected platform binding file is absent"
           : `binding failed to load: ${status.reason}`;
+}
+
+function knownUnavailableNativeBinding(
+    status: NativeLocalEmbeddingRuntimeFailure,
+): KnownUnavailableNativeBinding | undefined {
+    return status.state === "binary-missing" ? status.knownUnavailable : undefined;
+}
+
+function intelMacNativeGuidance(version: string): string {
+    return (
+        `onnxruntime-node ${version} has no native binding for darwin/x64; reinstalling the same package ` +
+        "(including doctor --force) cannot restore native inference. The supported fallback is WASM. " +
+        "For optional native speed, manually pin onnxruntime-node@1.23.0."
+    );
 }
 
 export function isLocalEmbeddingRuntimeBroken(
@@ -235,11 +262,24 @@ export function formatLocalEmbeddingRuntimeDoctorWarning(
         );
     }
     if (status.state !== "both-broken") {
+        const knownUnavailable = knownUnavailableNativeBinding(status);
+        if (knownUnavailable) {
+            return `Embedding provider: local — ${intelMacNativeGuidance(knownUnavailable.packageVersion)} WASM fallback is unavailable, so embeddings will not work.`;
+        }
         return (
             "Embedding provider: local — onnxruntime-node native binding missing — " +
             `${describeNativeFailure(status)}; its postinstall likely failed. Embeddings will not work. ` +
             "Reinstall with network access to the npm registry and GitHub releases, " +
             "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+        );
+    }
+
+    const knownUnavailable = knownUnavailableNativeBinding(status.nativeFailure);
+    if (knownUnavailable) {
+        return (
+            `Embedding provider: local — ${intelMacNativeGuidance(knownUnavailable.packageVersion)} ` +
+            `The WASM fallback is also unavailable: ${status.wasmReason}. Reinstall may repair the WASM package only; ` +
+            "otherwise switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
         );
     }
     return (
@@ -253,9 +293,18 @@ export function formatLocalEmbeddingRuntimeDoctorWarning(
 export function formatLocalEmbeddingRuntimeWasmFallback(
     status: Extract<LocalEmbeddingRuntimeStatus, { state: "wasm-fallback" }>,
 ): string {
+    const knownUnavailable = knownUnavailableNativeBinding(status.nativeFailure);
+    if (knownUnavailable) {
+        return (
+            "Embedding provider: local — " +
+            `onnxruntime-node ${knownUnavailable.packageVersion} has no native binding for darwin/x64; ` +
+            `WASM fallback active at ${status.wasmPath}. Reinstalling the same package (including doctor --force) ` +
+            "cannot restore native inference. WASM is slower; for optional native speed, manually pin onnxruntime-node@1.23.0."
+        );
+    }
     return (
         "Embedding provider: local — onnxruntime-node native binding failed " +
-        `(${describeNativeFailure(status.nativeFailure)}); using onnxruntime-web (WASM) at ${status.wasmPath}. ` +
+        `(${describeNativeFailure(status.nativeFailure)}); WASM fallback active at ${status.wasmPath}. ` +
         "WASM inference is slower than native; a remote `openai-compatible` provider may be faster."
     );
 }
@@ -271,6 +320,32 @@ function expectedBinaryRelPath(platform: NodeJS.Platform, arch: string): string 
     const supportedArch = arch === "x64" || arch === "arm64";
     if (!supportedPlatform || !supportedArch) return null;
     return join("bin", "napi-v6", platform, arch, "onnxruntime_binding.node");
+}
+
+function onnxRuntimeNodeVersion(packageDir: string): string | undefined {
+    try {
+        const parsed = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as {
+            version?: unknown;
+        };
+        return typeof parsed.version === "string" ? parsed.version : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function darwinX64BindingDropped(
+    packageDir: string,
+    platform: NodeJS.Platform,
+    arch: string,
+): KnownUnavailableNativeBinding | undefined {
+    if (platform !== "darwin" || arch !== "x64") return undefined;
+    const packageVersion = onnxRuntimeNodeVersion(packageDir);
+    const match = packageVersion?.match(/^(\d+)\.(\d+)(?:\.|$)/);
+    if (!match) return undefined;
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    if (major < 1 || (major === 1 && minor < 24)) return undefined;
+    return { kind: "darwin-x64-dropped", packageVersion: packageVersion as string };
 }
 
 type WasmRuntimeProbe = { state: "ok"; wasmPath: string } | { state: "failed"; reason: string };
@@ -314,9 +389,48 @@ export function formatLocalEmbeddingRuntimeWasmSelected(
     );
 }
 
+function requireNodeWasmBundle(
+    probe: WasmRuntimeProbe,
+    candidates: readonly string[],
+): WasmRuntimeProbe {
+    if (probe.state === "failed") return probe;
+    const bundlePath = candidates.find((candidate) => existsSync(candidate));
+    return bundlePath
+        ? probe
+        : {
+              state: "failed",
+              reason: `functional Node WASM Transformers bundle is missing (checked ${candidates.join(", ")})`,
+          };
+}
+
+function nodeWasmBundleCandidates(installRoot: string): string[] {
+    return [
+        join(installRoot, "dist", "transformers-node-wasm.js"),
+        join(
+            installRoot,
+            "node_modules",
+            "@cortexkit",
+            "opencode-magic-context",
+            "dist",
+            "transformers-node-wasm.js",
+        ),
+        join(
+            installRoot,
+            "node_modules",
+            "@cortexkit",
+            "pi-magic-context",
+            "dist",
+            "transformers-node-wasm.js",
+        ),
+    ];
+}
+
 function probeWasmRuntimeAt(installRoot: string): WasmRuntimeProbe {
     const requireFn = createRequire(join(installRoot, "package.json"));
-    return probeWasmRuntimeFromRequire(requireFn);
+    return requireNodeWasmBundle(
+        probeWasmRuntimeFromRequire(requireFn),
+        nodeWasmBundleCandidates(installRoot),
+    );
 }
 
 /**
@@ -356,7 +470,12 @@ export function checkLocalEmbeddingRuntimeAt(
             const binaryPath = join(packageDir, rel);
             native = existsSync(binaryPath)
                 ? (probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath })
-                : { state: "binary-missing", packageDir, expectedBinary: binaryPath };
+                : {
+                      state: "binary-missing",
+                      packageDir,
+                      expectedBinary: binaryPath,
+                      knownUnavailable: darwinX64BindingDropped(packageDir, platform, arch),
+                  };
         }
     }
     return withWasmFallback(native, () => probeWasmRuntimeAt(installRoot));
@@ -410,18 +529,18 @@ function probeWasmRuntimeByResolution(pluginDir: string): WasmRuntimeProbe {
     try {
         const reqPlugin = createRequire(join(pluginDir, "package.json"));
         const direct = probeWasmRuntimeFromRequire(reqPlugin);
+        let probe = direct;
         if (
-            direct.state === "ok" ||
-            !direct.reason.startsWith("onnxruntime-web is not resolvable")
+            direct.state === "failed" &&
+            direct.reason.startsWith("onnxruntime-web is not resolvable")
         ) {
-            return direct;
+            // Use transformers as the resolution parent for pnpm's strict layout,
+            // where its direct runtime dependencies are not hoisted.
+            const tfResolved = reqPlugin.resolve("@huggingface/transformers");
+            const tfDir = packageDirFromResolved(tfResolved, "@huggingface/transformers");
+            probe = probeWasmRuntimeFromRequire(createRequire(join(tfDir, "package.json")));
         }
-
-        // Use transformers as the resolution parent for pnpm's strict layout,
-        // where its direct runtime dependencies are not hoisted.
-        const tfResolved = reqPlugin.resolve("@huggingface/transformers");
-        const tfDir = packageDirFromResolved(tfResolved, "@huggingface/transformers");
-        return probeWasmRuntimeFromRequire(createRequire(join(tfDir, "package.json")));
+        return requireNodeWasmBundle(probe, [join(pluginDir, "dist", "transformers-node-wasm.js")]);
     } catch (error) {
         return {
             state: "failed",
@@ -523,7 +642,12 @@ export function checkLocalEmbeddingRuntimeByResolution(
         const binaryPath = join(onnxDir, rel);
         native = existsSync(binaryPath)
             ? (probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath })
-            : { state: "binary-missing", packageDir: onnxDir, expectedBinary: binaryPath };
+            : {
+                  state: "binary-missing",
+                  packageDir: onnxDir,
+                  expectedBinary: binaryPath,
+                  knownUnavailable: darwinX64BindingDropped(onnxDir, platform, arch),
+              };
     }
     return withWasmFallback(native, () => probeWasmRuntimeByResolution(pluginDir));
 }

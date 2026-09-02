@@ -777,11 +777,9 @@ async function runHealthChecks(options: {
     } else if (loadedConfig.config.embedding.provider === "off") {
         add(results, "info", "Embedding provider disabled");
     } else {
-        // Local (default) provider: verify the native ONNX runtime
-        // (onnxruntime-node) actually resolves + has its platform binary. On
-        // Windows it sometimes fails to install and the plugin's static import
-        // throws on every embedding (#128). Layout-agnostic resolution from the
-        // installed plugin dir; stays silent if no plugin dir can be inspected.
+        // Local (default) provider: verify the native ONNX runtime and the
+        // persistence-capable Node WASM fallback. Resolution starts from the
+        // installed plugin dir and stays silent when no tree can be inspected.
         let runtimeReported = false;
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {

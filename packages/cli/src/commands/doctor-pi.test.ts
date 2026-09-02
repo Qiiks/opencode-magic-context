@@ -144,6 +144,9 @@ function createInstalledPiPlugin(
             JSON.stringify({ name: "onnxruntime-web", main: "index.js" }),
         );
         writeFileSync(join(wasmDir, "index.js"), "module.exports = {};\n");
+        const distDir = join(pluginDir, "dist");
+        mkdirSync(distDir, { recursive: true });
+        writeFileSync(join(distDir, "transformers-node-wasm.js"), "export {};\n");
     }
 }
 
@@ -358,7 +361,7 @@ describe("Pi doctor", () => {
         expect(output).toContain(
             "WARN Embedding provider: local — onnxruntime-node native binding failed",
         );
-        expect(output).toContain("using onnxruntime-web (WASM)");
+        expect(output).toContain("WASM fallback active");
         expect(output).not.toContain("native runtime and WASM fallback both unavailable");
     });
 
