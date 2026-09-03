@@ -176,10 +176,17 @@ export function startCompartmentAgent(
             }
         })
         .finally(() => {
-            clearInterval(renewal);
-            releaseCompartmentLeaseBestEffort(deps.db, deps.sessionId, holderId, sessionLog);
-            if (activeRuns.get(deps.sessionId)?.promise === promise) {
-                activeRuns.delete(deps.sessionId);
+            // The `.catch` above has already run by the time this finalizer executes,
+            // so anything thrown here would reject a promise nobody awaits. Contain
+            // every step: cleanup must never become an unhandled rejection.
+            try {
+                clearInterval(renewal);
+                releaseCompartmentLeaseBestEffort(deps.db, deps.sessionId, holderId, sessionLog);
+                if (activeRuns.get(deps.sessionId)?.promise === promise) {
+                    activeRuns.delete(deps.sessionId);
+                }
+            } catch (err) {
+                sessionLog(deps.sessionId, "compartment agent: finalizer failed:", err);
             }
         });
     activeRuns.set(deps.sessionId, { promise, published: false, kind: "incremental" });
