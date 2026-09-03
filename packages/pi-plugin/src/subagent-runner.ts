@@ -162,23 +162,17 @@ function resolvePiBin(
 	const binKeys = ["pi", "omp"];
 	let binEntry: string | undefined;
 	for (const key of binKeys) {
-		if (
-			typeof bin === "string" && key === "pi"
-		) {
+		if (typeof bin === "string" && key === "pi") {
 			binEntry = bin;
 			break;
 		}
-		if (
-			bin &&
-			typeof bin === "object" &&
-			typeof (bin as Record<string, unknown>)[key] === "string"
-		) {
-			binEntry = (bin as Record<string, string>)[key];
+		const objectBin = bin && typeof bin === "object" ? (bin as Record<string, unknown>) : undefined;
+		if (objectBin && typeof objectBin[key] === "string") {
+			binEntry = objectBin[key] as string;
 			break;
 		}
 	}
 	if (!binEntry) return null;
-
 
 	const packageRoot = resolvePath(found.dir);
 	const candidate = resolvePath(packageRoot, binEntry);

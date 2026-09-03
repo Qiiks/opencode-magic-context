@@ -213,28 +213,36 @@ function nextTick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function writePiCliFixture(bin: string, useBinShim = false) {
+function writePiCliFixture(
+	bin: string,
+	useBinShim = false,
+	variant: "pi" | "omp" = "pi",
+) {
 	const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-layout-"));
+	const packageName =
+		variant === "omp"
+			? "@oh-my-pi/pi-coding-agent"
+			: "@earendil-works/pi-coding-agent";
 	const packageRoot = join(
 		root,
 		"node_modules",
-		"@earendil-works",
-		"pi-coding-agent",
+		...packageName.split("/"),
 	);
 	const cliPath = join(packageRoot, bin);
 	mkdirSync(packageRoot, { recursive: true });
 	mkdirSync(dirname(cliPath), { recursive: true });
 	writeFileSync(
 		join(packageRoot, "package.json"),
-		JSON.stringify({
-			name: "@earendil-works/pi-coding-agent",
-			bin: { pi: bin },
-		}),
+		JSON.stringify(
+			variant === "omp"
+				? { name: packageName, bin: { omp: bin } }
+				: { name: packageName, bin: { pi: bin } },
+		),
 	);
 	writeFileSync(cliPath, "#!/usr/bin/env node\n");
 	if (!useBinShim) return { root, packageRoot, cliPath, entry: cliPath };
 
-	const shim = join(root, "bin", "pi");
+	const shim = join(root, "bin", variant);
 	mkdirSync(dirname(shim), { recursive: true });
 	symlinkSync(cliPath, shim);
 	return { root, packageRoot, cliPath, entry: shim };
@@ -311,6 +319,25 @@ describe("subagent-runner pure helpers", () => {
 			rmSync(fixture.root, { recursive: true, force: true });
 		}
 	});
+
+	it("resolves the OMP host CLI via bin.omp (@oh-my-pi/pi-coding-agent declares no bin.pi)", () => {
+		const fixture = writePiCliFixture("dist/cli.js", false, "omp");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node.exe",
+				argv1: fixture.entry,
+				platform: "win32",
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node.exe",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
 
 	it("resolves a bin-shim symlink to the package-declared Pi CLI", () => {
 		const fixture = writePiCliFixture("dist/bundle/cli.js", true);
