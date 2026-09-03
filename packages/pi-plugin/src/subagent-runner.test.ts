@@ -240,6 +240,32 @@ function writePiCliFixture(bin: string, useBinShim = false) {
 	return { root, packageRoot, cliPath, entry: shim };
 }
 
+// OMP (@oh-my-pi/pi-coding-agent) declares `bin: { omp: "dist/cli.js" }` and
+// ships no `pi` bin. The resolver must accept the `omp` key so an OMP host
+// without a standalone `pi` on PATH still spawns its own CLI instead of the
+// bare `pi` fallback (which ENOENTs).
+function writeOmpCliFixture(bin: string) {
+	const root = mkdtempSync(join(tmpdir(), "mc-omp-cli-layout-"));
+	const packageRoot = join(
+		root,
+		"node_modules",
+		"@oh-my-pi",
+		"pi-coding-agent",
+	);
+	const cliPath = join(packageRoot, bin);
+	mkdirSync(packageRoot, { recursive: true });
+	mkdirSync(dirname(cliPath), { recursive: true });
+	writeFileSync(
+		join(packageRoot, "package.json"),
+		JSON.stringify({
+			name: "@oh-my-pi/pi-coding-agent",
+			bin: { omp: bin },
+		}),
+	);
+	writeFileSync(cliPath, "#!/usr/bin/env node\n");
+	return { root, packageRoot, cliPath, entry: cliPath };
+}
+
 const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
@@ -326,6 +352,110 @@ describe("subagent-runner pure helpers", () => {
 			});
 		} finally {
 			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves an OMP host CLI via bin.omp, never the bare pi fallback", () => {
+		// Regression: @oh-my-pi/pi-coding-agent declares `bin: { omp: ... }`
+		// (no `pi` key), so the pre-fix resolver returned null and every
+		// subagent spawn fell through to bare `pi` — "Executable not found in
+		// $PATH: \"pi\"" on OMP hosts without a standalone Pi install.
+		const fixture = writeOmpCliFixture("dist/cli.js");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+			});
+			expect(invocation.command).not.toBe("pi");
+			expect(invocation.fallbackDiagnostic).toBeUndefined();
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps resolving a Pi host via bin.pi unchanged", () => {
+		const fixture = writePiCliFixture("dist/cli.js");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("still resolves a string bin (no object map)", () => {
+		const root = mkdtempSync(join(tmpdir(), "mc-pi-string-bin-"));
+		const packageRoot = join(
+			root,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+		);
+		const cliPath = join(packageRoot, "dist/cli.js");
+		mkdirSync(dirname(cliPath), { recursive: true });
+		writeFileSync(
+			join(packageRoot, "package.json"),
+			JSON.stringify({
+				name: "@earendil-works/pi-coding-agent",
+				bin: "dist/cli.js",
+			}),
+		);
+		writeFileSync(cliPath, "#!/usr/bin/env node\n");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: cliPath,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(cliPath)],
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls through to the bare pi fallback when the manifest has neither bin.pi nor bin.omp", () => {
+		const root = mkdtempSync(join(tmpdir(), "mc-pi-no-bin-"));
+		const packageRoot = join(
+			root,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+		);
+		const cliPath = join(packageRoot, "dist/cli.js");
+		mkdirSync(dirname(cliPath), { recursive: true });
+		writeFileSync(
+			join(packageRoot, "package.json"),
+			JSON.stringify({
+				name: "@earendil-works/pi-coding-agent",
+				bin: { other: "dist/cli.js" },
+			}),
+		);
+		writeFileSync(cliPath, "#!/usr/bin/env node\n");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: cliPath,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation.command).toBe("pi");
+			expect(invocation.fallbackDiagnostic).toContain("script-detection miss");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 

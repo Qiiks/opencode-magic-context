@@ -147,7 +147,9 @@ function pathIsInside(root: string, candidate: string): boolean {
 }
 
 /**
- * Resolve the package's declared `pi` bin rather than assuming a dist layout.
+ * Resolve the package's declared CLI bin rather than assuming a dist layout.
+ * Pi declares `bin.pi`; OMP declares `bin.omp` (same package family —
+ * `@oh-my-pi/pi-coding-agent` is in the allowlist above but ships no `pi` bin).
  * Keep the containment guard: a package manifest may select only a
  * file below its own root, including after symlinks are canonicalized.
  */
@@ -157,14 +159,22 @@ function resolvePiBin(
 	checkedPaths: string[],
 ): string | null {
 	const bin = found.manifest.bin;
-	const binEntry =
-		typeof bin === "string"
-			? bin
-			: bin &&
-					typeof bin === "object" &&
-					typeof (bin as Record<string, unknown>).pi === "string"
-				? (bin as Record<string, string>).pi
-				: undefined;
+	const binKeys = ["pi", "omp"];
+	let binEntry: string | undefined;
+	for (const key of binKeys) {
+		if (typeof bin === "string" && key === "pi") {
+			binEntry = bin;
+			break;
+		}
+		if (
+			bin &&
+			typeof bin === "object" &&
+			typeof (bin as Record<string, unknown>)[key] === "string"
+		) {
+			binEntry = (bin as Record<string, string>)[key];
+			break;
+		}
+	}
 	if (!binEntry) return null;
 
 	const packageRoot = resolvePath(found.dir);
