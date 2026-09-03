@@ -35,13 +35,20 @@ const BASE_OPTIONS = {
 };
 
 describe("OmpSubagentRunner", () => {
-	test("surface unavailable → ok:false spawn_failed, never throws", async () => {
+	test("surface unavailable → delegates to subprocess fallback instead of failing (never throws)", async () => {
+		// With no surface injected and no OMP host (test env), the runner falls
+		// back to the subprocess path. The subprocess runner will fail to spawn
+		// `pi` in this environment (ENOENT) — the observable contract is a
+		// spawn-class failure, NOT a crash, and NOT an "omp surface unavailable"
+		// error from the native path.
 		const runner = new OmpSubagentRunner({ surface: null });
 		const result = await runner.run(BASE_OPTIONS);
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
-			expect(result.reason).toBe("spawn_failed");
-			expect(result.error).toContain("omp surface unavailable");
+			expect(["spawn_failed", "non_zero_exit"]).toContain(result.reason);
+			// Delegated: the error comes from the subprocess spawn, not the
+			// native surface gate.
+			expect(result.error).not.toContain("omp surface unavailable");
 			expect(result.durationMs).toBeGreaterThanOrEqual(0);
 		}
 	});

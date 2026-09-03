@@ -31,8 +31,16 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 import { recordChildInvocation } from "@magic-context/core/features/magic-context/subagent-token-capture";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage";
-import { inferAccountingSubagent } from "./subagent-runner";
+import { inferAccountingSubagent, PiSubagentRunner } from "./subagent-runner";
 import { loadOmpSubagentSurface, type OmpSubagentSurface } from "./omp-host";
+
+/**
+ * Subprocess fallback for OMP hosts whose structured-subagent surface cannot
+ * load (cortexkit/magic-context#418 review: a detected OMP process must never
+ * dead-end the historian when the subprocess path is available). Constructed
+ * lazily on first need; `undefined` until then.
+ */
+let subprocessFallback: PiSubagentRunner | undefined;
 
 /** Terminator instruction appended to every OMP assignment (yield contract). */
 const OMP_YIELD_INSTRUCTION =
@@ -192,12 +200,17 @@ export class OmpSubagentRunner implements SubagentRunner {
 		try {
 			const resolved = await this.resolveSurface();
 			if (!("runStructuredSubagent" in resolved)) {
-				return {
-					ok: false,
-					reason: "spawn_failed",
-					error: `omp surface unavailable: ${resolved.error}`,
-					durationMs: duration(),
-				};
+				// Surface unavailable on a detected OMP host — delegate to the
+				// subprocess runner instead of failing the run. The fallback is
+				// sticky for the process: if the surface cannot load once (broken
+				// install, missing package), it will not load later.
+				subprocessFallback ??= new PiSubagentRunner();
+				options.onProgress?.({
+					type: "spawned",
+					argv: ["omp:fallback-subprocess", options.agent],
+					pid: undefined,
+				});
+				return subprocessFallback.run(options);
 			}
 			const surface = resolved;
 
@@ -263,17 +276,25 @@ export class OmpSubagentRunner implements SubagentRunner {
 								...(reason === "model_failed" ? { transient: true } : {}),
 							};
 						})();
-				recordAccounting(successResult, usage);
-
-				if (!successResult.ok) return successResult;
+				// Record AFTER final classification: an exit-0 run with empty
+				// output is a failed attempt (no_assistant), not a completed
+				// invocation — recording the pre-classification result would log
+				// `completed` for a run that returns no_assistant.
+				if (!successResult.ok) {
+					recordAccounting(successResult, usage);
+					return successResult;
+				}
 				if (successResult.assistantText.length === 0) {
-					return {
+					const finalResult: SubagentRunResult = {
 						ok: false,
 						reason: "no_assistant",
 						error: "omp structured spawn produced no output",
 						durationMs: duration(),
 					};
+					recordAccounting(finalResult, usage);
+					return finalResult;
 				}
+				recordAccounting(successResult, usage);
 				return {
 					ok: true,
 					assistantText: successResult.assistantText,
