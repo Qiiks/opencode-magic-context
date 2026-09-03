@@ -326,12 +326,15 @@ export class OmpSubagentRunner implements SubagentRunner {
 			const surface = resolved;
 
 			const cwd = options.cwd ?? process.cwd();
-			// OMP selects models by its own selector grammar; the canonical
-			// provider prefix may need translation (openai→openai-codex etc.),
-			// which resolveModelRefForOmp already implements for the subprocess
-			// path. When no model is configured, let OMP's own resolution run.
-			const hostModel = this.hostContext.model ?? options.model;
-			const modelRef = hostModel ? resolveModelRefForOmp(hostModel) : undefined;
+		// OMP selects models by its own selector grammar; the canonical
+		// provider prefix may need translation (openai→openai-codex etc.),
+		// which resolveModelRefForOmp already implements for the subprocess
+		// path. The explicitly configured model (options.model) wins; the
+		// host's ambient session model is only the fallback when nothing is
+		// configured — reversing this would route every historian run to the
+		// parent's model instead of the configured historian model.
+		const hostModel = options.model ?? this.hostContext.model;
+		const modelRef = hostModel ? resolveModelRefForOmp(hostModel) : undefined;
 
 			// Timeout: race the caller's signal against an internal deadline.
 			const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;

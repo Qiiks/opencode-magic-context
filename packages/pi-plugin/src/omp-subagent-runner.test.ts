@@ -193,7 +193,6 @@ describe("OmpSubagentRunner", () => {
 		expect(session.restrictToolNames).toBe(true);
 		expect(session.getSessionSpawns).toBeTypeOf("function");
 	});
-
 	test("hostContext.modelRegistry rides the session into the structured request", async () => {
 		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
 		const surface = fakeSurface(
@@ -215,8 +214,10 @@ describe("OmpSubagentRunner", () => {
 		// catalog-only registry that cannot see runtime providers.
 		expect(session.modelRegistry).toBe(fakeRegistry);
 		expect(session.getSessionId?.()).toBe("ses-live");
+		// The explicitly configured model wins over the host's ambient model;
+		// otherwise every historian run would use the parent's model.
+		expect(request.model).toBe("bai/glm-5.3-flash:high");
 	});
-
 	test("timeoutMs elapsing maps to timeout (fake surface honors signal abort)", async () => {
 		const surface = {
 			Settings: FAKE_SETTINGS,
