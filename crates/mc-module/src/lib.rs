@@ -15224,6 +15224,22 @@ fn ctx_note_schema() -> Value {
 
 /// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
 /// bound sessions obtain preset-selected description text through `manifest.get`.
+/// The single-line `--version` self-report: `ck-mc <crate version> (<build sha>)`.
+/// The build sha is the same compile-time `MC_BUILD_SHA` that stamps manifest
+/// provenance, so a release train tag whose id is a prefix of that sha
+/// (`ck-mc-alpha.<short sha>`) can be checked against the placed binary by
+/// substring — the fleet's placement-acceptance contract. A bare `cargo build`
+/// prints the crate version alone rather than a fabricated sha.
+pub fn version_line() -> String {
+    match option_env!("MC_BUILD_SHA")
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+    {
+        Some(sha) => format!("ck-mc {} ({sha})", env!("CARGO_PKG_VERSION")),
+        None => format!("ck-mc {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 pub fn manifest(module_id: &str) -> ModuleManifest {
     // Constructed via the subc-protocol builder (never a struct literal): ModuleManifest is
     // #[non_exhaustive], so builder methods are the only construction path that survives additive
@@ -16085,6 +16101,22 @@ mod tests {
             StoreOpenPolicy::default().wait_window,
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn version_line_carries_the_build_sha_when_stamped() {
+        let line = version_line();
+        let expected_prefix = format!("ck-mc {}", env!("CARGO_PKG_VERSION"));
+        assert!(line.starts_with(&expected_prefix), "got {line}");
+        match option_env!("MC_BUILD_SHA") {
+            Some(sha) if !sha.trim().is_empty() => {
+                assert_eq!(line, format!("{expected_prefix} ({})", sha.trim()));
+                // A train tag id is a short prefix of the full sha; acceptance
+                // checks the tag id as a substring of this line.
+                assert!(line.contains(&sha.trim()[..8.min(sha.trim().len())]));
+            }
+            _ => assert_eq!(line, expected_prefix),
+        }
     }
 
     #[test]

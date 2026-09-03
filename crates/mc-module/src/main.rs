@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // any runtime argument so supervisors and test substrates can probe the binary
     // without a connection file.
     if std::env::args().skip(1).any(|arg| arg == "--version") {
-        println!("ck-mc {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", mc_module::version_line());
         return Ok(());
     }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
