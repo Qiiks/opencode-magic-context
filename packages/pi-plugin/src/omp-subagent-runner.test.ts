@@ -35,19 +35,43 @@ const BASE_OPTIONS = {
 };
 
 describe("OmpSubagentRunner", () => {
-	test("surface unavailable → delegates to subprocess fallback instead of failing (never throws)", async () => {
-		// With no surface injected and no OMP host (test env), the runner falls
-		// back to the subprocess path. The subprocess runner will fail to spawn
-		// `pi` in this environment (ENOENT) — the observable contract is a
-		// spawn-class failure, NOT a crash, and NOT an "omp surface unavailable"
-		// error from the native path.
-		const runner = new OmpSubagentRunner({ surface: null });
-		const result = await runner.run(BASE_OPTIONS);
+	test("surface unavailable → delegates to the fallback runner (hermetic, no pi spawn)", async () => {
+		// cubic P2: a real PiSubagentRunner would spawn an actual `pi` child on
+		// hosts where Pi/OMP is installed — the test would run a live subagent
+		// (or hang, since BASE_OPTIONS carries no timeoutMs). The injected
+		// fallback stub makes the delegation hermetic: assert the runner handed
+		// the run off (progress marker + stub result) and never touched the
+		// native surface path.
+		let fallbackCalls = 0;
+		const fallbackRunner = {
+			harness: "pi",
+			run: async (opts: { agent: string }) => {
+				fallbackCalls += 1;
+				return {
+					ok: false as const,
+					reason: "spawn_failed" as const,
+					error: "stub fallback: pi spawn blocked in test",
+					durationMs: 0,
+				};
+			},
+		};
+		const progress: Array<{ type: string; argv?: string[] }> = [];
+		const runner = new OmpSubagentRunner({
+			surface: null,
+			fallbackRunner: fallbackRunner as never,
+		});
+		const result = await runner.run({
+			...BASE_OPTIONS,
+			onProgress: (event: { type: string; argv?: string[] }) => progress.push(event),
+		});
+		// Delegation happened exactly once, through the injected stub.
+		expect(fallbackCalls).toBe(1);
+		// The fallback marker announced the subprocess hand-off.
+		expect(progress.some(event => event.argv?.[0] === "omp:fallback-subprocess")).toBe(true);
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
-			expect(["spawn_failed", "non_zero_exit"]).toContain(result.reason);
-			// Delegated: the error comes from the subprocess spawn, not the
-			// native surface gate.
+			// The result came from the stub, not the native surface gate.
+			expect(result.error).toContain("stub fallback");
 			expect(result.error).not.toContain("omp surface unavailable");
 			expect(result.durationMs).toBeGreaterThanOrEqual(0);
 		}

@@ -64,6 +64,13 @@ export interface OmpSubagentRunnerOptions {
 	surface?: OmpSubagentSurface | null;
 	/** Test seam: override the host context snapshot. */
 	hostContext?: OmpRunnerHostContext;
+	/**
+	 * Test seam: replace the subprocess fallback used when the OMP surface is
+	 * unavailable. Production constructs a real PiSubagentRunner lazily; tests
+	 * inject a stub so the delegation path is hermetic (no `pi` binary spawn,
+	 * which on hosts with Pi installed would run a live subagent or hang).
+	 */
+	fallbackRunner?: SubagentRunner;
 }
 
 /**
@@ -189,10 +196,12 @@ export class OmpSubagentRunner implements SubagentRunner {
 
 	private readonly injectedSurface: OmpSubagentSurface | null | undefined;
 	private readonly hostContext: OmpRunnerHostContext;
+	private readonly injectedFallback: SubagentRunner | undefined;
 
 	constructor(options: OmpSubagentRunnerOptions = {}) {
 		this.injectedSurface = options.surface;
 		this.hostContext = options.hostContext ?? {};
+		this.injectedFallback = options.fallbackRunner;
 	}
 
 	/**
@@ -255,13 +264,16 @@ export class OmpSubagentRunner implements SubagentRunner {
 				// subprocess runner instead of failing the run. The fallback is
 				// sticky for the process: if the surface cannot load once (broken
 				// install, missing package), it will not load later.
-				subprocessFallback ??= new PiSubagentRunner();
+				// Tests inject `fallbackRunner` so this delegation is hermetic —
+				// a real PiSubagentRunner would spawn an actual `pi` child on
+				// hosts where Pi is installed (hangs without a timeout).
+				const fallback = this.injectedFallback ?? (subprocessFallback ??= new PiSubagentRunner());
 				options.onProgress?.({
 					type: "spawned",
 					argv: ["omp:fallback-subprocess", options.agent],
 					pid: undefined,
 				});
-				return subprocessFallback.run(options);
+				return fallback.run(options);
 			}
 			const surface = resolved;
 
