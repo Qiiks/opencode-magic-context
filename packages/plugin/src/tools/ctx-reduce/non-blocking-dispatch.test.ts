@@ -19,7 +19,8 @@ function createDb(): Database {
       reasoning_byte_size INTEGER NOT NULL DEFAULT 0,
       caveman_depth INTEGER NOT NULL DEFAULT 0,
       harness TEXT NOT NULL DEFAULT 'opencode',
-      tool_owner_message_id TEXT DEFAULT NULL
+      tool_owner_message_id TEXT DEFAULT NULL,
+      entry_fingerprint TEXT DEFAULT NULL
     );
     CREATE TABLE pending_ops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

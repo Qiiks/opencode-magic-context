@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { markWhitespaceAssistantTagInert } from "../../features/magic-context/storage-tags";
 import { Database } from "../../shared/sqlite";
 import { createCtxReduceTools } from "./tools";
 
@@ -19,7 +20,8 @@ function createTestDb(): Database {
       reasoning_byte_size INTEGER NOT NULL DEFAULT 0,
       caveman_depth INTEGER NOT NULL DEFAULT 0,
       harness TEXT NOT NULL DEFAULT 'opencode',
-      tool_owner_message_id TEXT DEFAULT NULL
+      tool_owner_message_id TEXT DEFAULT NULL,
+      entry_fingerprint TEXT DEFAULT NULL
     );
     CREATE TABLE pending_ops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,6 +239,33 @@ describe("createCtxReduceTools", () => {
 
             expect(result).toContain("Conflicting");
             expect(result).toContain("from before compaction");
+        });
+
+        it("acknowledges an inert whitespace tag without queueing it", async () => {
+            seedTags(db, [{ id: 7, sessionId: "ses-1" }]);
+            markWhitespaceAssistantTagInert(db, "ses-1", 7, "assistant:p0");
+
+            const result = await tools.ctx_reduce.execute({ drop: "7" }, toolContext());
+
+            expect(result).toContain("§7§ is provider framing, nothing to reclaim");
+            expect(result).not.toContain("Error:");
+            expect(getPendingOps(db, "ses-1")).toEqual([]);
+        });
+
+        it("skips inert whitespace inside a range while queueing every live tag", async () => {
+            seedTags(db, [
+                { id: 6, sessionId: "ses-1" },
+                { id: 7, sessionId: "ses-1" },
+                { id: 8, sessionId: "ses-1" },
+            ]);
+            markWhitespaceAssistantTagInert(db, "ses-1", 7, "assistant:p0");
+
+            const result = await tools.ctx_reduce.execute({ drop: "6-8" }, toolContext());
+
+            expect(result).toContain("drop §6§, §8§");
+            expect(result).toContain("§7§ is provider framing, nothing to reclaim");
+            expect(result).not.toContain("Error:");
+            expect(getPendingOps(db, "ses-1").map((op) => op.tag_id)).toEqual([6, 8]);
         });
 
         it("skips duplicate drop requests", async () => {

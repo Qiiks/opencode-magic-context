@@ -8,6 +8,7 @@ import {
     queuePendingOp,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { getInertWhitespaceAssistantTags } from "../../features/magic-context/storage-tags";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { getErrorMessage } from "../../shared/error-message";
 import type { Database } from "../../shared/sqlite";
@@ -156,13 +157,25 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             const protectedSet = new Set(protectedTagIds);
 
             const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
+            const inertWhitespaceTagNumbers = new Set(
+                getInertWhitespaceAssistantTags(deps.db, sessionId).map((tag) => tag.tagNumber),
+            );
+            const inertDropIds = [
+                ...new Set(dropIds.filter((id) => inertWhitespaceTagNumbers.has(id))),
+            ];
+            const inertNote =
+                inertDropIds.length > 0
+                    ? `Skipped: ${inertDropIds
+                          .map((id) => `§${id}§ is provider framing, nothing to reclaim`)
+                          .join("; ")}.`
+                    : "";
 
             const pendingOps = getPendingOps(deps.db, sessionId);
             const pendingMap = new Map(pendingOps.map((op) => [op.tagId, op.operation]));
 
             const conflicts: string[] = [];
             for (const id of dropIds) {
-                if (tagStatusMap.get(id) === "compacted") {
+                if (tagStatusMap.get(id) === "compacted" && !inertWhitespaceTagNumbers.has(id)) {
                     conflicts.push(`§${id}§ is from before compaction`);
                 }
             }
@@ -172,12 +185,20 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
             const preFilterDropCount = dropIds.length;
             dropIds = dropIds.filter(
-                (id) => tagStatusMap.get(id) !== "dropped" && pendingMap.get(id) !== "drop",
+                (id) =>
+                    !inertWhitespaceTagNumbers.has(id) &&
+                    tagStatusMap.get(id) !== "dropped" &&
+                    pendingMap.get(id) !== "drop",
             );
             const skippedCount = preFilterDropCount - dropIds.length;
 
             if (dropIds.length === 0) {
-                return "All requested tags were already queued or processed. No new action is needed.";
+                return [
+                    inertNote,
+                    "All requested tags were already queued or processed. No new action is needed.",
+                ]
+                    .filter(Boolean)
+                    .join(" ");
             }
 
             try {
@@ -207,7 +228,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             if (immediateDropIds.length > 0) parts.push(`drop ${formatIds(immediateDropIds)}`);
             if (deferredDropIds.length > 0)
                 parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
-            return `Queued: ${parts.join(", ")}.${skippedNote}`;
+            return `Queued: ${parts.join(", ")}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
         },
     });
 }
