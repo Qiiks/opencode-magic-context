@@ -218,6 +218,26 @@ describe("OmpSubagentRunner", () => {
 		// otherwise every historian run would use the parent's model.
 		expect(request.model).toBe("bai/glm-5.3-flash:high");
 	});
+
+	test("a session change mid-run does not leak the new session's context into the in-flight run", async () => {
+		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
+		const surface = fakeSurface(
+			{ result: { exitCode: 0, output: "ok", stderr: "", truncated: false, durationMs: 1 } },
+			capture,
+		);
+		const oldRegistry = { tag: "old-session" };
+		const runner = new OmpSubagentRunner({ surface: surface as never });
+		runner.setHostContext({ modelRegistry: oldRegistry, sessionId: "ses-old" });
+		// Run starts (snapshots context), then hits the async settings/auth
+		// init — mutate mid-flight like a session_start would.
+		const pending = runner.run({ ...BASE_OPTIONS });
+		runner.setHostContext({ modelRegistry: { tag: "new-session" }, sessionId: "ses-new" });
+		await pending;
+		const request = capture.requests[0]!;
+		const session = request.session as Record<string, unknown>;
+		expect(session.modelRegistry).toBe(oldRegistry);
+		expect(session.getSessionId?.()).toBe("ses-old");
+	});
 	test("timeoutMs elapsing maps to timeout (fake surface honors signal abort)", async () => {
 		const surface = {
 			Settings: FAKE_SETTINGS,

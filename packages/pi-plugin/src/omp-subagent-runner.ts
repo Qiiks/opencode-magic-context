@@ -269,6 +269,10 @@ export class OmpSubagentRunner implements SubagentRunner {
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
 		const startedAt = Date.now();
 		const duration = () => Date.now() - startedAt;
+		// Snapshot the live host context for this run: session_start can fire
+		// while a run is awaiting settings/auth init, and the singleton must
+		// not build the in-flight run with the new session's registry and ids.
+		const host = { ...this.hostContext };
 		// Hoisted so the outer catch can distinguish deadline aborts from
 		// caller aborts (the AbortError message alone cannot).
 		let timedOut = false;
@@ -333,7 +337,8 @@ export class OmpSubagentRunner implements SubagentRunner {
 		// host's ambient session model is only the fallback when nothing is
 		// configured — reversing this would route every historian run to the
 		// parent's model instead of the configured historian model.
-		const hostModel = options.model ?? this.hostContext.model;
+		// `host` is the run-start snapshot (see top of run()).
+		const hostModel = options.model ?? host.model;
 		const modelRef = hostModel ? resolveModelRefForOmp(hostModel) : undefined;
 
 			// Timeout: race the caller's signal against an internal deadline.
@@ -351,7 +356,7 @@ export class OmpSubagentRunner implements SubagentRunner {
 			try {
 				const settings = await surface.Settings.init({ cwd });
 				const authStorage = await surface.discoverAuthStorage();
-				const session = buildToolSession(cwd, this.hostContext, settings, authStorage);
+				const session = buildToolSession(cwd, host, settings, authStorage);
 				// Thinking for this spawn, honoring the config's `thinking_level`
 				// (`options.thinkingLevel`), which the subprocess path enforces
 				// via `--thinking`. Two OMP-sanctioned mechanisms:
