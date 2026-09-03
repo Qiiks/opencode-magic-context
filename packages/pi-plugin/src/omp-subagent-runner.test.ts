@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 
-import { OmpSubagentRunner } from "./omp-subagent-runner";
+import { isLiteralThinkingLevel, OmpSubagentRunner, taskEffortForLevel } from "./omp-subagent-runner";
 
 /**
  * Tests for the OMP-native subagent runner's fail-soft contract and result
@@ -218,5 +218,77 @@ describe("OmpSubagentRunner", () => {
 	test("harness label is omp", () => {
 		const runner = new OmpSubagentRunner({ surface: null });
 		expect(runner.harness).toBe("omp");
+	});
+});
+
+describe("thinking level → OMP spawn mapping", () => {
+	test("taskEffortForLevel maps literal levels onto positional selectors", () => {
+		expect(taskEffortForLevel("minimal")).toBe("lo");
+		expect(taskEffortForLevel("low")).toBe("lo");
+		expect(taskEffortForLevel("medium")).toBe("med");
+		expect(taskEffortForLevel("high")).toBe("hi");
+		expect(taskEffortForLevel("xhigh")).toBe("hi");
+		expect(taskEffortForLevel("max")).toBe("hi");
+	});
+
+	test("taskEffortForLevel omits sentinels and unknowns (OMP default applies)", () => {
+		expect(taskEffortForLevel("off")).toBeUndefined();
+		expect(taskEffortForLevel("auto")).toBeUndefined();
+		expect(taskEffortForLevel("inherit")).toBeUndefined();
+		expect(taskEffortForLevel(undefined)).toBeUndefined();
+		expect(taskEffortForLevel("garbage")).toBeUndefined();
+	});
+
+	test("isLiteralThinkingLevel accepts exactly the wire-level vocabulary", () => {
+		for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
+			expect(isLiteralThinkingLevel(level)).toBe(true);
+		}
+		for (const sentinel of ["off", "auto", "inherit", undefined, "garbage"]) {
+			expect(isLiteralThinkingLevel(sentinel as string | undefined)).toBe(false);
+		}
+	});
+
+	test("configured thinking_level rides both effort and the model-ref suffix", async () => {
+		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
+		const surface = fakeSurface(
+			{
+				result: {
+					exitCode: 0,
+					output: "<compartment><title>t</title></compartment>",
+					stderr: "",
+					truncated: false,
+				},
+			},
+			capture,
+		);
+		const runner = new OmpSubagentRunner({ surface: surface as never });
+		const result = await runner.run({ ...BASE_OPTIONS, thinkingLevel: "max" });
+		expect(result.ok).toBe(true);
+		const request = capture.requests[0]!;
+		// hi: positional selector (validates against OMP's TASK_EFFORTS gate)
+		expect(request.effort).toBe("hi");
+		// max: exact literal suffix on the ref for per-model precision
+		expect(request.model).toBe("openai-codex/gpt-5.4:max");
+	});
+
+	test("sentinel thinking levels omit both effort and suffix", async () => {
+		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
+		const surface = fakeSurface(
+			{
+				result: {
+					exitCode: 0,
+					output: "<compartment><title>t</title></compartment>",
+					stderr: "",
+					truncated: false,
+				},
+			},
+			capture,
+		);
+		const runner = new OmpSubagentRunner({ surface: surface as never });
+		await runner.run({ ...BASE_OPTIONS, thinkingLevel: "off" });
+		const request = capture.requests[0]!;
+		expect(request.effort).toBeUndefined();
+		// openai → openai-codex translation still applies; NO :suffix
+		expect(request.model).toBe("openai-codex/gpt-5.4");
 	});
 });

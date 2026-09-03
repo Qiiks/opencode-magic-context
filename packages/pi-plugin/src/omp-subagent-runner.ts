@@ -133,6 +133,57 @@ function sanitizeLabel(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 48) || "Subagent";
 }
 
+/**
+ * Literal thinking levels OMP's model-pattern grammar accepts as `:level`
+ * suffixes (splitThinkingSuffix vocabulary, minus the non-level sentinels).
+ * `off`/`auto`/`inherit` are selector sentinels, not wire levels — they must
+ * NOT be appended to a model ref.
+ */
+const LITERAL_THINKING_LEVEL: Record<string, true> = {
+	minimal: true,
+	low: true,
+	medium: true,
+	high: true,
+	xhigh: true,
+	max: true,
+};
+
+/** True when the configured level can ride a model ref as an exact `:level` suffix. */
+export function isLiteralThinkingLevel(level: string | undefined): level is string {
+	return level !== undefined && LITERAL_THINKING_LEVEL[level] === true;
+}
+
+/**
+ * Map a literal thinking level onto OMP's positional TaskEffort selector.
+ * OMP's task-spawn surface only accepts "lo" | "med" | "hi"
+ * (TASK_EFFORTS, thinking.ts:270) — validateEffort rejects anything else —
+ * and resolveTaskEffortLevel then maps the selector onto the target model's
+ * OWN supported ladder (lo = lowest supported, med = middle, hi = highest,
+ * which is xhigh or max on models that go that high).
+ *
+ *   minimal/low -> "lo"   medium -> "med"   high/xhigh/max -> "hi"
+ *   off/auto/inherit/undefined -> undefined (omit; OMP default applies)
+ *
+ * Long ladders lose precision here (e.g. "medium" on a 6-rung ladder lands
+ * between rungs), which is why the literal `:level` suffix rides the model
+ * ref alongside — the selector is the fallback, not the primary signal.
+ */
+export function taskEffortForLevel(level: string | undefined): "lo" | "med" | "hi" | undefined {
+	switch (level) {
+		case "minimal":
+		case "low":
+			return "lo";
+		case "medium":
+			return "med";
+		case "high":
+		case "xhigh":
+		case "max":
+			return "hi";
+		default:
+			return undefined;
+	}
+}
+
 export class OmpSubagentRunner implements SubagentRunner {
 	readonly harness = "omp";
 
@@ -238,12 +289,35 @@ export class OmpSubagentRunner implements SubagentRunner {
 				const settings = await surface.Settings.init({ cwd });
 				const authStorage = await surface.discoverAuthStorage();
 				const session = buildToolSession(cwd, this.hostContext, settings, authStorage);
+				// Thinking for this spawn, honoring the config's `thinking_level`
+				// (`options.thinkingLevel`), which the subprocess path enforces
+				// via `--thinking`. Two OMP-sanctioned mechanisms:
+				//
+				// 1. `effort` — the positional TaskEffort selector ("lo" | "med" |
+				//    "hi"). resolveTaskEffortLevel maps it onto the target model's
+				//    OWN supported ladder (lo = lowest supported, hi = whatever the
+				//    model tops out at: high/xhigh/max). Literal levels ("high",
+				//    "max") are NOT valid here — OMP's validateEffort rejects
+				//    anything outside lo/med/hi.
+				// 2. A `:level` suffix on the model ref — OMP's model-pattern
+				//    grammar (splitThinkingSuffix) accepts exact literal levels
+				//    (minimal/low/medium/high/xhigh/max) and resolves them as
+				//    explicitThinkingLevel. Exact per-model; effort is the
+				//    positional fallback for long ladders where the selector is
+				//    less precise than the literal level.
+				const effort = taskEffortForLevel(options.thinkingLevel);
+				const literalLevel = isLiteralThinkingLevel(options.thinkingLevel)
+					? options.thinkingLevel
+					: undefined;
 				const request = {
 					session,
 					invocationKind: "task" as const,
 					assignment: buildAssignment(options.systemPrompt, options.userMessage),
 					agent: "task",
-					...(modelRef !== undefined ? { model: modelRef } : {}),
+					...(effort !== undefined ? { effort } : {}),
+					...(modelRef !== undefined
+						? { model: literalLevel !== undefined ? `${modelRef}:${literalLevel}` : modelRef }
+						: {}),
 					identity: { label: `MagicContext-${sanitizeLabel(options.agent)}` },
 					enableIrc: false,
 					enableLsp: false,
