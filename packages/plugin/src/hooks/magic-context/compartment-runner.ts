@@ -2,6 +2,7 @@ import {
     acquireCompartmentLease,
     COMPARTMENT_LEASE_RENEWAL_MS,
     releaseCompartmentLease,
+    releaseCompartmentLeaseBestEffort,
     renewCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
 import { isWrapupInProgress, updateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -108,7 +109,10 @@ function startLeaseRenewal(
     }, COMPARTMENT_LEASE_RENEWAL_MS);
 }
 
-export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
+export function startCompartmentAgent(
+    deps: CompartmentRunnerDeps,
+    runAgent: typeof runCompartmentAgent = runCompartmentAgent,
+): void {
     // Intentional: this check-then-set is safe in Bun's single-threaded event loop.
     // The synchronous code between activeRuns.get() and activeRuns.set() cannot interleave,
     // so another start for the same session cannot sneak in here.
@@ -161,7 +165,7 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
             realRunStarted = true;
         },
     });
-    const promise = runCompartmentAgent(runnerDeps)
+    const promise = runAgent(runnerDeps)
         .catch((err) => {
             sessionLog(deps.sessionId, "compartment agent: unhandled rejection:", err);
             // Ensure compartmentInProgress is cleared on any failure
@@ -173,7 +177,7 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
         })
         .finally(() => {
             clearInterval(renewal);
-            releaseCompartmentLease(deps.db, deps.sessionId, holderId);
+            releaseCompartmentLeaseBestEffort(deps.db, deps.sessionId, holderId, sessionLog);
             if (activeRuns.get(deps.sessionId)?.promise === promise) {
                 activeRuns.delete(deps.sessionId);
             }

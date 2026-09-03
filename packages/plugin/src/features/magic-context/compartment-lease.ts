@@ -1,3 +1,4 @@
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 
 export const COMPARTMENT_LEASE_TTL_MS = 5 * 60 * 1000;
@@ -55,6 +56,26 @@ export function releaseCompartmentLease(db: Database, sessionId: string, holderI
         sessionId,
         holderId,
     );
+}
+
+/**
+ * A failed release is safe: another holder can reclaim the row after its TTL passes.
+ * Do not let transient SQLite contention turn cleanup into an unhandled background failure.
+ */
+export function releaseCompartmentLeaseBestEffort(
+    db: Database,
+    sessionId: string,
+    holderId: string,
+    log: typeof sessionLog = sessionLog,
+): void {
+    try {
+        releaseCompartmentLease(db, sessionId, holderId);
+    } catch (err) {
+        log(
+            sessionId,
+            `lease release failed (${err instanceof Error ? err.message : String(err)}); row expires on its TTL`,
+        );
+    }
 }
 
 export function isCompartmentLeaseHeld(db: Database, sessionId: string, holderId: string): boolean {

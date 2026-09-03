@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import {
     acquireCompartmentLease,
     COMPARTMENT_LEASE_RENEWAL_MS,
-    releaseCompartmentLease,
+    releaseCompartmentLeaseBestEffort,
     renewCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
 import {
@@ -262,7 +262,7 @@ async function runOneWrapupIteration(args: {
         return { ran: true };
     } finally {
         clearInterval(renewal);
-        releaseCompartmentLease(ctx.db, sessionId, leaseHolderId);
+        releaseCompartmentLeaseBestEffort(ctx.db, sessionId, leaseHolderId, sessionLog);
     }
 }
 
