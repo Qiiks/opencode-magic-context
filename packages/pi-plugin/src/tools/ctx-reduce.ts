@@ -23,6 +23,7 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { getInertWhitespaceAssistantTags } from "@magic-context/core/features/magic-context/storage-tags";
 import { getErrorMessage } from "@magic-context/core/shared/error-message";
 import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
@@ -124,6 +125,20 @@ export function createCtxReduceTool(
 			const tagStatusMap = new Map(
 				allTags.map((tag) => [tag.tagNumber, tag.status]),
 			);
+			const inertWhitespaceTagNumbers = new Set(
+				getInertWhitespaceAssistantTags(deps.db, sessionId).map(
+					(tag) => tag.tagNumber,
+				),
+			);
+			const inertDropIds = [
+				...new Set(dropIds.filter((id) => inertWhitespaceTagNumbers.has(id))),
+			];
+			const inertNote =
+				inertDropIds.length > 0
+					? `Skipped: ${inertDropIds
+							.map((id) => `§${id}§ is provider framing, nothing to reclaim`)
+							.join("; ")}.`
+					: "";
 
 			const pendingOps = getPendingOps(deps.db, sessionId);
 			const pendingMap = new Map(
@@ -136,7 +151,10 @@ export function createCtxReduceTool(
 			// can't be dropped without confusing downstream readers.
 			const conflicts: string[] = [];
 			for (const id of dropIds) {
-				if (tagStatusMap.get(id) === "compacted") {
+				if (
+					tagStatusMap.get(id) === "compacted" &&
+					!inertWhitespaceTagNumbers.has(id)
+				) {
 					conflicts.push(`§${id}§ is from before compaction`);
 				}
 			}
@@ -147,13 +165,20 @@ export function createCtxReduceTool(
 			const preFilterDropCount = dropIds.length;
 			dropIds = dropIds.filter(
 				(id) =>
-					tagStatusMap.get(id) !== "dropped" && pendingMap.get(id) !== "drop",
+					!inertWhitespaceTagNumbers.has(id) &&
+					tagStatusMap.get(id) !== "dropped" &&
+					pendingMap.get(id) !== "drop",
 			);
 			const skippedCount = preFilterDropCount - dropIds.length;
 
 			if (dropIds.length === 0) {
 				return ok(
-					"All requested tags were already queued or processed. No new action is needed.",
+					[
+						inertNote,
+						"All requested tags were already queued or processed. No new action is needed.",
+					]
+						.filter(Boolean)
+						.join(" "),
 				);
 			}
 
@@ -190,7 +215,9 @@ export function createCtxReduceTool(
 				parts.push(`drop ${formatIds(immediateDropIds)}`);
 			if (deferredDropIds.length > 0)
 				parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
-			return ok(`Queued: ${parts.join(", ")}.${skippedNote}`);
+			return ok(
+				`Queued: ${parts.join(", ")}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}`,
+			);
 		},
 	};
 }

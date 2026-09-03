@@ -22,6 +22,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	insertTag,
+	markWhitespaceAssistantTagInert,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage-tags";
 import { createTestDb, fakeContext } from "../test-utils.test";
@@ -149,6 +150,43 @@ describe("Pi ctx_reduce tool", () => {
 		expect(isError).toBe(true);
 		expect(text).toContain("from before compaction");
 		expect(getPendingOps(db, sessionId)).toHaveLength(0);
+	});
+
+	it("acknowledges an inert whitespace tag without queueing it", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-inert";
+		seedTags(db, sessionId, [{ tagNumber: 7, messageId: "assistant:p0" }]);
+		db.prepare("UPDATE tags SET type = 'message' WHERE session_id = ?").run(
+			sessionId,
+		);
+		markWhitespaceAssistantTagInert(db, sessionId, 7, "assistant:p0");
+
+		const { isError, text } = await callDrop({ db, sessionId, drop: "7" });
+
+		expect(isError).toBe(false);
+		expect(text).toContain("§7§ is provider framing, nothing to reclaim");
+		expect(getPendingOps(db, sessionId)).toEqual([]);
+	});
+
+	it("skips inert whitespace inside a range while queueing every live tag", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-inert-range";
+		seedTags(db, sessionId, [
+			{ tagNumber: 6, messageId: "m6" },
+			{ tagNumber: 7, messageId: "assistant:p0" },
+			{ tagNumber: 8, messageId: "m8" },
+		]);
+		db.prepare(
+			"UPDATE tags SET type = 'message' WHERE session_id = ? AND tag_number = 7",
+		).run(sessionId);
+		markWhitespaceAssistantTagInert(db, sessionId, 7, "assistant:p0");
+
+		const { isError, text } = await callDrop({ db, sessionId, drop: "6-8" });
+
+		expect(isError).toBe(false);
+		expect(text).toContain("drop §6§, §8§");
+		expect(text).toContain("§7§ is provider framing, nothing to reclaim");
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([6, 8]);
 	});
 
 	it("treats already-dropped + already-queued IDs as idempotent (no error, no double-queue)", async () => {

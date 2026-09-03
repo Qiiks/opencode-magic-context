@@ -12,7 +12,11 @@ const getTagNumbersByMessageIdStatements = new WeakMap<Database, PreparedStateme
 const deleteTagsByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxTagNumberBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
+const getAssignableTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const hasPiFallbackMessageTagStatements = new WeakMap<Database, PreparedStatement>();
+
+const WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX = "__mc_whitespace_assistant_inert__:";
+const WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX = "mc:whitespace-assistant:";
 
 function getInsertTagStatement(db: Database): PreparedStatement {
     let stmt = insertTagStatements.get(db);
@@ -713,7 +717,12 @@ export function backfillTagTokenCounts(
 function getUpdateTagMessageIdStatement(db: Database): PreparedStatement {
     let stmt = updateTagMessageIdStatements.get(db);
     if (!stmt) {
-        stmt = db.prepare("UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ?");
+        stmt = db.prepare(
+            `UPDATE tags SET message_id = ?
+             WHERE session_id = ?
+               AND tag_number = ?
+               AND message_id NOT LIKE '${WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX}%'`,
+        );
         updateTagMessageIdStatements.set(db, stmt);
     }
     return stmt;
@@ -759,6 +768,28 @@ function getTagNumberByMessageIdStatement(db: Database): PreparedStatement {
             "SELECT tag_number FROM tags WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
         );
         getTagNumberByMessageIdStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getAssignableTagNumberByMessageIdStatement(db: Database): PreparedStatement {
+    let stmt = getAssignableTagNumberByMessageIdStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT tag_number FROM tags
+             WHERE session_id = ?
+               AND message_id = ?
+               AND NOT (
+                   status = 'compacted'
+                   AND COALESCE(
+                       entry_fingerprint LIKE '${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}%',
+                       0
+                   ) = 1
+               )
+             ORDER BY tag_number ASC
+             LIMIT 1`,
+        );
+        getAssignableTagNumberByMessageIdStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -907,8 +938,6 @@ export function updateTagStatus(
     getUpdateTagStatusStatement(db).run(status, sessionId, tagId);
 }
 
-const WHITESPACE_ASSISTANT_INERT_PREFIX = "mc:whitespace-assistant:";
-
 export interface InertWhitespaceAssistantTag {
     tagNumber: number;
     contentId: string;
@@ -931,8 +960,8 @@ export function markWhitespaceAssistantTagInert(
              entry_fingerprint = ?
          WHERE session_id = ? AND tag_number = ? AND type = 'message'`,
     ).run(
-        `__mc_whitespace_assistant_inert__:${tagNumber}`,
-        `${WHITESPACE_ASSISTANT_INERT_PREFIX}${contentId}`,
+        `${WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX}${tagNumber}`,
+        `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${contentId}`,
         sessionId,
         tagNumber,
     );
@@ -952,12 +981,14 @@ export function getInertWhitespaceAssistantTags(
                AND status = 'compacted'
                AND entry_fingerprint LIKE ?`,
         )
-        .all(sessionId, `${WHITESPACE_ASSISTANT_INERT_PREFIX}%`) as Array<{
+        .all(sessionId, `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}%`) as Array<{
         tagNumber: number;
         entryFingerprint: string;
     }>;
     return rows.flatMap((row) => {
-        const contentId = row.entryFingerprint.slice(WHITESPACE_ASSISTANT_INERT_PREFIX.length);
+        const contentId = row.entryFingerprint.slice(
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+        );
         return contentId.length > 0 ? [{ tagNumber: row.tagNumber, contentId }] : [];
     });
 }
@@ -1057,6 +1088,7 @@ export function adoptFallbackTagMessageId(
     oldFallbackMessageId: string,
     newRealMessageId: string,
 ): boolean {
+    if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) return false;
     const result = db
         .prepare(
             `UPDATE tags SET message_id = ?
@@ -1446,6 +1478,9 @@ export function adoptPiFallbackMessageTag(
     oldFallbackMessageId: string,
     newRealMessageId: string,
 ): PiFallbackTagAdoptionResult {
+    if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) {
+        return { action: "skipped" };
+    }
     const survivor = getPiFallbackFoldTagRowByNumber(db, sessionId, tagNumber);
     if (
         survivor === null ||
@@ -1594,6 +1629,16 @@ export function getTagNumberByMessageId(
     messageId: string,
 ): number | null {
     const row = getTagNumberByMessageIdStatement(db).get(sessionId, messageId);
+    return isTagNumberRow(row) ? row.tag_number : null;
+}
+
+/** Look up a live tag assignment without reviving a retired whitespace framing row. */
+export function getAssignableTagNumberByMessageId(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): number | null {
+    const row = getAssignableTagNumberByMessageIdStatement(db).get(sessionId, messageId);
     return isTagNumberRow(row) ? row.tag_number : null;
 }
 

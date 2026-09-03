@@ -18,6 +18,7 @@ import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/mag
 import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
+    addTrailingBlankDecisions,
     armThinkingBindingRecovery,
     getEmergencyRecoveryArmedAt,
     getMergedReasoningStrippedIds,
@@ -646,6 +647,65 @@ describe("Rust mode authority adapter", () => {
         } finally {
             logSpy.mockRestore();
         }
+    });
+
+    it("keeps host-only trailing blank stripping at a three-pass raw-ingress fixed point", async () => {
+        const sessionId = `rust-host-strip-fixed-point-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        addTrailingBlankDecisions(db, sessionId, [["m1", "strip"]]);
+        const transformBodies: Record<string, unknown>[] = [];
+        const sourceMessages = () =>
+            [
+                {
+                    info: {
+                        id: "m1",
+                        role: "assistant",
+                        sessionID: sessionId,
+                        providerID: "anthropic",
+                        modelID: "claude-sonnet",
+                    },
+                    parts: [
+                        { type: "text", text: "stable answer" },
+                        { type: "text", text: "" },
+                    ],
+                },
+            ] as unknown as MessageLike[];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBodies.push(structuredClone(body));
+                return {
+                    decision: "PASSTHROUGH",
+                    native_messages: sourceMessages(),
+                };
+            },
+        };
+        const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const served: string[] = [];
+
+        for (let pass = 0; pass < 3; pass += 1) {
+            const messages = sourceMessages();
+            const output = { messages };
+            await runner.run(sessionId, messages, output, makeMeta(db, sessionId));
+            served.push(JSON.stringify(output.messages));
+            expect((output.messages[0] as MessageLike).parts).toEqual([
+                { type: "text", text: "stable answer" },
+            ]);
+        }
+
+        expect(served[1]).toBe(served[0]);
+        expect(served[2]).toBe(served[0]);
+        expect(
+            (
+                ((transformBodies[0]?.native_messages as MessageLike[])[0]?.parts ?? []) as Array<{
+                    text?: string;
+                }>
+            ).at(-1)?.text,
+        ).toBe("");
+        expect(transformBodies.slice(1).map((body) => body.native_messages)).toEqual([[], []]);
+        expect(transformBodies.slice(1).every((body) => body.tail_delta !== undefined)).toBe(true);
     });
 
     it("keeps the rust pass line grep-compatible", () => {

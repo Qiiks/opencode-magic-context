@@ -3,9 +3,9 @@ import type { Database, Statement as PreparedStatement } from "../../shared/sqli
 import {
     adoptNullOwnerToolTag,
     backfillTagTokenCounts,
+    getAssignableTagNumberByMessageId,
     getMaxTagNumberBySession,
     getNullOwnerToolTag,
-    getTagNumberByMessageId,
     getToolTagNumberByOwner,
     insertTag,
     type TagTokenCounts,
@@ -524,7 +524,7 @@ export function createTagger(): Tagger {
             inputByteSize,
             null,
             messageId,
-            () => getTagNumberByMessageId(db, sessionId, messageId),
+            () => getAssignableTagNumberByMessageId(db, sessionId, messageId),
             entryFingerprint,
             tokenThunk,
         );
