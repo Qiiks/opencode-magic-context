@@ -520,3 +520,41 @@ export class OmpSubagentRunner implements SubagentRunner {
 		}
 	}
 }
+
+/**
+ * Minimal live-context surface needed to snapshot the host into the runner.
+ * Structural (not the Pi/OMP ExtensionContext types) so both harnesses'
+ * contexts satisfy it without importing host modules.
+ */
+export interface OmpHostSnapshotSource {
+	readonly model?: { readonly provider: string; readonly id: string } | undefined;
+	readonly modelRegistry?: unknown;
+	readonly sessionManager?:
+		| {
+				getSessionId?: () => string | undefined;
+				getSessionFile?: () => string | undefined;
+			}
+		| undefined;
+}
+
+/**
+ * Snapshot a live extension context into an OMP runner's host context: the
+ * parent session's ModelRegistry (so extension-registered runtime providers
+ * resolve in structured spawns), plus the active model ref and session ids.
+ * No-op unless `runner` is an OMP runner; best-effort — a capture failure
+ * must never break session start or spawn.
+ */
+export function captureOmpHostContext(runner: SubagentRunner | undefined, ctx: OmpHostSnapshotSource): void {
+	if (!(runner instanceof OmpSubagentRunner)) return;
+	try {
+		runner.setHostContext({
+			model: ctx.model !== undefined ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			modelRegistry: ctx.modelRegistry,
+			sessionFile: ctx.sessionManager?.getSessionFile?.() ?? null,
+			sessionId: ctx.sessionManager?.getSessionId?.() ?? null,
+		});
+	} catch {
+		// Best-effort capture; the run degrades to options.model + OMP
+		// default resolution when the snapshot is absent.
+	}
+}

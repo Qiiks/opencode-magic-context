@@ -219,6 +219,7 @@ import {
 	resolvePiUsableContextLimit,
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
+import { captureOmpHostContext } from "./omp-subagent-runner";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import {
 	formatPiPressureForLog,
@@ -3645,6 +3646,11 @@ function spawnPiHistorianRun(args: {
 		}
 		const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
 		try {
+			// Refresh the OMP runner's host snapshot from the live context right
+			// before spawning: session_start may not have fired for this session
+			// (resume paths), and /model switches mid-session would otherwise
+			// leave a stale registry/model. No-op on non-OMP runners.
+			captureOmpHostContext(historian.runner, ctx);
 			await runPiHistorian({
 				db,
 				sessionId,
