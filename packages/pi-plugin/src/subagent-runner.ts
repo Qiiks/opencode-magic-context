@@ -162,9 +162,7 @@ function resolvePiBin(
 	const binKeys = ["pi", "omp"];
 	let binEntry: string | undefined;
 	for (const key of binKeys) {
-		if (
-			typeof bin === "string" && key === "pi"
-		) {
+		if (typeof bin === "string" && key === "pi") {
 			binEntry = bin;
 			break;
 		}
@@ -178,7 +176,6 @@ function resolvePiBin(
 		}
 	}
 	if (!binEntry) return null;
-
 
 	const packageRoot = resolvePath(found.dir);
 	const candidate = resolvePath(packageRoot, binEntry);
