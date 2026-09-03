@@ -635,10 +635,15 @@ export function tagMessages(
                 // active accounting because ctx_reduce cannot reclaim provider framing.
                 let existingTagId: number | undefined;
                 if (whitespaceOnlyAssistant) {
+                    const persistedWhitespaceTag = getTagNumberByMessageId(
+                        db,
+                        sessionId,
+                        contentId,
+                    );
                     existingTagId = resolver.resolve(messageId, "message", contentId, textOrdinal, {
                         accept: (tagNumber) =>
-                            inertWhitespaceTagNumbers.has(tagNumber) ||
-                            !sourceContents.has(tagNumber),
+                            tagNumber === persistedWhitespaceTag ||
+                            inertWhitespaceTagNumbers.has(tagNumber),
                     });
                     if (existingTagId === undefined) {
                         const persisted = getTagNumberByMessageId(db, sessionId, contentId);

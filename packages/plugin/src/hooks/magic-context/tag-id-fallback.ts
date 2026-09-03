@@ -84,8 +84,7 @@ export function createExistingTagResolver(
         resolve(messageId, type, currentContentId, ordinal, options) {
             const accept = options?.accept ?? (() => true);
             const exactTagId = assignments.get(currentContentId);
-            if (exactTagId !== undefined) {
-                if (!accept(exactTagId)) return undefined;
+            if (exactTagId !== undefined && accept(exactTagId)) {
                 usedTagNumbers.add(exactTagId);
                 return exactTagId;
             }

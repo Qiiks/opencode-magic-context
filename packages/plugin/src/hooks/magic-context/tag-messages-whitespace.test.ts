@@ -9,6 +9,7 @@ import {
     getTagsBySession,
     getTailHygieneTags,
     insertTag,
+    markWhitespaceAssistantTagInert,
 } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { Database as DatabaseType } from "../../shared/sqlite";
@@ -64,7 +65,7 @@ describe("whitespace-only assistant tag transition", () => {
     it("retires an existing whitespace row from active accounting without wire oscillation", () => {
         const db = openTestDb();
         const sessionId = "ses-whitespace-accounting";
-        insertTag(db, sessionId, "assistant-blank:p1", "message", 1, 7, 0, null, 0, null, null, {
+        insertTag(db, sessionId, "assistant-blank:p0", "message", 1, 7, 0, null, 0, null, null, {
             tokenCount: 9,
             inputTokenCount: null,
             reasoningTokenCount: null,
@@ -90,6 +91,77 @@ describe("whitespace-only assistant tag transition", () => {
         expect(served).toEqual(["§7§  ", "§7§  "]);
         expect(getTagsBySession(db, sessionId)).toMatchObject([
             { tagNumber: 7, status: "compacted" },
+        ]);
+    });
+
+    it("keeps an inert prefix pinned when a stale source-less assignment occupies the remapped id", () => {
+        const db = openTestDb();
+        const sessionId = "ses-whitespace-remap-pin";
+        insertTag(db, sessionId, "assistant-remap:p0", "message", 1, 1);
+        markWhitespaceAssistantTagInert(db, sessionId, 1, "assistant-remap:p0");
+        insertTag(db, sessionId, "assistant-other:p0", "message", 1, 2);
+        const previousServe = "§1§  ";
+
+        for (let pass = 0; pass < 2; pass += 1) {
+            const tagger = createTagger();
+            tagger.initFromDb(sessionId, db);
+            // Model the stale part-id binding that OpenCode can retain while reverting a part.
+            tagger.bindTag(sessionId, "assistant-remap:p1", 2);
+            const message = assistant(
+                "assistant-remap",
+                [
+                    { type: "thinking", thinking: "signed", signature: "sig" },
+                    { type: "text", text: " " },
+                ],
+                sessionId,
+            );
+
+            tagMessages(sessionId, [message], tagger, db);
+
+            expect(textOf(message, 1)).toBe(previousServe);
+            expect(textOf(message, 1)).not.toContain("§2§");
+        }
+
+        const rows = getTagsBySession(db, sessionId);
+        expect(rows.find((tag) => tag.tagNumber === 1)?.messageId).toBe(
+            "__mc_whitespace_assistant_inert__:1",
+        );
+        expect(rows.find((tag) => tag.tagNumber === 2)).toMatchObject({
+            messageId: "assistant-other:p0",
+            status: "active",
+        });
+    });
+
+    it("mints a fresh tag when real text reaches an ordinal formerly occupied by inert whitespace", () => {
+        const db = openTestDb();
+        const sessionId = "ses-whitespace-remap-real";
+        insertTag(db, sessionId, "assistant-remap-real:p0", "message", 1, 1);
+        markWhitespaceAssistantTagInert(db, sessionId, 1, "assistant-remap-real:p0");
+        // Simulate a stale row whose message id moved from whitespace at p0 to the later p1 part.
+        db.prepare("UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = 1").run(
+            "assistant-remap-real:p1",
+            sessionId,
+        );
+
+        const real = assistant(
+            "assistant-remap-real",
+            [
+                { type: "thinking", thinking: "signed", signature: "sig" },
+                { type: "text", text: "real answer" },
+            ],
+            sessionId,
+        );
+        tagMessages(sessionId, [real], createTagger(), db);
+
+        expect(textOf(real, 1)).toBe("§2§ real answer");
+        expect(
+            getTagsBySession(db, sessionId).map((tag) => ({
+                tagNumber: tag.tagNumber,
+                status: tag.status,
+            })),
+        ).toEqual([
+            { tagNumber: 1, status: "compacted" },
+            { tagNumber: 2, status: "active" },
         ]);
     });
 
