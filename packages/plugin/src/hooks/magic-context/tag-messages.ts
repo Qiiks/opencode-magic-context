@@ -430,10 +430,26 @@ export function tagMessages(
     // (the same `unknown` instance walked twice in the loop).
     const ownerByPartKey = new Map<unknown, { ownerMsgId: string; callId: string }>();
     const batch = new ToolMutationBatch(messages);
+    // Inert whitespace rows are replayed by (message, whitespace rank), not by
+    // session-wide number membership: after a part-id remap the ordinal fallback
+    // offers whichever inert row sits at the current ordinal, and two inert parts
+    // in one message would otherwise swap their `§N§` digits on the wire.
     const inertWhitespaceTagNumbers = new Set<number>();
+    const inertWhitespaceTagsByMessage = new Map<
+        string,
+        Array<{ partIndex: number; tagNumber: number }>
+    >();
     for (const tag of getInertWhitespaceAssistantTags(db, sessionId)) {
         inertWhitespaceTagNumbers.add(tag.tagNumber);
         tagger.bindTag(sessionId, tag.contentId, tag.tagNumber);
+        const scoped = /^(.*):p(\d+)$/.exec(tag.contentId);
+        if (!scoped) continue;
+        const list = inertWhitespaceTagsByMessage.get(scoped[1]) ?? [];
+        list.push({ partIndex: Number(scoped[2]), tagNumber: tag.tagNumber });
+        inertWhitespaceTagsByMessage.set(scoped[1], list);
+    }
+    for (const list of inertWhitespaceTagsByMessage.values()) {
+        list.sort((left, right) => left.partIndex - right.partIndex);
     }
     const assignments = tagger.getAssignments(sessionId);
     const resolver = createExistingTagResolver(sessionId, tagger, db);
@@ -486,6 +502,7 @@ export function tagMessages(
         const messageHasTextPart = message.parts.some(isTextPart);
         let textOrdinal = 0;
         let fileOrdinal = 0;
+        let whitespaceRank = 0;
 
         for (let partIndex = 0; partIndex < message.parts.length; partIndex += 1) {
             const part = message.parts[partIndex];
@@ -640,11 +657,24 @@ export function tagMessages(
                         sessionId,
                         contentId,
                     );
-                    existingTagId = resolver.resolve(messageId, "message", contentId, textOrdinal, {
-                        accept: (tagNumber) =>
-                            tagNumber === persistedWhitespaceTag ||
-                            inertWhitespaceTagNumbers.has(tagNumber),
-                    });
+                    const inertForThisPart =
+                        inertWhitespaceTagsByMessage.get(messageId)?.[whitespaceRank]?.tagNumber;
+                    whitespaceRank += 1;
+                    if (inertForThisPart !== undefined) {
+                        // Bind by rank, bypassing the ordinal fallback: after a remap the
+                        // fallback offers whichever row sits at the current text ordinal,
+                        // which is the wrong inert row whenever a real text part moved.
+                        tagger.bindTag(sessionId, contentId, inertForThisPart);
+                        existingTagId = inertForThisPart;
+                    } else {
+                        existingTagId = resolver.resolve(
+                            messageId,
+                            "message",
+                            contentId,
+                            textOrdinal,
+                            { accept: (tagNumber) => tagNumber === persistedWhitespaceTag },
+                        );
+                    }
                     if (existingTagId === undefined) {
                         const persisted = getTagNumberByMessageId(db, sessionId, contentId);
                         if (

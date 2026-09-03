@@ -132,6 +132,42 @@ describe("whitespace-only assistant tag transition", () => {
         });
     });
 
+    it("keeps two inert prefixes in one message on their own parts after a part-id remap", () => {
+        const db = openTestDb();
+        const sessionId = "ses-whitespace-remap-pair";
+        // Two whitespace framing parts tagged before deploy, at part indexes 0 and 2.
+        insertTag(db, sessionId, "assistant-pair:p0", "message", 1, 4);
+        markWhitespaceAssistantTagInert(db, sessionId, 4, "assistant-pair:p0");
+        insertTag(db, sessionId, "assistant-pair:p2", "message", 1, 5);
+        markWhitespaceAssistantTagInert(db, sessionId, 5, "assistant-pair:p2");
+
+        for (let pass = 0; pass < 3; pass += 1) {
+            const tagger = createTagger();
+            tagger.initFromDb(sessionId, db);
+            // OpenCode re-assigned part ids and a real text part now precedes the
+            // framing, so current text ordinals (1, 2) no longer match the stored
+            // ones (0, 1): the ordinal fallback offers the SECOND inert row for the
+            // FIRST framing part. Each framing part must keep its own digits.
+            const message = assistant(
+                "assistant-pair",
+                [
+                    { type: "text", text: "real answer" },
+                    { type: "text", text: " " },
+                    { type: "thinking", thinking: "signed", signature: "sig" },
+                    { type: "text", text: " " },
+                ],
+                sessionId,
+            );
+
+            tagMessages(sessionId, [message], tagger, db);
+
+            expect(textOf(message, 1)).toBe("§4§  ");
+            expect(textOf(message, 3)).toBe("§5§  ");
+            expect(textOf(message, 0)).not.toContain("§4§");
+            expect(textOf(message, 0)).not.toContain("§5§");
+        }
+    });
+
     it("mints a fresh tag when real text reaches an ordinal formerly occupied by inert whitespace", () => {
         const db = openTestDb();
         const sessionId = "ses-whitespace-remap-real";
