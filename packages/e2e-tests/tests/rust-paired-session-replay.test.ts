@@ -2,17 +2,40 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+    type PairedReplayResult,
     runPairedSessionReplay,
     runPairedTrailingBlankSequenceReplay,
 } from "../src/paired-session-replay";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
+const DIVERGENCE_AXES = [
+    "empty_content_shapes",
+    "dropped_placeholder_shapes",
+    "reasoning_signature_shapes",
+    "tool_pairing_shapes",
+] as const;
+
+function namedDivergences(result: PairedReplayResult, unadjudicatedOnly = false): string[] {
+    return result.passes.flatMap((pass) =>
+        DIVERGENCE_AXES.flatMap((axis) => {
+            const valueSpace = pass[axis];
+            if (valueSpace.classification !== "divergent_value_space") return [];
+            if (unadjudicatedOnly && valueSpace.adjudication !== undefined) return [];
+            return [`${pass.pass}:${axis}`];
+        }),
+    );
+}
+
 describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
     it("keeps the H13 empty, dropped-placeholder, and signed-thinking value spaces aligned", async () => {
         const result = await runPairedSessionReplay({ providerID: "anthropic" });
 
-        expect(result.divergence_count).toBe(3);
-        expect(result.unadjudicated_divergence_count).toBe(0);
+        expect(namedDivergences(result)).toEqual([
+            "isolated-assistant-dropped-placeholder:reasoning_signature_shapes",
+            "raw-empty-assistant-text:reasoning_signature_shapes",
+            "observe-empty-and-placeholder:reasoning_signature_shapes",
+        ]);
+        expect(namedDivergences(result, true)).toEqual([]);
         expect(result.passes).toHaveLength(4);
         for (const pass of result.passes) {
             expect(pass.empty_content_shapes.classification).toBe("matched_value_space");
@@ -52,8 +75,8 @@ describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
     it("keeps MC-synthetic non-Anthropic sentinels non-empty in both lanes", async () => {
         const result = await runPairedSessionReplay({ providerID: "mock-anthropic" });
 
-        expect(result.unadjudicated_divergence_count).toBe(0);
-        expect(result.divergence_count).toBe(0);
+        expect(namedDivergences(result)).toEqual([]);
+        expect(namedDivergences(result, true)).toEqual([]);
         for (const pass of result.passes) {
             expect(pass.empty_content_shapes).toEqual({
                 classification: "matched_value_space",
@@ -74,8 +97,8 @@ describe.skipIf(!rustPrereqs.ok)("TS/Rust paired-session wire replay", () => {
         const result = await runPairedSessionReplay({ providerArm: "openai-responses" });
 
         expect(result.wire_family).toBe("openai_responses");
-        expect(result.unadjudicated_divergence_count).toBe(0);
-        expect(result.divergence_count).toBe(0);
+        expect(namedDivergences(result)).toEqual([]);
+        expect(namedDivergences(result, true)).toEqual([]);
         expect(result.passes).toHaveLength(2);
         for (const pass of result.passes) {
             expect(pass.empty_content_shapes.classification).toBe("matched_value_space");

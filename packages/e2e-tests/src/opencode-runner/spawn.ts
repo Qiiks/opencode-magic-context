@@ -12,6 +12,7 @@ import {
     existsSync,
     mkdirSync,
     readFileSync,
+    readdirSync,
     realpathSync,
     statSync,
     writeFileSync,
@@ -26,17 +27,30 @@ import {
 } from "../rust-runner/hermetic-subc";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-// Prefer the bundled `dist/index.js` (what published users actually run)
-// over raw `src/index.ts`. The bundled file is one ~5MB file with all imports
-// inlined; loading it is fast even on cold runners. The TS-source path
-// triggers Bun's runtime TS transpile + dynamic resolution across hundreds
-// of submodule imports — on slow Linux CI runners this can take long enough
-// to make `opencode serve` appear hung when it's just blocked in plugin
-// load. Production never loads from src/, so testing src/ doesn't reflect
-// reality and exposes us to a slowness path users never see.
+const PLUGIN_SRC_ROOT = join(REPO_ROOT, "packages/plugin/src");
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
-const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
-const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
+const PLUGIN_SRC_ENTRY = join(PLUGIN_SRC_ROOT, "index.ts");
+
+function newestSourceMtime(directory: string): number {
+    let newest = 0;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        newest = Math.max(
+            newest,
+            entry.isDirectory() ? newestSourceMtime(path) : statSync(path).mtimeMs,
+        );
+    }
+    return newest;
+}
+
+// A fresh bundle is the closest production representation and avoids slow source
+// loading on CI. Ignored dist files can survive a local checkout, though, so never
+// let an older bundle silently test different code from the current source tree.
+const PLUGIN_ENTRY =
+    existsSync(PLUGIN_DIST_ENTRY) &&
+    statSync(PLUGIN_DIST_ENTRY).mtimeMs >= newestSourceMtime(PLUGIN_SRC_ROOT)
+        ? PLUGIN_DIST_ENTRY
+        : PLUGIN_SRC_ENTRY;
 
 export interface IsolatedEnv {
     configDir: string;

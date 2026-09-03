@@ -168,6 +168,29 @@ describe("whitespace-only assistant tag transition", () => {
         }
     });
 
+    it("does not move an inert thinking-frame prefix onto a newly appended post-step blank", () => {
+        const db = openTestDb();
+        const sessionId = "ses-whitespace-late-post-step";
+        insertTag(db, sessionId, "assistant-late:p0", "message", 1, 6);
+        markWhitespaceAssistantTagInert(db, sessionId, 6, "assistant-late:p0");
+        const message = assistant(
+            "assistant-late",
+            [
+                { type: "thinking", thinking: "signed", signature: "sig" },
+                { type: "step-finish" },
+                { type: "text", text: "" },
+            ],
+            sessionId,
+        );
+        const tagger = createTagger();
+        tagger.initFromDb(sessionId, db);
+
+        tagMessages(sessionId, [message], tagger, db);
+
+        expect(textOf(message, 2)).toBe("");
+        expect(tagger.getTag(sessionId, "assistant-late:p2", "message")).toBeUndefined();
+    });
+
     it("mints a fresh tag when real text reaches an ordinal formerly occupied by inert whitespace", () => {
         const db = openTestDb();
         const sessionId = "ses-whitespace-remap-real";
