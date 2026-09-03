@@ -42,6 +42,7 @@ import {
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
+import { markWhitespaceAssistantTagInert } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
@@ -2361,6 +2362,143 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(JSON.stringify(postprocessMessages.map((message) => message.parts))).toBe(
             JSON.stringify(directMessages.map((message) => message.parts)),
         );
+    });
+
+    it("preserves a pre-deploy whitespace prefix through a HARD fold and rebuilt defer tail", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-hardfold-inert-whitespace";
+        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-hardfold-whitespace-"));
+        tempDirs.push(dataHome);
+        process.env.XDG_DATA_HOME = dataHome;
+        mkdirSync(join(dataHome, "opencode"), { recursive: true });
+        const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb.exec(
+            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        opencodeDb
+            .prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            )
+            .run("msg-fold-boundary", sessionId, 1_000, 1_000, JSON.stringify({ role: "user" }));
+        opencodeDb.close();
+
+        materializeBaseline(sessionId);
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "msg-fold-boundary",
+                endMessageId: "msg-fold-boundary",
+                title: "hard fold whitespace",
+                content: "folded content",
+            },
+        ]);
+        setPendingCompactionMarkerState(db, sessionId, {
+            ordinal: 10,
+            endMessageId: "msg-fold-boundary",
+            publishedAt: 1,
+        });
+        insertTag(db, sessionId, "assistant-framing:p0", "message", 1, 1);
+        markWhitespaceAssistantTagInert(db, sessionId, 1, "assistant-framing:p0");
+        const previousServe = "§1§  ";
+        const makeTail = () =>
+            [
+                {
+                    info: { id: "msg-tail-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained user turn" }],
+                },
+                {
+                    info: { id: "assistant-framing", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: " " }],
+                },
+            ] as unknown as MessageLike[];
+
+        const tagger = createTagger();
+        tagger.initFromDb(sessionId, db);
+        const hardMessages = makeTail();
+        const hardTagged = tagMessages(sessionId, hardMessages, tagger, db);
+        const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
+        const hardResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, hardMessages, {
+                tagger,
+                targets: hardTagged.targets,
+                reasoningByMessage: hardTagged.reasoningByMessage,
+                messageTagNumbers: hardTagged.messageTagNumbers,
+                batch: hardTagged.batch,
+                deferredHistoryWasPendingAtPassStart: true,
+                historyRebuiltThisPass: true,
+                canConsumeDeferredLate: true,
+                deferredHistoryRefreshSessions,
+                pendingCompartmentInjection: {
+                    block: "",
+                    compartmentEndMessage: 10,
+                    compartmentEndMessageId: "msg-fold-boundary",
+                    compartmentCount: 1,
+                    skippedVisibleMessages: 0,
+                    factCount: 0,
+                    memoryCount: 0,
+                    rebuiltFromDb: true,
+                },
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                },
+            }),
+        );
+
+        const marker = getPersistedCompactionMarkerState(db, sessionId);
+        const hardWhitespace = hardMessages.find(
+            (message) => message.info.id === "assistant-framing",
+        );
+        expect(hardResult.materialized).toBe(true);
+        expect(marker?.boundaryOrdinal).toBe(10);
+        expect(hardWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        const hardWire = JSON.stringify(hardMessages);
+
+        const deferMessages = [
+            {
+                info: {
+                    id: marker?.summaryMessageId,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    summary: true,
+                    finish: "stop",
+                },
+                parts: [{ type: "text", text: MARKER_SUMMARY_TEXT }],
+            },
+            ...makeTail(),
+        ] as unknown as MessageLike[];
+        const deferTagger = createTagger();
+        deferTagger.initFromDb(sessionId, db);
+        const deferTagged = tagMessages(sessionId, deferMessages, deferTagger, db);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                tagger: deferTagger,
+                targets: deferTagged.targets,
+                reasoningByMessage: deferTagged.reasoningByMessage,
+                messageTagNumbers: deferTagged.messageTagNumbers,
+                batch: deferTagged.batch,
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                },
+            }),
+        );
+
+        const deferWhitespace = deferMessages.find(
+            (message) => message.info.id === "assistant-framing",
+        );
+        expect(deferWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        expect(JSON.stringify(deferMessages)).toBe(hardWire);
     });
 
     it("observes a tool-set comparison without turning it into an m[0] fold", async () => {
