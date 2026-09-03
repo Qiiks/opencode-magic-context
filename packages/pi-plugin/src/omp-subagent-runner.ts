@@ -141,10 +141,13 @@ function sanitizeLabel(value: string): string {
 }
 
 /**
- * Literal thinking levels OMP's model-pattern grammar accepts as `:level`
- * suffixes (splitThinkingSuffix vocabulary, minus the non-level sentinels).
- * `off`/`auto`/`inherit` are selector sentinels, not wire levels — they must
- * NOT be appended to a model ref.
+ * Thinking selectors OMP's model-pattern grammar accepts as `:level`
+ * suffixes (parseThinkingLevel vocabulary — the same table that backs
+ * `--thinking`). Includes `off`, which is a wire-real selector: it parses
+ * as a `:off` suffix and lands on the child as `disableReasoning: true`
+ * (shouldDisableReasoning). `auto`/`inherit` are NOT included — `auto` is
+ * gated out of suffixes by parseThinkingSuffix (only via allowAutoAlias)
+ * and `inherit` is a role-storage sentinel, not a spawn selector.
  */
 const LITERAL_THINKING_LEVEL: Record<string, true> = {
 	minimal: true,
@@ -153,11 +156,29 @@ const LITERAL_THINKING_LEVEL: Record<string, true> = {
 	high: true,
 	xhigh: true,
 	max: true,
+	off: true,
 };
 
 /** True when the configured level can ride a model ref as an exact `:level` suffix. */
 export function isLiteralThinkingLevel(level: string | undefined): level is string {
 	return level !== undefined && LITERAL_THINKING_LEVEL[level] === true;
+}
+
+/**
+ * Strip a trailing `:suffix` from a model ref when that suffix parses as a
+ * thinking level (e.g. a config entry already written in selector form,
+ * `bai/glm-5.3-flash:high`). A non-level suffix (`nous-portal/
+ * meituan/longcat-2.0:free`) is left intact — it is part of the model id,
+ * and appending would produce the invalid grammar `:free:max`.
+ */
+function stripThinkingSuffixFromRef(ref: string): string {
+	const colonIdx = ref.lastIndexOf(":");
+	if (colonIdx <= 0) return ref;
+	const suffix = ref.slice(colonIdx + 1);
+	// Reuse OMP's own level vocabulary: anything the selector table knows is
+	// a thinking suffix, anything else is part of the id.
+	if (LITERAL_THINKING_LEVEL[suffix] === true) return ref.slice(0, colonIdx);
+	return ref;
 }
 
 /**
@@ -313,23 +334,36 @@ export class OmpSubagentRunner implements SubagentRunner {
 				//    anything outside lo/med/hi.
 				// 2. A `:level` suffix on the model ref — OMP's model-pattern
 				//    grammar (splitThinkingSuffix) accepts exact literal levels
-				//    (minimal/low/medium/high/xhigh/max) and resolves them as
-				//    explicitThinkingLevel. Exact per-model; effort is the
-				//    positional fallback for long ladders where the selector is
-				//    less precise than the literal level.
+				//    (minimal/low/medium/high/xhigh/max, plus `off` for
+				//    disableReasoning) and resolves them as explicitThinkingLevel.
+				//    Exact per-model; effort is the positional fallback for long
+				//    ladders where the selector is less precise.
 				const effort = taskEffortForLevel(options.thinkingLevel);
 				const literalLevel = isLiteralThinkingLevel(options.thinkingLevel)
 					? options.thinkingLevel
 					: undefined;
+				let model: string | undefined;
+				if (modelRef !== undefined) {
+					if (literalLevel === undefined) {
+						model = modelRef;
+					} else {
+						const stripped = stripThinkingSuffixFromRef(modelRef);
+						const hadThinkingSuffix = stripped !== modelRef;
+						const refHasNonLevelSuffix = modelRef.lastIndexOf(":") > 0 && !hadThinkingSuffix;
+						if (refHasNonLevelSuffix) {
+							model = modelRef;
+						} else {
+							model = `${stripped}:${literalLevel}`;
+						}
+					}
+				}
 				const request = {
 					session,
 					invocationKind: "task" as const,
 					assignment: buildAssignment(options.systemPrompt, options.userMessage),
 					agent: "task",
 					...(effort !== undefined ? { effort } : {}),
-					...(modelRef !== undefined
-						? { model: literalLevel !== undefined ? `${modelRef}:${literalLevel}` : modelRef }
-						: {}),
+					...(model !== undefined ? { model } : {}),
 					identity: { label: `MagicContext-${sanitizeLabel(options.agent)}` },
 					enableIrc: false,
 					enableLsp: false,

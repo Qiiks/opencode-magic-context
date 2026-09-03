@@ -263,11 +263,11 @@ describe("thinking level → OMP spawn mapping", () => {
 		expect(taskEffortForLevel("garbage")).toBeUndefined();
 	});
 
-	test("isLiteralThinkingLevel accepts exactly the wire-level vocabulary", () => {
-		for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
+	test("isLiteralThinkingLevel accepts the wire-level vocabulary plus off", () => {
+		for (const level of ["minimal", "low", "medium", "high", "xhigh", "max", "off"]) {
 			expect(isLiteralThinkingLevel(level)).toBe(true);
 		}
-		for (const sentinel of ["off", "auto", "inherit", undefined, "garbage"]) {
+		for (const sentinel of ["auto", "inherit", undefined, "garbage"]) {
 			expect(isLiteralThinkingLevel(sentinel as string | undefined)).toBe(false);
 		}
 	});
@@ -295,7 +295,7 @@ describe("thinking level → OMP spawn mapping", () => {
 		expect(request.model).toBe("openai-codex/gpt-5.4:max");
 	});
 
-	test("sentinel thinking levels omit both effort and suffix", async () => {
+	test("off rides the model ref as :off (disableReasoning) with effort omitted", async () => {
 		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
 		const surface = fakeSurface(
 			{
@@ -311,8 +311,61 @@ describe("thinking level → OMP spawn mapping", () => {
 		const runner = new OmpSubagentRunner({ surface: surface as never });
 		await runner.run({ ...BASE_OPTIONS, thinkingLevel: "off" });
 		const request = capture.requests[0]!;
+		// effort stays omitted: lo/med/hi has no off rung
 		expect(request.effort).toBeUndefined();
-		// openai → openai-codex translation still applies; NO :suffix
-		expect(request.model).toBe("openai-codex/gpt-5.4");
+		// :off parses as a ThinkingLevel suffix and lands as disableReasoning
+		expect(request.model).toBe("openai-codex/gpt-5.4:off");
+	});
+
+	test("colon-bearing ref with a non-level suffix keeps the id and skips the literal append", async () => {
+		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
+		const surface = fakeSurface(
+			{
+				result: {
+					exitCode: 0,
+					output: "<compartment><title>t</title></compartment>",
+					stderr: "",
+					truncated: false,
+				},
+			},
+			capture,
+		);
+		const runner = new OmpSubagentRunner({ surface: surface as never });
+		// nous-portal/meituan/longcat-2.0:free — :free is part of the model id
+		await runner.run({
+			...BASE_OPTIONS,
+			model: "nous-portal/meituan/longcat-2.0:free",
+			thinkingLevel: "max",
+		});
+		const request = capture.requests[0]!;
+		// effort carries the thinking intent instead
+		expect(request.effort).toBe("hi");
+		// NO invalid :free:max grammar; the id is untouched
+		expect(request.model).toBe("nous-portal/meituan/longcat-2.0:free");
+	});
+
+	test("ref already carrying a thinking-level suffix gets it replaced", async () => {
+		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
+		const surface = fakeSurface(
+			{
+				result: {
+					exitCode: 0,
+					output: "<compartment><title>t</title></compartment>",
+					stderr: "",
+					truncated: false,
+				},
+			},
+			capture,
+		);
+		const runner = new OmpSubagentRunner({ surface: surface as never });
+		// config entry written in selector form — the configured level wins
+		await runner.run({
+			...BASE_OPTIONS,
+			model: "bai/glm-5.3-flash:high",
+			thinkingLevel: "max",
+		});
+		const request = capture.requests[0]!;
+		expect(request.effort).toBe("hi");
+		expect(request.model).toBe("bai/glm-5.3-flash:max");
 	});
 });
