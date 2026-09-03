@@ -818,7 +818,7 @@ async function driveTrailingBlankLane(
 
 export async function runPairedTrailingBlankSequenceReplay(): Promise<TrailingBlankSequenceReplayResult> {
     const config = {
-        execute_threshold_percentage: 95,
+        execute_threshold_percentage: 90,
         memory: { auto_search: { enabled: false } },
         compressor: { enabled: false },
     };
@@ -898,7 +898,7 @@ export async function runPairedSessionReplay(options: {
         modelID: arm.model_id,
         modelContextLimit: 200_000,
         magicContextConfig: {
-            execute_threshold_percentage: 95,
+            execute_threshold_percentage: 90,
             memory: { auto_search: { enabled: false } },
             compressor: { enabled: false },
         },
@@ -909,7 +909,7 @@ export async function runPairedSessionReplay(options: {
         await harness.restart({
             rust: true,
             magicContextConfig: {
-                execute_threshold_percentage: 95,
+                execute_threshold_percentage: 90,
                 memory: { auto_search: { enabled: false } },
                 compressor: { enabled: false },
             },

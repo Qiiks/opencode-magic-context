@@ -657,8 +657,19 @@ export function tagMessages(
                         sessionId,
                         contentId,
                     );
-                    const inertForThisPart =
-                        inertWhitespaceTagsByMessage.get(messageId)?.[whitespaceRank]?.tagNumber;
+                    const rankedInertTag =
+                        inertWhitespaceTagsByMessage.get(messageId)?.[whitespaceRank];
+                    // Reuse a retired whitespace tag only at its original part index or
+                    // next to a thinking part, where whitespace is provider framing. A
+                    // blank added after a completed step must remain untagged instead of
+                    // inheriting an older prefix.
+                    const canReplayRankedTag =
+                        rankedInertTag?.partIndex === partIndex ||
+                        isThinkingPart(message.parts[partIndex - 1]) ||
+                        isThinkingPart(message.parts[partIndex + 1]);
+                    const inertForThisPart = canReplayRankedTag
+                        ? rankedInertTag?.tagNumber
+                        : undefined;
                     whitespaceRank += 1;
                     if (inertForThisPart !== undefined) {
                         // Bind by rank, bypassing the ordinal fallback: after a remap the
