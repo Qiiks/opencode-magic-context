@@ -57,6 +57,19 @@ export interface OmpRunnerHostContext {
 	sessionFile?: string | null;
 	/** Live host session id, when known. */
 	sessionId?: string | null;
+	/**
+	 * The host session's live ModelRegistry. OMP's structured spawn path
+	 * forwards `session.modelRegistry` into `runSubprocess`
+	 * (structured-subagent.ts:433 → executor.ts `registryFromParent`), so
+	 * passing the parent's registry here makes extension-registered runtime
+	 * providers (bai, nous-portal, kiosapi, …) resolvable in the child.
+	 * Without it, `runSubprocess` constructs a fresh registry that only knows
+	 * bundled-catalog providers + models.yml discoverables — a configured
+	 * historian model from a runtime provider then fails to resolve and the
+	 * spawn silently falls back to the session default ("No model selected"
+	 * when even that fails).
+	 */
+	modelRegistry?: unknown;
 }
 
 export interface OmpSubagentRunnerOptions {
@@ -106,6 +119,10 @@ function buildToolSession(
 		suppressSpawnAdvisory: true,
 		settings,
 		authStorage,
+		// Parent's live registry — lets the structured spawn resolve
+		// extension-registered (runtime) providers instead of falling back to
+		// a fresh registry that only knows bundled + models.yml providers.
+		modelRegistry: host.modelRegistry,
 	};
 }
 
@@ -216,13 +233,23 @@ export class OmpSubagentRunner implements SubagentRunner {
 	readonly harness = "omp";
 
 	private readonly injectedSurface: OmpSubagentSurface | null | undefined;
-	private readonly hostContext: OmpRunnerHostContext;
+	private hostContext: OmpRunnerHostContext;
 	private readonly injectedFallback: SubagentRunner | undefined;
 
 	constructor(options: OmpSubagentRunnerOptions = {}) {
 		this.injectedSurface = options.surface;
 		this.hostContext = options.hostContext ?? {};
 		this.injectedFallback = options.fallbackRunner;
+	}
+
+	/**
+	 * Update the live host context snapshot (model ref, session ids, and the
+	 * parent's ModelRegistry). Called by the extension when it has a live
+	 * `ExtensionContext` in scope — the singleton runner is constructed
+	 * before any session exists, so construction-time capture would be empty.
+	 */
+	setHostContext(patch: Partial<OmpRunnerHostContext>): void {
+		this.hostContext = { ...this.hostContext, ...patch };
 	}
 
 	/**

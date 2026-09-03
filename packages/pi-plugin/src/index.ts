@@ -1323,6 +1323,26 @@ async function startPiMagicContextRuntime(
 		const current = resolveCurrentProjectDeps(ctx);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
+		// Give the OMP-native runner the live host context: the parent session's
+		// ModelRegistry (so extension-registered runtime providers like bai/
+		// nous-portal resolve in structured spawns instead of falling back to a
+		// bundled-only fresh registry), plus the active model ref and session
+		// ids for fallback/lease wiring. Best-effort — a failure here must not
+		// break session start.
+		try {
+			resolveOmpRunner?.setHostContext({
+				model:
+					ctx.model !== undefined
+						? `${ctx.model.provider}/${ctx.model.id}`
+						: undefined,
+				modelRegistry: ctx.modelRegistry,
+				sessionFile: ctx.sessionManager?.getSessionFile?.() ?? null,
+				sessionId: ctx.sessionManager?.getSessionId?.() ?? null,
+			});
+		} catch (err) {
+			log(`session_start: omp runner host context capture skipped: ${String(err)}`);
+		}
+
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
