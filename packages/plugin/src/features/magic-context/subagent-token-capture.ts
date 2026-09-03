@@ -3,6 +3,7 @@ import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
     recordSubagentInvocation,
+    type SubagentInvocationHarness,
     type SubagentInvocationStatus,
     type SubagentKind,
 } from "./storage-subagent-invocations";
@@ -22,7 +23,7 @@ export interface LastAssistantModel {
 export interface ChildInvocationRecordInput {
     db: Database | null;
     parentSessionId: string;
-    harness: "opencode" | "pi";
+    harness: SubagentInvocationHarness;
     subagent: SubagentKind;
     startedAt: number;
     endedAt?: number;

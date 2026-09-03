@@ -166,9 +166,11 @@ import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 import {
 	configurePiSubagentExtensions,
+	isOmpHostProcess,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
+import { OmpSubagentRunner } from "./omp-subagent-runner";
 import {
 	buildMagicContextBlock,
 	clearPiSystemPromptSession,
@@ -675,6 +677,29 @@ export function resolveSidekickFromConfig(
 	};
 }
 
+
+/**
+ * Shared OMP-native historian runner, constructed at most once per process.
+ * `undefined` when this is not an OMP host — the caller then wires the
+ * subprocess runner. Construction is deliberately lazy and sync (the OMP
+ * surface load happens on first `run()`), so this never touches host modules
+ * at boot.
+ */
+let ompRunnerSingleton: OmpSubagentRunner | undefined;
+let ompRunnerResolved = false;
+
+function getOmpHistorianRunner(): OmpSubagentRunner | undefined {
+	if (!ompRunnerResolved) {
+		ompRunnerResolved = true;
+		if (isOmpHostProcess()) {
+			ompRunnerSingleton = new OmpSubagentRunner();
+		}
+	}
+	return ompRunnerSingleton;
+}
+
+const resolveOmpRunner = getOmpHistorianRunner();
+
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
 ): PiHistorianOptions | undefined {
@@ -699,7 +724,14 @@ export function resolveHistorianFromConfig(
 	const fallbackModels = resolved.fallbacks;
 
 	return {
-		runner: new PiSubagentRunner(),
+		// On OMP hosts, run the historian through OMP's native subagent
+		// machinery (visible in the subagent pane, yield-terminated) instead
+		// of a headless `--print` process. Falls back to the subprocess
+		// runner whenever the OMP surface is unavailable (cortexkit/magic-context#416).
+		runner:
+			isOmpHostProcess() && resolveOmpRunner !== undefined
+				? resolveOmpRunner
+				: new PiSubagentRunner(),
 		model,
 		fallbackModels,
 		historianChunkTokens,

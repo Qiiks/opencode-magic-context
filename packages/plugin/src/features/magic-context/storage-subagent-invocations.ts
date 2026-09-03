@@ -9,11 +9,13 @@ export type SubagentKind =
     | "user_memory_review"
     | "recomp";
 
+export type SubagentInvocationHarness = "opencode" | "pi" | "omp";
+
 export type SubagentInvocationStatus = "completed" | "failed" | "aborted";
 
 export interface SubagentInvocationInput {
     sessionId: string;
-    harness: "opencode" | "pi";
+    harness: SubagentInvocationHarness;
     subagent: SubagentKind;
     task?: string | null;
     providerId?: string | null;
@@ -32,7 +34,7 @@ export interface SubagentInvocationInput {
 export interface SubagentInvocationRow {
     id: number;
     sessionId: string;
-    harness: "opencode" | "pi";
+    harness: SubagentInvocationHarness;
     subagent: SubagentKind;
     task: string | null;
     providerId: string | null;
@@ -59,7 +61,7 @@ export interface SubagentTotals {
 interface SubagentInvocationDbRow {
     id: number;
     session_id: string;
-    harness: "opencode" | "pi";
+    harness: SubagentInvocationHarness;
     subagent: SubagentKind;
     task: string | null;
     provider_id: string | null;

@@ -500,7 +500,7 @@ function expandHomePath(value: string): string {
  * Positive OMP host identification. PI_CODING_AGENT_DIR alone is deliberately
  * insufficient because upstream Pi supports the same variable.
  */
-function isOmpHostProcess(): boolean {
+export function isOmpHostProcess(): boolean {
 	const execName = basename(process.execPath).toLowerCase();
 	if (/^omp(?:\.exe)?$/.test(execName)) return true;
 
@@ -752,7 +752,7 @@ const KNOWN_PI_SUBAGENT_AGENTS = [
 	"magic-context-dreamer",
 ] as const;
 
-function inferAccountingSubagent(agent: string): SubagentKind {
+export function inferAccountingSubagent(agent: string): SubagentKind {
 	if (agent.includes("sidekick")) return "sidekick";
 	if (agent.includes("retrospective")) return "dreamer";
 	if (agent.includes("dreamer")) return "dreamer";
