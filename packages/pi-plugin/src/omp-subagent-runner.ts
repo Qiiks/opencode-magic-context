@@ -343,6 +343,26 @@ export class OmpSubagentRunner implements SubagentRunner {
 					? options.thinkingLevel
 					: undefined;
 				let model: string | undefined;
+				// The one combination the structured path cannot express: `off`
+				// (disable reasoning) on a ref whose trailing suffix is part of
+				// the model id (`:free`). Appending is invalid grammar
+				// (`:free:off`) and there is no effort rung for "off" — so the
+				// subprocess runner, which passes `--thinking off`, serves this
+				// spawn instead.
+				const offBlockedByNonLevelSuffix =
+					options.thinkingLevel === "off" &&
+					modelRef !== undefined &&
+					stripThinkingSuffixFromRef(modelRef) === modelRef &&
+					modelRef.lastIndexOf(":") > 0;
+				if (offBlockedByNonLevelSuffix) {
+					const fallback = this.injectedFallback ?? (subprocessFallback ??= new PiSubagentRunner());
+					options.onProgress?.({
+						type: "spawned",
+						argv: ["omp:fallback-subprocess", options.agent],
+						pid: undefined,
+					});
+					return fallback.run(options);
+				}
 				if (modelRef !== undefined) {
 					if (literalLevel === undefined) {
 						model = modelRef;
@@ -441,18 +461,27 @@ export class OmpSubagentRunner implements SubagentRunner {
 				ms: duration(),
 			};
 			options.onProgress?.(progress);
+			// Every terminal failure records accounting — a rejected preflight
+			// or deadline abort is still a historian attempt the invocation
+			// history and token aggregates must not omit.
 			if (timedOut) {
-				return {
+				const result: SubagentRunResult = {
 					ok: false,
 					reason: "timeout",
 					error: `historian run exceeded deadline: ${message}`,
 					durationMs: duration(),
 				};
+				recordAccounting(result);
+				return result;
 			}
 			if (/aborted|AbortSignal/i.test(message)) {
-				return { ok: false, reason: "abort", error: message, durationMs: duration() };
+				const result: SubagentRunResult = { ok: false, reason: "abort", error: message, durationMs: duration() };
+				recordAccounting(result);
+				return result;
 			}
-			return { ok: false, reason: "spawn_failed", error: message, durationMs: duration() };
+			const result: SubagentRunResult = { ok: false, reason: "spawn_failed", error: message, durationMs: duration() };
+			recordAccounting(result);
+			return result;
 		}
 	}
 }

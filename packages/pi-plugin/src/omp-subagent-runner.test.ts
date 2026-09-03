@@ -368,4 +368,43 @@ describe("thinking level → OMP spawn mapping", () => {
 		expect(request.effort).toBe("hi");
 		expect(request.model).toBe("bai/glm-5.3-flash:max");
 	});
+	test("off on a :free ref delegates to the subprocess runner (structured path cannot express it)", async () => {
+		const capture: { requests: Array<Record<string, unknown>> } = { requests: [] };
+		const surface = fakeSurface(
+			{
+				result: {
+					exitCode: 0,
+					output: "<compartment><title>t</title></compartment>",
+					stderr: "",
+					truncated: false,
+				},
+			},
+			capture,
+		);
+		let fallbackCalls = 0;
+		const fallbackRunner = {
+			harness: "pi",
+			run: async () => {
+				fallbackCalls += 1;
+				return { ok: true as const, assistantText: "fallback-ok", durationMs: 1 };
+			},
+		};
+		const runner = new OmpSubagentRunner({
+			surface: surface as never,
+			fallbackRunner: fallbackRunner as never,
+		});
+		const result = await runner.run({
+			...BASE_OPTIONS,
+			model: "nous-portal/meituan/longcat-2.0:free",
+			thinkingLevel: "off",
+		});
+		// Delegated — the structured path has no disable-reasoning channel for
+		// a non-level-suffixed ref, so the subprocess runner (--thinking off)
+		// serves this spawn.
+		expect(fallbackCalls).toBe(1);
+		// The native surface was never invoked.
+		expect(capture.requests).toHaveLength(0);
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.assistantText).toBe("fallback-ok");
+	});
 });
